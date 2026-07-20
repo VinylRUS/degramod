@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard — Shadow Logger{% endblock %}
+
+{% block content %}
+
+{# ── Топ нарушителей за 30 дней ──────────────────────────────── #}
+<div class="section-title">Top offenders / 30d</div>
+<div class="stat-grid">
+    {% for off in top_offenders %}
+    <div class="stat-card">
+        <div class="label">
+            <a href="/user/{{ off.user_id }}">
+                {{ off.username or off.first_name or off.user_id }}
+            </a>
+        </div>
+        <div class="value">{{ off.cnt }}</div>
+    </div>
+    {% endfor %}
+    {% if not top_offenders %}
+    <div class="stat-card">
+        <div class="label">No data</div>
+        <div class="value">—</div>
+    </div>
+    {% endif %}
+</div>
+
+{# ── Глобальный лог ──────────────────────────────────────────── #}
+<div class="section-title">Recent sanctions / last 50</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Action</th>
+            <th>User</th>
+            <th>Moderator</th>
+            <th>Duration</th>
+            <th>Reason</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for punishment, user, moderator in rows %}
+        <tr>
+            <td class="dim">{{ punishment.id }}</td>
+            <td class="dim">{{ punishment.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td><span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span></td>
+            <td>
+                <a href="/user/{{ user.user_id }}">
+                    {{ user.username or user.first_name or user.user_id }}
+                </a>
+            </td>
+            <td class="dim">{{ moderator.username or moderator.first_name or moderator.mod_id }}</td>
+            <td>
+                {% if punishment.action_type == 'warn' %}
+                    {{ punishment.duration_seconds or 0 }} pts
+                {% elif punishment.duration_seconds %}
+                    {% set d = punishment.duration_seconds %}
+                    {% if d >= 86400 %}{{ d // 86400 }}d {% endif %}
+                    {% if d % 86400 >= 3600 %}{{ (d % 86400) // 3600 }}h {% endif %}
+                    {% if d % 3600 >= 60 %}{{ (d % 3600) // 60 }}m{% endif %}
+                {% else %}
+                    —
+                {% endif %}
+            </td>
+            <td>{{ punishment.reason or '—' }}</td>
+        </tr>
+        {% endfor %}
+        {% if not rows %}
+        <tr><td colspan="7" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
+        {% endif %}
+    </tbody>
+</table>
+
+{% endblock %}

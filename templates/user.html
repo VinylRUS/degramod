@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}User {{ user.user_id }} — Shadow Logger{% endblock %}
+
+{% block content %}
+
+{# ── Профиль ─────────────────────────────────────────────────── #}
+<div class="section-title">Profile</div>
+<table style="margin-bottom: 24px;">
+    <tr><td class="dim" style="width:120px;">ID</td><td>{{ user.user_id }}</td></tr>
+    <tr><td class="dim">Username</td><td>@{{ user.username or '—' }}</td></tr>
+    <tr><td class="dim">First name</td><td>{{ user.first_name or '—' }}</td></tr>
+    <tr><td class="dim">Last name</td><td>{{ user.last_name or '—' }}</td></tr>
+    <tr><td class="dim">Last seen</td><td>{{ user.last_seen.strftime('%Y-%m-%d %H:%M UTC') if user.last_seen else '—' }}</td></tr>
+</table>
+
+{# ── Счётчики ───────────────────────────────────────────────── #}
+<div class="section-title">Counters</div>
+<div class="stat-grid">
+    <div class="stat-card">
+        <div class="label">Mutes</div>
+        <div class="value" style="color: var(--warn);">{{ counters.get('mute', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Warns</div>
+        <div class="value" style="color: var(--info);">{{ counters.get('warn', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Bans</div>
+        <div class="value" style="color: var(--danger);">{{ counters.get('ban', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unmutes</div>
+        <div class="value" style="color: var(--accent);">{{ counters.get('unmute', 0) }}</div>
+    </div>
+</div>
+
+{# ── Фильтры ────────────────────────────────────────────────── #}
+<div class="section-title">History</div>
+<div class="filter-tabs">
+    <a href="/user/{{ user.user_id }}" class="{% if not action_filter %}active{% endif %}">ALL</a>
+    <a href="/user/{{ user.user_id }}?action=mute" class="{% if action_filter == 'mute' %}active{% endif %}">MUTE</a>
+    <a href="/user/{{ user.user_id }}?action=warn" class="{% if action_filter == 'warn' %}active{% endif %}">WARN</a>
+    <a href="/user/{{ user.user_id }}?action=ban" class="{% if action_filter == 'ban' %}active{% endif %}">BAN</a>
+    <a href="/user/{{ user.user_id }}?action=unmute" class="{% if action_filter == 'unmute' %}active{% endif %}">UNMUTE</a>
+</div>
+
+{# ── Хронология ─────────────────────────────────────────────── #}
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Moderator</th>
+            <th>Duration</th>
+            <th>Reason</th>
+            <th>Message</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for punishment, moderator in punishments %}
+        <tr>
+            <td class="dim">{{ punishment.id }}</td>
+            <td class="dim">{{ punishment.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td><span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span></td>
+            <td class="dim">{{ moderator.username or moderator.first_name or moderator.mod_id }}</td>
+            <td>
+                {% if punishment.action_type == 'warn' %}
+                    {{ punishment.duration_seconds or 0 }} pts
+                {% elif punishment.duration_seconds %}
+                    {% set d = punishment.duration_seconds %}
+                    {% if d >= 86400 %}{{ d // 86400 }}d {% endif %}
+                    {% if d % 86400 >= 3600 %}{{ (d % 86400) // 3600 }}h {% endif %}
+                    {% if d % 3600 >= 60 %}{{ (d % 3600) // 60 }}m{% endif %}
+                {% else %}
+                    —
+                {% endif %}
+            </td>
+            <td>{{ punishment.reason or '—' }}</td>
+            <td class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                {{ punishment.message_text or '—' }}
+            </td>
+        </tr>
+        {% endfor %}
+        {% if not punishments %}
+        <tr><td colspan="7" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
+        {% endif %}
+    </tbody>
+</table>
+
+{% endblock %}

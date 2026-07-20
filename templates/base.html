@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>{% block title %}Shadow Logger{% endblock %}</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg:        #0d0d0d;
+            --bg2:       #141414;
+            --bg3:       #1a1a1a;
+            --border:    #2a2a2a;
+            --text:      #c8c8c8;
+            --text-dim:  #666;
+            --accent:    #00cc66;
+            --danger:    #cc3333;
+            --warn:      #cc9933;
+            --info:      #3399cc;
+            --font-mono: 'JetBrains Mono', 'Roboto Mono', 'Fira Code', monospace;
+            --font-sans: 'Inter', -apple-system, system-ui, sans-serif;
+        }
+
+        html, body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: var(--font-mono);
+            font-size: 13px;
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+
+        /* ── Navbar ────────────────────────────────────── */
+        .navbar {
+            background: var(--bg2);
+            border-bottom: 1px solid var(--border);
+            padding: 0 24px;
+            display: flex;
+            align-items: center;
+            height: 44px;
+            gap: 24px;
+        }
+        .navbar .brand {
+            color: var(--accent);
+            font-weight: 700;
+            font-size: 14px;
+            letter-spacing: 1px;
+        }
+        .navbar a {
+            color: var(--text-dim);
+            font-size: 12px;
+            transition: color .15s;
+        }
+        .navbar a:hover { color: var(--text); text-decoration: none; }
+        .navbar .spacer { flex: 1; }
+
+        /* ── Container ─────────────────────────────────── */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* ── Section ───────────────────────────────────── */
+        .section-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--text-dim);
+            margin-bottom: 12px;
+            padding-bottom: 6px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        /* ── Table ─────────────────────────────────────── */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th {
+            text-align: left;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-dim);
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border);
+        }
+        td {
+            padding: 7px 10px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+        }
+        tr:hover td { background: var(--bg3); }
+
+        /* ── Badges ────────────────────────────────────── */
+        .badge {
+            display: inline-block;
+            padding: 2px 7px;
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            border: 1px solid;
+        }
+        .badge-mute   { color: var(--warn);  border-color: var(--warn);  background: rgba(204,153,51,.1); }
+        .badge-warn   { color: var(--info);  border-color: var(--info);  background: rgba(51,153,204,.1); }
+        .badge-ban    { color: var(--danger); border-color: var(--danger); background: rgba(204,51,51,.1); }
+        .badge-unmute { color: var(--accent); border-color: var(--accent); background: rgba(0,204,102,.1); }
+
+        /* ── Stat block ────────────────────────────────── */
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            padding: 14px 16px;
+        }
+        .stat-card .label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-dim);
+        }
+        .stat-card .value {
+            font-size: 22px;
+            font-weight: 700;
+            color: var(--accent);
+            margin-top: 4px;
+        }
+
+        /* ── Filter tabs ───────────────────────────────── */
+        .filter-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+        }
+        .filter-tabs a {
+            padding: 4px 10px;
+            font-size: 11px;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+        }
+        .filter-tabs a:hover { color: var(--text); text-decoration: none; }
+        .filter-tabs a.active {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+
+        /* ── Utilities ─────────────────────────────────── */
+        .mono { font-family: var(--font-mono); }
+        .dim  { color: var(--text-dim); }
+        .mt-2 { margin-top: 16px; }
+        .mt-3 { margin-top: 24px; }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    {% block navbar %}
+    <nav class="navbar">
+        <span class="brand">SHADOW LOGGER</span>
+        <a href="/dashboard">DASHBOARD</a>
+        <span class="spacer"></span>
+        <a href="/logout">LOGOUT</a>
+    </nav>
+    {% endblock %}
+
+    <div class="container">
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>
