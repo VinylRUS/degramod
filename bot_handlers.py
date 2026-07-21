@@ -1,10 +1,11 @@
 """
 bot_handlers.py — Обработка модераторских команд: !mute, !warn, !ban, !unmute.
-Бот удаляет сообщение с командой и логирует санкцию.
+Бот удаляет сообщение с командой, снимает слепок пермишенов и логирует санкцию.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import logging
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 
 from aiogram import Router, types
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from db import async_session, User, Moderator, Punishment
 
@@ -42,14 +43,43 @@ def _parse_duration(text: str) -> int | None:
     return total if total > 0 else None
 
 
-# ── Команда: !mute <duration> <reason> ─────────────────────────────────────
+# ── Команды ─────────────────────────────────────────────────────────────────
 _CMD_MUTE = re.compile(r"^!mute\s+(\S+)\s+(.+)$", re.IGNORECASE)
-# ── Команда: !warn <points> <reason> ───────────────────────────────────────
 _CMD_WARN = re.compile(r"^!warn\s+(\d+)\s+(.+)$", re.IGNORECASE)
-# ── Команда: !ban <reason> ─────────────────────────────────────────────────
 _CMD_BAN = re.compile(r"^!ban\s+(.+)$", re.IGNORECASE)
-# ── Команда: !unmute ───────────────────────────────────────────────────────
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
+
+# ── Permissions snapshot ───────────────────────────────────────────────────
+_PERM_FIELDS = [
+    "can_send_messages",
+    "can_send_audios",
+    "can_send_documents",
+    "can_send_photos",
+    "can_send_videos",
+    "can_send_video_notes",
+    "can_send_voice_notes",
+    "can_send_polls",
+    "can_send_other_messages",
+    "can_add_web_page_previews",
+    "can_change_info",
+    "can_invite_users",
+    "can_pin_messages",
+]
+
+
+def _snapshot_permissions(member: types.ChatMember) -> str | None:
+    """Сериализует текущие пермишены ChatMember в JSON-строку."""
+    perms = getattr(member, "permissions", None)
+    if perms is None:
+        return None
+    data = {field: bool(getattr(perms, field, False)) for field in _PERM_FIELDS}
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _restore_permissions(snapshot_json: str) -> types.ChatPermissions:
+    """Десериализует JSON-снапшот в объект ChatPermissions."""
+    data = json.loads(snapshot_json)
+    return types.ChatPermissions(**{k: data.get(k, False) for k in _PERM_FIELDS})
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -95,7 +125,8 @@ async def _save_punishment(session, user_id: int, mod_id: int,
                            chat_id: int, action_type: str,
                            duration_seconds: int | None,
                            reason: str | None,
-                           message_text: str | None) -> None:
+                           message_text: str | None,
+                           permissions_snapshot: str | None = None) -> None:
     punishment = Punishment(
         user_id=user_id,
         mod_id=mod_id,
@@ -104,9 +135,27 @@ async def _save_punishment(session, user_id: int, mod_id: int,
         duration_seconds=duration_seconds,
         reason=reason,
         message_text=message_text,
+        permissions_snapshot=permissions_snapshot,
     )
     session.add(punishment)
     await session.commit()
+
+
+async def _fetch_last_snapshot(session, user_id: int, chat_id: int) -> str | None:
+    """Находит снапшот пермишенов из последнего mute/ban для данного юзера в чате."""
+    stmt = (
+        select(Punishment.permissions_snapshot)
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.chat_id == chat_id,
+            Punishment.action_type.in_(["mute", "ban"]),
+            Punishment.permissions_snapshot.isnot(None),
+        )
+        .order_by(desc(Punishment.created_at))
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
 
 # ── Главный обработчик ─────────────────────────────────────────────────────
@@ -141,6 +190,15 @@ async def handle_mod_command(message: types.Message) -> None:
         duration_seconds = _parse_duration(dur_str)
         if duration_seconds is None:
             return
+
+        # Снимаем слепок пермишенов ДО мьюта
+        perm_snapshot = None
+        try:
+            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
+            perm_snapshot = _snapshot_permissions(member)
+        except TelegramBadRequest as e:
+            logger.warning("get_chat_member before mute failed: %s", e)
+
         # Restrict пользователя
         until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
         try:
@@ -160,6 +218,7 @@ async def handle_mod_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "mute", duration_seconds, reason, target_msg_text,
+                permissions_snapshot=perm_snapshot,
             )
         return
 
@@ -181,6 +240,15 @@ async def handle_mod_command(message: types.Message) -> None:
     m = _CMD_BAN.match(text)
     if m:
         reason = m.group(1)
+
+        # Снимаем слепок пермишенов ДО бана
+        perm_snapshot = None
+        try:
+            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
+            perm_snapshot = _snapshot_permissions(member)
+        except TelegramBadRequest as e:
+            logger.warning("get_chat_member before ban failed: %s", e)
+
         try:
             await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
         except TelegramBadRequest as e:
@@ -193,35 +261,55 @@ async def handle_mod_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "ban", None, reason, target_msg_text,
+                permissions_snapshot=perm_snapshot,
             )
         return
 
     # ── !unmute ─────────────────────────────────────────────────────────
     if _CMD_UNMUTE.match(text):
-        try:
-            from aiogram.types import ChatPermissions
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=target.id,
-                permissions=ChatPermissions(
-                    can_send_messages=True,
-                    can_send_audios=True,
-                    can_send_documents=True,
-                    can_send_photos=True,
-                    can_send_videos=True,
-                    can_send_video_notes=True,
-                    can_send_voice_notes=True,
-                    can_send_polls=True,
-                    can_send_other_messages=True,
-                    can_add_web_page_previews=True,
-                    can_change_info=True,
-                    can_invite_users=True,
-                    can_pin_messages=True,
-                ),
-            )
-        except TelegramBadRequest as e:
-            logger.error("unmute restrict failed: %s", e)
-            return
+        # Получаем снапшот пермишенов из последнего mute/ban
+        restored = False
+        async with async_session() as session:
+            snapshot_json = await _fetch_last_snapshot(session, target.id, chat_id)
+
+        if snapshot_json:
+            try:
+                perms = _restore_permissions(snapshot_json)
+                await message.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target.id,
+                    permissions=perms,
+                )
+                restored = True
+            except (TelegramBadRequest, json.JSONDecodeError) as e:
+                logger.warning("Restore from snapshot failed, falling back to defaults: %s", e)
+
+        # Fallback: выдать все пермишены, если снапшота нет или он повреждён
+        if not restored:
+            try:
+                await message.bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target.id,
+                    permissions=types.ChatPermissions(
+                        can_send_messages=True,
+                        can_send_audios=True,
+                        can_send_documents=True,
+                        can_send_photos=True,
+                        can_send_videos=True,
+                        can_send_video_notes=True,
+                        can_send_voice_notes=True,
+                        can_send_polls=True,
+                        can_send_other_messages=True,
+                        can_add_web_page_previews=True,
+                        can_change_info=True,
+                        can_invite_users=True,
+                        can_pin_messages=True,
+                    ),
+                )
+            except TelegramBadRequest as e:
+                logger.error("unmute restrict failed: %s", e)
+                return
+
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)

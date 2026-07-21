@@ -1,10 +1,11 @@
 """
-db.py — Асинхронный SQLAlchemy:引擎, модели, сессии.
+db.py — Асинхронный SQLAlchemy: модели, сессии.
 База: /app/data/shadow_logs.db  |  WAL режим для конкурентного доступа.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 
@@ -70,6 +71,7 @@ class Punishment(Base):
     duration_seconds = Column(Integer, nullable=True)        # NULL для warn/ban/unmute
     reason = Column(Text, nullable=True)
     message_text = Column(Text, nullable=True)               # текст удалённого сообщения нарушителя
+    permissions_snapshot = Column(Text, nullable=True)        # JSON: пермишены пользователя ДО санкции
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="punishments", foreign_keys=[user_id])

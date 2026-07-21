@@ -2,14 +2,11 @@
 web_app.py — FastAPI: маршруты, авторизация по кукам (HMAC), Jinja2-шаблоны.
 """
 
-from __future__ import annotations
-
 import hashlib
 import hmac
 import os
 import secrets
 from datetime import datetime, timezone, timedelta
-
 
 from fastapi import FastAPI, Request, Response, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -21,7 +18,7 @@ from db import async_session, User, Moderator, Punishment
 # ── Конфигурация ────────────────────────────────────────────────────────────
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 COOKIE_NAME = "sl_session"
-# Секрет для подписи кук — генерируется при старте, переживает перезапуск контейнера
+# Секрет для подписи кук — генерируется при старте
 _SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 _ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "").split(",") if os.getenv("ALLOWED_HOSTS") else []
 
@@ -62,6 +59,21 @@ def create_app() -> FastAPI:
         from starlette.middleware.trustedhost import TrustedHostMiddleware
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
 
+    # Bothost проксирует через HTTPS — пробрасываем X-Forwarded-* заголовки
+    @app.middleware("http")
+    async def proxy_headers_middleware(request: Request, call_next):
+        x_forwarded_proto = request.headers.get("x-forwarded-proto", "")
+        x_forwarded_host = request.headers.get("x-forwarded-host", "")
+        if x_forwarded_proto:
+            request.scope["scheme"] = x_forwarded_proto
+        if x_forwarded_host:
+            request.scope["headers"] = [
+                (k, v) for k, v in request.scope.get("headers", [])
+                if k != b"host"
+            ] + [(b"host", x_forwarded_host.encode())]
+        response = await call_next(request)
+        return response
+
     templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
     # ── GET /login ──────────────────────────────────────────────────────
@@ -78,12 +90,15 @@ def create_app() -> FastAPI:
             return templates.TemplateResponse("login.html", {"request": request, "error": True})
         token = _make_token()
         response = RedirectResponse(url="/dashboard", status_code=303)
+        # Определяем, работает ли приложение за HTTPS-прокси
+        forwarded_proto = request.headers.get("x-forwarded-proto", "http")
+        is_secure = forwarded_proto == "https"
         response.set_cookie(
             key=COOKIE_NAME,
             value=token,
             httponly=True,
-            secure=True,
-            samesite="strict",
+            secure=is_secure,
+            samesite="lax",
             max_age=86400 * 7,  # 7 дней
         )
         return response
