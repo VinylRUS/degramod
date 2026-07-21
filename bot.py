@@ -30,7 +30,7 @@ logger = logging.getLogger("shadow_logger")
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "3000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 # Путь вебхука извлекаем из URL: https://domain/webhook → /webhook
 WEBHOOK_PATH = "/webhook" if "/webhook" in WEBHOOK_URL else "/webhook"
