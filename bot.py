@@ -1,15 +1,19 @@
 """
-bot.py — Точка входа: FastAPI (daemon-поток) + Aiogram Long Polling (главный поток).
+bot.py — Точка входа: FastAPI + Aiogram Webhook.
+Bothost (Traefik) проксирует все запросы к контейнеру:
+  POST /webhook  → Telegram шлёт сюда обновления
+  GET  /*        → веб-панель (FastAPI маршруты)
 """
-
-from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import threading
+import socket
+import time
+from contextlib import asynccontextmanager
 
-from aiogram import Bot, Dispatcher
+import uvicorn
+from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -27,48 +31,138 @@ logger = logging.getLogger("shadow_logger")
 # ── Env ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "8000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+# Путь вебхука извлекаем из URL: https://domain/webhook → /webhook
+WEBHOOK_PATH = "/webhook" if "/webhook" in WEBHOOK_URL else "/webhook"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env variable is required")
 
+# ── Диагностика ─────────────────────────────────────────────────────────────
+logger.info("=== ENV DUMP ===")
+for key, val in sorted(os.environ.items()):
+    if key in ("BOT_TOKEN", "API_TOKEN", "BOT_API_TOKEN", "TELEGRAM_BOT_TOKEN",
+               "TOKEN", "WEB_PASSWORD", "SESSION_SECRET"):
+        val = val[:8] + "..." if val else "(empty)"
+    logger.info("  %s = %s", key, val)
+logger.info("=== END ENV ===")
 
-# ── FastAPI в daemon-потоке ─────────────────────────────────────────────────
-def _run_web() -> None:
-    import uvicorn
-    app = create_app()
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+_hostname = socket.gethostname()
+_host_ip = socket.gethostbyname(_hostname) if _hostname else "?"
+logger.info("Hostname: %s | IP: %s | Listening: 0.0.0.0:%d | Webhook: %s",
+            _hostname, _host_ip, PORT, WEBHOOK_URL or "(not set)")
+
+# ── Глобальные объекты бота ────────────────────────────────────────────────
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+dp.include_router(mod_router)
+
+# Флаг: удалось ли установить вебхук
+_webhook_set = False
+_polling_task = None
 
 
-# ── Aiogram в главном потоке ───────────────────────────────────────────────
-async def _run_bot() -> None:
+async def _start_polling():
+    """Fallback: запуск Long Polling если вебхук не настроен."""
+    logger.info("Starting Long Polling (fallback)...")
+    try:
+        await dp.start_polling(bot, handle_signals=False)
+    except Exception as e:
+        logger.error("Polling error: %s", e)
+
+
+# ── Lifespan ────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app):
+    global _webhook_set, _polling_task
+
+    # ── Startup ─────────────────────────────────────────────────
     await init_db()
     logger.info("DB initialized (WAL mode)")
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dp = Dispatcher()
-    dp.include_router(mod_router)
+    # Убираем команды из меню (стелс)
+    try:
+        await bot.delete_my_commands()
+        logger.info("Bot commands cleared (stealth mode)")
+    except Exception as e:
+        logger.warning("delete_my_commands failed: %s", e)
 
-    # Убираем все команды из меню бота
-    await bot.delete_my_commands()
-    logger.info("Bot commands cleared (stealth mode)")
+    # Пробуем установить вебхук
+    if WEBHOOK_URL:
+        try:
+            await bot.set_webhook(
+                url=WEBHOOK_URL,
+                allowed_updates=["message"],
+            )
+            info = await bot.get_webhook_info()
+            logger.info("Webhook set to %s (info.url=%s)", WEBHOOK_URL, info.url)
+            if info.url != WEBHOOK_URL:
+                logger.warning("Webhook URL mismatch! Expected %s, got %s", WEBHOOK_URL, info.url)
+            _webhook_set = True
+        except Exception as e:
+            logger.error("set_webhook FAILED: %s — falling back to polling", e)
+            _webhook_set = False
+    else:
+        logger.info("WEBHOOK_URL not set — using Long Polling mode")
 
-    logger.info("Starting Aiogram Long Polling …")
-    await dp.start_polling(bot, allowed_updates=["message"])
+    # Если вебхук не установлен — fallback на Long Polling
+    if not _webhook_set:
+        _polling_task = asyncio.create_task(_start_polling())
+
+    yield
+
+    # ── Shutdown ────────────────────────────────────────────────
+    if _polling_task:
+        _polling_task.cancel()
+        try:
+            await _polling_task
+        except asyncio.CancelledError:
+            pass
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
+    await bot.session.close()
+    logger.info("Shutdown complete")
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
-def main() -> None:
-    # Запускаем FastAPI в daemon-потоке
-    web_thread = threading.Thread(target=_run_web, daemon=True, name="web")
-    web_thread.start()
-    logger.info("FastAPI started on 0.0.0.0:%s (daemon thread)", PORT)
+# ── Создаём приложение с lifespan ──────────────────────────────────────────
+app = create_app(lifespan=lifespan)
 
-    # Запускаем Aiogram в главном потоке
-    asyncio.run(_run_bot())
+
+# ── Webhook endpoint — Telegram шлёт сюда обновления ───────────────────────
+@app.post(WEBHOOK_PATH)
+async def bot_webhook(update: dict):
+    """Telegram отправляет POST с Update на этот эндпоинт."""
+    try:
+        telegram_update = types.Update.model_validate(update)
+        await dp.feed_update(bot=bot, update=telegram_update)
+    except Exception as e:
+        logger.error("Webhook feed_update error: %s", e)
+    return {"ok": True}
+
+
+# ── Диагностический эндпоинт (не зависит от авторизации) ──────────────────
+@app.get("/ping")
+async def ping():
+    """Простой пинг для проверки, что сервер доступен."""
+    return {
+        "status": "ok",
+        "time": time.time(),
+        "webhook_mode": _webhook_set,
+        "webhook_url": WEBHOOK_URL,
+        "port": PORT,
+    }
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+        timeout_keep_alive=30,
+    )

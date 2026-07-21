@@ -1,26 +1,29 @@
 """
 web_app.py — FastAPI: маршруты, авторизация по кукам (HMAC), Jinja2-шаблоны.
+Минимальная конфигурация для Bothost: без TrustedHostMiddleware, без кастомных middleware.
 """
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
+import time
 from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, Request, Response, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func, desc
+
+_req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import async_session, User, Moderator, Punishment
 
 # ── Конфигурация ────────────────────────────────────────────────────────────
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 COOKIE_NAME = "sl_session"
-# Секрет для подписи кук — генерируется при старте
 _SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
-_ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "").split(",") if os.getenv("ALLOWED_HOSTS") else []
 
 
 def _sign(value: str) -> str:
@@ -51,30 +54,39 @@ async def require_auth(request: Request) -> None:
 
 
 # ── Создание приложения ─────────────────────────────────────────────────────
-def create_app() -> FastAPI:
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+def create_app(lifespan=None) -> FastAPI:
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
-    # Middleware: Trusted Host
-    if _ALLOWED_HOSTS and _ALLOWED_HOSTS != [""]:
-        from starlette.middleware.trustedhost import TrustedHostMiddleware
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=_ALLOWED_HOSTS)
-
-    # Bothost проксирует через HTTPS — пробрасываем X-Forwarded-* заголовки
+    # ── Request logging middleware ────────────────────────────────────
     @app.middleware("http")
-    async def proxy_headers_middleware(request: Request, call_next):
-        x_forwarded_proto = request.headers.get("x-forwarded-proto", "")
-        x_forwarded_host = request.headers.get("x-forwarded-host", "")
-        if x_forwarded_proto:
-            request.scope["scheme"] = x_forwarded_proto
-        if x_forwarded_host:
-            request.scope["headers"] = [
-                (k, v) for k, v in request.scope.get("headers", [])
-                if k != b"host"
-            ] + [(b"host", x_forwarded_host.encode())]
-        response = await call_next(request)
-        return response
+    async def log_requests(request: Request, call_next):
+        start = time.time()
+        _req_logger.info(">>> %s %s", request.method, request.url.path)
+        try:
+            response = await call_next(request)
+            elapsed = time.time() - start
+            _req_logger.info("<<< %s %s → %d (%.0fms)", request.method, request.url.path, response.status_code, elapsed * 1000)
+            return response
+        except Exception as e:
+            elapsed = time.time() - start
+            _req_logger.error("!!! %s %s → ERROR %s (%.0fms)", request.method, request.url.path, e, elapsed * 1000)
+            raise
 
     templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+
+    # ── Health check (для Bothost proxy, без авторизации) ─────────────
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "ok",
+            "service": "shadow-logger",
+            "time": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # ── Root → редирект на login ────────────────────────────────────────
+    @app.get("/")
+    async def root():
+        return RedirectResponse(url="/login", status_code=302)
 
     # ── GET /login ──────────────────────────────────────────────────────
     @app.get("/login", response_class=HTMLResponse)
@@ -90,16 +102,13 @@ def create_app() -> FastAPI:
             return templates.TemplateResponse("login.html", {"request": request, "error": True})
         token = _make_token()
         response = RedirectResponse(url="/dashboard", status_code=303)
-        # Определяем, работает ли приложение за HTTPS-прокси
-        forwarded_proto = request.headers.get("x-forwarded-proto", "http")
-        is_secure = forwarded_proto == "https"
         response.set_cookie(
             key=COOKIE_NAME,
             value=token,
             httponly=True,
-            secure=is_secure,
+            secure=False,      # Bothost проксирует SSL, куки должны работать и по HTTP
             samesite="lax",
-            max_age=86400 * 7,  # 7 дней
+            max_age=86400 * 7,
         )
         return response
 
@@ -114,7 +123,6 @@ def create_app() -> FastAPI:
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard(request: Request, _=Depends(require_auth)):
         async with async_session() as session:
-            # Последние 50 наказаний
             stmt = (
                 select(Punishment, User, Moderator)
                 .join(User, Punishment.user_id == User.user_id)
@@ -125,7 +133,6 @@ def create_app() -> FastAPI:
             result = await session.execute(stmt)
             rows = result.all()
 
-            # Топ нарушителей за 30 дней
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             top_stmt = (
                 select(
@@ -154,14 +161,12 @@ def create_app() -> FastAPI:
     @app.get("/user/{user_id:int}", response_class=HTMLResponse)
     async def user_page(request: Request, user_id: int, _=Depends(require_auth)):
         async with async_session() as session:
-            # Профиль
             user_stmt = select(User).where(User.user_id == user_id)
             user_result = await session.execute(user_stmt)
             user = user_result.scalar_one_or_none()
             if user is None:
                 raise HTTPException(status_code=404)
 
-            # Счётчики
             count_stmt = (
                 select(Punishment.action_type, func.count(Punishment.id))
                 .where(Punishment.user_id == user_id)
@@ -170,7 +175,6 @@ def create_app() -> FastAPI:
             count_result = await session.execute(count_stmt)
             counters = {row[0]: row[1] for row in count_result.all()}
 
-            # Фильтр по action_type
             action_filter = request.query_params.get("action", "")
             punishment_stmt = (
                 select(Punishment, Moderator)
