@@ -3,6 +3,13 @@ bot.py — Точка входа: FastAPI + Aiogram Webhook.
 Bothost (Traefik) проксирует все запросы к контейнеру:
   POST /webhook  → Telegram шлёт сюда обновления
   GET  /*        → веб-панель (FastAPI маршруты)
+
+ВАЖНО для Bothost:
+  - Не задавай PORT в env-переменных вручную! Bothost сам установит PORT
+    на основе поля «Порт веб-приложения» в панели (по умолчанию 3000).
+  - Если PORT задать вручную и он не совпадёт с полем в панели —
+    будет 502/504 Gateway Timeout.
+  - Сервер ДОЛЖЕН слушать на 0.0.0.0 (не 127.0.0.1).
 """
 
 import asyncio
@@ -30,6 +37,8 @@ logger = logging.getLogger("shadow_logger")
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Bothost автоматически устанавливает PORT на основе поля «Порт» в панели.
+# По умолчанию 3000. НЕ добавляй PORT в env-переменные вручную!
 PORT = int(os.getenv("PORT", "3000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 # Путь вебхука извлекаем из URL: https://domain/webhook → /webhook
@@ -159,6 +168,7 @@ async def ping():
 
 
 if __name__ == "__main__":
+    logger.info("Starting Uvicorn on 0.0.0.0:%d (must match Bothost 'Port' field in panel)", PORT)
     uvicorn.run(
         app,
         host="0.0.0.0",
