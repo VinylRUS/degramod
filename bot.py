@@ -1,15 +1,10 @@
 """
-bot.py — Точка входа: FastAPI + Aiogram Webhook.
-Bothost (Traefik) проксирует все запросы к контейнеру:
-  POST /webhook  → Telegram шлёт сюда обновления
-  GET  /*        → веб-панель (FastAPI маршруты)
+bot.py — Точка входа: FastAPI + Aiogram.
+Режим работы определяется автоматически:
+  - Если WEBHOOK_URL задан И вебхук удалось установить → webhook
+  - Иначе → Long Polling (надёжный фоллбэк)
 
-ВАЖНО для Bothost:
-  - Не задавай PORT в env-переменных вручную! Bothost сам установит PORT
-    на основе поля «Порт веб-приложения» в панели (по умолчанию 3000).
-  - Если PORT задать вручную и он не совпадёт с полем в панели —
-    будет 502/504 Gateway Timeout.
-  - Сервер ДОЛЖЕН слушать на 0.0.0.0 (не 127.0.0.1).
+FastAPI запускается всегда — для веб-панели (когда Bothost починит Traefik).
 """
 
 import asyncio
@@ -37,11 +32,8 @@ logger = logging.getLogger("shadow_logger")
 
 # ── Env ─────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Bothost автоматически устанавливает PORT на основе поля «Порт» в панели.
-# По умолчанию 3000. НЕ добавляй PORT в env-переменные вручную!
 PORT = int(os.getenv("PORT", "3000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-# Путь вебхука извлекаем из URL: https://domain/webhook → /webhook
 WEBHOOK_PATH = "/webhook" if "/webhook" in WEBHOOK_URL else "/webhook"
 
 if not BOT_TOKEN:
@@ -69,14 +61,14 @@ bot = Bot(
 dp = Dispatcher()
 dp.include_router(mod_router)
 
-# Флаг: удалось ли установить вебхук
+# Флаги режима
 _webhook_set = False
 _polling_task = None
 
 
 async def _start_polling():
-    """Fallback: запуск Long Polling если вебхук не настроен."""
-    logger.info("Starting Long Polling (fallback)...")
+    """Запуск Long Polling."""
+    logger.info("Starting Long Polling...")
     try:
         await dp.start_polling(bot, handle_signals=False)
     except Exception as e:
@@ -108,17 +100,21 @@ async def lifespan(app):
             )
             info = await bot.get_webhook_info()
             logger.info("Webhook set to %s (info.url=%s)", WEBHOOK_URL, info.url)
-            if info.url != WEBHOOK_URL:
-                logger.warning("Webhook URL mismatch! Expected %s, got %s", WEBHOOK_URL, info.url)
             _webhook_set = True
         except Exception as e:
             logger.error("set_webhook FAILED: %s — falling back to polling", e)
             _webhook_set = False
-    else:
-        logger.info("WEBHOOK_URL not set — using Long Polling mode")
 
-    # Если вебхук не установлен — fallback на Long Polling
+    # Если вебхук не установлен — Long Polling
     if not _webhook_set:
+        if WEBHOOK_URL:
+            logger.info("Webhook not confirmed — deleting webhook and starting Long Polling")
+            try:
+                await bot.delete_webhook()
+            except Exception:
+                pass
+        else:
+            logger.info("WEBHOOK_URL not set — using Long Polling mode")
         _polling_task = asyncio.create_task(_start_polling())
 
     yield
@@ -168,7 +164,7 @@ async def ping():
 
 
 if __name__ == "__main__":
-    logger.info("Starting Uvicorn on 0.0.0.0:%d (must match Bothost 'Port' field in panel)", PORT)
+    logger.info("Starting Uvicorn on 0.0.0.0:%d", PORT)
     uvicorn.run(
         app,
         host="0.0.0.0",

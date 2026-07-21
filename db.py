@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, event,
+    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, event,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -68,7 +68,7 @@ class Punishment(Base):
     mod_id = Column(BigInteger, ForeignKey("moderators.mod_id"), nullable=False)
     chat_id = Column(BigInteger, nullable=False)
     action_type = Column(String(20), nullable=False)        # mute / warn / ban / unmute
-    duration_seconds = Column(Integer, nullable=True)        # NULL для warn/ban/unmute
+    duration_seconds = Column(Integer, nullable=True)        # NULL для warn/ban/unmute; для warn = кол-во поинтов
     reason = Column(Text, nullable=True)
     message_text = Column(Text, nullable=True)               # текст удалённого сообщения нарушителя
     permissions_snapshot = Column(Text, nullable=True)        # JSON: пермишены пользователя ДО санкции
@@ -76,6 +76,29 @@ class Punishment(Base):
 
     user = relationship("User", back_populates="punishments", foreign_keys=[user_id])
     moderator = relationship("Moderator", back_populates="punishments", foreign_keys=[mod_id])
+
+
+class ChatAdmin(Base):
+    """Дополнительные админы, добавленные через /addadmin в личке."""
+    __tablename__ = "chat_admins"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False)
+    user_id = Column(BigInteger, nullable=False)
+    added_by = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ChatSettings(Base):
+    """Настройки чата: пороги варнов, хэштег и т.д."""
+    __tablename__ = "chat_settings"
+
+    chat_id = Column(BigInteger, primary_key=True)
+    hashtag = Column(String(64), nullable=True)              # хэштег чата (#Бэбэй, #Деградач)
+    warns_to_mute = Column(Integer, default=3)               # варнов до мьюта (0 = отключено)
+    mute_duration_seconds = Column(Integer, default=3600)    # длительность мьюта по умолчанию (1ч)
+    warns_to_ban = Column(Integer, default=5)                # варнов до бана (0 = отключено)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────

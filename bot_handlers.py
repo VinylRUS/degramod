@@ -1,6 +1,24 @@
 """
-bot_handlers.py — Обработка модераторских команд: !mute, !warn, !ban, !unmute.
-Бот удаляет сообщение с командой, снимает слепок пермишенов и логирует санкцию.
+bot_handlers.py — Обработка модераторских команд + отчёты в чат + настройки через личку.
+
+★★★ СТЕЛС-РЕЖИМ: бот НЕ реагирует ни на какие команды от обычных юзеров.
+Ни /start, ни /help, ни любые другие — молча игнорируются.
+Только ADMIN_IDS и ChatAdmin могут использовать команды. ★★★
+
+Команды в группах (reply на сообщение нарушителя):
+  !mute <1d/2h/30m> <причина>  — замьютить
+  !warn <причина>               — выдать варн (1 поинт)
+  !ban <причина>                — забанить
+  !unmute                       — размьютить
+
+Команды в личке (только для ADMIN_IDS):
+  /addadmin <chat_id> <user_id> — добавить админа в чат
+  /deladmin <chat_id> <user_id> — убрать админа
+  /sethashtag <chat_id> #хэштег — установить хэштег чата
+  /warns_mute <chat_id> <число> — варнов до авто-мьюта (0 = выкл)
+  /warns_ban <chat_id> <число>  — варнов до авто-бана (0 = выкл)
+  /mute_duration <chat_id> <1d/2h/30m> — длительность мьюта
+  /settings <chat_id>           — показать текущие настройки
 """
 
 from __future__ import annotations
@@ -9,21 +27,39 @@ import json
 import os
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
-from aiogram import Router, types
+from aiogram import Router, types, F
 from aiogram.exceptions import TelegramBadRequest
-from sqlalchemy import select, desc
+from aiogram.filters import Command
+from aiogram.types import FSInputFile
+from sqlalchemy import select, desc, func
 
-from db import async_session, User, Moderator, Punishment
+from db import async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings
 
 logger = logging.getLogger("shadow_logger.bot_handlers")
 
 router = Router()
 
-# ── ADMIN_IDS из окружения ─────────────────────────────────────────────────
+# ── Конфигурация из окружения ──────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip()}
+
+REPORT_CHAT_ID = int(os.getenv("REPORT_CHAT_ID", "0"))  # ID чата для отчётов (0 = выкл)
+
+# Жёсткая привязка chat_id → хэштег (можно переопределить через /sethashtag)
+_CHAT_HASHTAGS: dict[int, str] = {}
+_raw_hashtags = os.getenv("CHAT_HASHTAGS", "")  # формат: "chat_id1:хэштег1,chat_id2:хэштег2"
+for pair in _raw_hashtags.split(","):
+    pair = pair.strip()
+    if ":" in pair:
+        cid, tag = pair.split(":", 1)
+        _CHAT_HASHTAGS[int(cid.strip())] = tag.strip()
+
+# МСК-таймзона
+MSK = timezone(timedelta(hours=3))
+
 
 # ── Парсинг длительности: 1d, 2h, 30m, 1d12h ──────────────────────────────
 _DURATION_RE = re.compile(
@@ -43,9 +79,24 @@ def _parse_duration(text: str) -> int | None:
     return total if total > 0 else None
 
 
-# ── Команды ─────────────────────────────────────────────────────────────────
+def _format_duration(seconds: int) -> str:
+    """Форматирует секунды в человекочитаемый вид."""
+    parts = []
+    days = seconds // 86400
+    if days:
+        parts.append(f"{days}д")
+    hours = (seconds % 86400) // 3600
+    if hours:
+        parts.append(f"{hours}ч")
+    mins = (seconds % 3600) // 60
+    if mins:
+        parts.append(f"{mins}м")
+    return "".join(parts) if parts else "0м"
+
+
+# ── Команды в группах ──────────────────────────────────────────────────────
 _CMD_MUTE = re.compile(r"^!mute\s+(\S+)\s+(.+)$", re.IGNORECASE)
-_CMD_WARN = re.compile(r"^!warn\s+(\d+)\s+(.+)$", re.IGNORECASE)
+_CMD_WARN = re.compile(r"^!warn\s+(.+)$", re.IGNORECASE)
 _CMD_BAN = re.compile(r"^!ban\s+(.+)$", re.IGNORECASE)
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
 
@@ -82,7 +133,41 @@ def _restore_permissions(snapshot_json: str) -> types.ChatPermissions:
     return types.ChatPermissions(**{k: data.get(k, False) for k in _PERM_FIELDS})
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers: получение/сохранение настроек чата ────────────────────────────
+async def _get_chat_settings(session, chat_id: int) -> ChatSettings:
+    """Возвращает настройки чата, создаёт с дефолтами если нет."""
+    stmt = select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+    result = await session.execute(stmt)
+    settings = result.scalar_one_or_none()
+    if settings is None:
+        settings = ChatSettings(chat_id=chat_id)
+        if chat_id in _CHAT_HASHTAGS:
+            settings.hashtag = _CHAT_HASHTAGS[chat_id]
+        session.add(settings)
+        await session.flush()
+    return settings
+
+
+async def _is_admin(session, chat_id: int, user_id: int) -> bool:
+    """Проверяет, является ли юзер админом чата (из ADMIN_IDS или из ChatAdmin)."""
+    if user_id in ADMIN_IDS:
+        return True
+    stmt = select(ChatAdmin).where(
+        ChatAdmin.chat_id == chat_id,
+        ChatAdmin.user_id == user_id,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none() is not None
+
+
+async def _get_chat_admins(session, chat_id: int) -> list[ChatAdmin]:
+    """Возвращает список дополнительных админов чата."""
+    stmt = select(ChatAdmin).where(ChatAdmin.chat_id == chat_id)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+# ── Helpers: upsert ────────────────────────────────────────────────────────
 async def _upsert_user(session, user_id: int, username: str | None,
                        first_name: str | None, last_name: str | None) -> User:
     stmt = select(User).where(User.user_id == user_id)
@@ -126,7 +211,7 @@ async def _save_punishment(session, user_id: int, mod_id: int,
                            duration_seconds: int | None,
                            reason: str | None,
                            message_text: str | None,
-                           permissions_snapshot: str | None = None) -> None:
+                           permissions_snapshot: str | None = None) -> Punishment:
     punishment = Punishment(
         user_id=user_id,
         mod_id=mod_id,
@@ -139,6 +224,7 @@ async def _save_punishment(session, user_id: int, mod_id: int,
     )
     session.add(punishment)
     await session.commit()
+    return punishment
 
 
 async def _fetch_last_snapshot(session, user_id: int, chat_id: int) -> str | None:
@@ -158,25 +244,237 @@ async def _fetch_last_snapshot(session, user_id: int, chat_id: int) -> str | Non
     return result.scalar_one_or_none()
 
 
-# ── Главный обработчик ─────────────────────────────────────────────────────
-@router.message()
-async def handle_mod_command(message: types.Message) -> None:
-    # Только reply-сообщения от ADMIN_IDS
-    if message.reply_to_message is None:
-        return
-    if message.from_user.id not in ADMIN_IDS:
+async def _count_warns(session, user_id: int, chat_id: int) -> int:
+    """Считает общее количество варн-поинтов для юзера в чате."""
+    stmt = (
+        select(func.coalesce(func.sum(Punishment.duration_seconds), 0))
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.chat_id == chat_id,
+            Punishment.action_type == "warn",
+        )
+    )
+    result = await session.execute(stmt)
+    return int(result.scalar() or 0)
+
+
+# ── Отправка отчёта в чат ──────────────────────────────────────────────────
+async def _send_report(
+    bot: types.Bot,
+    chat_id: int,
+    target: types.User,
+    action_type: str,
+    reason: str | None,
+    warn_points: int | None = None,
+    duration_seconds: int | None = None,
+) -> None:
+    """Отправляет форматированный отчёт о санкции в REPORT_CHAT_ID."""
+    if not REPORT_CHAT_ID:
         return
 
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        hashtag = settings.hashtag or ""
+
+    # Формируем хэштег
+    tag_line = f"{hashtag}\n" if hashtag else ""
+
+    # Имя и ник
+    full_name = target.first_name or ""
+    if target.last_name:
+        full_name += f" {target.last_name}"
+    name_line = f"👤 {full_name}\n" if full_name else ""
+
+    username_line = ""
+    if target.username:
+        username_line = f"@{target.username}\n"
+
+    # Причина
+    reason_line = ""
+    if reason:
+        reason_line = f"📝 Причина: {reason}\n"
+
+    # Варны
+    warn_line = ""
+    if action_type == "warn" and warn_points is not None:
+        async with async_session() as session:
+            total_warns = await _count_warns(session, target.id, chat_id)
+        warn_line = f"⚠️ Варнов: {total_warns}\n"
+
+    # Время (МСК)
+    msk_time = datetime.now(MSK).strftime("%d.%m.%Y %H:%МСК")
+    # Исправляем: формируем строку вручную
+    now_msk = datetime.now(MSK)
+    time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+
+    # Заголовок действия
+    action_labels = {
+        "mute": "🔇 МУТ",
+        "ban": "🚫 БАН",
+        "warn": "⚠️ ВАРН",
+        "unmute": "🔊 РАЗМУТ",
+    }
+    action_label = action_labels.get(action_type, action_type.upper())
+
+    # Длительность
+    duration_line = ""
+    if duration_seconds:
+        duration_line = f"⏱ Длительность: {_format_duration(duration_seconds)}\n"
+
+    # Собираем сообщение
+    report = (
+        f"{tag_line}"
+        f"{action_label}\n"
+        f"{name_line}"
+        f"{username_line}"
+        f"{reason_line}"
+        f"{warn_line}"
+        f"{duration_line}"
+        f"🕐 {time_str}"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=REPORT_CHAT_ID,
+            text=report.strip(),
+        )
+    except TelegramBadRequest as e:
+        logger.error("Failed to send report to chat %s: %s", REPORT_CHAT_ID, e)
+
+
+# ── Авто-санкция при превышении порога варнов ──────────────────────────────
+async def _check_warn_threshold(
+    bot: types.Bot,
+    chat_id: int,
+    target: types.User,
+    mod: types.User,
+) -> None:
+    """Проверяет, не достигнут ли порог варнов для автосанкции."""
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        total_warns = await _count_warns(session, target.id, chat_id)
+
+        # Проверяем бан
+        if settings.warns_to_ban > 0 and total_warns >= settings.warns_to_ban:
+            # Снимаем слепок пермишенов ДО бана
+            perm_snapshot = None
+            try:
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=target.id)
+                perm_snapshot = _snapshot_permissions(member)
+            except TelegramBadRequest:
+                pass
+
+            try:
+                await bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+                await _upsert_user(session, target.id, target.username,
+                                   target.first_name, target.last_name)
+                await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+                await _save_punishment(
+                    session, target.id, mod.id, chat_id,
+                    "ban", None, f"Автобан: {total_warns} варнов", None,
+                    permissions_snapshot=perm_snapshot,
+                )
+                await _send_report(bot, chat_id, target, "ban",
+                                   f"Автобан: {total_warns} варнов")
+                logger.info("Auto-ban triggered for user %s in chat %s (%d warns)",
+                            target.id, chat_id, total_warns)
+            except TelegramBadRequest as e:
+                logger.error("Auto-ban failed: %s", e)
+            return
+
+        # Проверяем мьют
+        if settings.warns_to_mute > 0 and total_warns >= settings.warns_to_mute:
+            # Снимаем слепок пермишенов ДО мьюта
+            perm_snapshot = None
+            try:
+                member = await bot.get_chat_member(chat_id=chat_id, user_id=target.id)
+                perm_snapshot = _snapshot_permissions(member)
+            except TelegramBadRequest:
+                pass
+
+            mute_dur = settings.mute_duration_seconds or 3600
+            until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
+            try:
+                await bot.restrict_chat_member(
+                    chat_id=chat_id,
+                    user_id=target.id,
+                    can_send_messages=False,
+                    until_date=until_date,
+                )
+                await _upsert_user(session, target.id, target.username,
+                                   target.first_name, target.last_name)
+                await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+                await _save_punishment(
+                    session, target.id, mod.id, chat_id,
+                    "mute", mute_dur, f"Автомьют: {total_warns} варнов", None,
+                    permissions_snapshot=perm_snapshot,
+                )
+                await _send_report(bot, chat_id, target, "mute",
+                                   f"Автомьют: {total_warns} варнов",
+                                   duration_seconds=mute_dur)
+                logger.info("Auto-mute triggered for user %s in chat %s (%d warns, %s)",
+                            target.id, chat_id, total_warns, _format_duration(mute_dur))
+            except TelegramBadRequest as e:
+                logger.error("Auto-mute failed: %s", e)
+
+
+# ── Получить описание контента пересланного сообщения ──────────────────────
+def _get_message_content_desc(msg: types.Message) -> str | None:
+    """Возвращает текстовое описание контента сообщения для причины."""
+    if msg.text:
+        return msg.text
+    if msg.caption:
+        return msg.caption
+    if msg.photo:
+        return "🖼 [Фото]"
+    if msg.video:
+        return "🎬 [Видео]"
+    if msg.sticker:
+        return f"🎭 [Стикер: {msg.sticker.emoji or ''}]"
+    if msg.animation:
+        return "🎞 [GIF]"
+    if msg.voice:
+        return "🎤 [Голосовое]"
+    if msg.audio:
+        return "🎵 [Аудио]"
+    if msg.document:
+        return f"📄 [Документ: {msg.document.file_name or ''}]"
+    if msg.video_note:
+        return "📹 [Кружок]"
+    if msg.contact:
+        return "📞 [Контакт]"
+    if msg.location:
+        return "📍 [Геолокация]"
+    if msg.poll:
+        return f"📊 [Опрос: {msg.poll.question}]"
+    if msg.dice:
+        return f"🎲 [Dice: {msg.dice.emoji}]"
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Обработчики команд в ГРУППАХ
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.message(F.chat.type.in_(["group", "supergroup"]), F.reply_to_message)
+async def handle_group_command(message: types.Message) -> None:
+    """Обрабатывает !mute, !warn, !ban, !unmute в группах."""
     text = message.text
     if not text:
         return
 
-    target: types.User = message.reply_to_message.from_user
+    # Проверяем, что отправитель — админ
     chat_id = message.chat.id
-    mod = message.from_user
-    target_msg_text = message.reply_to_message.text or message.reply_to_message.caption
+    async with async_session() as session:
+        is_adm = await _is_admin(session, chat_id, message.from_user.id)
+    if not is_adm:
+        return
 
-    # Удаляем сообщение модератора с командой (независимо от исхода парсинга)
+    target: types.User = message.reply_to_message.from_user
+    mod = message.from_user
+    target_content = _get_message_content_desc(message.reply_to_message)
+
+    # Удаляем сообщение модератора с командой
     try:
         await message.delete()
     except TelegramBadRequest:
@@ -191,7 +489,6 @@ async def handle_mod_command(message: types.Message) -> None:
         if duration_seconds is None:
             return
 
-        # Снимаем слепок пермишенов ДО мьюта
         perm_snapshot = None
         try:
             member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
@@ -199,41 +496,52 @@ async def handle_mod_command(message: types.Message) -> None:
         except TelegramBadRequest as e:
             logger.warning("get_chat_member before mute failed: %s", e)
 
-        # Restrict пользователя
         until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
         try:
             await message.bot.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=target.id,
-                can_send_messages=False,
-                until_date=until_date,
+                chat_id=chat_id, user_id=target.id,
+                can_send_messages=False, until_date=until_date,
             )
         except TelegramBadRequest as e:
             logger.error("restrict_chat_member failed: %s", e)
             return
+
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
             await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
-                "mute", duration_seconds, reason, target_msg_text,
+                "mute", duration_seconds, reason, target_content,
                 permissions_snapshot=perm_snapshot,
             )
+
+        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
+                           action_type="mute", reason=reason,
+                           duration_seconds=duration_seconds)
         return
 
     # ── !warn ───────────────────────────────────────────────────────────
     m = _CMD_WARN.match(text)
     if m:
-        points, reason = int(m.group(1)), m.group(2)
+        reason = m.group(1)
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
             await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
-                "warn", points, reason, target_msg_text,
+                "warn", 1, reason, target_content,
             )
+
+        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
+                           action_type="warn", reason=reason, warn_points=1)
+
+        # Проверяем порог варнов
+        await _check_warn_threshold(
+            bot=message.bot, chat_id=chat_id,
+            target=target, mod=mod,
+        )
         return
 
     # ── !ban ────────────────────────────────────────────────────────────
@@ -241,7 +549,6 @@ async def handle_mod_command(message: types.Message) -> None:
     if m:
         reason = m.group(1)
 
-        # Снимаем слепок пермишенов ДО бана
         perm_snapshot = None
         try:
             member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
@@ -254,20 +561,23 @@ async def handle_mod_command(message: types.Message) -> None:
         except TelegramBadRequest as e:
             logger.error("ban_chat_member failed: %s", e)
             return
+
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
             await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
-                "ban", None, reason, target_msg_text,
+                "ban", None, reason, target_content,
                 permissions_snapshot=perm_snapshot,
             )
+
+        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
+                           action_type="ban", reason=reason)
         return
 
     # ── !unmute ─────────────────────────────────────────────────────────
     if _CMD_UNMUTE.match(text):
-        # Получаем снапшот пермишенов из последнего mute/ban
         restored = False
         async with async_session() as session:
             snapshot_json = await _fetch_last_snapshot(session, target.id, chat_id)
@@ -276,20 +586,16 @@ async def handle_mod_command(message: types.Message) -> None:
             try:
                 perms = _restore_permissions(snapshot_json)
                 await message.bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=target.id,
-                    permissions=perms,
+                    chat_id=chat_id, user_id=target.id, permissions=perms,
                 )
                 restored = True
             except (TelegramBadRequest, json.JSONDecodeError) as e:
-                logger.warning("Restore from snapshot failed, falling back to defaults: %s", e)
+                logger.warning("Restore from snapshot failed: %s", e)
 
-        # Fallback: выдать все пермишены, если снапшота нет или он повреждён
         if not restored:
             try:
                 await message.bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=target.id,
+                    chat_id=chat_id, user_id=target.id,
                     permissions=types.ChatPermissions(
                         can_send_messages=True,
                         can_send_audios=True,
@@ -316,6 +622,297 @@ async def handle_mod_command(message: types.Message) -> None:
             await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
-                "unmute", None, None, target_msg_text,
+                "unmute", None, None, target_content,
             )
+
+        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
+                           action_type="unmute")
         return
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Обработчики команд в ЛИЧКЕ (настройки)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.message(F.chat.type == "private", Command("addadmin"))
+async def cmd_addadmin(message: types.Message) -> None:
+    """Добавляет админа в чат. Формат: /addadmin <chat_id> <user_id>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /addadmin <chat_id> <user_id>")
+        return
+
+    try:
+        chat_id = int(parts[1])
+        user_id = int(parts[2])
+    except ValueError:
+        await message.reply("❌ chat_id и user_id должны быть числами")
+        return
+
+    async with async_session() as session:
+        # Проверяем, не добавлен ли уже
+        stmt = select(ChatAdmin).where(
+            ChatAdmin.chat_id == chat_id,
+            ChatAdmin.user_id == user_id,
+        )
+        result = await session.execute(stmt)
+        if result.scalar_one_or_none():
+            await message.reply(f"⚠️ Пользователь {user_id} уже админ в чате {chat_id}")
+            return
+
+        admin = ChatAdmin(
+            chat_id=chat_id, user_id=user_id,
+            added_by=message.from_user.id,
+        )
+        session.add(admin)
+        await session.commit()
+
+    await message.reply(f"✅ Пользователь {user_id} добавлен в админы чата {chat_id}")
+
+
+@router.message(F.chat.type == "private", Command("deladmin"))
+async def cmd_deladmin(message: types.Message) -> None:
+    """Убирает админа из чата. Формат: /deladmin <chat_id> <user_id>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /deladmin <chat_id> <user_id>")
+        return
+
+    try:
+        chat_id = int(parts[1])
+        user_id = int(parts[2])
+    except ValueError:
+        await message.reply("❌ chat_id и user_id должны быть числами")
+        return
+
+    async with async_session() as session:
+        stmt = select(ChatAdmin).where(
+            ChatAdmin.chat_id == chat_id,
+            ChatAdmin.user_id == user_id,
+        )
+        result = await session.execute(stmt)
+        admin = result.scalar_one_or_none()
+        if not admin:
+            await message.reply(f"⚠️ Пользователь {user_id} не админ в чате {chat_id}")
+            return
+
+        await session.delete(admin)
+        await session.commit()
+
+    await message.reply(f"✅ Пользователь {user_id} убран из админов чата {chat_id}")
+
+
+@router.message(F.chat.type == "private", Command("sethashtag"))
+async def cmd_sethashtag(message: types.Message) -> None:
+    """Устанавливает хэштег чата. Формат: /sethashtag <chat_id> #хэштег"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /sethashtag <chat_id> #хэштег")
+        return
+
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ chat_id должен быть числом")
+        return
+
+    hashtag = parts[2].strip()
+    if not hashtag.startswith("#"):
+        hashtag = "#" + hashtag
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        settings.hashtag = hashtag
+        await session.commit()
+
+    await message.reply(f"✅ Хэштег чата {chat_id}: {hashtag}")
+
+
+@router.message(F.chat.type == "private", Command("warns_mute"))
+async def cmd_warns_mute(message: types.Message) -> None:
+    """Устанавливает порог варнов до автомьюта. Формат: /warns_mute <chat_id> <число>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /warns_mute <chat_id> <число>\n💡 0 = отключить автомьют")
+        return
+
+    try:
+        chat_id = int(parts[1])
+        count = int(parts[2])
+    except ValueError:
+        await message.reply("❌ chat_id и число должны быть числами")
+        return
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        settings.warns_to_mute = count
+        await session.commit()
+
+    status = f"{count} варнов" if count > 0 else "отключён"
+    await message.reply(f"✅ Автомьют в чате {chat_id}: {status}")
+
+
+@router.message(F.chat.type == "private", Command("warns_ban"))
+async def cmd_warns_ban(message: types.Message) -> None:
+    """Устанавливает порог варнов до автобана. Формат: /warns_ban <chat_id> <число>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /warns_ban <chat_id> <число>\n💡 0 = отключить автобан")
+        return
+
+    try:
+        chat_id = int(parts[1])
+        count = int(parts[2])
+    except ValueError:
+        await message.reply("❌ chat_id и число должны быть числами")
+        return
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        settings.warns_to_ban = count
+        await session.commit()
+
+    status = f"{count} варнов" if count > 0 else "отключён"
+    await message.reply(f"✅ Автобан в чате {chat_id}: {status}")
+
+
+@router.message(F.chat.type == "private", Command("mute_duration"))
+async def cmd_mute_duration(message: types.Message) -> None:
+    """Устанавливает длительность автомьюта. Формат: /mute_duration <chat_id> <1d/2h/30m>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply("📋 Формат: /mute_duration <chat_id> <1d/2h/30m>")
+        return
+
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ chat_id должен быть числом")
+        return
+
+    duration = _parse_duration(parts[2])
+    if duration is None:
+        await message.reply("❌ Неверный формат длительности. Пример: 1d, 2h, 30m, 1d12h")
+        return
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        settings.mute_duration_seconds = duration
+        await session.commit()
+
+    await message.reply(f"✅ Длительность автомьюта в чате {chat_id}: {_format_duration(duration)}")
+
+
+@router.message(F.chat.type == "private", Command("settings"))
+async def cmd_settings(message: types.Message) -> None:
+    """Показывает текущие настройки чата. Формат: /settings <chat_id>"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("📋 Формат: /settings <chat_id>")
+        return
+
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ chat_id должен быть числом")
+        return
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        admins = await _get_chat_admins(session, chat_id)
+
+    hashtag = settings.hashtag or "(не задан)"
+    warns_mute = f"{settings.warns_to_mute} варнов" if settings.warns_to_mute > 0 else "отключён"
+    warns_ban = f"{settings.warns_to_ban} варнов" if settings.warns_to_ban > 0 else "отключён"
+    mute_dur = _format_duration(settings.mute_duration_seconds or 3600)
+
+    admin_list = ""
+    if admins:
+        admin_lines = []
+        for a in admins:
+            admin_lines.append(f"  • <code>{a.user_id}</code> (добавил: <code>{a.added_by or '?'}</code>)")
+        admin_list = "\n👤 Доп. админы:\n" + "\n".join(admin_lines)
+
+    text = (
+        f"⚙️ <b>Настройки чата</b> <code>{chat_id}</code>\n\n"
+        f"🏷 Хэштег: {hashtag}\n"
+        f"⚠️ Варнов до мьюта: {warns_mute}\n"
+        f"⚠️ Варнов до бана: {warns_ban}\n"
+        f"⏱ Длительность мьюта: {mute_dur}\n"
+        f"{admin_list}"
+    )
+
+    await message.reply(text, parse_mode="HTML")
+
+
+@router.message(F.chat.type == "private", Command("help"))
+async def cmd_help(message: types.Message) -> None:
+    """Показывает список команд (только для ADMIN_IDS)."""
+    if message.from_user.id not in ADMIN_IDS:
+        return  # Стелс: молча игнорируем не-админов
+
+    text = (
+        "📖 <b>Команды Shadow Logger</b>\n\n"
+        "<b>В группах (reply на сообщение):</b>\n"
+        "  !mute 1d2h причина — замьютить\n"
+        "  !warn причина — выдать варн\n"
+        "  !ban причина — забанить\n"
+        "  !unmute — размьютить\n\n"
+        "<b>В личке (настройки):</b>\n"
+        "  /addadmin chat_id user_id — добавить админа\n"
+        "  /deladmin chat_id user_id — убрать админа\n"
+        "  /sethashtag chat_id #хэштег — хэштег чата\n"
+        "  /warns_mute chat_id число — варнов до мьюта\n"
+        "  /warns_ban chat_id число — варнов до бана\n"
+        "  /mute_duration chat_id 1d2h — длительность мьюта\n"
+        "  /settings chat_id — показать настройки\n"
+    )
+    await message.reply(text, parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# СТЕЛС: Catch-all — молча игнорируем ВСЕ сообщения от не-админов
+# Эти обработчики стоят ПОСЛЕ всех остальных, поэтому срабатывают
+# только если ни один специфичный хэндлер не подошёл.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.message(F.chat.type == "private")
+async def stealth_catchall_private(message: types.Message) -> None:
+    """Стелс: молча игнорируем ВСЕ сообщения в личке от не-админов.
+    Ни /start, ни /help, ни любой другой текст — бот не реагирует.
+    Если это админ, но команда не распознана — тоже молчим (нет подсказок).
+    """
+    # Просто return — бот НИКОГДА не отвечает обычным юзерам.
+    # Даже если это админ отправил неизвестную команду — молчим,
+    # чтобы случайно не выдать существование бота.
+    return
+
+
+@router.message(F.chat.type.in_(["group", "supergroup"]))
+async def stealth_catchall_group(message: types.Message) -> None:
+    """Стелс: молча игнорируем все сообщения в группах,
+    которые не были обработаны модераторскими командами.
+    Сюда попадают: обычные сообщения, /start, /help и т.д.
+    """
+    return
