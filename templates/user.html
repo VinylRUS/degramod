@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}User {{ user.user_id }} — Shadow Logger{% endblock %}
+{% block title %}User {{ user.user_id }} — Дедушка Вобжак{% endblock %}
 
 {% block content %}
 
@@ -11,18 +11,22 @@
     <tr><td class="dim">Username</td><td>@{{ user.username or '—' }}</td></tr>
     <tr><td class="dim">First name</td><td>{{ user.first_name or '—' }}</td></tr>
     <tr><td class="dim">Last name</td><td>{{ user.last_name or '—' }}</td></tr>
-    <tr><td class="dim">Last seen</td><td>{{ user.last_seen.strftime('%Y-%m-%d %H:%M UTC') if user.last_seen else '—' }}</td></tr>
+    <tr><td class="dim">Last seen</td><td>{{ user.last_seen | msk }}</td></tr>
 </table>
 
 {# ── Счётчики ───────────────────────────────────────────────── #}
 <div class="section-title">Counters</div>
 <div class="stat-grid">
     <div class="stat-card">
+        <div class="label">Current warn points</div>
+        <div class="value" style="color: {% if current_warns >= 3 %}var(--danger){% elif current_warns >= 1 %}var(--info){% else %}var(--accent){% endif %};">{{ current_warns }}</div>
+    </div>
+    <div class="stat-card">
         <div class="label">Mutes</div>
         <div class="value" style="color: var(--warn);">{{ counters.get('mute', 0) }}</div>
     </div>
     <div class="stat-card">
-        <div class="label">Warns</div>
+        <div class="label">Warns (total)</div>
         <div class="value" style="color: var(--info);">{{ counters.get('warn', 0) }}</div>
     </div>
     <div class="stat-card">
@@ -50,41 +54,44 @@
     <thead>
         <tr>
             <th>#</th>
-            <th>Time</th>
+            <th>Time (MSK)</th>
             <th>Action</th>
             <th>Moderator</th>
             <th>Duration</th>
             <th>Reason</th>
-            <th>Message</th>
+            <th>Content</th>
         </tr>
     </thead>
     <tbody>
         {% for punishment, moderator in punishments %}
         <tr>
             <td class="dim">{{ punishment.id }}</td>
-            <td class="dim">{{ punishment.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+            <td class="dim">{{ punishment.created_at | msk }}</td>
             <td><span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span></td>
             <td class="dim">{{ moderator.username or moderator.first_name or moderator.mod_id }}</td>
             <td>
                 {% if punishment.action_type == 'warn' %}
                     {{ punishment.duration_seconds or 0 }} pts
                 {% elif punishment.duration_seconds %}
-                    {% set d = punishment.duration_seconds %}
-                    {% if d >= 86400 %}{{ d // 86400 }}d {% endif %}
-                    {% if d % 86400 >= 3600 %}{{ (d % 86400) // 3600 }}h {% endif %}
-                    {% if d % 3600 >= 60 %}{{ (d % 3600) // 60 }}m{% endif %}
+                    {{ punishment.duration_seconds | dur }}
                 {% else %}
                     —
                 {% endif %}
             </td>
             <td>{{ punishment.reason or '—' }}</td>
-            <td class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-                {{ punishment.message_text or '—' }}
+            <td>
+                {% if punishment.report_message_id and report_chat_id %}
+                    <a href="{{ report_chat_id | tglink }}/{{ punishment.report_message_id }}" target="_blank" rel="noopener">📎 Media</a>
+                {% elif punishment.message_text %}
+                    <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;">{{ punishment.message_text }}</span>
+                {% else %}
+                    <span class="dim">—</span>
+                {% endif %}
             </td>
         </tr>
         {% endfor %}
         {% if not punishments %}
-        <tr><td colspan="7" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
+        <tr><td colspan="8" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
         {% endif %}
     </tbody>
 </table>

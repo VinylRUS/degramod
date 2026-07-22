@@ -10,7 +10,7 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, event,
+    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, event, text,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -72,6 +72,7 @@ class Punishment(Base):
     reason = Column(Text, nullable=True)
     message_text = Column(Text, nullable=True)               # текст удалённого сообщения нарушителя
     permissions_snapshot = Column(Text, nullable=True)        # JSON: пермишены пользователя ДО санкции
+    report_message_id = Column(BigInteger, nullable=True)    # ID пересланного сообщения в канале отчётов (для медиа)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="punishments", foreign_keys=[user_id])
@@ -103,9 +104,18 @@ class ChatSettings(Base):
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────
 async def init_db() -> None:
-    """Создаёт таблицы при первом запуске."""
+    """Создаёт таблицы при первом запуске + миграции для новых колонок."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # ── Миграция: добавляем report_message_id если колонка отсутствует ──
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(punishments)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "report_message_id" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE punishments ADD COLUMN report_message_id BIGINT NULL"
+            ))
 
 
 async def get_session() -> AsyncSession:

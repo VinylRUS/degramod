@@ -18,12 +18,17 @@ from sqlalchemy import select, func, desc
 
 _req_logger = logging.getLogger("shadow_logger.requests")
 
-from db import async_session, User, Moderator, Punishment
+from db import async_session, User, Moderator, Punishment, ChatSettings
 
 # ── Конфигурация ────────────────────────────────────────────────────────────
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 COOKIE_NAME = "sl_session"
 _SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
+
+# МСК таймзона
+MSK = timezone(timedelta(hours=3))
+
+PAGE_SIZE = 50  # записей на страницу в дашборде
 
 
 def _sign(value: str) -> str:
@@ -53,6 +58,51 @@ async def require_auth(request: Request) -> None:
         raise HTTPException(status_code=303, headers={"Location": "/login"})
 
 
+# ── Jinja2 filters ──────────────────────────────────────────────────────────
+def _msk_time(dt: datetime | None) -> str:
+    """Конвертирует UTC datetime в МСК строку."""
+    if dt is None:
+        return "—"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    msk_dt = dt.astimezone(MSK)
+    return msk_dt.strftime("%d.%m.%Y %H:%M")
+
+
+def _duration_fmt(seconds: int | None) -> str:
+    """Форматирует секунды длительности в человекочитаемый вид."""
+    if seconds is None:
+        return "—"
+    if seconds == 0:
+        return "0"
+    parts = []
+    days = seconds // 86400
+    if days:
+        parts.append(f"{days}д")
+    hours = (seconds % 86400) // 3600
+    if hours:
+        parts.append(f"{hours}ч")
+    mins = (seconds % 3600) // 60
+    if mins:
+        parts.append(f"{mins}м")
+    return "".join(parts) if parts else "0"
+
+
+def _telegram_link(chat_id: int, message_id: int) -> str:
+    """Конструирует ссылку на сообщение в Telegram канале/чате.
+
+    Для приватных каналов: https://t.me/c/<id_without_-100>/<message_id>
+    Для публичных: ссылка не может быть построена без username — используется числовой ID.
+    """
+    if chat_id < 0:
+        # Приватный канал/супергруппа: убираем префикс -100
+        clean_id = str(chat_id).replace("-100", "").lstrip("-")
+        return f"https://t.me/c/{clean_id}/{message_id}"
+    else:
+        # Публичная группа/канал — числовый ID (публичный username неизвестен)
+        return f"https://t.me/c/{chat_id}/{message_id}"
+
+
 # ── Создание приложения ─────────────────────────────────────────────────────
 def create_app(lifespan=None) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -73,13 +123,16 @@ def create_app(lifespan=None) -> FastAPI:
             raise
 
     templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
+    templates.env.filters["msk"] = _msk_time
+    templates.env.filters["dur"] = _duration_fmt
+    templates.env.filters["tglink"] = _telegram_link
 
     # ── Health check (для Bothost proxy, без авторизации) ─────────────
     @app.get("/health")
     async def health():
         return {
             "status": "ok",
-            "service": "shadow-logger",
+            "service": "dedushka-vobzhak",
             "time": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -121,18 +174,20 @@ def create_app(lifespan=None) -> FastAPI:
 
     # ── GET /dashboard ──────────────────────────────────────────────────
     @app.get("/dashboard", response_class=HTMLResponse)
-    async def dashboard(request: Request, _=Depends(require_auth)):
-        async with async_session() as session:
-            stmt = (
-                select(Punishment, User, Moderator)
-                .join(User, Punishment.user_id == User.user_id)
-                .join(Moderator, Punishment.mod_id == Moderator.mod_id)
-                .order_by(desc(Punishment.created_at))
-                .limit(50)
-            )
-            result = await session.execute(stmt)
-            rows = result.all()
+    async def dashboard(request: Request, page: int = 1, _=Depends(require_auth)):
+        offset = (page - 1) * PAGE_SIZE
 
+        async with async_session() as session:
+            # ── Общая статистика (все время) ────────────────────────────────
+            total_stmt = (
+                select(Punishment.action_type, func.count(Punishment.id))
+                .group_by(Punishment.action_type)
+            )
+            total_result = await session.execute(total_stmt)
+            total_stats = {row[0]: row[1] for row in total_result.all()}
+            total_all = sum(total_stats.values())
+
+            # ── Топ нарушителей за 30 дней ──────────────────────────────────
             thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
             top_stmt = (
                 select(
@@ -151,10 +206,60 @@ def create_app(lifespan=None) -> FastAPI:
             top_result = await session.execute(top_stmt)
             top_offenders = top_result.all()
 
+            # ── Топ модераторов за 30 дней ──────────────────────────────────
+            mod_stmt = (
+                select(
+                    Punishment.mod_id,
+                    Moderator.username,
+                    Moderator.first_name,
+                    func.count(Punishment.id).label("cnt"),
+                )
+                .join(Moderator, Punishment.mod_id == Moderator.mod_id)
+                .where(Punishment.created_at >= thirty_days_ago)
+                .group_by(Punishment.mod_id)
+                .order_by(desc("cnt"))
+                .limit(10)
+            )
+            mod_result = await session.execute(mod_stmt)
+            top_moderators = mod_result.all()
+
+            # ── Лог санкций (с пагинацией) ──────────────────────────────────
+            count_stmt = select(func.count(Punishment.id))
+            total_rows_result = await session.execute(count_stmt)
+            total_row_count = total_rows_result.scalar() or 0
+            total_pages = max(1, (total_row_count + PAGE_SIZE - 1) // PAGE_SIZE)
+
+            stmt = (
+                select(Punishment, User, Moderator)
+                .join(User, Punishment.user_id == User.user_id)
+                .join(Moderator, Punishment.mod_id == Moderator.mod_id)
+                .order_by(desc(Punishment.created_at))
+                .offset(offset)
+                .limit(PAGE_SIZE)
+            )
+            result = await session.execute(stmt)
+            rows = result.all()
+
+            # ── Чат-хэштеги ──────────────────────────────────────────────────
+            settings_stmt = select(ChatSettings)
+            settings_result = await session.execute(settings_stmt)
+            chat_settings = settings_result.scalars().all()
+
+        # ── REPORT_CHAT_ID для построения ссылок на медиа ────────────────────
+        report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "rows": rows,
             "top_offenders": top_offenders,
+            "top_moderators": top_moderators,
+            "total_stats": total_stats,
+            "total_all": total_all,
+            "page": page,
+            "total_pages": total_pages,
+            "page_size": PAGE_SIZE,
+            "chat_settings": chat_settings,
+            "report_chat_id": report_chat_id,
         })
 
     # ── GET /user/<user_id> ─────────────────────────────────────────────
@@ -175,6 +280,17 @@ def create_app(lifespan=None) -> FastAPI:
             count_result = await session.execute(count_stmt)
             counters = {row[0]: row[1] for row in count_result.all()}
 
+            # ── Текущие варны (сумма duration_seconds для warn) ──────────
+            warn_sum_stmt = (
+                select(func.coalesce(func.sum(Punishment.duration_seconds), 0))
+                .where(
+                    Punishment.user_id == user_id,
+                    Punishment.action_type == "warn",
+                )
+            )
+            warn_result = await session.execute(warn_sum_stmt)
+            current_warns = int(warn_result.scalar() or 0)
+
             action_filter = request.query_params.get("action", "")
             punishment_stmt = (
                 select(Punishment, Moderator)
@@ -187,12 +303,17 @@ def create_app(lifespan=None) -> FastAPI:
             punishment_result = await session.execute(punishment_stmt)
             punishments = punishment_result.all()
 
+        # ── REPORT_CHAT_ID для построения ссылок на медиа ────────────────────
+        report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+
         return templates.TemplateResponse("user.html", {
             "request": request,
             "user": user,
             "counters": counters,
+            "current_warns": current_warns,
             "punishments": punishments,
             "action_filter": action_filter,
+            "report_chat_id": report_chat_id,
         })
 
     # ── GET /api/search?q=<query> ──────────────────────────────────────

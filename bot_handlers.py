@@ -1,15 +1,17 @@
 """
-bot_handlers.py — Обработка модераторских команд + отчёты в чат + настройки через личку.
+bot_handlers.py — Дедушка Вобжак: скрытый модераторский бот + отчёты в чат + настройки.
 
 ★★★ СТЕЛС-РЕЖИМ: бот НЕ реагирует ни на какие команды от обычных юзеров.
 Ни /start, ни /help, ни любые другие — молча игнорируются.
 Только ADMIN_IDS и ChatAdmin могут использовать команды. ★★★
 
 Команды в группах (reply на сообщение нарушителя):
-  !mute <1d/2h/30m> <причина>  — замьютить
+  !mute <1d/2h/30m> <причина>  — замьютить (полный мьют — все виды отправки)
   !warn <причина>               — выдать варн (1 поинт)
   !ban <причина>                — забанить
-  !unmute                       — размьютить
+  !unmute                       — размьютить (выдаёт текущие права чата)
+  !warns                        — показать текущее кол-во варнов юзера (в личку админу)
+  !resetwarns                   — обнулить варны юзера
 
 Команды в личке (только для ADMIN_IDS):
   /addadmin <chat_id> <user_id> — добавить админа в чат
@@ -23,6 +25,7 @@ bot_handlers.py — Обработка модераторских команд +
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -63,7 +66,7 @@ MSK = timezone(timedelta(hours=3))
 
 # ── Парсинг длительности: 1d, 2h, 30m, 1d12h ──────────────────────────────
 _DURATION_RE = re.compile(
-    r"(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?", re.IGNORECASE
+    r"(?:(\d+)(?:d|д))?(?:(\d+)(?:h|ч))?(?:(\d+)(?:m|м))?", re.IGNORECASE
 )
 
 
@@ -94,11 +97,36 @@ def _format_duration(seconds: int) -> str:
     return "".join(parts) if parts else "0м"
 
 
+# ── Full mute permissions — запретить ВСЕ виды отправки ──────────────────────
+def _mute_permissions() -> types.ChatPermissions:
+    """ChatPermissions для полного мьюта: запрещает отправку всех типов контента.
+    Telegram интерпретирует None в ChatPermissions как True (разрешено),
+    поэтому нужно явно ставить False на каждое поле.
+    """
+    return types.ChatPermissions(
+        can_send_messages=False,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        can_change_info=False,
+        can_invite_users=False,
+        can_pin_messages=False,
+    )
+
+
 # ── Команды в группах ──────────────────────────────────────────────────────
-_CMD_MUTE = re.compile(r"^!mute\s+(\S+)\s+(.+)$", re.IGNORECASE)
+_CMD_MUTE = re.compile(r"^!mute\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
 _CMD_WARN = re.compile(r"^!warn\s+(.+)$", re.IGNORECASE)
 _CMD_BAN = re.compile(r"^!ban\s+(.+)$", re.IGNORECASE)
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
+_CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
+_CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
 
 # ── Permissions snapshot ───────────────────────────────────────────────────
 _PERM_FIELDS = [
@@ -211,7 +239,8 @@ async def _save_punishment(session, user_id: int, mod_id: int,
                            duration_seconds: int | None,
                            reason: str | None,
                            message_text: str | None,
-                           permissions_snapshot: str | None = None) -> Punishment:
+                           permissions_snapshot: str | None = None,
+                           report_message_id: int | None = None) -> Punishment:
     punishment = Punishment(
         user_id=user_id,
         mod_id=mod_id,
@@ -221,6 +250,7 @@ async def _save_punishment(session, user_id: int, mod_id: int,
         reason=reason,
         message_text=message_text,
         permissions_snapshot=permissions_snapshot,
+        report_message_id=report_message_id,
     )
     session.add(punishment)
     await session.commit()
@@ -259,6 +289,12 @@ async def _count_warns(session, user_id: int, chat_id: int) -> int:
 
 
 # ── Отправка отчёта в чат ──────────────────────────────────────────────────
+def _has_media(msg: types.Message) -> bool:
+    """Проверяет, содержит ли сообщение медиа-контент (не только текст)."""
+    return bool(msg.photo or msg.video or msg.animation or msg.sticker
+               or msg.voice or msg.audio or msg.document or msg.video_note)
+
+
 async def _send_report(
     bot: types.Bot,
     chat_id: int,
@@ -267,10 +303,32 @@ async def _send_report(
     reason: str | None,
     warn_points: int | None = None,
     duration_seconds: int | None = None,
-) -> None:
-    """Отправляет форматированный отчёт о санкции в REPORT_CHAT_ID."""
+    reply_to_message: types.Message | None = None,
+) -> int | None:
+    """Отправляет форматированный отчёт о санкции в REPORT_CHAT_ID.
+
+    Если reply_to_message содержит текст — он прикладывается к отчёту.
+    Если содержит медиа — сообщение пересылается в канал отчётов,
+    а ID пересланного сообщения возвращается для ссылки в веб-панели.
+
+    Returns: report_message_id (int) если медиа было переслано, иначе None.
+    """
     if not REPORT_CHAT_ID:
-        return
+        return None
+
+    report_msg_id: int | None = None
+
+    # ── Пересылка медиа-контента в канал отчётов ─────────────────────────
+    if reply_to_message and _has_media(reply_to_message):
+        try:
+            forwarded = await bot.forward_message(
+                chat_id=REPORT_CHAT_ID,
+                from_chat_id=reply_to_message.chat.id,
+                message_id=reply_to_message.message_id,
+            )
+            report_msg_id = forwarded.message_id
+        except TelegramBadRequest as e:
+            logger.error("Failed to forward media to report chat: %s", e)
 
     async with async_session() as session:
         settings = await _get_chat_settings(session, chat_id)
@@ -294,6 +352,25 @@ async def _send_report(
     if reason:
         reason_line = f"📝 Причина: {reason}\n"
 
+    # ── Контент пересланного сообщения ────────────────────────────────────
+    content_line = ""
+    if reply_to_message:
+        if reply_to_message.text:
+            # Обрезаем длинный текст, чтобы не выйти за лимит Telegram
+            txt = reply_to_message.text
+            if len(txt) > 800:
+                txt = txt[:800] + "..."
+            content_line = f"💬 Сообщение:\n{txt}\n"
+        elif reply_to_message.caption:
+            txt = reply_to_message.caption
+            if len(txt) > 800:
+                txt = txt[:800] + "..."
+            content_line = f"💬 Описание:\n{txt}\n"
+
+        # Медиа — ссылка на пересланное сообщение
+        if _has_media(reply_to_message) and report_msg_id is not None:
+            content_line += f"📎 Медиа: см. пересланное сообщение в канале отчётов\n"
+
     # Варны
     warn_line = ""
     if action_type == "warn" and warn_points is not None:
@@ -302,8 +379,6 @@ async def _send_report(
         warn_line = f"⚠️ Варнов: {total_warns}\n"
 
     # Время (МСК)
-    msk_time = datetime.now(MSK).strftime("%d.%m.%Y %H:%МСК")
-    # Исправляем: формируем строку вручную
     now_msk = datetime.now(MSK)
     time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
 
@@ -328,6 +403,7 @@ async def _send_report(
         f"{name_line}"
         f"{username_line}"
         f"{reason_line}"
+        f"{content_line}"
         f"{warn_line}"
         f"{duration_line}"
         f"🕐 {time_str}"
@@ -340,6 +416,8 @@ async def _send_report(
         )
     except TelegramBadRequest as e:
         logger.error("Failed to send report to chat %s: %s", REPORT_CHAT_ID, e)
+
+    return report_msg_id
 
 
 # ── Авто-санкция при превышении порога варнов ──────────────────────────────
@@ -398,7 +476,7 @@ async def _check_warn_threshold(
                 await bot.restrict_chat_member(
                     chat_id=chat_id,
                     user_id=target.id,
-                    can_send_messages=False,
+                    permissions=_mute_permissions(),
                     until_date=until_date,
                 )
                 await _upsert_user(session, target.id, target.username,
@@ -484,9 +562,18 @@ async def handle_group_command(message: types.Message) -> None:
     # ── !mute ───────────────────────────────────────────────────────────
     m = _CMD_MUTE.match(text)
     if m:
-        dur_str, reason = m.group(1), m.group(2)
+        dur_str = m.group(1)
+        reason = m.group(2) or "(без причины)"
         duration_seconds = _parse_duration(dur_str)
         if duration_seconds is None:
+            try:
+                await message.bot.send_message(
+                    chat_id=mod.id,
+                    text=f"❌ Не удалось распознать длительность: {dur_str}\n"
+                         f"💡 Формат: 1m, 30м, 1d, 2ч, 1d12h30m (рус/англ)",
+                )
+            except TelegramBadRequest:
+                pass
             return
 
         perm_snapshot = None
@@ -500,11 +587,26 @@ async def handle_group_command(message: types.Message) -> None:
         try:
             await message.bot.restrict_chat_member(
                 chat_id=chat_id, user_id=target.id,
-                can_send_messages=False, until_date=until_date,
+                permissions=_mute_permissions(),
+                until_date=until_date,
             )
         except TelegramBadRequest as e:
             logger.error("restrict_chat_member failed: %s", e)
+            try:
+                await message.bot.send_message(
+                    chat_id=mod.id,
+                    text=f"❌ Мут не удался: {e}",
+                )
+            except TelegramBadRequest:
+                pass
             return
+
+        report_msg_id = await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="mute", reason=reason,
+            duration_seconds=duration_seconds,
+            reply_to_message=message.reply_to_message,
+        )
 
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
@@ -514,17 +616,21 @@ async def handle_group_command(message: types.Message) -> None:
                 session, target.id, mod.id, chat_id,
                 "mute", duration_seconds, reason, target_content,
                 permissions_snapshot=perm_snapshot,
+                report_message_id=report_msg_id,
             )
 
-        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
-                           action_type="mute", reason=reason,
-                           duration_seconds=duration_seconds)
         return
 
     # ── !warn ───────────────────────────────────────────────────────────
     m = _CMD_WARN.match(text)
     if m:
         reason = m.group(1)
+        report_msg_id = await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="warn", reason=reason, warn_points=1,
+            reply_to_message=message.reply_to_message,
+        )
+
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
@@ -532,10 +638,8 @@ async def handle_group_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "warn", 1, reason, target_content,
+                report_message_id=report_msg_id,
             )
-
-        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
-                           action_type="warn", reason=reason, warn_points=1)
 
         # Проверяем порог варнов
         await _check_warn_threshold(
@@ -560,7 +664,20 @@ async def handle_group_command(message: types.Message) -> None:
             await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
         except TelegramBadRequest as e:
             logger.error("ban_chat_member failed: %s", e)
+            try:
+                await message.bot.send_message(
+                    chat_id=mod.id,
+                    text=f"❌ Бан не удался: {e}",
+                )
+            except TelegramBadRequest:
+                pass
             return
+
+        report_msg_id = await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="ban", reason=reason,
+            reply_to_message=message.reply_to_message,
+        )
 
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
@@ -570,51 +687,48 @@ async def handle_group_command(message: types.Message) -> None:
                 session, target.id, mod.id, chat_id,
                 "ban", None, reason, target_content,
                 permissions_snapshot=perm_snapshot,
+                report_message_id=report_msg_id,
             )
 
-        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
-                           action_type="ban", reason=reason)
         return
 
     # ── !unmute ─────────────────────────────────────────────────────────
+    # Размут выдаёт ТЕКУЩИЕ дефолтные права чата (Chat.permissions),
+    # а не индивидуальный снапшот — так ночной режим и прочие
+    # ограничения чата не ломаются при размуте посреди ночи.
     if _CMD_UNMUTE.match(text):
-        restored = False
-        async with async_session() as session:
-            snapshot_json = await _fetch_last_snapshot(session, target.id, chat_id)
-
-        if snapshot_json:
+        try:
+            chat_info = await message.bot.get_chat(chat_id=chat_id)
+            chat_perms = chat_info.permissions
+            if chat_perms is None:
+                # Группа с супер-админом без дефолтных прав — даём всё
+                chat_perms = types.ChatPermissions(can_send_messages=True)
+        except TelegramBadRequest as e:
+            logger.error("get_chat for unmute failed: %s", e)
             try:
-                perms = _restore_permissions(snapshot_json)
-                await message.bot.restrict_chat_member(
-                    chat_id=chat_id, user_id=target.id, permissions=perms,
-                )
-                restored = True
-            except (TelegramBadRequest, json.JSONDecodeError) as e:
-                logger.warning("Restore from snapshot failed: %s", e)
+                await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался (get_chat): {e}")
+            except TelegramBadRequest:
+                pass
+            return
 
-        if not restored:
+        try:
+            await message.bot.restrict_chat_member(
+                chat_id=chat_id, user_id=target.id,
+                permissions=chat_perms,
+            )
+        except TelegramBadRequest as e:
+            logger.error("unmute restrict failed: %s", e)
             try:
-                await message.bot.restrict_chat_member(
-                    chat_id=chat_id, user_id=target.id,
-                    permissions=types.ChatPermissions(
-                        can_send_messages=True,
-                        can_send_audios=True,
-                        can_send_documents=True,
-                        can_send_photos=True,
-                        can_send_videos=True,
-                        can_send_video_notes=True,
-                        can_send_voice_notes=True,
-                        can_send_polls=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True,
-                        can_change_info=True,
-                        can_invite_users=True,
-                        can_pin_messages=True,
-                    ),
-                )
-            except TelegramBadRequest as e:
-                logger.error("unmute restrict failed: %s", e)
-                return
+                await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался: {e}")
+            except TelegramBadRequest:
+                pass
+            return
+
+        report_msg_id = await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="unmute",
+            reply_to_message=message.reply_to_message,
+        )
 
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
@@ -623,10 +737,88 @@ async def handle_group_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "unmute", None, None, target_content,
+                report_message_id=report_msg_id,
             )
 
-        await _send_report(bot=message.bot, chat_id=chat_id, target=target,
-                           action_type="unmute")
+        return
+
+    # ── !warns — показать текущее количество варнов юзера ─────────────
+    if _CMD_WARNS.match(text):
+        async with async_session() as session:
+            total_warns = await _count_warns(session, target.id, chat_id)
+            settings = await _get_chat_settings(session, chat_id)
+
+        warn_mute = settings.warns_to_mute if settings.warns_to_mute > 0 else None
+        warn_ban = settings.warns_to_ban if settings.warns_to_ban > 0 else None
+
+        info_parts = [f"⚠️ Варнов: {total_warns}"]
+        if warn_mute:
+            info_parts.append(f"Автомьют при {warn_mute}")
+        if warn_ban:
+            info_parts.append(f"Автобан при {warn_ban}")
+
+        try:
+            await message.bot.send_message(
+                chat_id=message.from_user.id,
+                text=f"👤 {target.first_name or ''}{' ' + target.last_name if target.last_name else ''}"
+                     f"{' @' + target.username if target.username else ''}\n"
+                     + "\n".join(info_parts),
+            )
+        except TelegramBadRequest:
+            # Если бот не может написать в личку — ответ в чат (будет удалён)
+            sent = await message.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ {target.first_name or target.id}: {total_warns} варнов",
+            )
+            # Удаляем ответ через 30 секунд
+            async def _del_msg():
+                await asyncio.sleep(30)
+                try:
+                    await message.bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+                except TelegramBadRequest:
+                    pass
+            asyncio.create_task(_del_msg())
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
+        return
+
+    # ── !resetwarns — обнулить варны юзера ────────────────────────────
+    if _CMD_RESETWARNS.match(text):
+        async with async_session() as session:
+            # Обнуляем duration_seconds для всех warn-записей юзера в чате
+            stmt = (
+                select(Punishment)
+                .where(
+                    Punishment.user_id == target.id,
+                    Punishment.chat_id == chat_id,
+                    Punishment.action_type == "warn",
+                    Punishment.duration_seconds.isnot(None),
+                    Punishment.duration_seconds > 0,
+                )
+            )
+            result = await session.execute(stmt)
+            warns = result.scalars().all()
+            for w in warns:
+                w.duration_seconds = 0
+            await session.commit()
+            total_reset = len(warns)
+
+        try:
+            await message.bot.send_message(
+                chat_id=message.from_user.id,
+                text=f"✅ Варны обнулены: {target.first_name or ''}"
+                     f"{' ' + target.last_name if target.last_name else ''}"
+                     f"{' @' + target.username if target.username else ''}"
+                     f" (сброшено {total_reset} записей)",
+            )
+        except TelegramBadRequest:
+            pass
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            pass
         return
 
 
@@ -810,7 +1002,7 @@ async def cmd_mute_duration(message: types.Message) -> None:
 
     duration = _parse_duration(parts[2])
     if duration is None:
-        await message.reply("❌ Неверный формат длительности. Пример: 1d, 2h, 30m, 1d12h")
+        await message.reply("❌ Неверный формат длительности. Пример: 1d, 2h, 30m, 1д, 2ч, 30м, 1d12h30m")
         return
 
     async with async_session() as session:
@@ -873,12 +1065,15 @@ async def cmd_help(message: types.Message) -> None:
         return  # Стелс: молча игнорируем не-админов
 
     text = (
-        "📖 <b>Команды Shadow Logger</b>\n\n"
+        "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
         "<b>В группах (reply на сообщение):</b>\n"
-        "  !mute 1d2h причина — замьютить\n"
+        "  !mute 1d2h причина — замьютить (полный мьют; причина опциональна)\n"
+        "  !mute 30м — мьют на 30 минут без причины (рус/англ суффиксы)\n"
         "  !warn причина — выдать варн\n"
         "  !ban причина — забанить\n"
-        "  !unmute — размьютить\n\n"
+        "  !unmute — размьютить (текущие права чата)\n"
+        "  !warns — показать варны юзера\n"
+        "  !resetwarns — обнулить варны юзера\n\n"
         "<b>В личке (настройки):</b>\n"
         "  /addadmin chat_id user_id — добавить админа\n"
         "  /deladmin chat_id user_id — убрать админа\n"

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
-    <title>{% block title %}Shadow Logger{% endblock %}</title>
+    <title>{% block title %}Дедушка Вобжак{% endblock %}</title>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -108,7 +108,7 @@
 
         .stat-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
             gap: 12px;
             margin-bottom: 24px;
         }
@@ -148,13 +148,86 @@
         }
 
         .dim  { color: var(--text-dim); }
+
+        /* ── Search bar ──────────────────────────────────────────── */
+        .search-bar {
+            margin-bottom: 24px;
+            display: flex;
+            gap: 8px;
+        }
+        .search-bar input {
+            width: 100%;
+            padding: 8px 12px;
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            color: var(--text);
+            font-family: var(--font-mono);
+            font-size: 13px;
+            outline: none;
+        }
+        .search-bar input:focus { border-color: var(--accent); }
+        .search-results {
+            position: absolute;
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            max-height: 320px;
+            overflow-y: auto;
+            z-index: 100;
+            width: 400px;
+        }
+        .search-results a {
+            display: block;
+            padding: 8px 12px;
+            font-size: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        .search-results a:hover {
+            background: var(--bg3);
+            text-decoration: none;
+            color: var(--accent);
+        }
+
+        /* ── Pagination ─────────────────────────────────────────── */
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 4px;
+            margin-top: 20px;
+            padding-bottom: 24px;
+        }
+        .pagination a, .pagination span {
+            padding: 6px 12px;
+            font-size: 11px;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+        }
+        .pagination a:hover { color: var(--text); text-decoration: none; border-color: var(--text-dim); }
+        .pagination .current {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+        .pagination .disabled {
+            opacity: .3;
+            pointer-events: none;
+        }
+
+        /* ── Two-column layout for stats sections ──────────────── */
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        @media (max-width: 700px) {
+            .two-col { grid-template-columns: 1fr; }
+            .stat-grid { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+        }
     </style>
     {% block extra_head %}{% endblock %}
 </head>
 <body>
     {% block navbar %}
     <nav class="navbar">
-        <span class="brand">SHADOW LOGGER</span>
+        <span class="brand">ДЕДУШКА ВОБЖАК</span>
         <a href="/dashboard">DASHBOARD</a>
         <span class="spacer"></span>
         <a href="/logout">LOGOUT</a>
@@ -164,5 +237,7 @@
     <div class="container">
         {% block content %}{% endblock %}
     </div>
+
+    {% block extra_js %}{% endblock %}
 </body>
 </html>
