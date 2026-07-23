@@ -91,11 +91,12 @@ class ChatAdmin(Base):
 
 
 class ChatSettings(Base):
-    """Настройки чата: пороги варнов, хэштег и т.д."""
+    """Настройки чата: пороги варнов, хэштег, репорт-чат и т.д."""
     __tablename__ = "chat_settings"
 
     chat_id = Column(BigInteger, primary_key=True)
     hashtag = Column(String(64), nullable=True)              # хэштег чата (#Бэбэй, #Деградач)
+    report_chat_id = Column(BigInteger, nullable=True)       # чат для отчётов (NULL = использовать env REPORT_CHAT_ID)
     warns_to_mute = Column(Integer, default=3)               # варнов до мьюта (0 = отключено)
     mute_duration_seconds = Column(Integer, default=3600)    # длительность мьюта по умолчанию (1ч)
     warns_to_ban = Column(Integer, default=5)                # варнов до бана (0 = отключено)
@@ -115,6 +116,15 @@ async def init_db() -> None:
         if "report_message_id" not in columns:
             await conn.execute(text(
                 "ALTER TABLE punishments ADD COLUMN report_message_id BIGINT NULL"
+            ))
+
+    # ── Миграция: добавляем report_chat_id в chat_settings если колонка отсутствует ──
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "report_chat_id" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN report_chat_id BIGINT NULL"
             ))
 
 

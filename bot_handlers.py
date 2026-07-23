@@ -14,13 +14,14 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
   !resetwarns                   — обнулить варны юзера
 
 Команды в личке (только для ADMIN_IDS):
-  /addadmin <chat_id> <user_id> — добавить админа в чат
-  /deladmin <chat_id> <user_id> — убрать админа
-  /sethashtag <chat_id> #хэштег — установить хэштег чата
-  /warns_mute <chat_id> <число> — варнов до авто-мьюта (0 = выкл)
-  /warns_ban <chat_id> <число>  — варнов до авто-бана (0 = выкл)
-  /mute_duration <chat_id> <1d/2h/30m> — длительность мьюта
-  /settings <chat_id>           — показать текущие настройки
+  /addadmin chat_id user_id      — добавить админа в чат
+  /deladmin chat_id user_id      — убрать админа
+  /sethashtag chat_id #хэштег   — установить хэштег чата
+  /setreport chat_id report_chat_id — задать чат для отчётов (0 = сбросить, использовать env)
+  /warns_mute chat_id число      — варнов до авто-мьюта (0 = выкл)
+  /warns_ban chat_id число       — варнов до авто-бана (0 = выкл)
+  /mute_duration chat_id 1d/2h/30m — длительность мьюта
+  /settings chat_id              — показать текущие настройки
 """
 
 from __future__ import annotations
@@ -295,6 +296,17 @@ def _has_media(msg: types.Message) -> bool:
                or msg.voice or msg.audio or msg.document or msg.video_note)
 
 
+async def _get_report_chat_id(session, chat_id: int) -> int | None:
+    """Возвращает ID чата для отчётов: из ChatSettings.report_chat_id или из env."""
+    settings = await _get_chat_settings(session, chat_id)
+    if settings.report_chat_id is not None and settings.report_chat_id != 0:
+        return settings.report_chat_id
+    # Fallback на env-переменную
+    if REPORT_CHAT_ID:
+        return REPORT_CHAT_ID
+    return None
+
+
 async def _send_report(
     bot: types.Bot,
     chat_id: int,
@@ -305,15 +317,24 @@ async def _send_report(
     duration_seconds: int | None = None,
     reply_to_message: types.Message | None = None,
 ) -> int | None:
-    """Отправляет форматированный отчёт о санкции в REPORT_CHAT_ID.
+    """Отправляет форматированный отчёт о санкции в репорт-чат.
+
+    Использует ChatSettings.report_chat_id для конкретного чата,
+    или fallback на env REPORT_CHAT_ID.
 
     Если reply_to_message содержит текст — он прикладывается к отчёту.
     Если содержит медиа — сообщение пересылается в канал отчётов,
     а ID пересланного сообщения возвращается для ссылки в веб-панели.
 
     Returns: report_message_id (int) если медиа было переслано, иначе None.
+              Возвращает (int, int) tuple (report_chat_id, report_message_id) в interna,
+              но для совместимости старых вызовов — только report_message_id.
     """
-    if not REPORT_CHAT_ID:
+    # ── Определяем репорт-чат для данного чата ──────────────────────────
+    async with async_session() as session:
+        report_dest = await _get_report_chat_id(session, chat_id)
+
+    if not report_dest:
         return None
 
     report_msg_id: int | None = None
@@ -322,13 +343,13 @@ async def _send_report(
     if reply_to_message and _has_media(reply_to_message):
         try:
             forwarded = await bot.forward_message(
-                chat_id=REPORT_CHAT_ID,
+                chat_id=report_dest,
                 from_chat_id=reply_to_message.chat.id,
                 message_id=reply_to_message.message_id,
             )
             report_msg_id = forwarded.message_id
         except TelegramBadRequest as e:
-            logger.error("Failed to forward media to report chat: %s", e)
+            logger.error("Failed to forward media to report chat %s: %s", report_dest, e)
 
     async with async_session() as session:
         settings = await _get_chat_settings(session, chat_id)
@@ -411,11 +432,11 @@ async def _send_report(
 
     try:
         await bot.send_message(
-            chat_id=REPORT_CHAT_ID,
+            chat_id=report_dest,
             text=report.strip(),
         )
     except TelegramBadRequest as e:
-        logger.error("Failed to send report to chat %s: %s", REPORT_CHAT_ID, e)
+        logger.error("Failed to send report to chat %s: %s", report_dest, e)
 
     return report_msg_id
 
@@ -834,7 +855,7 @@ async def cmd_addadmin(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("📋 Формат: /addadmin <chat_id> <user_id>")
+        await message.reply("📋 Формат: /addadmin chat_id user_id", parse_mode=None)
         return
 
     try:
@@ -873,7 +894,7 @@ async def cmd_deladmin(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("📋 Формат: /deladmin <chat_id> <user_id>")
+        await message.reply("📋 Формат: /deladmin chat_id user_id", parse_mode=None)
         return
 
     try:
@@ -908,7 +929,7 @@ async def cmd_sethashtag(message: types.Message) -> None:
 
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await message.reply("📋 Формат: /sethashtag <chat_id> #хэштег")
+        await message.reply("📋 Формат: /sethashtag chat_id #хэштег", parse_mode=None)
         return
 
     try:
@@ -937,7 +958,7 @@ async def cmd_warns_mute(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("📋 Формат: /warns_mute <chat_id> <число>\n💡 0 = отключить автомьют")
+        await message.reply("📋 Формат: /warns_mute chat_id число\n💡 0 = отключить автомьют", parse_mode=None)
         return
 
     try:
@@ -964,7 +985,7 @@ async def cmd_warns_ban(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("📋 Формат: /warns_ban <chat_id> <число>\n💡 0 = отключить автобан")
+        await message.reply("📋 Формат: /warns_ban chat_id число\n💡 0 = отключить автобан", parse_mode=None)
         return
 
     try:
@@ -991,7 +1012,7 @@ async def cmd_mute_duration(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 3:
-        await message.reply("📋 Формат: /mute_duration <chat_id> <1d/2h/30m>")
+        await message.reply("📋 Формат: /mute_duration chat_id 1d/2h/30m", parse_mode=None)
         return
 
     try:
@@ -1013,6 +1034,54 @@ async def cmd_mute_duration(message: types.Message) -> None:
     await message.reply(f"✅ Длительность автомьюта в чате {chat_id}: {_format_duration(duration)}")
 
 
+@router.message(F.chat.type == "private", Command("setreport"))
+async def cmd_setreport(message: types.Message) -> None:
+    """Задает чат для отчётов. Формат: /setreport <chat_id> <report_chat_id>
+    0 = сбросить, использовать env REPORT_CHAT_ID"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /setreport chat_id report_chat_id\n💡 0 = сбросить (использовать env REPORT_CHAT_ID)",
+            parse_mode=None,
+        )
+        return
+
+    try:
+        chat_id = int(parts[1])
+        report_chat_id = int(parts[2])
+    except ValueError:
+        await message.reply("❌ chat_id и report_chat_id должны быть числами")
+        return
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+        if report_chat_id == 0:
+            # Сброс — вернуть к env-значению
+            settings.report_chat_id = None
+            await session.commit()
+            env_info = f" (из env: {REPORT_CHAT_ID})" if REPORT_CHAT_ID else " (env не задан)"
+            await message.reply(f"✅ Репорт-чат для {chat_id} сброшен{env_info}")
+        else:
+            # Проверяем, что бот может достучаться до указанного чата
+            try:
+                await message.bot.get_chat(report_chat_id)
+            except TelegramBadRequest as e:
+                await message.reply(
+                    f"❌ Бот не может найти чат {report_chat_id}.\n"
+                    f"Убедитесь, что бот добавлен в этот чат и имеет права отправки.\n"
+                    f"Ошибка: {e}",
+                    parse_mode=None,
+                )
+                return
+
+            settings.report_chat_id = report_chat_id
+            await session.commit()
+            await message.reply(f"✅ Репорт-чат для {chat_id}: {report_chat_id}")
+
+
 @router.message(F.chat.type == "private", Command("settings"))
 async def cmd_settings(message: types.Message) -> None:
     """Показывает текущие настройки чата. Формат: /settings <chat_id>"""
@@ -1021,7 +1090,7 @@ async def cmd_settings(message: types.Message) -> None:
 
     parts = message.text.split()
     if len(parts) < 2:
-        await message.reply("📋 Формат: /settings <chat_id>")
+        await message.reply("📋 Формат: /settings chat_id", parse_mode=None)
         return
 
     try:
@@ -1035,6 +1104,7 @@ async def cmd_settings(message: types.Message) -> None:
         admins = await _get_chat_admins(session, chat_id)
 
     hashtag = settings.hashtag or "(не задан)"
+    report_chat_str = f"<code>{settings.report_chat_id}</code>" if settings.report_chat_id else "(из env)"
     warns_mute = f"{settings.warns_to_mute} варнов" if settings.warns_to_mute > 0 else "отключён"
     warns_ban = f"{settings.warns_to_ban} варнов" if settings.warns_to_ban > 0 else "отключён"
     mute_dur = _format_duration(settings.mute_duration_seconds or 3600)
@@ -1049,6 +1119,7 @@ async def cmd_settings(message: types.Message) -> None:
     text = (
         f"⚙️ <b>Настройки чата</b> <code>{chat_id}</code>\n\n"
         f"🏷 Хэштег: {hashtag}\n"
+        f"📢 Репорт-чат: {report_chat_str}\n"
         f"⚠️ Варнов до мьюта: {warns_mute}\n"
         f"⚠️ Варнов до бана: {warns_ban}\n"
         f"⏱ Длительность мьюта: {mute_dur}\n"
@@ -1081,6 +1152,7 @@ async def cmd_help(message: types.Message) -> None:
         "  /warns_mute chat_id число — варнов до мьюта\n"
         "  /warns_ban chat_id число — варнов до бана\n"
         "  /mute_duration chat_id 1d2h — длительность мьюта\n"
+        "  /setreport chat_id report_chat_id — чат для отчётов (0 = env)\n"
         "  /settings chat_id — показать настройки\n"
     )
     await message.reply(text, parse_mode="HTML")

@@ -80,8 +80,9 @@
             </td>
             <td>{{ punishment.reason or '—' }}</td>
             <td>
-                {% if punishment.report_message_id and report_chat_id %}
-                    <a href="{{ report_chat_id | tglink }}/{{ punishment.report_message_id }}" target="_blank" rel="noopener">📎 Media</a>
+                {% set resolved_rc = report_chat_map.get(punishment.chat_id) or env_report_chat_id %}
+                {% if punishment.report_message_id and resolved_rc %}
+                    <a href="{{ resolved_rc | tglink }}/{{ punishment.report_message_id }}" target="_blank" rel="noopener">📎 Media</a>
                 {% elif punishment.message_text %}
                     <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;">{{ punishment.message_text }}</span>
                 {% else %}

@@ -245,8 +245,15 @@ def create_app(lifespan=None) -> FastAPI:
             settings_result = await session.execute(settings_stmt)
             chat_settings = settings_result.scalars().all()
 
-        # ── REPORT_CHAT_ID для построения ссылок на медиа ────────────────────
-        report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+            # ── Карта chat_id → report_chat_id (из ChatSettings) ────────────
+            report_chat_map = {
+                cs.chat_id: cs.report_chat_id
+                for cs in chat_settings
+                if cs.report_chat_id is not None
+            }
+
+        # ── Env fallback для report_chat_id ──────────────────────────────
+        env_report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
 
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
@@ -259,7 +266,8 @@ def create_app(lifespan=None) -> FastAPI:
             "total_pages": total_pages,
             "page_size": PAGE_SIZE,
             "chat_settings": chat_settings,
-            "report_chat_id": report_chat_id,
+            "report_chat_map": report_chat_map,
+            "env_report_chat_id": env_report_chat_id,
         })
 
     # ── GET /user/<user_id> ─────────────────────────────────────────────
@@ -303,8 +311,18 @@ def create_app(lifespan=None) -> FastAPI:
             punishment_result = await session.execute(punishment_stmt)
             punishments = punishment_result.all()
 
-        # ── REPORT_CHAT_ID для построения ссылок на медиа ────────────────────
-        report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+            # ── Карта chat_id → report_chat_id (из ChatSettings) ────────────
+            settings_stmt = select(ChatSettings)
+            settings_result = await session.execute(settings_stmt)
+            all_settings = settings_result.scalars().all()
+            report_chat_map = {
+                cs.chat_id: cs.report_chat_id
+                for cs in all_settings
+                if cs.report_chat_id is not None
+            }
+
+        # ── Env fallback для report_chat_id ──────────────────────────────
+        env_report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
 
         return templates.TemplateResponse("user.html", {
             "request": request,
@@ -313,7 +331,8 @@ def create_app(lifespan=None) -> FastAPI:
             "current_warns": current_warns,
             "punishments": punishments,
             "action_filter": action_filter,
-            "report_chat_id": report_chat_id,
+            "report_chat_map": report_chat_map,
+            "env_report_chat_id": env_report_chat_id,
         })
 
     # ── GET /api/search?q=<query> ──────────────────────────────────────

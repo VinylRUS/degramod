@@ -54,9 +54,11 @@ logger.info("Hostname: %s | IP: %s | Listening: 0.0.0.0:%d | Webhook: %s",
             _hostname, _host_ip, PORT, WEBHOOK_URL or "(not set)")
 
 # ── Глобальные объекты бота ────────────────────────────────────────────────
+# Default parse_mode=None — HTML используется только там где явно указано.
+# Это предотвращает ошибки парсинга когда в тексте есть <...> (например "<chat_id>").
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    default=DefaultBotProperties(parse_mode=None),
 )
 dp = Dispatcher()
 dp.include_router(mod_router)
@@ -90,6 +92,23 @@ async def lifespan(app):
         logger.info("Bot commands cleared (stealth mode)")
     except Exception as e:
         logger.warning("delete_my_commands failed: %s", e)
+
+    # ── Проверяем доступ к каналу отчётов ──────────────────────
+    _report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+    if _report_chat_id:
+        try:
+            chat_info = await bot.get_chat(chat_id=_report_chat_id)
+            logger.info("Report chat (env default) OK: id=%s title='%s' type='%s'",
+                        chat_info.id, chat_info.title or "", chat_info.type)
+        except Exception as e:
+            logger.error(
+                "⚠️ REPORT_CHAT_ID=%s is NOT accessible: %s\n"
+                "   Make sure the bot is added as admin to the report channel/group!\n"
+                "   Per-chat overrides can be set via /setreport command.",
+                _report_chat_id, e,
+            )
+    else:
+        logger.warning("REPORT_CHAT_ID not set in env — per-chat overrides via /setreport are still available")
 
     # Пробуем установить вебхук
     if WEBHOOK_URL:
