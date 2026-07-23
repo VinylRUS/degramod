@@ -88,19 +88,19 @@ def _duration_fmt(seconds: int | None) -> str:
     return "".join(parts) if parts else "0"
 
 
-def _telegram_link(chat_id: int, message_id: int) -> str:
-    """Конструирует ссылку на сообщение в Telegram канале/чате.
+def _telegram_link_base(chat_id: int) -> str:
+    """Конструирует базовую ссылку на Telegram канал/чат (без message_id).
 
-    Для приватных каналов: https://t.me/c/<id_without_-100>/<message_id>
-    Для публичных: ссылка не может быть построена без username — используется числовой ID.
+    Используется как Jinja2-фильтр: {{ chat_id | tglink }}/{{ msg_id }}
+    Для приватных каналов: https://t.me/c/<id_without_-100>
     """
     if chat_id < 0:
         # Приватный канал/супергруппа: убираем префикс -100
         clean_id = str(chat_id).replace("-100", "").lstrip("-")
-        return f"https://t.me/c/{clean_id}/{message_id}"
+        return f"https://t.me/c/{clean_id}"
     else:
-        # Публичная группа/канал — числовый ID (публичный username неизвестен)
-        return f"https://t.me/c/{chat_id}/{message_id}"
+        # Публичная группа/канал — числовой ID
+        return f"https://t.me/c/{chat_id}"
 
 
 # ── Создание приложения ─────────────────────────────────────────────────────
@@ -125,7 +125,7 @@ def create_app(lifespan=None) -> FastAPI:
     templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
     templates.env.filters["msk"] = _msk_time
     templates.env.filters["dur"] = _duration_fmt
-    templates.env.filters["tglink"] = _telegram_link
+    templates.env.filters["tglink"] = _telegram_link_base
 
     # ── Health check (для Bothost proxy, без авторизации) ─────────────
     @app.get("/health")
