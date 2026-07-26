@@ -1,7 +1,7 @@
 # Дедушка Вобжак — TODO / Что осталось доделать
 
 ## Статус проекта
-**Версия**: v4.4.3 (рабочий бот с per-chat report_chat_id, мульти-админ веб-панель с привязкой к Telegram ID, автообновление, стелс-режим, Rich Messages с кликабельным нарушителем/модератором/веб-ссылкой, welcome-сообщение новому админу в ЛС с паролем под спойлером, **управление модераторами чатов через веб-панель (команды /addadmin, /deladmin — как fallback)**, Ephemeral-подтверждения модератору, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля)
+**Версия**: v4.4.6 (рабочий бот с per-chat report_chat_id, **ролевая модель SU/admin/moderator в веб-панели**, автообновление, стелс-режим, Rich Messages с кликабельным нарушителем/модератором/веб-ссылкой, welcome-сообщение новому админу/модератору в ЛС с паролем под спойлером, управление модераторами чатов через веб-панель (команды /addadmin, /deladmin — как fallback), **управление настройками чатов через /admin/chats**, Ephemeral-подтверждения модератору, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля, очистка тестовых данных из БД через кнопку в веб-панели SU)
 **Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`)
 **Архитектура репорт-чата**: per-chat override → default (chat_id=0) → disabled
 **Стелс-режим**: нарушитель НИКОГДА не получает уведомлений от бота; ephemeral видят только модераторы
@@ -407,6 +407,271 @@ shadow-logger/
 13. HTML: nav link "Moderators" виден SU и **не виден** обычным админам.
 
 **Без новых env / БД-миграций**: используется существующая таблица `chat_admins` (была добавлена в одной из ранних версий для бот-команды `/addadmin`).
+
+---
+
+## ✅ Готово — v4.4.4 (Скрипт очистки тестовых данных)
+
+### 30 ✅ `scripts/cleanup_test_data.py` — безопасная очистка БД от тестового мусора
+
+**Проблема**: при тестировании бота в реальной БД накапливаются тестовые нарушители, варны/мьюты/баны, тестовые доп. админы чатов. Удалять вручную через `sqlite3` опасно — можно случайно снести модераторов или веб-админов.
+
+**Что сделано в `scripts/cleanup_test_data.py`**:
+- Standalone Python-скрипт (без зависимостей от проекта — только stdlib `sqlite3`, `shutil`, `argparse`).
+- Работает прямо с SQLite-файлом (через `DB_PATH` env, по умолчанию `/app/data/shadow_logs.db`).
+
+**Логика удаления**:
+| Таблица | Действие | Почему |
+|---------|----------|--------|
+| `punishments` | **УДАЛИТЬ ВСЕ** | Тестовые варны/мьюты/баны/unmute/unwarn/unban |
+| `users` | **Удалить тех, кто НЕ в `moderators`** | Тестовые нарушители; модератор, случайно попавший в users, сохраняется |
+| `chat_admins` | **Опционально** (флаг `--include-chat-admins`) | По умолчанию настройки чатов не трогаем |
+| `moderators` | **СОХРАНИТЬ** | Модераторы Telegram |
+| `web_users` | **СОХРАНИТЬ** | SU + веб-админы/модераторы |
+| `chat_settings` | **СОХРАНИТЬ** | Per-chat конфиги (хэштег, пороги, report-chat) |
+
+**Безопасность**:
+1. **Dry-run по умолчанию**: без флага `--apply` скрипт только показывает что было бы удалено.
+2. **Бэкап**: перед реальным удалением создаётся `<db>.backup-YYYYMMDD-HHMMSS.db` в той же папке.
+3. **Защита от пустой БД**: если в `moderators` И `web_users` нет ни одной записи — скрипт отказывается работать (защита от случайного запуска на свежей БД).
+4. **VACUUM** после удаления — файл БД сжимается.
+5. **Foreign keys ON**: удаления идут в правильном порядке (сначала `punishments`, потом `users`).
+
+**Использование**:
+```bash
+# Dry-run (БЕЗ изменений):
+python scripts/cleanup_test_data.py
+
+# Реальная очистка:
+python scripts/cleanup_test_data.py --apply
+
+# Также очистить chat_admins:
+python scripts/cleanup_test_data.py --apply --include-chat-admins
+
+# Свой путь к БД:
+DB_PATH=/path/to/shadow_logs.db python scripts/cleanup_test_data.py --apply
+```
+
+**Восстановление из бэкапа**:
+```bash
+cp /app/data/shadow_logs.db.backup-20260726-153000.db /app/data/shadow_logs.db
+```
+
+**Тесты** (`scripts/test_cleanup_test_data.py`, 7 проверок):
+1. Dry-run не меняет данные.
+2. Apply очищает `punishments` полностью + тестовых `users` (но сохраняет модератора, попавшего в `users`).
+3. `--include-chat-admins` очищает `chat_admins`.
+4. Бэкап создаётся с правильным именем.
+5. VACUUM срабатывает (по сообщению в stdout).
+6. На пустой БД (нет модераторов и веб-юзеров) — отказ с exit code 3.
+7. На отсутствующей БД — exit code 2.
+
+**Запуск в Docker** (если бот крутится в контейнере):
+```bash
+# Узнать имя контейнера:
+docker ps | grep degrab
+
+# Dry-run:
+docker exec -it <container> python /app/scripts/cleanup_test_data.py
+
+# Apply:
+docker exec -it <container> python /app/scripts/cleanup_test_data.py --apply
+```
+Бэкап создаётся внутри контейнера по пути `/app/data/shadow_logs.db.backup-*.db`. Чтобы вытащить его на хост: `docker cp <container>:/app/data/shadow_logs.db.backup-XXXX.db ./`
+
+**Не требует перезапуска бота** — скрипт работает с SQLite-файлом напрямую (WAL-режим позволяет конкурентный доступ).
+
+---
+
+## ✅ Готово — v4.4.5 (Очистка тестовых данных через веб-панель SU)
+
+### 31 ✅ Кнопка "Cleanup" в веб-панели (SU-only)
+
+**Контекст**: предыдущая версия добавила standalone-скрипт `scripts/cleanup_test_data.py`, но пользователю удобнее иметь кнопку прямо в админке — не нужно заходить по SSH в контейнер.
+
+**Что сделано**:
+
+1. **`templates/admin_cleanup.html`** (новый, 167 строк):
+   - Раздел **Preview**: live-таблица с текущими счётчиками всех 6 таблиц, для каждой — действие (`DELETE ALL` / `DELETE non-moderators` / `PRESERVED`) и количество затронутых строк.
+   - Раздел **Apply**: форма с чекбоксом `include_chat_admins` (по умолчанию off) и кнопкой подтверждения.
+   - Раздел **Result** (после POST): зелёный блок со статистикой (`Punishments removed: N`, `Test users removed: N`, `Backup file: <name>`) и инструкцией по восстановлению.
+   - Раздел **Safety**: подробная справка что сохраняется, что удаляется, операционные заметки (WAL, FK, VACUUM).
+   - JavaScript `confirm()` в `onsubmit` с подробным текстом что произойдёт — защита от случайного клика.
+   - Если `moderators=0 AND web_users=0` — кнопка задизейблена, форма semi-transparent, показан red warning "Refusing to apply".
+
+2. **`web_app.py`** (+197 строк):
+   - Импорты `sqlite3`, `shutil` добавлены.
+   - Импортирован `DB_PATH` из `db.py`.
+   - Хелпер `_cleanup_counts(conn)` — возвращает словарь счётчиков (7 ключей, включая `users_to_delete`).
+   - `GET /admin/cleanup` (SU-only):
+     - Открывает SQLite напрямую, считает live-счётчики.
+     - Рендерит `admin_cleanup.html` с превью.
+     - Если файла БД нет — рендерит с нулями (dev-режим).
+   - `POST /admin/cleanup` (SU-only):
+     1. Проверяет что БД существует.
+     2. Pre-flight: считает счётчики ДО.
+     3. **Safety**: если `moderators == 0 AND web_users == 0` → отказ с flash, без бэкапа и удаления.
+     4. **Backup**: `shutil.copy2(DB_PATH, "<DB>.backup-YYYYMMDD-HHMMSS-microsec.db")` — timestamp с микросекундами против коллизий при быстрых повторных вызовах.
+     5. **Delete** (в одной транзакции):
+        - `DELETE FROM punishments` (все)
+        - `DELETE FROM users WHERE user_id NOT IN (SELECT mod_id FROM moderators)` (сохраняет модераторов)
+        - Если `include_chat_admins` — `DELETE FROM chat_admins`
+     6. **VACUUM** (вне транзакции — SQLite требует).
+     7. Post-counts, логирование, рендер страницы с блоком результата.
+
+3. **`templates/base.html`** (+1 строка):
+   - Nav link `Cleanup` добавлен, виден только SU (внутри `{% if auth_user.is_su %}`).
+
+4. **`scripts/cleanup_test_data.py`** (правка):
+   - Timestamp в имени бэкапа теперь `%Y%m%d-%H%M%S-%f` (с микросекундами) — для консистентности с веб-версией.
+
+**Безопасность**:
+| Мера | Где |
+|------|-----|
+| SU-only (require_su) | Оба эндпоинта |
+| `confirm()` JS перед сабмитом | Форма |
+| Чекбокс `include_chat_admins` off по умолчанию | Форма |
+| Бэкап SQLite-файла перед удалением | POST handler |
+| Refuse на пустой БД (no mods + no web_users) | POST handler |
+| Foreign keys ON — удаления в правильном порядке | POST handler |
+| VACUUM после удаления | POST handler |
+| Бот продолжает работать во время очистки (WAL) | Архитектурно |
+
+**Что удаляется / что сохраняется**:
+| Таблица | Действие | Логика |
+|---------|----------|--------|
+| `punishments` | **DELETE ALL** | Все тестовые варны/мьюты/баны |
+| `users` | **DELETE non-moderators** | `WHERE user_id NOT IN (SELECT mod_id FROM moderators)` — модератор, случайно попавший в `users`, сохраняется |
+| `chat_admins` | **Опционально DELETE ALL** | Только если чекбокс `include_chat_admins` отмечен |
+| `moderators` | **PRESERVED** | Все модераторы Telegram |
+| `web_users` | **PRESERVED** | SU + все админы/модераторы веб-панели |
+| `chat_settings` | **PRESERVED** | Per-chat конфиги (хэштег, пороги, report-chat) |
+
+**Тесты** (`scripts/test_v44_cleanup_web.py`, 67 проверок):
+1. GET /admin/cleanup — страница SU с превью, содержит все элементы (form, checkbox, confirm, backup, VACUUM, PRESERVED, DELETE ALL).
+2. POST без `include_chat_admins` — удаляет punishments + test users, сохраняет moderators/web_users/chat_settings/chat_admins.
+3. POST с `include_chat_admins=1` — также очищает chat_admins.
+4. Backup создаётся: 1 новый `.backup-*.db` файл, содержит snapshot данных ДО удаления (punishments=3), имя содержит timestamp.
+5. Защита: на полностью пустой БД (no moderators + no web_users) → POST без auth редиректит на /login; с auth (только SU, без модераторов) → cleanup выполняется (т.к. web_users > 0).
+6. Non-SU → 303 redirect на /dashboard (как GET, так и POST). Данные не меняются.
+7. Неавторизованный → 303 redirect на /login (как GET, так и POST).
+8. HTML: nav link "Cleanup" виден SU, не виден non-SU.
+9. VACUUM — файл БД уменьшается после очистки (500 filler-rows + VACUUM).
+10. HTML: форма содержит `onsubmit="return confirm(...)"` с текстом "Apply cleanup".
+11. Идемпотентность: повторный POST на уже очищенной БД не ломает структуру, moderators сохраняются.
+12. Backup — валидный SQLite, `PRAGMA integrity_check = 'ok'`, содержит все 6 таблиц.
+
+**Запуск из браузера**:
+1. SU логинится в https://degraban.bothost.tech/login
+2. Кликает "Cleanup" в навбаре
+3. Видит live-превью (какие таблицы и сколько строк будут затронуты)
+4. (Опционально) отмечает "Also clear chat_admins"
+5. Жмёт "⚠ Apply cleanup" → JS confirm с подробным текстом
+6. Видит результат: сколько удалено, какой бэкап создан, как восстановиться
+
+**Восстановление из бэкапа** (если что-то пошло не так):
+```bash
+# На сервере:
+docker cp <container>:/app/data/shadow_logs.db.backup-20260726-153000-123456.db ./
+docker cp ./shadow_logs.db.backup-20260726-153000-123456.db <container>:/app/data/shadow_logs.db
+docker restart <container>
+```
+
+**Standalone-скрипт остаётся** как fallback для SSH-доступа (без веб-панели), см. v4.4.4 выше.
+
+---
+
+## ✅ Готово — v4.4.6 (Ролевая модель SU / admin / moderator + управление чатами)
+
+### 32 ✅ Три уровня доступа в веб-панели
+
+**Контекст**: до v4.4.6 в веб-панели было только 2 уровня — SU (через env WEB_PASSWORD) и "админ" (созданный через /admin/users). Все админы имели одинаковые права. Пользователь захотел:
+- **SU** — весь доступ (как сейчас)
+- **admin** — управление чатами (хэштеги, пороги), модераторами чатов, без управления админами
+- **moderator** — только просмотр логов в веб-панели
+
+**Что сделано**:
+
+1. **`db.py`** (+30 строк):
+   - В модель `WebUser` добавлена колонка `role` (`String(16)`, default `'admin'`).
+   - В `init_db()` миграция: `ALTER TABLE web_users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'admin'`, затем `UPDATE web_users SET role='su' WHERE is_su=1`.
+   - При seed SU — явно `role='su'`. На случай если SU существовал до миграции — `if existing_su.role != "su": existing_su.role = "su"; commit`.
+
+2. **`web_app.py`** (правки в auth + новый раздел /admin/chats):
+   - Токен сессии расширен полем `r` (role). Старые токены (без `r`) — fallback: `is_su=True → role='su'`, иначе `'admin'`.
+   - `AuthUser` получил поле `role` (`__slots__` расширен).
+   - `require_auth` теперь берёт роль **из БД** (а не из токена) — если SU понизил роль пользователю, следующий запрос пользователя увидит новую роль без перелогина.
+   - **`require_su`** — только `role='su'` (для `/admin/users`, `/admin/cleanup`).
+   - **`require_admin`** (новый dependency) — `role in ('su', 'admin')`. Moderator → 303 redirect на `/dashboard`.
+   - `/admin/moderators*` (GET, POST create, POST delete) — сменён с `require_su` на `require_admin`. Теперь admin может управлять модераторами чатов.
+   - `/admin/users/create` — добавлен параметр `role: str = Form("admin")`. Валидируется: `'admin'` или `'moderator'`. Невалидное значение → flash, WebUser не создаётся.
+   - `_send_admin_welcome(bot, tg_user_id, login, password, first_name, role='admin')` — добавлен параметр `role`. Текст приветствия адаптируется:
+     - **admin**: `"🎉 Доступ к веб-панели (админ)"` + `"Ваши права: управление модераторами чатов и настройками чатов (хэштег, пороги варнов), а также просмотр логов."`
+     - **moderator**: `"🔎 Доступ к веб-панели (модератор)"` + `"Ваши права: только просмотр логов нарушителей (раздел Dashboard). Управление админами, чатами и модераторами недоступно."`
+   - Логирование при создании: добавлено `role=%s`.
+
+3. **`templates/admin.html`** (формa + список):
+   - В форму `/admin/users/create` добавлены 2 radio-кнопки (admin/moderator) с описаниями. `admin` отмечен по умолчанию.
+   - Кнопка переименована с "Create admin" на "Create user".
+   - В таблице существующих юзеров колонка "Role" теперь показывает: `super-user` (для SU), `admin` (дефолт), `moderator` (с цветом warn).
+
+4. **`templates/admin_chats.html`** (новый, 175 строк):
+   - Таблица всех `chat_settings` (включая default `chat_id=0`).
+   - Колонки: Chat ID, Hashtag, Report chat, Warns→mute, Mute duration (с human-readable суффиксом), Warns→ban, Punishments (count из `punishments`), Updated.
+   - Кнопка "Edit" раскрывает inline-форму с 5 полями (hashtag, report_chat_id, warns_to_mute, mute_duration_seconds, warns_to_ban) + Save / Cancel.
+   - Раздел "Help" с пояснением каждого поля и логики report-chat (empty/0/specific ID).
+
+5. **`/admin/chats` (GET) + `/admin/chats/{chat_id_str}/update` (POST)** — новые эндпоинты (`require_admin`):
+   - GET — список всех `chat_settings` + кол-во наказаний по каждому чату.
+   - POST — валидация: `hashtag` (max 64 chars, auto-prefix `#`), `report_chat_id` (пусто → NULL, иначе число ≥ -10¹⁵ — TG supergroup IDs отрицательные), `warns_to_mute`/`mute_duration_seconds`/`warns_to_ban` (≥ 0).
+   - `chat_id_str` строкой — Starlette `int`-конвертер не парсит минус, парсим вручную.
+   - Логирование: `admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, ...)`.
+
+6. **`templates/base.html`** (навигация):
+   - Nav link `Chats` добавлен, виден SU + admin (внутри `role in ('su', 'admin')`).
+   - Nav links `Admins`, `Cleanup` — только SU (`role == 'su'`).
+   - Nav links `Moderators`, `Chats` — SU + admin.
+   - User-chip теперь показывает роль: `SU` (синий), `ADMIN` (зелёный), `MOD` (жёлтый).
+
+**Ролевая матрица доступа**:
+
+| Endpoint | SU | admin | moderator |
+|----------|----|----|-----------|
+| `/dashboard`, `/user/{id}`, `/api/*`, `/me/password` | ✅ | ✅ | ✅ |
+| `/admin/moderators` (GET, POST create, POST delete) | ✅ | ✅ | ❌ → /dashboard |
+| `/admin/chats` (GET), `/admin/chats/{id}/update` (POST) | ✅ | ✅ | ❌ → /dashboard |
+| `/admin/users` (GET, POST create, toggle, reset, delete) | ✅ | ❌ → /dashboard | ❌ → /dashboard |
+| `/admin/cleanup` (GET, POST) | ✅ | ❌ → /dashboard | ❌ → /dashboard |
+
+**Тесты** (`scripts/test_v44_roles.py`, 70 проверок):
+1. Миграция: SU→`role='su'`, старый admin→`role='admin'` после `init_db`.
+2. AuthUser: role из БД, не из токена.
+3. `require_su`: SU OK, admin/moderator → /dashboard.
+4. POST `/admin/users/create` с `role=moderator` — создаётся moderator.
+5. POST с `role=admin` (явно и по умолчанию) — создаётся admin.
+6. POST с невалидной `role='superadmin'` — flash, WebUser не создаётся.
+7. HTML форма содержит radio buttons (admin checked по умолчанию).
+8. GET `/admin/chats` — SU+admin OK, moderator → /dashboard. HTML содержит #Test, Edit, form action.
+9. POST `/admin/chats/{id}/update` — обновляет hashtag/report_chat_id/warns_to_mute/mute_duration/warns_to_ban.
+10. POST update от moderator — rejected.
+11. POST update с невалидным `warns_to_mute='abc'` — flash error.
+12. Welcome DM: для moderator — "модератор" + "только просмотр"; для admin — "админ" + "управление модераторами".
+13. Nav visibility: SU видит Dashboard/Moderators/Chats/Admins/Cleanup; admin видит Dashboard/Moderators/Chats (НЕ Admins/Cleanup); moderator видит только Dashboard.
+14. `/admin/users` список показывает role каждого юзера.
+15. Role change: если SU понижает admin → moderator, следующий запрос этого пользователя увидит новую роль (т.к. require_auth читает из БД).
+
+**Адаптированы существующие тесты**:
+- `test_v44_moderators_web.py` test_non_su_access — теперь проверяет что **admin имеет** доступ, а **moderator не имеет** (раньше проверял что non-SU не имеет).
+- `test_v44_moderators_web.py` test_nav_link_present — добавлены проверки admin видит Moderators, moderator не видит Moderators/Admins/Cleanup.
+- `test_v44_cleanup_web.py` _seed_test_data — добавлено `role='admin'` в INSERT web_users.
+- `test_cleanup_test_data.py` (pytest) — схема `web_users` расширена колонкой `role`.
+
+**Backward compatibility**:
+- Старые сессии (токены без `r`) — валидны, role вычисляется из `is_su`/`s` поля.
+- Старые записи web_users без `role` — миграция проставит `'admin'` (для не-SU) или `'su'` (для SU).
+- Все существующие тесты проходят без правок кода (только schema/seed правки).
+
+**Welcome DM для модераторов теперь работает**: когда SU создаёт модератора через веб-панель, бот отправляет в ЛС Rich-сообщение с паролем под спойлером + пояснением "только просмотр логов". Это и было задачей A из прошлой сессии (DM новому админу), расширенное до модераторов.
 
 ---
 

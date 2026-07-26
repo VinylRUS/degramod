@@ -458,20 +458,29 @@ async def test_delete_nonexistent():
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 9. Non-SU не имеет доступа
+# 9. v4.4.6: role-based access — admin OK, moderator rejected
 # ──────────────────────────────────────────────────────────────────────────
 async def test_non_su_access():
-    print("\n[9] Non-SU admin не имеет доступа к /admin/moderators")
+    print("\n[9] Role-based: admin имеет доступ, moderator НЕ имеет")
     from db import async_session, WebUser, _hash_password
     from web_app import create_app
     from httpx import AsyncClient, ASGITransport
 
+    # Создаём двух пользователей: admin и moderator
     async with async_session() as s:
         s.add(WebUser(
             username="regular_admin",
             password_hash=_hash_password("admin_pw_123"),
             tg_user_id=12345001,
             tg_username="regular_admin",
+            role="admin",
+        ))
+        s.add(WebUser(
+            username="just_moderator",
+            password_hash=_hash_password("mod_pw_123"),
+            tg_user_id=12345002,
+            tg_username="just_moderator",
+            role="moderator",
         ))
         await s.commit()
 
@@ -480,33 +489,56 @@ async def test_non_su_access():
     app = create_app(bot=mock_bot)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # Логинимся как regular_admin
-        resp = await client.post("/login", data={"username": "regular_admin", "password": "admin_pw_123"},
-                                  follow_redirects=False)
-        check("regular_admin login → 303", resp.status_code == 303)
-        cookie = resp.cookies.get("sl_session")
+        # ── admin: имеет доступ (require_admin) ──────────────────────
+        resp = await client.post("/login",
+                                 data={"username": "regular_admin", "password": "admin_pw_123"},
+                                 follow_redirects=False)
+        admin_cookie = resp.cookies.get("sl_session")
+        check("admin login → 303", resp.status_code == 303)
 
-        # GET → redirect на /dashboard (require_su)
-        resp = await client.get("/admin/moderators", cookies={"sl_session": cookie}, follow_redirects=False)
-        check("GET /admin/moderators → 303 (non-SU rejected)",
+        resp = await client.get("/admin/moderators",
+                                cookies={"sl_session": admin_cookie},
+                                follow_redirects=False)
+        check("admin: GET /admin/moderators → 200 (allowed)",
+              resp.status_code == 200,
+              f"got {resp.status_code}, loc: {resp.headers.get('location')}")
+
+        resp = await client.post(
+            "/admin/moderators/create",
+            data={"chat_id": "-100999999", "user_id": "888777"},
+            cookies={"sl_session": admin_cookie}, follow_redirects=False,
+        )
+        check("admin: POST /admin/moderators/create → 303 (allowed)",
+              resp.status_code == 303,
+              f"got {resp.status_code}, loc: {resp.headers.get('location')}")
+
+        # ── moderator: НЕ имеет доступ (require_admin rejects) ───────
+        resp = await client.post("/login",
+                                 data={"username": "just_moderator", "password": "mod_pw_123"},
+                                 follow_redirects=False)
+        mod_cookie = resp.cookies.get("sl_session")
+        check("moderator login → 303", resp.status_code == 303)
+
+        resp = await client.get("/admin/moderators",
+                                cookies={"sl_session": mod_cookie},
+                                follow_redirects=False)
+        check("moderator: GET /admin/moderators → 303 redirect /dashboard (rejected)",
               resp.status_code == 303 and "/dashboard" in resp.headers.get("location", ""),
               f"got {resp.status_code}, loc: {resp.headers.get('location')}")
 
-        # POST create → redirect на /dashboard
         resp = await client.post(
             "/admin/moderators/create",
-            data={"chat_id": "-100123", "user_id": "456"},
-            cookies={"sl_session": cookie}, follow_redirects=False,
+            data={"chat_id": "-100888", "user_id": "999"},
+            cookies={"sl_session": mod_cookie}, follow_redirects=False,
         )
-        check("POST /admin/moderators/create → 303 (non-SU rejected)",
+        check("moderator: POST /admin/moderators/create → 303 /dashboard (rejected)",
               resp.status_code == 303 and "/dashboard" in resp.headers.get("location", ""))
 
-        # POST delete → redirect на /dashboard
         resp = await client.post(
             "/admin/moderators/1/delete",
-            cookies={"sl_session": cookie}, follow_redirects=False,
+            cookies={"sl_session": mod_cookie}, follow_redirects=False,
         )
-        check("POST /admin/moderators/{id}/delete → 303 (non-SU rejected)",
+        check("moderator: POST /admin/moderators/{id}/delete → 303 /dashboard (rejected)",
               resp.status_code == 303 and "/dashboard" in resp.headers.get("location", ""))
 
 
@@ -671,22 +703,46 @@ async def test_nav_link_present():
         resp = await client.get("/dashboard", cookies={"sl_session": su_cookie})
         check("SU видит 'Moderators' в навбаре", 'href="/admin/moderators"' in resp.text)
 
-        # Non-SU не видит
+        # ── admin: тоже видит Moderators (require_admin) ────────────
         from db import async_session, WebUser, _hash_password
         async with async_session() as s:
             s.add(WebUser(
                 username="nav_test_admin",
                 password_hash=_hash_password("pw_123"),
-                tg_user_id=12345002,
+                tg_user_id=12345004,
                 tg_username="nav_test_admin",
+                role="admin",
             ))
             await s.commit()
         resp = await client.post("/login", data={"username": "nav_test_admin", "password": "pw_123"},
                                   follow_redirects=False)
         reg_cookie = resp.cookies.get("sl_session")
         resp = await client.get("/dashboard", cookies={"sl_session": reg_cookie})
-        check("non-SU НЕ видит 'Moderators' в навбаре",
-              'href="/admin/moderators"' not in resp.text, "non-SU should not see Moderators link")
+        check("admin видит 'Moderators' в навбаре",
+              'href="/admin/moderators"' in resp.text,
+              "admin should see Moderators link")
+
+        # ── moderator: НЕ видит Moderators (только Dashboard) ───────
+        async with async_session() as s:
+            s.add(WebUser(
+                username="nav_test_moderator",
+                password_hash=_hash_password("pw_456"),
+                tg_user_id=12345003,
+                tg_username="nav_test_moderator",
+                role="moderator",
+            ))
+            await s.commit()
+        resp = await client.post("/login", data={"username": "nav_test_moderator", "password": "pw_456"},
+                                  follow_redirects=False)
+        mod_cookie = resp.cookies.get("sl_session")
+        resp = await client.get("/dashboard", cookies={"sl_session": mod_cookie})
+        check("moderator НЕ видит 'Moderators' в навбаре",
+              'href="/admin/moderators"' not in resp.text,
+              "moderator should not see Moderators link")
+        check("moderator НЕ видит 'Admins' в навбаре",
+              'href="/admin/users"' not in resp.text)
+        check("moderator НЕ видит 'Cleanup' в навбаре",
+              'href="/admin/cleanup"' not in resp.text)
 
 
 # ──────────────────────────────────────────────────────────────────────────

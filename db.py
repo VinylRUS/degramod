@@ -137,10 +137,16 @@ class WebUser(Base):
 
     SU (super-user) — единственный, чьё имя = 'su', пароль хранится в env WEB_PASSWORD
     (в БЕЗ хэша — сверка идёт напрямую через == в web_app.py).
-    Все остальные — обычные админы, созданные через /admin/users (v4.4: по TGID):
+    Все остальные — созданные через /admin/users (v4.4: по TGID):
       пароль автогенерируется и сохраняется в password_hash (PBKDF2-HMAC-SHA256),
       профиль заполняется из Telegram (tg_user_id / tg_first_name / tg_last_name / tg_username).
     Логин (username) = @username из Telegram (без @).
+
+    v4.4.6: role — 'su' | 'admin' | 'moderator'.
+      • 'su'         — полный доступ (is_su=True, role='su' — синонимы)
+      • 'admin'      — управление чатами/модераторами, без управления админами
+      • 'moderator'  — только просмотр логов в веб-панели
+    Поле is_su сохранено для обратной совместимости (всегда role='su' ⇔ is_su=True).
     """
     __tablename__ = "web_users"
 
@@ -157,6 +163,10 @@ class WebUser(Base):
     tg_first_name = Column(String(255), nullable=True)
     tg_last_name = Column(String(255), nullable=True)
     tg_username = Column(String(255), nullable=True)            # @username из TG (без @, lowercase)
+    # ── v4.4.6: role ────────────────────────────────────────────────────
+    # 'su' / 'admin' / 'moderator'. Для существующих записей при миграции:
+    #   is_su=True → role='su'; is_su=False → role='admin'.
+    role = Column(String(16), nullable=False, default="admin")
 
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────
@@ -231,6 +241,22 @@ async def init_db() -> None:
             "ON web_users (tg_user_id) WHERE tg_user_id IS NOT NULL"
         ))
 
+    # ── Миграция: добавляем role в web_users (v4.4.6) ──────────────────
+    # role = 'su' | 'admin' | 'moderator'. Для существующих записей:
+    #   is_su=True → role='su'; is_su=False → role='admin'.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(web_users)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "role" not in columns:
+            # Добавляем колонку с дефолтом 'admin' (подойдёт для всех не-SU).
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'admin'"
+            ))
+            # Помечаем SU-аккаунты role='su'
+            await conn.execute(text(
+                "UPDATE web_users SET role='su' WHERE is_su=1"
+            ))
+
     # ── Seed: гарантируем что SU-аккаунт существует в web_users ──────────
     # SU не имеет password_hash — пароль берётся из env WEB_PASSWORD при логине.
     # Это позволяет менять SU-пароль через env без перезаписи БД.
@@ -247,8 +273,14 @@ async def init_db() -> None:
                 is_su=True,
                 is_active=True,
                 created_by="system",
+                role="su",
             ))
             await session.commit()
+        else:
+            # На случай если SU существует, но role ещё не проставлен (старая БД)
+            if existing_su.role != "su":
+                existing_su.role = "su"
+                await session.commit()
 
 
 async def get_session() -> AsyncSession:

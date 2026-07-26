@@ -83,9 +83,36 @@
                 Password is auto-generated and shown above after creation.
             </small>
         </div>
+
+        <div style="margin-bottom: var(--sp-4);">
+            <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Role</label>
+            <div style="display: flex; gap: var(--sp-4); flex-wrap: wrap;">
+                <label style="display: flex; align-items: flex-start; gap: var(--sp-2); cursor: pointer; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); flex: 1; min-width: 220px;">
+                    <input type="radio" name="role" value="admin" checked style="margin-top: 2px; cursor: pointer;">
+                    <span style="font-size: 12px;">
+                        <strong>admin</strong>
+                        <span class="dim" style="display: block; font-size: 10px; margin-top: 3px; line-height: 1.6;">
+                            Manage chat moderators, chat settings (hashtags, warn thresholds), view logs.
+                            Cannot create/disable other admins or run cleanup.
+                        </span>
+                    </span>
+                </label>
+                <label style="display: flex; align-items: flex-start; gap: var(--sp-2); cursor: pointer; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); flex: 1; min-width: 220px;">
+                    <input type="radio" name="role" value="moderator" style="margin-top: 2px; cursor: pointer;">
+                    <span style="font-size: 12px;">
+                        <strong>moderator</strong>
+                        <span class="dim" style="display: block; font-size: 10px; margin-top: 3px; line-height: 1.6;">
+                            View-only access to the dashboard (violation logs, user history).
+                            Cannot manage anything.
+                        </span>
+                    </span>
+                </label>
+            </div>
+        </div>
+
         <button type="submit"
                 style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s;">
-            Create admin
+            Create user
         </button>
     </form>
 </div>
@@ -134,6 +161,8 @@
             <td>
                 {% if wu.is_su %}
                 <span class="dim">super-user</span>
+                {% elif wu.role == 'moderator' %}
+                <span style="color: var(--warn);">moderator</span>
                 {% else %}
                 <span class="dim">admin</span>
                 {% endif %}
