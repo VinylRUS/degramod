@@ -1,13 +1,14 @@
 # Дедушка Вобжак — TODO / Что осталось доделать
 
 ## Статус проекта
-**Версия**: v4.4.1 (рабочий бот с per-chat report_chat_id, мульти-админ веб-панель с привязкой к Telegram ID, автообновление, стелс-режим, Rich Messages с кликабельным нарушителем/модератором/веб-ссылкой, Ephemeral-подтверждения модератору, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля)
+**Версия**: v4.4.3 (рабочий бот с per-chat report_chat_id, мульти-админ веб-панель с привязкой к Telegram ID, автообновление, стелс-режим, Rich Messages с кликабельным нарушителем/модератором/веб-ссылкой, welcome-сообщение новому админу в ЛС с паролем под спойлером, **управление модераторами чатов через веб-панель (команды /addadmin, /deladmin — как fallback)**, Ephemeral-подтверждения модератору, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля)
 **Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`)
 **Архитектура репорт-чата**: per-chat override → default (chat_id=0) → disabled
 **Стелс-режим**: нарушитель НИКОГДА не получает уведомлений от бота; ephemeral видят только модераторы
 **Санкции**: !mute / !warn / !ban / !unmute / !unban / !unwarn [N] / !warns / !resetwarns
 **Веб-панель**: SU (env WEB_PASSWORD) + мульти-админ (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи
 **v4.4 web-админы**: создаются SU по TGID, профиль подтягивается из Telegram (`bot.get_chat`), пароль автогенерируется и показывается SU один раз, юзер сам меняет пароль через /dashboard
+**v4.4.3 модераторы**: SU может добавлять/удалять модераторов чатов через `/admin/moderators` (SU-only). Команды `/addadmin`, `/deladmin` в боте остаются как fallback. Профиль модератора (имя, @username) подтягивается через `bot.get_chat` best-effort.
 
 ---
 
@@ -249,6 +250,163 @@ shadow-logger/
 | Имя | Назначение | По умолчанию |
 |-----|------------|--------------|
 | `WEB_PUBLIC_URL` | Публичный URL веб-панели для кликабельных ссылок в Rich-отчётах. Формат: `https://shadow-logs.example.com` (без завершающего `/`). | `https://degraban.bothost.tech` (production Bothost) — переопределяется env только если деплой на другой домен |
+
+---
+
+## ✅ Готово — v4.4.2 (Welcome-сообщение новому админу в ЛС)
+
+### 27 ✅ Автоматическая доставка учётных данных в Telegram
+
+**Проблема**: в v4.4 после создания веб-админа пароль показывался только SU один раз в зелёном блоке на `/admin/users`. SU должен был **вручную** пересылать логин/пароль новому админу через любой безопасный канал (ЛС в Telegram, лично, и т.д.) — это лишний шаг, особенно если админов много.
+
+**Решение**: раз `bot.get_chat(user_id)` сработал (значит юзер уже общался с ботом и диалог открыт) — бот может сам отправить приветствие с данными для входа. SU больше не нужен как «почтальон».
+
+**Что сделано в `web_app.py`**:
+- В импортах добавлены Rich Messages-типы: `InputRichMessage`, `InputRichBlockSectionHeading`, `InputRichBlockParagraph`, `InputRichBlockFooter`, `RichTextUrl`, `RichTextBold`, `RichTextSpoiler`. Также `TelegramBadRequest`.
+- Добавлена константа `WEB_PUBLIC_URL` (дублирует `bot_handlers.py` намеренно — веб-слой не должен зависеть от модуля бота; дефолт тот же: `https://degraban.bothost.tech`).
+- Добавлена функция `_send_admin_welcome(bot, tg_user_id, login, password, first_name=None) -> tuple[bool, str]`:
+  - Строит Rich-сообщение со структурой:
+    1. `SectionHeading` — `🎉 Доступ к веб-панели[, <first_name>]`
+    2. `Paragraph` — текст + кликабельная ссылка `RichTextUrl(text=web_root_url, url=web_root_url)` на `https://degraban.bothost.tech/`
+    3. `Paragraph` — `"Данные для входа (скрыты под спойлером):"`
+    4. `Paragraph` с `RichTextSpoiler` — внутри спойлера: `Логин: <RichTextBold(login)>`, `Пароль: <RichTextBold(password)>`. Спойлер в Telegram выглядит как затемнённый текст, раскрываемый по клику — безопаснее чем plain text (если кто-то рядом смотрит на экран, пароль не виден сразу).
+    5. `Paragraph` — `🔐 После первого входа смените пароль: раздел <RichTextBold("Dashboard")> → блок <RichTextBold("Change my password")> (нужно указать текущий пароль и новый).`
+    6. `Footer` — `⏱ DD.MM.YYYY HH:MM МСК`
+  - Отправляет через `bot.send_rich_message(chat_id=tg_user_id, rich_message=InputRichMessage(blocks=...))`.
+  - Возвращает `(True, "ok")` при успехе, `(False, "<error>")` при ошибке.
+  - Ловит `TelegramBadRequest` (юзер заблокировал бота) и любые другие `Exception` — не падает.
+
+**Интеграция в `POST /admin/users/create`**:
+- После `session.commit()` (юзер создан в БД) вызывается `_send_admin_welcome(bot, tg_id, login, password, tg_first_name)`.
+- Результат добавляется в signed-flash payload как поле `w` (1 — отправлено, 0 — нет):
+  ```python
+  flash_token = _sign_flash({
+      "u": login, "p": password, "tg": tg_id,
+      "t": int(time.time()),
+      "w": 1 if welcome_ok else 0,
+  })
+  ```
+- Логирование: success → INFO, failure → WARNING с подсказкой "SU must deliver credentials manually".
+
+**Обновлён `GET /admin/users`**:
+- Из signed-flash извлекается `welcome_sent = bool(payload.get("w", 0))` и передаётся в шаблон.
+
+**Обновлён `templates/admin.html`**:
+- В зелёном блоке «Admin created» под таблицей с паролем появился новый блок со статусом доставки:
+  - `welcome_sent=True` → зелёная надпись `✅ Welcome message with these credentials was sent to the user's Telegram private chat. The password is hidden under a spoiler there — the user clicks to reveal it.`
+  - `welcome_sent=False` → красная надпись `⚠ Welcome message could not be delivered to the user's Telegram (the user may have blocked the bot). Please forward the credentials above to the user via another secure channel.`
+- Так SU сразу видит: либо «всё ок, бот сам отправил», либо «юзер заблокировал бота — передавай пароль руками».
+
+**Обратная совместимость**:
+- Если `bot=None` (веб-панель запущена без бота) — `_send_admin_welcome` возвращает `(False, "bot is None")`, но `/admin/users/create` и так уже отказывает в работе при `bot=None` (раньше в п.2 эндпоинта).
+- Если Rich Messages не поддерживаются (маловероятно при Bot API 10.2) — `TelegramBadRequest` ловится, SU видит предупреждение, пароль в зелёном блоке всё равно показан.
+
+### 28 ✅ Тесты v4.4.2
+
+**`scripts/test_v44_welcome.py`** — 38 проверок, 8 секций:
+1. Базовая отправка: ok=True, err='ok', chat_id передан, Rich-сообщение сериализуется, есть ссылка на `degraban.bothost.tech`, логин, пароль, «Change my password», «Dashboard», «Логин:», «Пароль:», есть `RichTextSpoiler` (type=spoiler), имя `Иван` в заголовке, `🎉` в заголовке.
+2. Без `first_name`: ok=True, заголовок без `, `, логин присутствует.
+3. `bot=None`: ok=False, err='bot is None'.
+4. `send_rich_message` падает: ok=False, err содержит 'TelegramBadRequest' и 'chat not found'.
+5. `POST /admin/users/create` вызывает welcome: SU логинится, создание → 303, `_send_admin_welcome` вызван с правильным chat_id, логин присутствует в сообщении.
+6. `GET /admin/users?created=<token>` показывает `✅` (welcome_sent=True).
+7. `welcome_sent=False` когда бот не может отправить (`bot was blocked by the user`): в HTML есть `⚠` и «could not be delivered».
+8. Структура Rich-сообщения: `RichTextSpoiler` найден, в нём есть логин и пароль через `RichTextBold`.
+
+**Результат**: 38/38 ✅. Старые тесты — `test_v44_tgid_create.py` 82/82 ✅, `test_v44_rich_report.py` 29/29 ✅. **Итого 149/149 ✅.**
+
+### Технические заметки v4.4.2
+
+**Почему `RichTextSpoiler`, а не plain text для пароля?**
+Спойлер в Telegram — это затемнённый текст, который раскрывается только по клику пользователя. Если кто-то рядом смотрит на экран получателя (в офисе, в метро) — пароль сразу не виден. Получатель должен осознанно кликнуть, чтобы увидеть его. Это заметно безопаснее чем plain text, который виден сразу в превью сообщения.
+
+**Почему `RichTextBold` внутри спойлера?**
+Логин и пароль выделены bold-стилем, чтобы их было удобно читать после раскрытия спойлера — глаз сразу цепляется за значения, а не за лейблы «Логин:»/«Пароль:».
+
+**Почему бот отправляет, а не "стелс" уже нарушен?**
+Стелс-режим бота означает: **обычные нарушители в группах не получают сообщений от бота** (бот не представляется, не пишет «вы забанены за спам», и т.д.). Это сохранено. Но новый админ — это не нарушитель. Он:
+1. Уже знает про бота (он сам инициировал диалог, иначе `bot.get_chat()` не сработал бы).
+2. Является модератором с доступом к веб-панели.
+3. Нуждается в учётных данных для входа.
+
+Отправка welcome-сообщения админу в ЛС — это часть онбординга модератора, а не нарушение стелса. Нарушители в группах по-прежнему не получают от бота ничего.
+
+**Почему `_send_admin_welcome` в `web_app.py`, а не в `bot_handlers.py`?**
+Логически это часть флоу создания веб-админа — оно инициируется из `/admin/users/create` (веб-слой). Бот здесь используется как «почтовый клиент» — ему всё равно что отправлять. Если вынести в `bot_handlers.py`, придётся тащить туда знание о структуре welcome-сообщения (HTML/Rich), что размывает ответственность. Сейчас `web_app.py` владеет всем UX веб-панели (включая welcome), а `bot_handlers.py` — логикой модерации.
+
+**Файловая структура v4.4.2** (без изменений относительно v4.4.1, только правки):
+```
+shadow-logger/
+├── web_app.py                 # v4.4.2: _send_admin_welcome(), WEB_PUBLIC_URL const, поле 'w' в flash
+├── templates/admin.html       # v4.4.2: блок со статусом доставки welcome (✅/⚠)
+└── scripts/
+    ├── test_v44_tgid_create.py  # 82 теста (без изменений)
+    ├── test_v44_rich_report.py  # 29 тестов (без изменений)
+    └── test_v44_welcome.py      # v4.4.2: 38 тестов нового welcome-флоу
+```
+
+**Без новых env**: используется тот же `WEB_PUBLIC_URL` (дефолт `https://degraban.bothost.tech`).
+
+---
+
+## ✅ Готово — v4.4.3 (Управление модераторами через веб-панель)
+
+### 21 ✅ Добавление/удаление модераторов чатов через `/admin/moderators`
+
+**Проблема v4.4.2**: для добавления модератора в чат (пользователя, который может использовать команды `!mute`/`!warn`/`!ban` в конкретном чате, помимо глобального `ADMIN_IDS` env) существовала только бот-команда `/addadmin chat_id user_id` в ЛС бота. Это неудобно с телефона, требует помнить синтаксис, и не работает если веб-панель нужна для аудита списка модераторов.
+
+**Что сделано в `web_app.py`**:
+- 3 новых маршрута (все **SU-only**, как и `/admin/users`):
+  | Метод | Путь | Назначение |
+  |-------|------|------------|
+  | `GET` | `/admin/moderators` | Страница с формой добавления + список существующих модераторов |
+  | `POST` | `/admin/moderators/create` | Создание записи в `chat_admins` (поля `chat_id`, `user_id`) |
+  | `POST` | `/admin/moderators/{id}/delete` | Удаление записи из `chat_admins` |
+- Список модераторов собирается через `LEFT JOIN ChatAdmin → Moderator → ChatSettings`:
+  - `Moderator.username` / `Moderator.first_name` — если модератор уже применял санкции (профиль подтянулся через `_upsert_moderator`).
+  - `ChatSettings.hashtag` — если у чата задан хэштег.
+  - `LEFT JOIN` (а не `INNER`) — потому что модератор мог быть добавлен, но ни разу не использовать бота.
+- **Best-effort подтягивание профиля**: после сохранения `ChatAdmin`, если передан `bot`, дёргается `bot.get_chat(user_id)` и полученные `username` / `first_name` upsert-ятся в таблицу `Moderator`. Если `bot.get_chat` падает (юзер не общался с ботом, бот заблокирован и т.д.) — запись в `chat_admins` всё равно создаётся, профиль подтянется при первой же команде.
+- **Валидация**:
+  - `chat_id` и `user_id` должны быть числами (иначе flash "must be numbers").
+  - `chat_id = 0` запрещён (это default-чат, не реальный) → flash "cannot be 0".
+  - `user_id <= 0` запрещён → flash "must be positive".
+  - Дубликат `(chat_id, user_id)` отклоняется → flash "already a moderator".
+- **`Form("")` вместо `Form(...)`**: чтобы пустые строки доходили до нашего кода валидации, а не отбивались FastAPI как missing field (422). Так мы контролируем сообщение об ошибке.
+- **`.first()` вместо `.scalar_one_or_none()`**: на уровне БД нет UNIQUE constraint на `(chat_id, user_id)`, поэтому теоретически может быть несколько строк (если `/addadmin` и web создали дубликат до проверки приложением). Нам достаточно знать, что хотя бы одна существует.
+
+**Что сделано в `templates/admin_moderators.html`** (новый файл):
+- Форма добавления: 2 поля (`chat_id`, `user_id`) с `pattern` для клиентской валидации.
+- Блок **Known chats**: кнопки быстрого заполнения `chat_id` из существующих `ChatSettings` (исключая default `chat_id=0`). Клик вставляет значение в поле.
+- Таблица модераторов: `#`, `Chat ID`, `Hashtag`, `User ID`, `Name` (с @username ссылкой на `t.me`), `Added by` (показывает `via bot` если `added_by` не None, или `via web` если None), `Added at`, `Actions` (кнопка Remove с `confirm()`).
+- Блок **Fallback**: явное упоминание, что команды `/addadmin` и `/deladmin` в боте продолжают работать и пишут в ту же таблицу `chat_admins`. Записи, созданные через бот-команду, имеют `added_by = <TGID су>`; через веб — `added_by = None`.
+
+**Что сделано в `templates/base.html`**:
+- В навбар добавлена ссылка **Moderators** (видна только SU, рядом с Admins).
+- Активный подсвет ссылки: `request.url.path.startswith('/admin/moderators')`.
+- Ссылка **Admins** теперь подсвечивается только для `/admin/users` (а не для любого `/admin/*`).
+
+**Паритет с бот-командой**:
+- Записи, созданные через `/addadmin chat_id user_id` (в bot_handlers.py), и через `/admin/moderators/create` (в web_app.py), попадают в **одну и ту же таблицу** `chat_admins`.
+- Удаление через `/deladmin` или через `/admin/moderators/{id}/delete` — также работает с одной и той же таблицей.
+- При удалении записи из `chat_admins` профиль модератора в таблице `moderators` **сохраняется** — история его санкций не должна потеряться.
+
+**Тесты** (`scripts/test_v44_moderators_web.py`, 65 проверок):
+1. `GET /admin/moderators` — рендеринг с данными (LEFT JOIN с Moderator + ChatSettings).
+2. `POST /admin/moderators/create` — успешное создание + best-effort подтягивание профиля через `bot.get_chat`.
+3. Дубликат `(chat_id, user_id)` отклоняется, `bot.get_chat` не вызывается.
+4. Валидация: нечисловые ID, `chat_id=0`, отрицательный `user_id`, `user_id=0`, пустые строки.
+5. `bot=None` — запись создаётся, профиль не подтягивается (non-critical).
+6. `bot.get_chat` падает — запись всё равно создаётся.
+7. `POST /admin/moderators/{id}/delete` — успешное удаление, профиль модератора сохраняется.
+8. Удаление несуществующего ID — silent 303 (no crash).
+9. Non-SU admin не имеет доступа (redirect на `/dashboard`).
+10. Неавторизованный — redirect на `/login`.
+11. **Паритет**: web + `/addadmin` пишут в одну таблицу; web-проверка дубликата срабатывает даже если `/addadmin` уже создал запись.
+12. Best-effort: профиль модератора **обновляется**, если он уже существует в `moderators` (например, изменил @username).
+13. HTML: nav link "Moderators" виден SU и **не виден** обычным админам.
+
+**Без новых env / БД-миграций**: используется существующая таблица `chat_admins` (была добавлена в одной из ранних версий для бот-команды `/addadmin`).
 
 ---
 
@@ -659,16 +817,23 @@ await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
 ```
 shadow-logger/
 ├── .dockerignore
-├── .env.example              # REPORT_CHAT_ID убран, добавлены комменты про /setreport
+├── .env.example              # REPORT_CHAT_ID убран, добавлены комменты про /setreport, WEB_PUBLIC_URL
 ├── Dockerfile
 ├── requirements.txt          # aiogram==3.30.0
 ├── bot.py                    # lifespan проверяет default report_chat_id из DB
-├── bot_handlers.py           # Rich Messages + Ephemeral + без REPORT_CHAT_ID env
-├── db.py                     # без изменений (report_message_id soft-deprecated)
-├── web_app.py                # без env_report_chat_id, с default_report_chat_id
+├── bot_handlers.py           # Rich Messages + Ephemeral + clickable violator/mod/web link + WEB_PUBLIC_URL
+├── db.py                     # tg_user_id/tg_first_name/tg_last_name/tg_username в web_users
+├── web_app.py                # v4.4.3: +/admin/moderators (CRUD); SU-only; best-effort bot.get_chat
+├── scripts/
+│   ├── test_v44_rich_report.py      # 29 проверок: Rich-отчёт с кликабельными ссылками
+│   ├── test_v44_tgid_create.py      # 82 проверки: TGID-создание админа + смена пароля + удаление
+│   ├── test_v44_welcome.py          # 38 проверок: welcome-сообщение новому админу в ЛС
+│   └── test_v44_moderators_web.py   # 65 проверок: веб-управление модераторами чатов
 └── templates/
-    ├── base.html
-    ├── dashboard.html        # + секция Chat settings, без env_report_chat_id
+    ├── base.html             # + nav link Moderators (SU-only)
+    ├── admin.html            # SU → создание/удаление веб-админов по TGID
+    ├── admin_moderators.html # v4.4.3: SU → CRUD модераторов чатов
+    ├── dashboard.html        # + Chat settings + Change my password
     ├── login.html
-    └── user.html             # без env_report_chat_id, без 📎 Media link
+    └── user.html
 ```

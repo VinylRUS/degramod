@@ -28,10 +28,24 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func, desc, or_
 
+# Rich Messages (Bot API 10.2 / aiogram 3.30) — для приветствия новому админу.
+# Импортируем лениво внутри функции, чтобы не тащить зависимость на aiogram.types
+# при статическом импорте модуля (на случай если бот запускается без aiogram).
+from aiogram.types import (
+    InputRichMessage,
+    InputRichBlockSectionHeading,
+    InputRichBlockParagraph,
+    InputRichBlockFooter,
+    RichTextUrl,
+    RichTextBold,
+    RichTextSpoiler,
+)
+from aiogram.exceptions import TelegramBadRequest
+
 _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
-    async_session, User, Moderator, Punishment, ChatSettings, WebUser,
+    async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
     _hash_password, _verify_password,
 )
 
@@ -44,6 +58,13 @@ _SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 MSK = timezone(timedelta(hours=3))
 
 PAGE_SIZE = 50  # записей на страницу в дашборде
+
+# ── Публичный URL веб-панели ────────────────────────────────────────────────
+# Дублируется из bot_handlers.py намеренно (web_app.py не должен зависеть от
+# bot_handlers — там вся логика бота, тут только веб-слой). Значение по умолчанию
+# — production-инсталляция на Bothost. Меняется через env только если деплой
+# на другой домен.
+WEB_PUBLIC_URL = (os.getenv("WEB_PUBLIC_URL") or "https://degraban.bothost.tech").rstrip("/")
 
 
 # ── Токены сессий ───────────────────────────────────────────────────────────
@@ -198,6 +219,81 @@ def _verify_flash(token: str, max_age_seconds: int = 120) -> dict | None:
     if not isinstance(ts, (int, float)) or abs(time.time() - ts) > max_age_seconds:
         return None
     return payload
+
+
+# ── v4.4.2: Welcome-сообщение новому админу в ЛС ───────────────────────────
+async def _send_admin_welcome(bot, tg_user_id: int, login: str, password: str,
+                              first_name: str | None = None) -> tuple[bool, str]:
+    """Отправляет новому админу в ЛС приветствие с данными для входа.
+
+    Использует Rich Messages (Bot API 10.2): пароль скрыт под спойлером.
+
+    Возвращает (ok, message):
+      - ok=True, message="ok"        — успешно отправлено
+      - ok=False, message="<reason>" — отправка не удалась (юзер заблокировал
+                                       бота, бот не передан, и т.д.)
+    """
+    if bot is None:
+        return False, "bot is None"
+
+    # Имя для приветствия (если есть)
+    greeting_name = ""
+    if first_name:
+        greeting_name = f", {first_name}"
+
+    web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
+    # '/' в конце для человекочитаемой ссылки (без /user/<id>, просто корень)
+    web_root_url = web_url + "/"
+
+    blocks = [
+        InputRichBlockSectionHeading(
+            text=f"🎉 Доступ к веб-панели{greeting_name}",
+            size=2,
+        ),
+        InputRichBlockParagraph(
+            text=[
+                "Вас добавили как модератора в систему «Дедушка Вобжак». ",
+                "Веб-панель: ",
+                RichTextUrl(text=web_root_url, url=web_root_url),
+            ]
+        ),
+        InputRichBlockParagraph(text="Данные для входа (скрыты под спойлером):"),
+        # Блок со спойлером — клик по «Показать» раскрывает логин/пароль.
+        # Используем RichTextSpoiler с вложенным RichTextBold для выделения
+        # самих значений. Telegram показывает спойлер как затемнённый текст,
+        # раскрываемый по клику — это безопаснее чем plain text.
+        InputRichBlockParagraph(
+            text=RichTextSpoiler(
+                text=[
+                    "Логин: ", RichTextBold(text=login), "\n",
+                    "Пароль: ", RichTextBold(text=password),
+                ]
+            )
+        ),
+        InputRichBlockParagraph(
+            text=[
+                "🔐 После первого входа смените пароль: раздел ",
+                RichTextBold(text="Dashboard"),
+                " → блок ",
+                RichTextBold(text="Change my password"),
+                " (нужно указать текущий пароль и новый).",
+            ]
+        ),
+        InputRichBlockFooter(
+            text=f"⏱ {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК"
+        ),
+    ]
+
+    try:
+        await bot.send_rich_message(
+            chat_id=tg_user_id,
+            rich_message=InputRichMessage(blocks=blocks),
+        )
+        return True, "ok"
+    except TelegramBadRequest as e:
+        return False, f"TelegramBadRequest: {e}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 # ── Создание приложения ─────────────────────────────────────────────────────
@@ -634,6 +730,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     "username": payload["u"],
                     "password": payload["p"],
                     "tg_user_id": payload.get("tg"),
+                    # w=1 → бот доставил приветствие с паролем в ЛС юзеру
+                    # w=0 (или нет ключа) → бот не смог отправить (юзер заблокировал),
+                    # SU должен передать пароль вручную
+                    "welcome_sent": bool(payload.get("w", 0)),
                 }
 
         async with async_session() as session:
@@ -770,12 +870,41 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             login, tg_id, _auth.username,
         )
 
-        # ── 7. Signed-flash с паролем для показа один раз ──────────────
+        # ── 7. Welcome-сообщение новому админу в ЛС ─────────────────────
+        # Бот уже может написать юзеру — раз bot.get_chat() сработал, значит
+        # диалог открыт. Отправляем Rich-сообщение со ссылкой на веб-панель
+        # и данными для входа (пароль под спойлером).
+        # Если отправка упала (юзер успел заблокировать бота) — SU всё равно
+        # увидит пароль в зелёном блоке one-time, так что юзер не останется
+        # без доступа. Просто покажем SU предупреждение.
+        welcome_ok, welcome_err = await _send_admin_welcome(
+            bot=bot,
+            tg_user_id=tg_id,
+            login=login,
+            password=password,
+            first_name=tg_first_name,
+        )
+        if welcome_ok:
+            _req_logger.info(
+                "admin_users_create: welcome sent to tg_user_id=%s (login=%s)",
+                tg_id, login,
+            )
+        else:
+            _req_logger.warning(
+                "admin_users_create: welcome FAILED for tg_user_id=%s "
+                "(login=%s): %s — SU must deliver credentials manually",
+                tg_id, login, welcome_err,
+            )
+
+        # ── 8. Signed-flash с паролем для показа один раз ──────────────
         flash_token = _sign_flash({
             "u": login,
             "p": password,
             "tg": tg_id,
             "t": int(time.time()),
+            # Добавляем флаг welcome-статуса, чтобы SU видел в зелёном блоке
+            # было отправлено сообщение в ЛС или нет.
+            "w": 1 if welcome_ok else 0,
         })
         return RedirectResponse(
             url=f"/admin/users?created={flash_token}",
@@ -838,6 +967,208 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             user_id, _auth.username,
         )
         return RedirectResponse(url="/admin/users", status_code=303)
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /admin/moderators — управление модераторами чатов (v4.4.3)
+    #
+    #  Модераторы = дополнительные (помимо ADMIN_IDS env) пользователи,
+    #  которые могут использовать команды бота (!mute/!warn/!ban/...) в
+    #  конкретном чате. Хранятся в таблице `chat_admins` (chat_id, user_id).
+    #
+    #  Доступ: только SU (как и /admin/users). Команды /addadmin и /deladmin
+    #  в боте остаются как fallback — на случай если веб-панель недоступна
+    #  или неудобна с телефона.
+    # ──────────────────────────────────────────────────────────────────
+    @app.get("/admin/moderators", response_class=HTMLResponse)
+    async def admin_moderators_page(
+        request: Request,
+        flash: str = "",
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """Страница управления модераторами чатов.
+
+        Показывает:
+          - Форму добавления модератора (chat_id + user_id)
+          - Список существующих модераторов (присоединённый к Moderator
+            и ChatSettings для отображения имён/хэштегов)
+          - Кнопку удаления для каждой записи
+        """
+        async with async_session() as session:
+            # Список всех ChatAdmin с LEFT JOIN к Moderator (для имени) и
+            # ChatSettings (для хэштега). LEFT JOIN — потому что модератор
+            # мог быть добавлен, но ни разу не использовал команды бота
+            # (значит, записи в `moderators` ещё нет).
+            stmt = (
+                select(
+                    ChatAdmin.id,
+                    ChatAdmin.chat_id,
+                    ChatAdmin.user_id,
+                    ChatAdmin.added_by,
+                    ChatAdmin.created_at,
+                    Moderator.username.label("mod_username"),
+                    Moderator.first_name.label("mod_first_name"),
+                    ChatSettings.hashtag.label("chat_hashtag"),
+                )
+                .outerjoin(Moderator, ChatAdmin.user_id == Moderator.mod_id)
+                .outerjoin(ChatSettings, ChatAdmin.chat_id == ChatSettings.chat_id)
+                .order_by(ChatAdmin.chat_id.asc(), ChatAdmin.user_id.asc())
+            )
+            rows = (await session.execute(stmt)).all()
+
+            # Известные чаты (для подсказки в форме) — берём из ChatSettings,
+            # исключая default (chat_id=0).
+            known_chats = (await session.execute(
+                select(ChatSettings.chat_id, ChatSettings.hashtag)
+                .where(ChatSettings.chat_id != 0)
+                .order_by(ChatSettings.chat_id.asc())
+            )).all()
+
+        return templates.TemplateResponse("admin_moderators.html", {
+            "request": request,
+            "moderators": rows,
+            "known_chats": known_chats,
+            "auth_user": _auth,
+            "flash": flash or None,
+        })
+
+    @app.post("/admin/moderators/create")
+    async def admin_moderators_create(
+        request: Request,
+        chat_id: str = Form(""),
+        user_id: str = Form(""),
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """Добавляет модератора в чат.
+
+        Логика:
+          1. Валидирует chat_id и user_id (должны быть положительными числами).
+          2. Проверяет, что связка (chat_id, user_id) ещё не существует.
+          3. Сохраняет в `chat_admins` (added_by = None — веб-SU не имеет
+             Telegram ID в этой сессии).
+          4. Best-effort: если передан `bot` и `bot.get_chat(user_id)` успешен —
+             upsert модератора в таблицу `moderators` (чтобы сразу отображалось
+             имя/@username). Если падает — игнорируем (запись всё равно создаётся,
+             профиль подтянется при первой же команде бота).
+
+        Команда /addadmin остаётся как fallback.
+        """
+        # ── 1. Валидация ───────────────────────────────────────────────
+        chat_raw = (chat_id or "").strip()
+        user_raw = (user_id or "").strip()
+        try:
+            chat_id_int = int(chat_raw)
+            user_id_int = int(user_raw)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/moderators?flash=chat_id+and+user_id+must+be+numbers",
+                status_code=303,
+            )
+        if chat_id_int == 0:
+            return RedirectResponse(
+                url="/admin/moderators?flash=chat_id+cannot+be+0",
+                status_code=303,
+            )
+        if user_id_int <= 0:
+            return RedirectResponse(
+                url="/admin/moderators?flash=user_id+must+be+positive",
+                status_code=303,
+            )
+
+        # ── 2. Сохранение в БД ──────────────────────────────────────────
+        async with async_session() as session:
+            # Используем .first() вместо .scalar_one_or_none() — т.к. на уровне БД
+            # нет UNIQUE constraint на (chat_id, user_id), теоретически может быть
+            # несколько строк (если /addadmin и web создали дубликат до проверки
+            # приложением). Нам достаточно знать, что хотя бы одна существует.
+            existing = (await session.execute(
+                select(ChatAdmin).where(
+                    ChatAdmin.chat_id == chat_id_int,
+                    ChatAdmin.user_id == user_id_int,
+                )
+            )).scalars().first()
+            if existing:
+                return RedirectResponse(
+                    url=f"/admin/moderators?flash=User+{user_id_int}+is+already+"
+                        f"a+moderator+in+chat+{chat_id_int}",
+                    status_code=303,
+                )
+
+            session.add(ChatAdmin(
+                chat_id=chat_id_int,
+                user_id=user_id_int,
+                added_by=None,  # веб-SU не имеет TGID в этой сессии
+            ))
+            await session.commit()
+
+        _req_logger.info(
+            "admin_moderators_create: added chat_id=%s user_id=%s by=%s",
+            chat_id_int, user_id_int, _auth.username,
+        )
+
+        # ── 3. Best-effort: подтянуть профиль из Telegram ──────────────
+        # Если бот доступен — пробуем получить имя/username модератора,
+        # чтобы сразу отобразить их в списке. Профиль сохраняется в
+        # таблицу `moderators` (тот же upsert, что использует бот при
+        # первой команде). Ошибки игнорируем — запись в `chat_admins`
+        # уже создана, профиль подтянется позже.
+        if bot is not None:
+            try:
+                chat = await bot.get_chat(chat_id=user_id_int)
+                tg_username = getattr(chat, "username", None)
+                tg_first_name = getattr(chat, "first_name", None)
+                async with async_session() as session:
+                    existing_mod = (await session.execute(
+                        select(Moderator).where(Moderator.mod_id == user_id_int)
+                    )).scalar_one_or_none()
+                    if existing_mod is None:
+                        session.add(Moderator(
+                            mod_id=user_id_int,
+                            username=tg_username,
+                            first_name=tg_first_name,
+                        ))
+                    else:
+                        if tg_username:
+                            existing_mod.username = tg_username
+                        if tg_first_name:
+                            existing_mod.first_name = tg_first_name
+                    await session.commit()
+            except Exception as e:
+                # Не падаем — профиль подтянется при первой команде бота.
+                _req_logger.info(
+                    "admin_moderators_create: bot.get_chat(%s) failed (non-critical): %s",
+                    user_id_int, e,
+                )
+
+        return RedirectResponse(
+            url=f"/admin/moderators?flash=Added+moderator+{user_id_int}+to+chat+{chat_id_int}",
+            status_code=303,
+        )
+
+    @app.post("/admin/moderators/{chat_admin_id:int}/delete")
+    async def admin_moderators_delete(
+        chat_admin_id: int,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """Удаляет запись о модераторе (ChatAdmin).
+
+        Удаляет только связку (chat_id, user_id) — пользователь остаётся в
+        таблице `moderators` (если он уже успел применить хоть одну санкцию,
+        её история должна сохраниться).
+        """
+        async with async_session() as session:
+            ca = (await session.execute(
+                select(ChatAdmin).where(ChatAdmin.id == chat_admin_id)
+            )).scalar_one_or_none()
+            if ca is None:
+                return RedirectResponse(url="/admin/moderators", status_code=303)
+            await session.delete(ca)
+            await session.commit()
+
+        _req_logger.info(
+            "admin_moderators_delete: deleted chat_admin id=%s by=%s",
+            chat_admin_id, _auth.username,
+        )
+        return RedirectResponse(url="/admin/moderators", status_code=303)
 
     # ──────────────────────────────────────────────────────────────────
     #  /me/password — смена своего пароля (v4.4)
