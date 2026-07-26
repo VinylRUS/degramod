@@ -59,6 +59,8 @@ from aiogram.types import (
     InputMediaAnimation,
     InputMediaAudio,
     InputMediaVoiceNote,
+    RichTextUrl,
+    RichTextBold,
 )
 from sqlalchemy import select, desc, func
 
@@ -83,6 +85,12 @@ for pair in _raw_hashtags.split(","):
 
 # МСК-таймзона
 MSK = timezone(timedelta(hours=3))
+
+# ── Публичный URL веб-панели (для кликабельных ссылок в отчётах) ───────────
+# Если env WEB_PUBLIC_URL не задан — используется дефолт production-инсталляции
+# (Bothost). Env позволяет переопределить для локальных/dev инсталляций.
+# Формат: только схема+домен(+порт), без завершающего '/'.
+WEB_PUBLIC_URL = (os.getenv("WEB_PUBLIC_URL") or "https://degraban.bothost.tech").rstrip("/")
 
 
 # ── Парсинг длительности: 1d, 2h, 30m, 1d12h ──────────────────────────────
@@ -196,6 +204,18 @@ def _user_mention_html(user: types.User) -> str:
     name = name.strip() or f"id:{user.id}"
     name = html.escape(name, quote=False)
     return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
+def _user_display_name(user: types.User) -> str:
+    """Возвращает 'Имя Фамилия' или 'id:<user_id>' если имени нет.
+
+    Используется в RichTextUrl.text — без экранирования (Rich Messages
+    сами управляют разметкой), без HTML.
+    """
+    name = (user.first_name or "") + (
+        f" {user.last_name}" if user.last_name else ""
+    )
+    return name.strip() or f"id:{user.id}"
 
 
 # ── Helpers: получение/сохранение настроек чата ────────────────────────────
@@ -462,6 +482,7 @@ async def _send_report(
     target: types.User,
     action_type: str,
     reason: str | None,
+    mod: types.User | None = None,
     warn_points: int | None = None,
     duration_seconds: int | None = None,
     reply_to_message: types.Message | None = None,
@@ -473,12 +494,16 @@ async def _send_report(
 
     Структура Rich-сообщения:
       1. SectionHeading — 🔇 МУТ / 🚫 БАН / ⚠️ ВАРН / 🔊 РАЗМУТ
-      2. Paragraph      — Нарушитель (имя @username, ID)
-      3. Paragraph      — Причина (если есть)
-      4. BlockQuotation — Текст/caption сообщения нарушителя
-      5. Photo/Video/…  — Inline-медиа (вместо forward_message)
-      6. Details        — Доп. инфо (chat_id, длительность, варны всего) — сворачиваемо
-      7. Footer         — Время МСК + хэштег чата
+      2. Paragraph      — Нарушитель (кликабельное имя → tg://user?id=…,
+                          @username если есть, ID)
+      3. Paragraph      — Модератор (если передан mod): кликабельное имя
+      4. Paragraph      — Веб-профиль нарушителя (если задан WEB_PUBLIC_URL):
+                          кликабельная ссылка на /user/<id>
+      5. Paragraph      — Причина (если есть)
+      6. BlockQuotation — Текст/caption сообщения нарушителя
+      7. Photo/Video/…  — Inline-медиа (вместо forward_message)
+      8. Details        — Доп. инфо (chat_id, длительность, варны всего) — сворачиваемо
+      9. Footer         — Время МСК + хэштег чата
 
     Returns: None (медиа теперь inline в rich message, report_message_id больше не нужен).
     """
@@ -508,19 +533,25 @@ async def _send_report(
     }
     action_label = action_labels.get(action_type, action_type.upper())
 
-    # ── Нарушитель ─────────────────────────────────────────────
+    # ── Нарушитель: имя кликабельно → tg://user?id=… ───────────
+    # RichTextUrl оборачивает имя нарушителя в inline-ссылку на его профиль
+    # в Telegram. Клик по имени открывает профиль — это работает даже если
+    # у нарушителя нет @username (тогда ссылка — единственный способ быстро
+    # перейти к его профилю из репорт-чата).
     full_name = (target.first_name or "") + (
         f" {target.last_name}" if target.last_name else ""
     )
-    offender_lines: list[str] = []
-    if full_name:
-        offender_lines.append(f"👤 {full_name}")
-    else:
-        offender_lines.append("👤 (без имени)")
+    display_name = full_name.strip() or "(без имени)"
+    offender_text: list = [
+        "👤 ",
+        RichTextUrl(
+            text=display_name,
+            url=f"tg://user?id={target.id}",
+        ),
+    ]
     if target.username:
-        offender_lines.append(f"   @{target.username}")
-    offender_lines.append(f"   ID: {target.id}")
-    offender_text = "\n".join(offender_lines)
+        offender_text.append(f"\n   @{target.username}")
+    offender_text.append(f"\n   ID: {target.id}")
 
     # ── Контент нарушителя ─────────────────────────────────────
     text_content: str | None = None
@@ -545,6 +576,33 @@ async def _send_report(
     blocks: list = []
     blocks.append(InputRichBlockSectionHeading(text=action_label, size=2))
     blocks.append(InputRichBlockParagraph(text=offender_text))
+
+    # ── Модератор: кто применил санкцию ────────────────────────
+    if mod is not None:
+        mod_name = _user_display_name(mod)
+        blocks.append(
+            InputRichBlockParagraph(
+                text=[
+                    "👮 Модератор: ",
+                    RichTextUrl(
+                        text=mod_name,
+                        url=f"tg://user?id={mod.id}",
+                    ),
+                ]
+            )
+        )
+
+    # ── Веб-профиль нарушителя (если задан WEB_PUBLIC_URL) ─────
+    if WEB_PUBLIC_URL:
+        web_url = f"{WEB_PUBLIC_URL}/user/{target.id}"
+        blocks.append(
+            InputRichBlockParagraph(
+                text=[
+                    "🌐 Веб-профиль: ",
+                    RichTextUrl(text=web_url, url=web_url),
+                ]
+            )
+        )
 
     if reason:
         blocks.append(InputRichBlockParagraph(text=f"📝 Причина: {reason}"))
@@ -583,6 +641,28 @@ async def _send_report(
 
     rich_msg = InputRichMessage(blocks=blocks)
 
+    # ── Plain-text версия нарушителя для fallback'а ────────────
+    # Rich Messages редко падают, но если упадут — отправим обычный текст.
+    # В plain text ссылки не нужны (Telegram сам распознает URL'ы), поэтому
+    # собираем простую строку.
+    offender_lines_plain: list[str] = [f"👤 {display_name}"]
+    if target.username:
+        offender_lines_plain.append(f"   @{target.username}")
+    offender_lines_plain.append(f"   ID: {target.id}")
+    offender_text_plain = "\n".join(offender_lines_plain)
+
+    mod_text_plain: str | None = None
+    if mod is not None:
+        mod_name = _user_display_name(mod)
+        mod_text_plain = f"👮 Модератор: {mod_name}"
+        if mod.username:
+            mod_text_plain += f" @{mod.username}"
+        mod_text_plain += f" (ID: {mod.id})"
+
+    web_url_plain: str | None = None
+    if WEB_PUBLIC_URL:
+        web_url_plain = f"{WEB_PUBLIC_URL}/user/{target.id}"
+
     try:
         await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
     except TelegramBadRequest as e:
@@ -593,7 +673,9 @@ async def _send_report(
                 bot=bot,
                 report_dest=report_dest,
                 action_label=action_label,
-                offender_text=offender_text,
+                offender_text=offender_text_plain,
+                mod_text=mod_text_plain,
+                web_url=web_url_plain,
                 reason=reason,
                 text_content=text_content,
                 duration_seconds=duration_seconds,
@@ -623,6 +705,8 @@ async def _send_report_plain_fallback(
     report_dest: int,
     action_label: str,
     offender_text: str,
+    mod_text: str | None,
+    web_url: str | None,
     reason: str | None,
     text_content: str | None,
     duration_seconds: int | None,
@@ -630,13 +714,23 @@ async def _send_report_plain_fallback(
     time_str: str,
     hashtag: str,
 ) -> None:
-    """Резервный plain-text отчёт, если Rich Message не удалась."""
+    """Резервный plain-text отчёт, если Rich Message не удалась.
+
+    В plain text URL'ы распознаются Telegram автоматически — веб-ссылка
+    остаётся кликабельной. tg://user?id=… в plain text НЕ распознаётся,
+    поэтому кликабельные упоминания нарушителя/модератора опускаем —
+    только текстовая информация.
+    """
     parts: list[str] = []
     if hashtag:
         parts.append(hashtag)
     parts.append(action_label)
     parts.append("")
     parts.append(offender_text)
+    if mod_text:
+        parts.append(mod_text)
+    if web_url:
+        parts.append(f"🌐 Веб-профиль: {web_url}")
     if reason:
         parts.append(f"📝 Причина: {reason}")
     if text_content:
@@ -719,7 +813,8 @@ async def _check_warn_threshold(
                     permissions_snapshot=perm_snapshot,
                 )
                 await _send_report(bot, chat_id, target, "ban",
-                                   f"Автобан: {total_warns} варнов")
+                                   f"Автобан: {total_warns} варнов",
+                                   mod=mod)
                 logger.info("Auto-ban triggered for user %s in chat %s (%d warns)",
                             target.id, chat_id, total_warns)
                 # ── Ephemeral-уведомление модератору (видно только ему) ────
@@ -764,6 +859,7 @@ async def _check_warn_threshold(
                 )
                 await _send_report(bot, chat_id, target, "mute",
                                    f"Автомьют: {total_warns} варнов",
+                                   mod=mod,
                                    duration_seconds=mute_dur)
                 logger.info("Auto-mute triggered for user %s in chat %s (%d warns, %s)",
                             target.id, chat_id, total_warns, _format_duration(mute_dur))
@@ -887,7 +983,7 @@ async def handle_group_command(message: types.Message) -> None:
 
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
-            action_type="mute", reason=reason,
+            action_type="mute", reason=reason, mod=mod,
             duration_seconds=duration_seconds,
             reply_to_message=message.reply_to_message,
         )
@@ -944,7 +1040,7 @@ async def handle_group_command(message: types.Message) -> None:
         # Теперь отчёт — в нём будет правильный счётчик варнов
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
-            action_type="warn", reason=reason, warn_points=1,
+            action_type="warn", reason=reason, warn_points=1, mod=mod,
             reply_to_message=message.reply_to_message,
         )
 
@@ -994,7 +1090,7 @@ async def handle_group_command(message: types.Message) -> None:
 
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
-            action_type="ban", reason=reason,
+            action_type="ban", reason=reason, mod=mod,
             reply_to_message=message.reply_to_message,
         )
 
@@ -1056,7 +1152,7 @@ async def handle_group_command(message: types.Message) -> None:
 
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
-            action_type="unmute",
+            action_type="unmute", mod=mod,
             reply_to_message=message.reply_to_message,
         )
 
@@ -1106,7 +1202,7 @@ async def handle_group_command(message: types.Message) -> None:
 
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
-            action_type="unban",
+            action_type="unban", mod=mod,
             reply_to_message=message.reply_to_message,
         )
 
@@ -1161,7 +1257,7 @@ async def handle_group_command(message: types.Message) -> None:
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="unwarn", reason=f"Снято {revoked_count} варн(а/ов)",
-            warn_points=revoked_count,
+            warn_points=revoked_count, mod=mod,
             reply_to_message=message.reply_to_message,
         )
 

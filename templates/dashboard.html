@@ -287,6 +287,49 @@
 </div>
 {% endif %}
 
+{# ── v4.4: Change my password ───────────────────────────────────── #}
+<div id="changepw" class="section-title">Change my password <a class="anchor" href="#changepw">#</a></div>
+<div style="max-width: 480px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5);">
+
+    {% if pw_msg %}
+    <div style="background: rgba(204,204,204,.08); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); margin-bottom: var(--sp-3); font-size: 11px; color: var(--text-dim);">
+        {{ pw_msg }}
+    </div>
+    {% endif %}
+
+    {% if auth_user.is_su %}
+    <div style="font-size: 11px; color: var(--text-dim); padding: var(--sp-2) var(--sp-3); background: rgba(204,153,51,.08); border: 1px solid rgba(204,153,51,.4); border-radius: var(--r-sm);">
+        SU password is managed via the <code style="font-family: var(--font-mono); color: var(--accent);">WEB_PASSWORD</code> environment variable. To change it, update the env and restart the bot.
+    </div>
+    {% else %}
+    <form method="post" action="/me/password" style="display: flex; flex-direction: column; gap: var(--sp-3);">
+        <div>
+            <label for="old_password" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Current password</label>
+            <input type="password" id="old_password" name="old_password" required
+                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
+                   autocomplete="current-password">
+        </div>
+        <div>
+            <label for="new_password" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">New password</label>
+            <input type="password" id="new_password" name="new_password" required minlength="6"
+                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
+                   autocomplete="new-password">
+            <small style="display: block; margin-top: 4px; color: var(--text-dim); font-size: 10px;">At least 6 characters. Must differ from the current password.</small>
+        </div>
+        <div>
+            <label for="confirm" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Confirm new password</label>
+            <input type="password" id="confirm" name="confirm" required minlength="6"
+                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
+                   autocomplete="new-password">
+        </div>
+        <button type="submit"
+                style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s; align-self: flex-start;">
+            Change password
+        </button>
+    </form>
+    {% endif %}
+</div>
+
 {% endblock %}
 
 {% block extra_js %}

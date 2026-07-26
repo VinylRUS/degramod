@@ -137,8 +137,10 @@ class WebUser(Base):
 
     SU (super-user) — единственный, чьё имя = 'su', пароль хранится в env WEB_PASSWORD
     (в БЕЗ хэша — сверка идёт напрямую через == в web_app.py).
-    Все остальные — обычные админы, созданные через /admin/users:
-      пароль хранится в поле password_hash (PBKDF2-HMAC-SHA256).
+    Все остальные — обычные админы, созданные через /admin/users (v4.4: по TGID):
+      пароль автогенерируется и сохраняется в password_hash (PBKDF2-HMAC-SHA256),
+      профиль заполняется из Telegram (tg_user_id / tg_first_name / tg_last_name / tg_username).
+    Логин (username) = @username из Telegram (без @).
     """
     __tablename__ = "web_users"
 
@@ -150,6 +152,11 @@ class WebUser(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     created_by = Column(String(64), nullable=True)             # username создателя
     last_login_at = Column(DateTime, nullable=True)
+    # ── v4.4: привязка к Telegram ────────────────────────────────────────
+    tg_user_id = Column(BigInteger, nullable=True, unique=True, index=True)
+    tg_first_name = Column(String(255), nullable=True)
+    tg_last_name = Column(String(255), nullable=True)
+    tg_username = Column(String(255), nullable=True)            # @username из TG (без @, lowercase)
 
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────
@@ -193,6 +200,36 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE punishments ADD COLUMN revoked_by_mod_id BIGINT NULL"
             ))
+
+    # ── Миграция: привязка веб-юзеров к Telegram (v4.4) ────────────────
+    # tg_user_id (unique) / tg_first_name / tg_last_name / tg_username —
+    # для создания админов через TGID с автозаполнением профиля из Telegram.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(web_users)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "tg_user_id" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN tg_user_id BIGINT NULL"
+            ))
+        if "tg_first_name" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN tg_first_name VARCHAR(255) NULL"
+            ))
+        if "tg_last_name" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN tg_last_name VARCHAR(255) NULL"
+            ))
+        if "tg_username" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN tg_username VARCHAR(255) NULL"
+            ))
+    # Уникальный индекс на tg_user_id (создаём после колонки; IF NOT EXISTS для идемпотентности).
+    # SQLite поддерживает CREATE UNIQUE INDEX IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_web_users_tg_user_id "
+            "ON web_users (tg_user_id) WHERE tg_user_id IS NOT NULL"
+        ))
 
     # ── Seed: гарантируем что SU-аккаунт существует в web_users ──────────
     # SU не имеет password_hash — пароль берётся из env WEB_PASSWORD при логине.

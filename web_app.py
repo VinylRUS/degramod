@@ -1,6 +1,12 @@
 """
 web_app.py — FastAPI: маршруты, авторизация по кукам (HMAC), Jinja2-шаблоны.
 
+v4.4 — Создание админов через TGID:
+  - SU вводит только Telegram ID пользователя.
+  - Бот дёргает bot.get_chat(user_id) и подтягивает first_name / last_name / @username.
+  - Логин = @username (без @), пароль автогенерируется (16 chars, показывается SU один раз).
+  - Юзер может сам сменить пароль через блок на /dashboard.
+
 v4.3 — Поддержка нескольких админ-аккаунтов:
   - SU (super-user) логинится через env WEB_PASSWORD
   - SU может создавать/редактировать/удалять/блокировать других админов через /admin/users
@@ -146,8 +152,63 @@ def _telegram_link_base(chat_id: int) -> str:
         return f"https://t.me/c/{chat_id}"
 
 
+# ── v4.4: генерация пароля и signed-flash для показа пароля один раз ────────
+_PASSWORD_LEN = 16  # длина автогенерированного пароля (base64url ≈ 107 бит энтропии)
+
+
+def _generate_password() -> str:
+    """Генерирует случайный пароль длиной _PASSWORD_LEN символов (base64url, без padding)."""
+    # token_urlsafe(12) даёт 16 символов. Подходит.
+    return secrets.token_urlsafe(12)[:_PASSWORD_LEN]
+
+
+def _sign_flash(payload: dict) -> str:
+    """Подписывает payload (dict) для передачи в query string.
+
+    Возвращает base64url(JSON):<hmac>. Payload должен быть коротким.
+    Используется для показа пароля один раз после создания юзера.
+    """
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    sig = _sign(raw)
+    import base64
+    b64 = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+    return f"{b64}.{sig}"
+
+
+def _verify_flash(token: str, max_age_seconds: int = 120) -> dict | None:
+    """Проверяет подпись и свежесть signed-flash. Возвращает payload или None."""
+    if not token or "." not in token:
+        return None
+    b64, sig = token.rsplit(".", 1)
+    try:
+        import base64
+        # восстановим padding
+        padding = "=" * (-len(b64) % 4)
+        raw = base64.urlsafe_b64decode(b64 + padding).decode()
+    except Exception:
+        return None
+    expected = _sign(raw)
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    ts = payload.get("t", 0)
+    if not isinstance(ts, (int, float)) or abs(time.time() - ts) > max_age_seconds:
+        return None
+    return payload
+
+
 # ── Создание приложения ─────────────────────────────────────────────────────
-def create_app(lifespan=None) -> FastAPI:
+def create_app(lifespan=None, bot=None) -> FastAPI:
+    """Создаёт FastAPI-приложение.
+
+    :param lifespan: async context manager для startup/shutdown (передаётся в FastAPI).
+    :param bot: экземпляр aiogram.Bot — нужен для эндпоинта создания админа через TGID
+                (дёргает bot.get_chat(user_id) для получения профиля из Telegram).
+                Если None — эндпоинт /admin/users/create вернёт 503.
+    """
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
     # ── Request logging middleware ────────────────────────────────────
@@ -254,6 +315,7 @@ def create_app(lifespan=None) -> FastAPI:
         action: str = "",
         rev: str = "",          # "all" / "active" / "revoked"; по умолчанию ""
         sort: str = "new",      # "new" / "old" / "type" / "user"
+        pw_msg: str = "",       # v4.4: сообщение о смене пароля
         _auth: AuthUser = Depends(require_auth),
     ):
         offset = (page - 1) * PAGE_SIZE
@@ -380,6 +442,7 @@ def create_app(lifespan=None) -> FastAPI:
             "rev_filter": rev,
             "sort": sort,
             "auth_user": _auth,
+            "pw_msg": pw_msg or None,
         })
 
     # ── GET /user/<user_id> ─────────────────────────────────────────────
@@ -553,13 +616,26 @@ def create_app(lifespan=None) -> FastAPI:
 
     # ──────────────────────────────────────────────────────────────────
     #  /admin/users — управление админ-аккаунтами (только SU)
+    #  v4.4: создание через TGID с автозаполнением профиля из Telegram.
     # ──────────────────────────────────────────────────────────────────
     @app.get("/admin/users", response_class=HTMLResponse)
     async def admin_users_page(
         request: Request,
         flash: str = "",
+        created: str = "",       # v4.4: signed-flash с паролем нового админа
         _auth: AuthUser = Depends(require_su),
     ):
+        # Если есть created-токен — пробуем верифицировать подпись и свежесть.
+        created_info = None
+        if created:
+            payload = _verify_flash(created, max_age_seconds=180)
+            if payload and "u" in payload and "p" in payload:
+                created_info = {
+                    "username": payload["u"],
+                    "password": payload["p"],
+                    "tg_user_id": payload.get("tg"),
+                }
+
         async with async_session() as session:
             users = (await session.execute(
                 select(WebUser).order_by(WebUser.is_su.desc(), WebUser.created_at.asc())
@@ -569,40 +645,142 @@ def create_app(lifespan=None) -> FastAPI:
             "web_users": users,
             "auth_user": _auth,
             "flash": flash or None,
+            "created_info": created_info,
         })
 
     @app.post("/admin/users/create")
     async def admin_users_create(
         request: Request,
-        username: str = Form(...),
-        password: str = Form(...),
+        tg_user_id: str = Form(...),
         _auth: AuthUser = Depends(require_su),
     ):
-        username = username.strip().lower()
-        if username == "su":
-            return RedirectResponse(url="/admin/users?flash=%27su%27+is+reserved", status_code=303)
-        if not username or len(username) < 3 or len(username) > 32:
-            return RedirectResponse(url="/admin/users?flash=Username+must+be+3-32+chars", status_code=303)
-        if len(password) < 6:
-            return RedirectResponse(url="/admin/users?flash=Password+must+be+at+least+6+chars", status_code=303)
+        """v4.4: создаёт веб-админа по Telegram ID.
+
+        Логин = @username из TG (без @, lowercase). Если у юзера нет username — отказ.
+        Пароль автогенерируется, показывается SU один раз через signed-flash в query.
+        Профиль (first_name / last_name / username) берётся из bot.get_chat(user_id).
+        """
+        # ── 1. Валидация TGID ───────────────────────────────────────────
+        tg_raw = (tg_user_id or "").strip()
+        try:
+            tg_id = int(tg_raw)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/users?flash=Telegram+ID+must+be+a+number",
+                status_code=303,
+            )
+        if tg_id <= 0:
+            return RedirectResponse(
+                url="/admin/users?flash=Telegram+ID+must+be+positive",
+                status_code=303,
+            )
+
+        # ── 2. bot должен быть передан (иначе эндпоинт бесполезен) ──────
+        if bot is None:
+            _req_logger.error("admin_users_create: bot is None — create_app called without bot?")
+            return RedirectResponse(
+                url="/admin/users?flash=Bot+instance+not+available",
+                status_code=303,
+            )
+
+        # ── 3. Дёргаем Telegram: bot.get_chat(user_id) ─────────────────
+        # Работает только если юзер уже хоть раз общался с ботом (или бот админ
+        # в чате, где юзер состоит). Иначе — TelegramBadRequest.
+        try:
+            chat = await bot.get_chat(chat_id=tg_id)
+        except Exception as e:
+            _req_logger.warning("admin_users_create: bot.get_chat(%s) failed: %s", tg_id, e)
+            return RedirectResponse(
+                url="/admin/users?flash=Cannot+fetch+user+from+Telegram.+"
+                    "The+user+must+have+interacted+with+the+bot+at+least+once+"
+                    "(sent+%2Fstart+or+any+message).",
+                status_code=303,
+            )
+
+        # ── 4. Извлекаем профиль из Chat объекта ────────────────────────
+        # Для приватных чатов: type='private', first_name, last_name, username.
+        tg_username = getattr(chat, "username", None)
+        tg_first_name = getattr(chat, "first_name", None)
+        tg_last_name = getattr(chat, "last_name", None)
+
+        if not tg_username:
+            return RedirectResponse(
+                url=f"/admin/users?flash=User+{tg_id}+has+no+%40username+in+Telegram.+"
+                    "Cannot+create+login+without+it.",
+                status_code=303,
+            )
+
+        # Логин = @username (без @, lowercase). Telegram usernames: 5-32 chars, [a-zA-Z0-9_].
+        login = tg_username.strip().lstrip("@").lower()
+        # 'su' reserved — проверяем ПЕРВЫМ, чтобы @username='su' (даже если бы такое было
+        # возможно в TG) не падало с ошибкой длины, а давало понятный 'reserved'.
+        if login == "su":
+            return RedirectResponse(
+                url="/admin/users?flash=%27su%27+is+reserved",
+                status_code=303,
+            )
+        if not (5 <= len(login) <= 32):
+            return RedirectResponse(
+                url=f"/admin/users?flash=Telegram+username+%27{login}%27+has+invalid+length+"
+                    f"(must+be+5-32+chars)",
+                status_code=303,
+            )
+
+        # ── 5. Генерируем пароль ────────────────────────────────────────
+        password = _generate_password()
+
+        # ── 6. Сохраняем в БД ───────────────────────────────────────────
         async with async_session() as session:
-            existing = (await session.execute(
-                select(WebUser).where(WebUser.username == username)
+            # Проверка уникальности TGID — ПЕРВОЙ, т.к. SU ввёл именно TGID.
+            # Если TGID уже привязан — нет смысла идти дальше.
+            existing_by_tg = (await session.execute(
+                select(WebUser).where(WebUser.tg_user_id == tg_id)
             )).scalar_one_or_none()
-            if existing:
+            if existing_by_tg:
                 return RedirectResponse(
-                    url=f"/admin/users?flash=User+%27{username}%27+already+exists",
+                    url=f"/admin/users?flash=Telegram+ID+{tg_id}+already+bound+to+"
+                        f"admin+%27{existing_by_tg.username}%27",
                     status_code=303,
                 )
+            # Проверка уникальности логина
+            existing_by_login = (await session.execute(
+                select(WebUser).where(WebUser.username == login)
+            )).scalar_one_or_none()
+            if existing_by_login:
+                return RedirectResponse(
+                    url=f"/admin/users?flash=Admin+with+username+%27{login}%27+already+exists",
+                    status_code=303,
+                )
+
             session.add(WebUser(
-                username=username,
+                username=login,
                 password_hash=_hash_password(password),
                 is_su=False,
                 is_active=True,
                 created_by=_auth.username,
+                tg_user_id=tg_id,
+                tg_first_name=tg_first_name,
+                tg_last_name=tg_last_name,
+                tg_username=login,  # храним без @, lowercase — синхронно с полем username
             ))
             await session.commit()
-        return RedirectResponse(url="/admin/users", status_code=303)
+
+        _req_logger.info(
+            "admin_users_create: created web_user username=%s tg_user_id=%s by=%s",
+            login, tg_id, _auth.username,
+        )
+
+        # ── 7. Signed-flash с паролем для показа один раз ──────────────
+        flash_token = _sign_flash({
+            "u": login,
+            "p": password,
+            "tg": tg_id,
+            "t": int(time.time()),
+        })
+        return RedirectResponse(
+            url=f"/admin/users?created={flash_token}",
+            status_code=303,
+        )
 
     @app.post("/admin/users/{user_id:int}/toggle")
     async def admin_users_toggle(
@@ -628,6 +806,7 @@ def create_app(lifespan=None) -> FastAPI:
         password: str = Form(...),
         _auth: AuthUser = Depends(require_su),
     ):
+        """SU вручную сбрасывает пароль любого админа (кроме SU)."""
         if len(password) < 6:
             return RedirectResponse(url="/admin/users?flash=Password+must+be+at+least+6+chars", status_code=303)
         async with async_session() as session:
@@ -645,6 +824,7 @@ def create_app(lifespan=None) -> FastAPI:
         user_id: int,
         _auth: AuthUser = Depends(require_su),
     ):
+        """Удаляет веб-админа. SU удалить нельзя. Привязка к TGID очищается автоматически."""
         async with async_session() as session:
             wu = (await session.execute(
                 select(WebUser).where(WebUser.id == user_id)
@@ -653,6 +833,75 @@ def create_app(lifespan=None) -> FastAPI:
                 return RedirectResponse(url="/admin/users", status_code=303)
             await session.delete(wu)
             await session.commit()
+        _req_logger.info(
+            "admin_users_delete: deleted web_user id=%s by=%s",
+            user_id, _auth.username,
+        )
         return RedirectResponse(url="/admin/users", status_code=303)
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /me/password — смена своего пароля (v4.4)
+    #  Доступен всем авторизованным, но SU пароль хранится в env — ему форма
+    #  показывает предупреждение и ничего не делает.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/me/password")
+    async def me_change_password(
+        request: Request,
+        old_password: str = Form(...),
+        new_password: str = Form(...),
+        confirm: str = Form(...),
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        # SU пароль в env — менять через /me нельзя.
+        if _auth.is_su:
+            return RedirectResponse(
+                url="/dashboard?pw_msg=SU+password+is+managed+via+WEB_PASSWORD+env+variable",
+                status_code=303,
+            )
+
+        # Валидация
+        if len(new_password) < 6:
+            return RedirectResponse(
+                url="/dashboard?pw_msg=New+password+must+be+at+least+6+chars",
+                status_code=303,
+            )
+        if new_password != confirm:
+            return RedirectResponse(
+                url="/dashboard?pw_msg=New+password+and+confirmation+do+not+match",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.username == _auth.username)
+            )).scalar_one_or_none()
+            if wu is None or not wu.is_active or not wu.password_hash:
+                return RedirectResponse(
+                    url="/dashboard?pw_msg=Account+not+found",
+                    status_code=303,
+                )
+            # Проверяем старый пароль
+            if not _verify_password(old_password, wu.password_hash):
+                return RedirectResponse(
+                    url="/dashboard?pw_msg=Current+password+is+incorrect",
+                    status_code=303,
+                )
+            # Проверяем, что новый пароль отличается от старого
+            if _verify_password(new_password, wu.password_hash):
+                return RedirectResponse(
+                    url="/dashboard?pw_msg=New+password+must+differ+from+current",
+                    status_code=303,
+                )
+            wu.password_hash = _hash_password(new_password)
+            await session.commit()
+
+        _req_logger.info(
+            "me_change_password: user=%s changed own password",
+            _auth.username,
+        )
+        return RedirectResponse(
+            url="/dashboard?pw_msg=Password+changed+successfully",
+            status_code=303,
+        )
 
     return app

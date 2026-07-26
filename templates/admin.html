@@ -10,35 +10,71 @@
     <a href="#list">List</a>
 </div>
 
-{# ── Flash message ───────────────────────────────────────────── #}
+{# ── Flash message (error) ─────────────────────────────────────── #}
 {% if flash %}
 <div style="background: rgba(204,51,51,.1); border: 1px solid var(--danger); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--danger); font-size: 12px;">
     <strong>Error:</strong> {{ flash }}
 </div>
 {% endif %}
 
-{# ── Create new admin ────────────────────────────────────────── #}
-<div id="create" class="section-title">Create admin <a class="anchor" href="#create">#</a></div>
-<div style="max-width: 480px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5);">
+{# ── v4.4: Создание через TGID ────────────────────────────────── #}
+<div id="create" class="section-title">Create admin by Telegram ID <a class="anchor" href="#create">#</a></div>
+<div style="max-width: 560px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5);">
+
+    {% if created_info %}
+    {# ── Зелёный блок с паролем — показывается один раз после создания ── #}
+    <div style="background: rgba(46,160,67,.12); border: 1px solid #2ea043; border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4);">
+        <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #2ea043; font-weight: 700; margin-bottom: var(--sp-2);">
+            ⚠ Admin created — save credentials now
+        </div>
+        <div style="font-size: 12px; color: var(--text-dim); margin-bottom: var(--sp-3);">
+            This password is shown <strong>only once</strong>. Copy it and pass to the user via a secure channel. The password is stored as a PBKDF2 hash — it cannot be recovered.
+        </div>
+        <table class="profile-table" style="margin-bottom: 0;">
+            <tr>
+                <td style="width: 110px;">Login</td>
+                <td><code style="font-family: var(--font-mono); color: var(--accent); font-size: 13px;">{{ created_info.username }}</code></td>
+            </tr>
+            {% if created_info.tg_user_id %}
+            <tr>
+                <td>Telegram ID</td>
+                <td><code style="font-family: var(--font-mono); font-size: 12px;">{{ created_info.tg_user_id }}</code></td>
+            </tr>
+            {% endif %}
+            <tr>
+                <td>Password</td>
+                <td>
+                    <code id="genpw" style="font-family: var(--font-mono); color: var(--accent); font-size: 14px; font-weight: 700; letter-spacing: 0.5px; user-select: all;">{{ created_info.password }}</code>
+                    <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('genpw').innerText); this.innerText='✓ copied';"
+                            style="margin-left: 8px; padding: 2px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs);">
+                        copy
+                    </button>
+                </td>
+            </tr>
+        </table>
+        <div style="margin-top: var(--sp-3); font-size: 11px; color: var(--text-dim);">
+            The user can change this password themselves via the <em>Change my password</em> block on the dashboard.
+        </div>
+    </div>
+    {% endif %}
+
     <form method="post" action="/admin/users/create">
         <div style="margin-bottom: var(--sp-4);">
-            <label for="username" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Username</label>
-            <input type="text" id="username" name="username" required minlength="3" maxlength="32"
-                   pattern="[a-zA-Z0-9_\-]+" placeholder="moderator1"
+            <label for="tg_user_id" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Telegram ID</label>
+            <input type="text" id="tg_user_id" name="tg_user_id" required
+                   pattern="[0-9]+" placeholder="123456789"
                    style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
                    autocomplete="off">
-            <small style="display: block; margin-top: 4px; color: var(--text-dim); font-size: 10px;">3–32 chars: a-z, 0-9, _ or -</small>
-        </div>
-        <div style="margin-bottom: var(--sp-4);">
-            <label for="password" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Password</label>
-            <input type="password" id="password" name="password" required minlength="6"
-                   placeholder="at least 6 chars"
-                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
-                   autocomplete="new-password">
+            <small style="display: block; margin-top: 4px; color: var(--text-dim); font-size: 10px;">
+                Numeric Telegram user ID. The user must have sent at least one message to the bot
+                (e.g. <code>/start</code>) — otherwise their profile cannot be fetched.
+                Login = <code>@username</code> from Telegram (the user must have one).
+                Password is auto-generated and shown above after creation.
+            </small>
         </div>
         <button type="submit"
                 style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s;">
-            Create
+            Create admin
         </button>
     </form>
 </div>
@@ -50,7 +86,8 @@
     <thead>
         <tr>
             <th>#</th>
-            <th>Username</th>
+            <th>Login</th>
+            <th>Telegram</th>
             <th>Role</th>
             <th>Status</th>
             <th>Created by</th>
@@ -66,6 +103,22 @@
             <td>
                 <strong>{{ wu.username }}</strong>
                 {% if wu.is_su %}<span class="badge badge-active" style="margin-left: 6px;">SU</span>{% endif %}
+            </td>
+            <td>
+                {% if wu.tg_user_id %}
+                    <div style="font-size: 11px;">
+                        {% if wu.tg_first_name or wu.tg_last_name %}
+                            <span>{{ wu.tg_first_name }}{% if wu.tg_last_name %} {{ wu.tg_last_name }}{% endif %}</span>
+                        {% endif %}
+                        {% if wu.tg_username %}
+                            <a href="https://t.me/{{ wu.tg_username }}" target="_blank" rel="noopener"
+                               style="color: var(--accent); text-decoration: none; margin-left: 4px;">@{{ wu.tg_username }}</a>
+                        {% endif %}
+                    </div>
+                    <div class="dim" style="font-size: 10px; font-family: var(--font-mono);">{{ wu.tg_user_id }}</div>
+                {% else %}
+                    <span class="dim">—</span>
+                {% endif %}
             </td>
             <td>
                 {% if wu.is_su %}
@@ -99,7 +152,7 @@
                         Reset pw
                     </button>
                     <form method="post" action="/admin/users/{{ wu.id }}/delete" style="display: inline; margin-left: 4px;"
-                          onsubmit="return confirm('Delete admin {{ wu.username }}?');">
+                          onsubmit="return confirm('Delete admin {{ wu.username }}? This removes their web-panel access. Their Telegram ID will be unbound and can be reused.');">
                         <button type="submit"
                                 style="background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                             Delete
@@ -110,7 +163,7 @@
         </tr>
         {% if not wu.is_su %}
         <tr id="reset-{{ wu.id }}" style="display: none; background: var(--bg3);">
-            <td colspan="8" style="padding: var(--sp-3) var(--sp-4);">
+            <td colspan="9" style="padding: var(--sp-3) var(--sp-4);">
                 <form method="post" action="/admin/users/{{ wu.id }}/reset" style="display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap;">
                     <strong style="color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: var(--sp-2);">New password:</strong>
                     <input type="password" name="password" required minlength="6" placeholder="at least 6 chars"
@@ -129,7 +182,7 @@
         {% endif %}
         {% endfor %}
         {% if not web_users %}
-        <tr class="empty-row"><td colspan="8">No admins found</td></tr>
+        <tr class="empty-row"><td colspan="9">No admins found</td></tr>
         {% endif %}
     </tbody>
 </table>

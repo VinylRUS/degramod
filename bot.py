@@ -164,7 +164,9 @@ async def lifespan(app):
 
 
 # ── Создаём приложение с lifespan ──────────────────────────────────────────
-app = create_app(lifespan=lifespan)
+# v4.4: передаём bot в web_app, чтобы эндпоинт /admin/users/create мог дёргать
+# bot.get_chat(user_id) для получения профиля из Telegram по TGID.
+app = create_app(lifespan=lifespan, bot=bot)
 
 
 # ── Webhook endpoint — Telegram шлёт сюда обновления ───────────────────────
