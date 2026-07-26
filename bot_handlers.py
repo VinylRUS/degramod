@@ -3,7 +3,10 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
 
 ★★★ СТЕЛС-РЕЖИМ: бот НЕ реагирует ни на какие команды от обычных юзеров.
 Ни /start, ни /help, ни любые другие — молча игнорируются.
-Только ADMIN_IDS и ChatAdmin могут использовать команды. ★★★
+Только ADMIN_IDS и ChatAdmin могут использовать команды.
+Нарушитель НИКОГДА не получает уведомлений от бота — он не должен
+догадываться о его существовании. Эphemeral-подтверждения получают
+только модераторы (видны только им в группе, через receiver_user_id). ★★★
 
 Команды в группах (reply на сообщение нарушителя):
   !mute <1d/2h/30m> <причина>  — замьютить (полный мьют — все виды отправки)
@@ -17,7 +20,7 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
   /addadmin chat_id user_id      — добавить админа в чат
   /deladmin chat_id user_id      — убрать админа
   /sethashtag chat_id #хэштег   — установить хэштег чата
-  /setreport chat_id report_chat_id — задать чат для отчётов (0 = сбросить, использовать env)
+  /setreport chat_id report_chat_id — задать чат для отчётов (0 = сбросить, использовать default)
   /warns_mute chat_id число      — варнов до авто-мьюта (0 = выкл)
   /warns_ban chat_id число       — варнов до авто-бана (0 = выкл)
   /mute_duration chat_id 1d/2h/30m — длительность мьюта
@@ -27,17 +30,34 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import re
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional
 
 from aiogram import Router, types, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import FSInputFile
+from aiogram.types import (
+    InputRichMessage,
+    InputRichBlockSectionHeading,
+    InputRichBlockParagraph,
+    InputRichBlockBlockQuotation,
+    InputRichBlockDetails,
+    InputRichBlockFooter,
+    InputRichBlockPhoto,
+    InputRichBlockVideo,
+    InputRichBlockAnimation,
+    InputRichBlockAudio,
+    InputRichBlockVoiceNote,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaAnimation,
+    InputMediaAudio,
+    InputMediaVoiceNote,
+)
 from sqlalchemy import select, desc, func
 
 from db import async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings
@@ -49,8 +69,6 @@ router = Router()
 # ── Конфигурация из окружения ──────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip()}
-
-REPORT_CHAT_ID = int(os.getenv("REPORT_CHAT_ID", "0"))  # ID чата для отчётов (0 = выкл)
 
 # Жёсткая привязка chat_id → хэштег (можно переопределить через /sethashtag)
 _CHAT_HASHTAGS: dict[int, str] = {}
@@ -162,6 +180,20 @@ def _restore_permissions(snapshot_json: str) -> types.ChatPermissions:
     return types.ChatPermissions(**{k: data.get(k, False) for k in _PERM_FIELDS})
 
 
+def _user_mention_html(user: types.User) -> str:
+    """Возвращает HTML-mention юзера для модераторских уведомлений.
+
+    Имя экранируется от HTML-инъекций, ссылка ведёт на профиль юзера
+    (``tg://user?id=...``) — модератор может кликнуть и открыть профиль.
+    """
+    name = (user.first_name or "") + (
+        f" {user.last_name}" if user.last_name else ""
+    )
+    name = name.strip() or f"id:{user.id}"
+    name = html.escape(name, quote=False)
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
+
+
 # ── Helpers: получение/сохранение настроек чата ────────────────────────────
 async def _get_chat_settings(session, chat_id: int) -> ChatSettings:
     """Возвращает настройки чата, создаёт с дефолтами если нет."""
@@ -242,6 +274,13 @@ async def _save_punishment(session, user_id: int, mod_id: int,
                            message_text: str | None,
                            permissions_snapshot: str | None = None,
                            report_message_id: int | None = None) -> Punishment:
+    """Сохраняет запись о санкции в БД.
+
+    Параметр ``report_message_id`` оставлен для обратной совместимости
+    (soft-deprecated). После перехода на Rich Messages медиа встраивается
+    инлайн в rich-сообщение, и отдельный message_id пересылки не нужен.
+    Колонка в DB сохраняется для старых записей, новые не пишут.
+    """
     punishment = Punishment(
         user_id=user_id,
         mod_id=mod_id,
@@ -251,7 +290,7 @@ async def _save_punishment(session, user_id: int, mod_id: int,
         reason=reason,
         message_text=message_text,
         permissions_snapshot=permissions_snapshot,
-        report_message_id=report_message_id,
+        # report_message_id больше не записываем — soft-deprecated
     )
     session.add(punishment)
     await session.commit()
@@ -289,21 +328,59 @@ async def _count_warns(session, user_id: int, chat_id: int) -> int:
     return int(result.scalar() or 0)
 
 
-# ── Отправка отчёта в чат ──────────────────────────────────────────────────
-def _has_media(msg: types.Message) -> bool:
-    """Проверяет, содержит ли сообщение медиа-контент (не только текст)."""
-    return bool(msg.photo or msg.video or msg.animation or msg.sticker
-               or msg.voice or msg.audio or msg.document or msg.video_note)
+# ── Отправка отчёта в чат (Rich Messages, Bot API 10.2) ─────────────────────
+
+# Карта типов медиа → фабрика inline-блока для Rich Message.
+# Стикеры, документы, кружки (video_note), контакты, локации, опросы —
+# НЕ имеют соответствующего RichBlock-типа, поэтому для них inline-блок
+# не строится (контент просто показывается текстом в BlockQuotation).
+def _build_media_block(msg: types.Message):
+    """Возвращает InputRichBlock* для inline-медиа или None.
+
+    Поддерживаются: photo, video, animation, audio, voice.
+    Стикеры/документы/кружки — без inline-блока (только текст в blockquote).
+    """
+    try:
+        if msg.photo:
+            # photo — список PhotoSize, берём последний (самый большой)
+            file_id = msg.photo[-1].file_id
+            return InputRichBlockPhoto(photo=InputMediaPhoto(media=file_id))
+        if msg.video:
+            return InputRichBlockVideo(video=InputMediaVideo(media=msg.video.file_id))
+        if msg.animation:
+            return InputRichBlockAnimation(
+                animation=InputMediaAnimation(media=msg.animation.file_id)
+            )
+        if msg.audio:
+            return InputRichBlockAudio(audio=InputMediaAudio(media=msg.audio.file_id))
+        if msg.voice:
+            return InputRichBlockVoiceNote(
+                voice_note=InputMediaVoiceNote(media=msg.voice.file_id)
+            )
+    except Exception as e:
+        logger.warning("Could not build media block: %s", e)
+    return None
 
 
 async def _get_report_chat_id(session, chat_id: int) -> int | None:
-    """Возвращает ID чата для отчётов: из ChatSettings.report_chat_id или из env."""
+    """Возвращает ID чата для отчётов.
+
+    Приоритет:
+      1. Per-chat override (ChatSettings.report_chat_id для данного chat_id)
+      2. Глобальный default (ChatSettings.report_chat_id для chat_id=0)
+      3. None (отчёты отключены)
+    """
+    # 1. Per-chat override
     settings = await _get_chat_settings(session, chat_id)
     if settings.report_chat_id is not None and settings.report_chat_id != 0:
         return settings.report_chat_id
-    # Fallback на env-переменную
-    if REPORT_CHAT_ID:
-        return REPORT_CHAT_ID
+
+    # 2. Глобальный default (chat_id=0)
+    default_settings = await _get_chat_settings(session, 0)
+    if default_settings.report_chat_id is not None and default_settings.report_chat_id != 0:
+        return default_settings.report_chat_id
+
+    # 3. Disabled
     return None
 
 
@@ -316,94 +393,39 @@ async def _send_report(
     warn_points: int | None = None,
     duration_seconds: int | None = None,
     reply_to_message: types.Message | None = None,
-) -> int | None:
-    """Отправляет форматированный отчёт о санкции в репорт-чат.
+) -> None:
+    """Отправляет Rich-отчёт о санкции в репорт-чат (Bot API 10.2).
 
-    Использует ChatSettings.report_chat_id для конкретного чата,
-    или fallback на env REPORT_CHAT_ID.
+    Приоритет репорт-чата: per-chat override → default (chat_id=0) → disabled.
+    Если репорт-чат не задан — молча ничего не делает.
 
-    Если reply_to_message содержит текст — он прикладывается к отчёту.
-    Если содержит медиа — сообщение пересылается в канал отчётов,
-    а ID пересланного сообщения возвращается для ссылки в веб-панели.
+    Структура Rich-сообщения:
+      1. SectionHeading — 🔇 МУТ / 🚫 БАН / ⚠️ ВАРН / 🔊 РАЗМУТ
+      2. Paragraph      — Нарушитель (имя @username, ID)
+      3. Paragraph      — Причина (если есть)
+      4. BlockQuotation — Текст/caption сообщения нарушителя
+      5. Photo/Video/…  — Inline-медиа (вместо forward_message)
+      6. Details        — Доп. инфо (chat_id, длительность, варны всего) — сворачиваемо
+      7. Footer         — Время МСК + хэштег чата
 
-    Returns: report_message_id (int) если медиа было переслано, иначе None.
-              Возвращает (int, int) tuple (report_chat_id, report_message_id) в interna,
-              но для совместимости старых вызовов — только report_message_id.
+    Returns: None (медиа теперь inline в rich message, report_message_id больше не нужен).
     """
-    # ── Определяем репорт-чат для данного чата ──────────────────────────
+    # ── Определяем репорт-чат ──────────────────────────────────
     async with async_session() as session:
         report_dest = await _get_report_chat_id(session, chat_id)
 
     if not report_dest:
         return None
 
-    report_msg_id: int | None = None
-
-    # ── Пересылка медиа-контента в канал отчётов ─────────────────────────
-    if reply_to_message and _has_media(reply_to_message):
-        try:
-            forwarded = await bot.forward_message(
-                chat_id=report_dest,
-                from_chat_id=reply_to_message.chat.id,
-                message_id=reply_to_message.message_id,
-            )
-            report_msg_id = forwarded.message_id
-        except TelegramBadRequest as e:
-            logger.error("Failed to forward media to report chat %s: %s", report_dest, e)
-
+    # ── Хэштег чата + счётчик варнов (один запрос в БД) ────────
     async with async_session() as session:
         settings = await _get_chat_settings(session, chat_id)
         hashtag = settings.hashtag or ""
-
-    # Формируем хэштег
-    tag_line = f"{hashtag}\n" if hashtag else ""
-
-    # Имя и ник
-    full_name = target.first_name or ""
-    if target.last_name:
-        full_name += f" {target.last_name}"
-    name_line = f"👤 {full_name}\n" if full_name else ""
-
-    username_line = ""
-    if target.username:
-        username_line = f"@{target.username}\n"
-
-    # Причина
-    reason_line = ""
-    if reason:
-        reason_line = f"📝 Причина: {reason}\n"
-
-    # ── Контент пересланного сообщения ────────────────────────────────────
-    content_line = ""
-    if reply_to_message:
-        if reply_to_message.text:
-            # Обрезаем длинный текст, чтобы не выйти за лимит Telegram
-            txt = reply_to_message.text
-            if len(txt) > 800:
-                txt = txt[:800] + "..."
-            content_line = f"💬 Сообщение:\n{txt}\n"
-        elif reply_to_message.caption:
-            txt = reply_to_message.caption
-            if len(txt) > 800:
-                txt = txt[:800] + "..."
-            content_line = f"💬 Описание:\n{txt}\n"
-
-        # Медиа — ссылка на пересланное сообщение
-        if _has_media(reply_to_message) and report_msg_id is not None:
-            content_line += f"📎 Медиа: см. пересланное сообщение в канале отчётов\n"
-
-    # Варны
-    warn_line = ""
-    if action_type == "warn" and warn_points is not None:
-        async with async_session() as session:
+        total_warns: int | None = None
+        if action_type == "warn" and warn_points is not None:
             total_warns = await _count_warns(session, target.id, chat_id)
-        warn_line = f"⚠️ Варнов: {total_warns}\n"
 
-    # Время (МСК)
-    now_msk = datetime.now(MSK)
-    time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
-
-    # Заголовок действия
+    # ── Заголовок действия ─────────────────────────────────────
     action_labels = {
         "mute": "🔇 МУТ",
         "ban": "🚫 БАН",
@@ -412,33 +434,167 @@ async def _send_report(
     }
     action_label = action_labels.get(action_type, action_type.upper())
 
-    # Длительность
-    duration_line = ""
-    if duration_seconds:
-        duration_line = f"⏱ Длительность: {_format_duration(duration_seconds)}\n"
+    # ── Нарушитель ─────────────────────────────────────────────
+    full_name = (target.first_name or "") + (
+        f" {target.last_name}" if target.last_name else ""
+    )
+    offender_lines: list[str] = []
+    if full_name:
+        offender_lines.append(f"👤 {full_name}")
+    else:
+        offender_lines.append("👤 (без имени)")
+    if target.username:
+        offender_lines.append(f"   @{target.username}")
+    offender_lines.append(f"   ID: {target.id}")
+    offender_text = "\n".join(offender_lines)
 
-    # Собираем сообщение
-    report = (
-        f"{tag_line}"
-        f"{action_label}\n"
-        f"{name_line}"
-        f"{username_line}"
-        f"{reason_line}"
-        f"{content_line}"
-        f"{warn_line}"
-        f"{duration_line}"
-        f"🕐 {time_str}"
+    # ── Контент нарушителя ─────────────────────────────────────
+    text_content: str | None = None
+    media_block = None
+    if reply_to_message is not None:
+        text_content = reply_to_message.text or reply_to_message.caption
+        # Если есть только caption без отдельного текста — это и есть контент
+        media_block = _build_media_block(reply_to_message)
+        # Для медиа-типов без inline-блока (стикер/документ/кружок) добавим
+        # текстовое описание, чтобы было что показать
+        if media_block is None and text_content is None:
+            desc = _get_message_content_desc(reply_to_message)
+            if desc:
+                text_content = desc
+
+    # ── Список блоков ──────────────────────────────────────────
+    blocks: list = []
+    blocks.append(InputRichBlockSectionHeading(text=action_label, size=2))
+    blocks.append(InputRichBlockParagraph(text=offender_text))
+
+    if reason:
+        blocks.append(InputRichBlockParagraph(text=f"📝 Причина: {reason}"))
+
+    if text_content:
+        # BlockQuotation содержит вложенные блоки (paragraph)
+        blocks.append(
+            InputRichBlockBlockQuotation(
+                blocks=[InputRichBlockParagraph(text=text_content)]
+            )
+        )
+
+    if media_block is not None:
+        blocks.append(media_block)
+
+    # ── Details: доп. инфо (сворачиваемое) ─────────────────────
+    details_lines: list[str] = [f"Чат: {chat_id}"]
+    if duration_seconds:
+        details_lines.append(f"Длительность: {_format_duration(duration_seconds)}")
+    if total_warns is not None:
+        details_lines.append(f"Варнов всего: {total_warns}")
+    blocks.append(
+        InputRichBlockDetails(
+            summary="Доп. инфо",
+            blocks=[InputRichBlockParagraph(text="\n".join(details_lines))],
+        )
     )
 
+    # ── Footer: время МСК + хэштег ─────────────────────────────
+    now_msk = datetime.now(MSK)
+    time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+    footer_text = f"🕐 {time_str}"
+    if hashtag:
+        footer_text += f" | {hashtag}"
+    blocks.append(InputRichBlockFooter(text=footer_text))
+
+    rich_msg = InputRichMessage(blocks=blocks)
+
+    try:
+        await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
+    except TelegramBadRequest as e:
+        logger.error("Failed to send rich report to chat %s: %s", report_dest, e)
+        # ── Fallback: простой plain-text отчёт ──────────────
+        try:
+            await _send_report_plain_fallback(
+                bot=bot,
+                report_dest=report_dest,
+                action_label=action_label,
+                offender_text=offender_text,
+                reason=reason,
+                text_content=text_content,
+                duration_seconds=duration_seconds,
+                total_warns=total_warns,
+                time_str=time_str,
+                hashtag=hashtag,
+            )
+        except TelegramBadRequest as e2:
+            logger.error("Plain-text fallback also failed: %s", e2)
+
+    return None
+
+
+async def _send_report_plain_fallback(
+    *,
+    bot: types.Bot,
+    report_dest: int,
+    action_label: str,
+    offender_text: str,
+    reason: str | None,
+    text_content: str | None,
+    duration_seconds: int | None,
+    total_warns: int | None,
+    time_str: str,
+    hashtag: str,
+) -> None:
+    """Резервный plain-text отчёт, если Rich Message не удалась."""
+    parts: list[str] = []
+    if hashtag:
+        parts.append(hashtag)
+    parts.append(action_label)
+    parts.append("")
+    parts.append(offender_text)
+    if reason:
+        parts.append(f"📝 Причина: {reason}")
+    if text_content:
+        parts.append(f"💬 Контент: {text_content[:500]}")
+    if duration_seconds:
+        parts.append(f"⏱ Длительность: {_format_duration(duration_seconds)}")
+    if total_warns is not None:
+        parts.append(f"⚠️ Варнов всего: {total_warns}")
+    parts.append(f"🕐 {time_str}")
+    await bot.send_message(chat_id=report_dest, text="\n".join(parts))
+
+
+async def _send_ephemeral(
+    *,
+    bot: types.Bot,
+    chat_id: int,
+    recipient: types.User,
+    text: str,
+) -> None:
+    """Отправляет ephemeral-сообщение модератору в группе (Bot API 10.2).
+
+    Сообщение видно ТОЛЬКО указанному юзеру (``receiver_user_id``) —
+    остальные участники чата (включая нарушителя) его не видят. Используется
+    для подтверждений модератору при !warn, !mute, !ban, !unmute, чтобы
+    модератор точно видел, кого он только что наказал/размьютил.
+
+    Стелс-режим бота при этом сохраняется: нарушитель не получает никаких
+    уведомлений и не догадывается о существовании бота.
+
+    Если отправка не удалась (модератор заблокировал бота или ограничил
+    ephemeral-сообщения) — тихо логируем и продолжаем.
+    """
     try:
         await bot.send_message(
-            chat_id=report_dest,
-            text=report.strip(),
+            chat_id=chat_id,
+            text=text,
+            receiver_user_id=recipient.id,
+            parse_mode="HTML",
         )
     except TelegramBadRequest as e:
-        logger.error("Failed to send report to chat %s: %s", report_dest, e)
-
-    return report_msg_id
+        logger.info(
+            "Ephemeral message to moderator %s in chat %s failed: %s "
+            "(this is normal if user restricted ephemeral messages)",
+            recipient.id, chat_id, e,
+        )
+    except Exception as e:
+        logger.warning("Ephemeral message unexpected error: %s", e)
 
 
 # ── Авто-санкция при превышении порога варнов ──────────────────────────────
@@ -477,6 +633,15 @@ async def _check_warn_threshold(
                                    f"Автобан: {total_warns} варнов")
                 logger.info("Auto-ban triggered for user %s in chat %s (%d warns)",
                             target.id, chat_id, total_warns)
+                # ── Ephemeral-уведомление модератору (видно только ему) ────
+                # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+                await _send_ephemeral(
+                    bot=bot, chat_id=chat_id, recipient=mod,
+                    text=(
+                        f"🤖 Автобан: {_user_mention_html(target)} "
+                        f"({total_warns} варнов)."
+                    ),
+                )
             except TelegramBadRequest as e:
                 logger.error("Auto-ban failed: %s", e)
             return
@@ -513,6 +678,15 @@ async def _check_warn_threshold(
                                    duration_seconds=mute_dur)
                 logger.info("Auto-mute triggered for user %s in chat %s (%d warns, %s)",
                             target.id, chat_id, total_warns, _format_duration(mute_dur))
+                # ── Ephemeral-уведомление модератору (видно только ему) ────
+                # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+                await _send_ephemeral(
+                    bot=bot, chat_id=chat_id, recipient=mod,
+                    text=(
+                        f"🤖 Автомьют: {_user_mention_html(target)} "
+                        f"({total_warns} варнов, {_format_duration(mute_dur)})."
+                    ),
+                )
             except TelegramBadRequest as e:
                 logger.error("Auto-mute failed: %s", e)
 
@@ -622,7 +796,7 @@ async def handle_group_command(message: types.Message) -> None:
                 pass
             return
 
-        report_msg_id = await _send_report(
+        await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="mute", reason=reason,
             duration_seconds=duration_seconds,
@@ -637,8 +811,20 @@ async def handle_group_command(message: types.Message) -> None:
                 session, target.id, mod.id, chat_id,
                 "mute", duration_seconds, reason, target_content,
                 permissions_snapshot=perm_snapshot,
-                report_message_id=report_msg_id,
             )
+
+        # ── Ephemeral-подтверждение модератору (видно только ему) ────
+        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+        reason_safe = html.escape(reason, quote=False) if reason and reason != "(без причины)" else ""
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=(
+                f"✅ Замьютил {_user_mention_html(target)} на "
+                f"{_format_duration(duration_seconds)}"
+                + (f" за: {reason_safe}" if reason_safe else "")
+                + "."
+            ),
+        )
 
         return
 
@@ -646,12 +832,9 @@ async def handle_group_command(message: types.Message) -> None:
     m = _CMD_WARN.match(text)
     if m:
         reason = m.group(1)
-        report_msg_id = await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="warn", reason=reason, warn_points=1,
-            reply_to_message=message.reply_to_message,
-        )
 
+        # Сначала сохраняем наказание — тогда _count_warns внутри _send_report
+        # и здесь будет учитывать только что выданный варн.
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
@@ -659,10 +842,29 @@ async def handle_group_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "warn", 1, reason, target_content,
-                report_message_id=report_msg_id,
             )
+            total_warns_now = await _count_warns(session, target.id, chat_id)
 
-        # Проверяем порог варнов
+        # Теперь отчёт — в нём будет правильный счётчик варнов
+        await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="warn", reason=reason, warn_points=1,
+            reply_to_message=message.reply_to_message,
+        )
+
+        # ── Ephemeral-подтверждение модератору (видно только ему) ────
+        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+        reason_safe = html.escape(reason, quote=False) if reason else ""
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=(
+                f"✅ Варн выдан {_user_mention_html(target)}"
+                + (f" за: {reason_safe}" if reason_safe else "")
+                + f". Варнов всего: {total_warns_now}"
+            ),
+        )
+
+        # Проверяем порог варнов (тоже использует обновлённый счётчик)
         await _check_warn_threshold(
             bot=message.bot, chat_id=chat_id,
             target=target, mod=mod,
@@ -694,7 +896,7 @@ async def handle_group_command(message: types.Message) -> None:
                 pass
             return
 
-        report_msg_id = await _send_report(
+        await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="ban", reason=reason,
             reply_to_message=message.reply_to_message,
@@ -708,8 +910,19 @@ async def handle_group_command(message: types.Message) -> None:
                 session, target.id, mod.id, chat_id,
                 "ban", None, reason, target_content,
                 permissions_snapshot=perm_snapshot,
-                report_message_id=report_msg_id,
             )
+
+        # ── Ephemeral-подтверждение модератору (видно только ему) ────
+        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+        reason_safe = html.escape(reason, quote=False) if reason else ""
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=(
+                f"✅ Забанен {_user_mention_html(target)}"
+                + (f" за: {reason_safe}" if reason_safe else "")
+                + "."
+            ),
+        )
 
         return
 
@@ -745,7 +958,7 @@ async def handle_group_command(message: types.Message) -> None:
                 pass
             return
 
-        report_msg_id = await _send_report(
+        await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="unmute",
             reply_to_message=message.reply_to_message,
@@ -758,8 +971,14 @@ async def handle_group_command(message: types.Message) -> None:
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "unmute", None, None, target_content,
-                report_message_id=report_msg_id,
             )
+
+        # ── Ephemeral-подтверждение модератору (видно только ему) ────
+        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=f"✅ Размьючен {_user_mention_html(target)}.",
+        )
 
         return
 
@@ -1036,34 +1255,58 @@ async def cmd_mute_duration(message: types.Message) -> None:
 
 @router.message(F.chat.type == "private", Command("setreport"))
 async def cmd_setreport(message: types.Message) -> None:
-    """Задает чат для отчётов. Формат: /setreport <chat_id> <report_chat_id>
-    0 = сбросить, использовать env REPORT_CHAT_ID"""
+    """Задает чат для отчётов.
+
+    Форматы:
+      /setreport default <report_chat_id> — глобальный для ВСЕХ чатов
+      /setreport <chat_id> <report_chat_id> — индивидуально для чата
+      /setreport default 0 — сбросить глобальный (отчёты отключены)
+      /setreport <chat_id> 0 — сбросить индивидуальный (fallback на default)
+    """
     if message.from_user.id not in ADMIN_IDS:
         return
 
     parts = message.text.split()
     if len(parts) < 3:
         await message.reply(
-            "📋 Формат: /setreport chat_id report_chat_id\n💡 0 = сбросить (использовать env REPORT_CHAT_ID)",
+            "📋 Форматы:\n"
+            "  /setreport default report_chat_id — для ВСЕХ чатов\n"
+            "  /setreport chat_id report_chat_id — для конкретного чата\n"
+            "  0 = сбросить (default fallback или отключить)",
             parse_mode=None,
         )
         return
 
+    arg1 = parts[1]
+    arg2 = parts[2]
+
+    # Определяем: default или конкретный chat_id
+    is_default = arg1.lower() in ("default", "все", "all")
+    if is_default:
+        target_chat_id = 0  # Специальный ID — глобальный default
+    else:
+        try:
+            target_chat_id = int(arg1)
+        except ValueError:
+            await message.reply("❌ chat_id должен быть числом или 'default'", parse_mode=None)
+            return
+
     try:
-        chat_id = int(parts[1])
-        report_chat_id = int(parts[2])
+        report_chat_id = int(arg2)
     except ValueError:
-        await message.reply("❌ chat_id и report_chat_id должны быть числами")
+        await message.reply("❌ report_chat_id должен быть числом", parse_mode=None)
         return
 
     async with async_session() as session:
-        settings = await _get_chat_settings(session, chat_id)
+        settings = await _get_chat_settings(session, target_chat_id)
         if report_chat_id == 0:
-            # Сброс — вернуть к env-значению
+            # Сброс
             settings.report_chat_id = None
             await session.commit()
-            env_info = f" (из env: {REPORT_CHAT_ID})" if REPORT_CHAT_ID else " (env не задан)"
-            await message.reply(f"✅ Репорт-чат для {chat_id} сброшен{env_info}")
+            if is_default:
+                await message.reply("✅ Глобальный репорт-чат сброшен (отчёты отключены)", parse_mode=None)
+            else:
+                await message.reply(f"✅ Репорт-чат для {target_chat_id} сброшен → fallback на default", parse_mode=None)
         else:
             # Проверяем, что бот может достучаться до указанного чата
             try:
@@ -1079,7 +1322,8 @@ async def cmd_setreport(message: types.Message) -> None:
 
             settings.report_chat_id = report_chat_id
             await session.commit()
-            await message.reply(f"✅ Репорт-чат для {chat_id}: {report_chat_id}")
+            scope = "глобальный (для всех чатов)" if is_default else f"для чата {target_chat_id}"
+            await message.reply(f"✅ Репорт-чат ({scope}): {report_chat_id}", parse_mode=None)
 
 
 @router.message(F.chat.type == "private", Command("settings"))
@@ -1104,7 +1348,7 @@ async def cmd_settings(message: types.Message) -> None:
         admins = await _get_chat_admins(session, chat_id)
 
     hashtag = settings.hashtag or "(не задан)"
-    report_chat_str = f"<code>{settings.report_chat_id}</code>" if settings.report_chat_id else "(из env)"
+    report_chat_str = f"<code>{settings.report_chat_id}</code>" if settings.report_chat_id else "(не задан — fallback на default)"
     warns_mute = f"{settings.warns_to_mute} варнов" if settings.warns_to_mute > 0 else "отключён"
     warns_ban = f"{settings.warns_to_ban} варнов" if settings.warns_to_ban > 0 else "отключён"
     mute_dur = _format_duration(settings.mute_duration_seconds or 3600)
@@ -1152,7 +1396,7 @@ async def cmd_help(message: types.Message) -> None:
         "  /warns_mute chat_id число — варнов до мьюта\n"
         "  /warns_ban chat_id число — варнов до бана\n"
         "  /mute_duration chat_id 1d2h — длительность мьюта\n"
-        "  /setreport chat_id report_chat_id — чат для отчётов (0 = env)\n"
+        "  /setreport chat_id report_chat_id — чат для отчётов (0 = сбросить)\n"
         "  /settings chat_id — показать настройки\n"
     )
     await message.reply(text, parse_mode="HTML")

@@ -18,9 +18,10 @@ import uvicorn
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from sqlalchemy import select
 
 from bot_handlers import router as mod_router
-from db import init_db
+from db import init_db, async_session, ChatSettings
 from web_app import create_app
 
 logging.basicConfig(
@@ -93,22 +94,31 @@ async def lifespan(app):
     except Exception as e:
         logger.warning("delete_my_commands failed: %s", e)
 
-    # ── Проверяем доступ к каналу отчётов ──────────────────────
-    _report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
-    if _report_chat_id:
+    # ── Проверяем глобальный default репорт-чат из DB (chat_id=0) ──
+    try:
+        async with async_session() as _sess:
+            _default_cs = (await _sess.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == 0)
+            )).scalar_one_or_none()
+        _default_rc = _default_cs.report_chat_id if _default_cs else None
+    except Exception as _e:
+        logger.warning("Could not read default report_chat_id from DB: %s", _e)
+        _default_rc = None
+
+    if _default_rc:
         try:
-            chat_info = await bot.get_chat(chat_id=_report_chat_id)
-            logger.info("Report chat (env default) OK: id=%s title='%s' type='%s'",
+            chat_info = await bot.get_chat(chat_id=_default_rc)
+            logger.info("Default report chat (DB chat_id=0) OK: id=%s title='%s' type='%s'",
                         chat_info.id, chat_info.title or "", chat_info.type)
         except Exception as e:
             logger.error(
-                "⚠️ REPORT_CHAT_ID=%s is NOT accessible: %s\n"
+                "⚠️ Default report_chat_id=%s (DB chat_id=0) is NOT accessible: %s\n"
                 "   Make sure the bot is added as admin to the report channel/group!\n"
                 "   Per-chat overrides can be set via /setreport command.",
-                _report_chat_id, e,
+                _default_rc, e,
             )
     else:
-        logger.warning("REPORT_CHAT_ID not set in env — per-chat overrides via /setreport are still available")
+        logger.warning("Default report_chat_id not set in DB — set via /setreport default <chat_id>")
 
     # Пробуем установить вебхук
     if WEBHOOK_URL:

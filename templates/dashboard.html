@@ -80,6 +80,71 @@
 </div>
 </div>
 
+{# ── Настройки чатов: per-chat + default report_chat_id ─────── #}
+<div class="section-title">Chat settings</div>
+<table>
+    <thead>
+        <tr>
+            <th>Chat ID</th>
+            <th>Scope</th>
+            <th>Hashtag</th>
+            <th>Report chat</th>
+            <th>Warns → mute</th>
+            <th>Warns → ban</th>
+            <th>Mute duration</th>
+        </tr>
+    </thead>
+    <tbody>
+        {# Сначала глобальный default (chat_id=0) ── всегда первая строка #}
+        <tr style="background: var(--bg3);">
+            <td><span class="dim">default</span></td>
+            <td><span class="badge" style="color: var(--accent); border-color: var(--accent); background: rgba(0,204,102,.1);">GLOBAL</span></td>
+            <td class="dim">—</td>
+            <td>
+                {% if default_report_chat_id %}
+                    <code>{{ default_report_chat_id }}</code>
+                {% else %}
+                    <span class="dim" style="color: var(--danger);">not set (reports disabled)</span>
+                {% endif %}
+            </td>
+            <td class="dim">—</td>
+            <td class="dim">—</td>
+            <td class="dim">—</td>
+        </tr>
+        {# Per-chat настройки ── всё, что есть в ChatSettings кроме chat_id=0 #}
+        {% set per_chat_settings = chat_settings | rejectattr('chat_id', 'equalto', 0) | list %}
+        {% for cs in per_chat_settings %}
+        <tr>
+            <td><code>{{ cs.chat_id }}</code></td>
+            <td><span class="dim">per-chat</span></td>
+            <td>{{ cs.hashtag or '—' }}</td>
+            <td>
+                {% if cs.report_chat_id %}
+                    <code>{{ cs.report_chat_id }}</code>
+                {% else %}
+                    <span class="dim">→ default</span>
+                {% endif %}
+            </td>
+            <td>{{ cs.warns_to_mute if cs.warns_to_mute > 0 else '—' }}</td>
+            <td>{{ cs.warns_to_ban if cs.warns_to_ban > 0 else '—' }}</td>
+            <td>{{ (cs.mute_duration_seconds or 3600) | dur }}</td>
+        </tr>
+        {% endfor %}
+        {% if not per_chat_settings and not default_report_chat_id %}
+        {# Никаких настроек нет — показываем подсказку #}
+        <tr><td colspan="7" class="dim" style="text-align:center; padding:16px;">
+            No report chat configured. Use <code>/setreport default &lt;chat_id&gt;</code> in bot PM to enable reports globally.
+        </td></tr>
+        {% elif not per_chat_settings %}
+        {# Default есть, но per-chat override'ов нет #}
+        <tr><td colspan="7" class="dim" style="text-align:center; padding:12px;">
+            No per-chat overrides. All chats use the global default report chat.
+            Use <code>/setreport &lt;chat_id&gt; &lt;report_chat_id&gt;</code> for per-chat override.
+        </td></tr>
+        {% endif %}
+    </tbody>
+</table>
+
 {# ── Глобальный лог ──────────────────────────────────────────── #}
 <div class="section-title">Recent sanctions / page {{ page }} of {{ total_pages }}</div>
 
@@ -119,11 +184,8 @@
             </td>
             <td>{{ punishment.reason or '—' }}</td>
             <td>
-                {% set resolved_rc = report_chat_map.get(punishment.chat_id) or env_report_chat_id %}
-                {% if punishment.report_message_id and resolved_rc %}
-                    <a href="{{ resolved_rc | tglink }}/{{ punishment.report_message_id }}" target="_blank" rel="noopener">📎 Media</a>
-                {% elif punishment.message_text %}
-                    <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;">{{ punishment.message_text }}</span>
+                {% if punishment.message_text %}
+                    <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;" title="{{ punishment.message_text }}">{{ punishment.message_text }}</span>
                 {% else %}
                     <span class="dim">—</span>
                 {% endif %}

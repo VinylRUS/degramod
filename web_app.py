@@ -252,8 +252,13 @@ def create_app(lifespan=None) -> FastAPI:
                 if cs.report_chat_id is not None
             }
 
-        # ── Env fallback для report_chat_id ──────────────────────────────
-        env_report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+            # ── Глобальный default report_chat_id (chat_id=0 в ChatSettings) ──
+            default_rc_row = (
+                await session.execute(
+                    select(ChatSettings).where(ChatSettings.chat_id == 0)
+                )
+            ).scalar_one_or_none()
+            default_report_chat_id = default_rc_row.report_chat_id if default_rc_row else None
 
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
@@ -267,7 +272,7 @@ def create_app(lifespan=None) -> FastAPI:
             "page_size": PAGE_SIZE,
             "chat_settings": chat_settings,
             "report_chat_map": report_chat_map,
-            "env_report_chat_id": env_report_chat_id,
+            "default_report_chat_id": default_report_chat_id,
         })
 
     # ── GET /user/<user_id> ─────────────────────────────────────────────
@@ -321,8 +326,13 @@ def create_app(lifespan=None) -> FastAPI:
                 if cs.report_chat_id is not None
             }
 
-        # ── Env fallback для report_chat_id ──────────────────────────────
-        env_report_chat_id = int(os.getenv("REPORT_CHAT_ID", "0"))
+            # ── Глобальный default report_chat_id (chat_id=0 в ChatSettings) ──
+            default_rc_row = (
+                await session.execute(
+                    select(ChatSettings).where(ChatSettings.chat_id == 0)
+                )
+            ).scalar_one_or_none()
+            default_report_chat_id = default_rc_row.report_chat_id if default_rc_row else None
 
         return templates.TemplateResponse("user.html", {
             "request": request,
@@ -332,7 +342,7 @@ def create_app(lifespan=None) -> FastAPI:
             "punishments": punishments,
             "action_filter": action_filter,
             "report_chat_map": report_chat_map,
-            "env_report_chat_id": env_report_chat_id,
+            "default_report_chat_id": default_report_chat_id,
         })
 
     # ── GET /api/search?q=<query> ──────────────────────────────────────
