@@ -10,9 +10,11 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
 
 Команды в группах (reply на сообщение нарушителя):
   !mute <1d/2h/30m> <причина>  — замьютить (полный мьют — все виды отправки)
-  !warn <причина>               — выдать варн (1 поинт)
+  !warn <причина>               — выдать варн (1 поинт) + удалить сообщение нарушителя
   !ban <причина>                — забанить
   !unmute                       — размьютить (выдаёт текущие права чата)
+  !unban                        — разбанить (only_if_banned — безопасный)
+  !unwarn [N]                   — снять N последних варнов (по умолчанию 1, макс. 100)
   !warns                        — показать текущее кол-во варнов юзера (в личку админу)
   !resetwarns                   — обнулить варны юзера
 
@@ -144,6 +146,8 @@ _CMD_MUTE = re.compile(r"^!mute\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)
 _CMD_WARN = re.compile(r"^!warn\s+(.+)$", re.IGNORECASE)
 _CMD_BAN = re.compile(r"^!ban\s+(.+)$", re.IGNORECASE)
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
+_CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
+_CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
 _CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
 
@@ -315,17 +319,85 @@ async def _fetch_last_snapshot(session, user_id: int, chat_id: int) -> str | Non
 
 
 async def _count_warns(session, user_id: int, chat_id: int) -> int:
-    """Считает общее количество варн-поинтов для юзера в чате."""
+    """Считает общее количество активных (не снятых) варн-поинтов для юзера в чате.
+
+    Использует `duration_seconds` как поинты варна (обычно 1).
+    Снятые варны (``is_revoked=True``) не учитываются.
+    """
     stmt = (
         select(func.coalesce(func.sum(Punishment.duration_seconds), 0))
         .where(
             Punishment.user_id == user_id,
             Punishment.chat_id == chat_id,
             Punishment.action_type == "warn",
+            Punishment.is_revoked.is_(False),
         )
     )
     result = await session.execute(stmt)
     return int(result.scalar() or 0)
+
+
+async def _revoke_last_warns(
+    session, user_id: int, chat_id: int, count: int, revoked_by_mod_id: int,
+) -> int:
+    """Помечает последние N активных варнов как снятые.
+
+    Возвращает количество фактически снятых варнов (может быть меньше count,
+    если активных варнов меньше запрошенного).
+    """
+    stmt = (
+        select(Punishment)
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.chat_id == chat_id,
+            Punishment.action_type == "warn",
+            Punishment.is_revoked.is_(False),
+        )
+        .order_by(desc(Punishment.created_at))
+        .limit(count)
+    )
+    result = await session.execute(stmt)
+    warns_to_revoke = result.scalars().all()
+    now = datetime.now(timezone.utc)
+    revoked_count = 0
+    for p in warns_to_revoke:
+        p.is_revoked = True
+        p.revoked_at = now
+        p.revoked_by_mod_id = revoked_by_mod_id
+        revoked_count += 1
+    if revoked_count:
+        await session.commit()
+    return revoked_count
+
+
+async def _revoke_last_action(
+    session, user_id: int, chat_id: int, action_type: str,
+    revoked_by_mod_id: int,
+) -> bool:
+    """Помечает последнюю активную санкцию (mute/ban) как снятую.
+
+    Возвращает True если запись найдена и помечена, иначе False.
+    """
+    stmt = (
+        select(Punishment)
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.chat_id == chat_id,
+            Punishment.action_type == action_type,
+            Punishment.is_revoked.is_(False),
+        )
+        .order_by(desc(Punishment.created_at))
+        .limit(1)
+    )
+    result = await session.execute(stmt)
+    punishment = result.scalar_one_or_none()
+    if punishment is None:
+        return False
+    punishment.is_revoked = True
+    punishment.revoked_at = datetime.now(timezone.utc)
+    punishment.revoked_by_mod_id = revoked_by_mod_id
+    await session.commit()
+    return True
 
 
 # ── Отправка отчёта в чат (Rich Messages, Bot API 10.2) ─────────────────────
@@ -422,7 +494,7 @@ async def _send_report(
         settings = await _get_chat_settings(session, chat_id)
         hashtag = settings.hashtag or ""
         total_warns: int | None = None
-        if action_type == "warn" and warn_points is not None:
+        if action_type in ("warn", "unwarn") and warn_points is not None:
             total_warns = await _count_warns(session, target.id, chat_id)
 
     # ── Заголовок действия ─────────────────────────────────────
@@ -431,6 +503,8 @@ async def _send_report(
         "ban": "🚫 БАН",
         "warn": "⚠️ ВАРН",
         "unmute": "🔊 РАЗМУТ",
+        "unban": "🎉 РАЗБАН",
+        "unwarn": "↩️ СНЯТИЕ ВАРНА",
     }
     action_label = action_labels.get(action_type, action_type.upper())
 
@@ -451,10 +525,15 @@ async def _send_report(
     # ── Контент нарушителя ─────────────────────────────────────
     text_content: str | None = None
     media_block = None
+    sticker_file_id: str | None = None
     if reply_to_message is not None:
         text_content = reply_to_message.text or reply_to_message.caption
         # Если есть только caption без отдельного текста — это и есть контент
         media_block = _build_media_block(reply_to_message)
+        # Стикер: нет inline-блока в Rich Messages, отправим отдельным
+        # сообщением после rich-отчёта (через bot.send_sticker).
+        if reply_to_message.sticker is not None:
+            sticker_file_id = reply_to_message.sticker.file_id
         # Для медиа-типов без inline-блока (стикер/документ/кружок) добавим
         # текстовое описание, чтобы было что показать
         if media_block is None and text_content is None:
@@ -524,6 +603,16 @@ async def _send_report(
             )
         except TelegramBadRequest as e2:
             logger.error("Plain-text fallback also failed: %s", e2)
+
+    # ── Стикер: отправляем отдельным сообщением после rich-отчёта ──
+    # Rich Messages не имеют inline-блока для стикеров, поэтому крепим его
+    # отдельным send_sticker — так модератор в репорт-чате видит сам стикер.
+    if sticker_file_id:
+        try:
+            await bot.send_sticker(chat_id=report_dest, sticker=sticker_file_id)
+        except TelegramBadRequest as e:
+            logger.warning("Failed to attach sticker to report chat %s: %s",
+                           report_dest, e)
 
     return None
 
@@ -731,7 +820,7 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 
 @router.message(F.chat.type.in_(["group", "supergroup"]), F.reply_to_message)
 async def handle_group_command(message: types.Message) -> None:
-    """Обрабатывает !mute, !warn, !ban, !unmute в группах."""
+    """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах."""
     text = message.text
     if not text:
         return
@@ -844,6 +933,13 @@ async def handle_group_command(message: types.Message) -> None:
                 "warn", 1, reason, target_content,
             )
             total_warns_now = await _count_warns(session, target.id, chat_id)
+
+        # Удаляем сообщение нарушителя, за которое выдан варн
+        try:
+            await message.reply_to_message.delete()
+        except TelegramBadRequest as e:
+            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                           target.id, chat_id, e)
 
         # Теперь отчёт — в нём будет правильный счётчик варнов
         await _send_report(
@@ -968,6 +1064,10 @@ async def handle_group_command(message: types.Message) -> None:
             await _upsert_user(session, target.id, target.username,
                                target.first_name, target.last_name)
             await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+            # Пометим последний активный мьют как снятый (для истории/веб-панели)
+            await _revoke_last_action(
+                session, target.id, chat_id, "mute", revoked_by_mod_id=mod.id,
+            )
             await _save_punishment(
                 session, target.id, mod.id, chat_id,
                 "unmute", None, None, target_content,
@@ -978,6 +1078,100 @@ async def handle_group_command(message: types.Message) -> None:
         await _send_ephemeral(
             bot=message.bot, chat_id=chat_id, recipient=mod,
             text=f"✅ Размьючен {_user_mention_html(target)}.",
+        )
+
+        return
+
+    # ── !unban — разбанить юзера (reply) ──────────────────────────────
+    # Telegram: unban_chat_member снимает бан. Если юзер не забанен —
+    # команда безопасна (ничего не делает, но Bot API может вернуть ошибку,
+    # которую мы просто логируем).
+    if _CMD_UNBAN.match(text):
+        try:
+            # only_if_banned=True — безопасный разбан: не разбанит того,
+            # кто не забанен (иначе можно было бы использовать для обхода кика)
+            await message.bot.unban_chat_member(
+                chat_id=chat_id, user_id=target.id, only_if_banned=True,
+            )
+        except TelegramBadRequest as e:
+            logger.error("unban_chat_member failed: %s", e)
+            try:
+                await message.bot.send_message(
+                    chat_id=mod.id,
+                    text=f"❌ Разбан не удался: {e}",
+                )
+            except TelegramBadRequest:
+                pass
+            return
+
+        await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="unban",
+            reply_to_message=message.reply_to_message,
+        )
+
+        async with async_session() as session:
+            await _upsert_user(session, target.id, target.username,
+                               target.first_name, target.last_name)
+            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+            # Пометим последний активный бан как снятый (для истории/веб-панели)
+            await _revoke_last_action(
+                session, target.id, chat_id, "ban", revoked_by_mod_id=mod.id,
+            )
+            await _save_punishment(
+                session, target.id, mod.id, chat_id,
+                "unban", None, None, target_content,
+            )
+
+        # ── Ephemeral-подтверждение модератору ────
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=f"✅ Разбанен {_user_mention_html(target)}.",
+        )
+
+        return
+
+    # ── !unwarn [N] — снять N последних варнов (reply) ────────────────
+    # По умолчанию N=1. Снятые варны помечаются is_revoked=True и больше
+    # не учитываются в _count_warns / _check_warn_threshold.
+    m = _CMD_UNWARN.match(text)
+    if m:
+        n_str = m.group(1)
+        n = int(n_str) if n_str else 1
+        if n < 1:
+            n = 1
+        # Ограничим сверху, чтобы не снимать тысячу варнов по опечатке
+        if n > 100:
+            n = 100
+
+        async with async_session() as session:
+            await _upsert_user(session, target.id, target.username,
+                               target.first_name, target.last_name)
+            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+            revoked_count = await _revoke_last_warns(
+                session, target.id, chat_id, n, revoked_by_mod_id=mod.id,
+            )
+            # Сохраняем запись о снятии (как отдельную "санкцию" типа unwarn)
+            await _save_punishment(
+                session, target.id, mod.id, chat_id,
+                "unwarn", revoked_count, f"Снято {revoked_count} варн(а/ов)", None,
+            )
+            total_warns_now = await _count_warns(session, target.id, chat_id)
+
+        await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="unwarn", reason=f"Снято {revoked_count} варн(а/ов)",
+            warn_points=revoked_count,
+            reply_to_message=message.reply_to_message,
+        )
+
+        # ── Ephemeral-подтверждение модератору ────
+        await _send_ephemeral(
+            bot=message.bot, chat_id=chat_id, recipient=mod,
+            text=(
+                f"✅ Снято {revoked_count} варн(а/ов) с {_user_mention_html(target)}."
+                f" Варнов всего: {total_warns_now}"
+            ),
         )
 
         return
@@ -1384,9 +1578,11 @@ async def cmd_help(message: types.Message) -> None:
         "<b>В группах (reply на сообщение):</b>\n"
         "  !mute 1d2h причина — замьютить (полный мьют; причина опциональна)\n"
         "  !mute 30м — мьют на 30 минут без причины (рус/англ суффиксы)\n"
-        "  !warn причина — выдать варн\n"
+        "  !warn причина — выдать варн (сообщение нарушителя удаляется)\n"
         "  !ban причина — забанить\n"
         "  !unmute — размьютить (текущие права чата)\n"
+        "  !unban — разбанить (only_if_banned — безопасный)\n"
+        "  !unwarn [N] — снять N последних варнов (по умолчанию 1, макс. 100)\n"
         "  !warns — показать варны юзера\n"
         "  !resetwarns — обнулить варны юзера\n\n"
         "<b>В личке (настройки):</b>\n"

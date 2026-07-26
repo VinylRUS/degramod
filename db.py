@@ -5,15 +5,40 @@ db.py — Асинхронный SQLAlchemy: модели, сессии.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, event, text,
+    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, Boolean, event, text, select,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, relationship
+
+
+# ── Хэширование паролей для веб-панели ───────────────────────────────────────
+# PBKDF2-HMAC-SHA256, 200 000 итераций, соль 16 байт. Возвращает 'salt:hash'.
+
+def _hash_password(password: str, salt: str | None = None) -> str:
+    """PBKDF2-HMAC-SHA256 хэш пароля с солью. Возвращает 'salt:hash'."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
+    return f"{salt}:{h.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    """Проверка пароля против 'salt:hash' строки."""
+    try:
+        salt, expected_hex = stored.split(":", 1)
+    except ValueError:
+        return False
+    h = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000)
+    return hmac.compare_digest(h.hex(), expected_hex)
+
 
 # ── Engine ──────────────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "/app/data/shadow_logs.db")
@@ -67,13 +92,17 @@ class Punishment(Base):
     user_id = Column(BigInteger, ForeignKey("users.user_id"), nullable=False)
     mod_id = Column(BigInteger, ForeignKey("moderators.mod_id"), nullable=False)
     chat_id = Column(BigInteger, nullable=False)
-    action_type = Column(String(20), nullable=False)        # mute / warn / ban / unmute
+    action_type = Column(String(20), nullable=False)        # mute / warn / ban / unmute / unwarn / unban
     duration_seconds = Column(Integer, nullable=True)        # NULL для warn/ban/unmute; для warn = кол-во поинтов
     reason = Column(Text, nullable=True)
     message_text = Column(Text, nullable=True)               # текст удалённого сообщения нарушителя
     permissions_snapshot = Column(Text, nullable=True)        # JSON: пермишены пользователя ДО санкции
     report_message_id = Column(BigInteger, nullable=True)    # ID пересланного сообщения в канале отчётов (для медиа)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # ── Soft-revoke: помечаем что санкция снята (для unwarn/unban/unmute) ──
+    is_revoked = Column(Boolean, default=False, nullable=False)   # True = санкция снята, не учитывать в счётчиках
+    revoked_at = Column(DateTime, nullable=True)                  # когда снята
+    revoked_by_mod_id = Column(BigInteger, nullable=True)         # кто из модераторов снял
 
     user = relationship("User", back_populates="punishments", foreign_keys=[user_id])
     moderator = relationship("Moderator", back_populates="punishments", foreign_keys=[mod_id])
@@ -103,6 +132,26 @@ class ChatSettings(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class WebUser(Base):
+    """Учётные записи администраторов веб-панели.
+
+    SU (super-user) — единственный, чьё имя = 'su', пароль хранится в env WEB_PASSWORD
+    (в БЕЗ хэша — сверка идёт напрямую через == в web_app.py).
+    Все остальные — обычные админы, созданные через /admin/users:
+      пароль хранится в поле password_hash (PBKDF2-HMAC-SHA256).
+    """
+    __tablename__ = "web_users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(64), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=True)        # NULL только для 'su' (пароль из env)
+    is_su = Column(Boolean, default=False, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_by = Column(String(64), nullable=True)             # username создателя
+    last_login_at = Column(DateTime, nullable=True)
+
+
 # ── Init / Shutdown ────────────────────────────────────────────────────────
 async def init_db() -> None:
     """Создаёт таблицы при первом запуске + миграции для новых колонок."""
@@ -126,6 +175,43 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE chat_settings ADD COLUMN report_chat_id BIGINT NULL"
             ))
+
+    # ── Миграция: добавляем soft-revoke колонки в punishments (v4.2) ──
+    # is_revoked / revoked_at / revoked_by_mod_id — для команд !unwarn / !unban / !unmute
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(punishments)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "is_revoked" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE punishments ADD COLUMN is_revoked BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "revoked_at" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE punishments ADD COLUMN revoked_at DATETIME NULL"
+            ))
+        if "revoked_by_mod_id" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE punishments ADD COLUMN revoked_by_mod_id BIGINT NULL"
+            ))
+
+    # ── Seed: гарантируем что SU-аккаунт существует в web_users ──────────
+    # SU не имеет password_hash — пароль берётся из env WEB_PASSWORD при логине.
+    # Это позволяет менять SU-пароль через env без перезаписи БД.
+    async with async_session() as session:
+        existing_su = (
+            await session.execute(
+                select(WebUser).where(WebUser.username == "su")
+            )
+        ).scalar_one_or_none()
+        if existing_su is None:
+            session.add(WebUser(
+                username="su",
+                password_hash=None,
+                is_su=True,
+                is_active=True,
+                created_by="system",
+            ))
+            await session.commit()
 
 
 async def get_session() -> AsyncSession:

@@ -11,45 +11,64 @@
         align-items: center;
         justify-content: center;
         min-height: 100vh;
+        padding: var(--sp-4);
     }
     .login-box {
         background: var(--bg2);
         border: 1px solid var(--border);
-        padding: 32px 36px;
-        width: 340px;
+        border-radius: var(--r-md);
+        padding: var(--sp-7) var(--sp-6);
+        width: 360px;
     }
     .login-box h1 {
         font-size: 12px;
         text-transform: uppercase;
         letter-spacing: 3px;
         color: var(--accent);
-        margin-bottom: 24px;
+        margin-bottom: var(--sp-5);
         text-align: center;
     }
-    .login-box input[type="password"] {
+    .login-box .field {
+        margin-bottom: var(--sp-4);
+    }
+    .login-box label {
+        display: block;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 1.5px;
+        color: var(--text-dim);
+        margin-bottom: 6px;
+        font-weight: 600;
+    }
+    .login-box input {
         width: 100%;
-        padding: 10px 12px;
+        padding: 10px 14px;
         background: var(--bg);
         border: 1px solid var(--border);
+        border-radius: var(--r-sm);
         color: var(--text);
         font-family: var(--font-mono);
         font-size: 13px;
         outline: none;
-        margin-bottom: 16px;
+        transition: border-color .15s, box-shadow .15s;
     }
-    .login-box input[type="password"]:focus {
+    .login-box input:focus {
         border-color: var(--accent);
+        box-shadow: 0 0 0 3px rgba(0,204,102,.08);
     }
+    .login-box input::placeholder { color: var(--text-dim); }
     .login-box button {
         width: 100%;
-        padding: 10px;
+        padding: 11px;
         background: transparent;
         border: 1px solid var(--accent);
+        border-radius: var(--r-sm);
         color: var(--accent);
         font-family: var(--font-mono);
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 2px;
+        font-weight: 700;
         cursor: pointer;
         transition: background .15s, color .15s;
     }
@@ -61,7 +80,20 @@
         color: var(--danger);
         font-size: 11px;
         text-align: center;
-        margin-bottom: 12px;
+        margin-bottom: var(--sp-3);
+        padding: var(--sp-2);
+        background: rgba(204,51,51,.08);
+        border-radius: var(--r-sm);
+    }
+    .hint {
+        margin-top: var(--sp-5);
+        text-align: center;
+        font-size: 10px;
+        color: var(--text-dim);
+        line-height: 1.6;
+    }
+    .hint code {
+        color: var(--accent);
     }
 </style>
 {% endblock %}
@@ -74,9 +106,20 @@
         <div class="error-msg">ACCESS DENIED</div>
         {% endif %}
         <form method="post" action="/login">
-            <input type="password" name="password" placeholder="password" autofocus autocomplete="current-password">
-            <button type="submit">AUTHENTICATE</button>
+            <div class="field">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" placeholder="su" autofocus autocomplete="username">
+            </div>
+            <div class="field">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="password" autocomplete="current-password">
+            </div>
+            <button type="submit">Authenticate</button>
         </form>
+        <div class="hint">
+            SU: login <code>su</code> + password from <code>WEB_PASSWORD</code> env<br>
+            Other admins: created by SU via /admin/users
+        </div>
     </div>
 </div>
 {% endblock %}

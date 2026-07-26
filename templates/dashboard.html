@@ -4,15 +4,25 @@
 
 {% block content %}
 
+{# ── In-page anchor nav ──────────────────────────────────────────── #}
+<div class="anchor-nav">
+    <span class="label">Jump:</span>
+    <a href="#search">Search</a>
+    <a href="#stats">Stats</a>
+    <a href="#top">Top</a>
+    <a href="#chat-settings">Chats</a>
+    <a href="#recent">Log</a>
+</div>
+
 {# ── Поиск ──────────────────────────────────────────────────── #}
-<div class="section-title">Search user</div>
-<div class="search-bar" style="position: relative;">
+<div id="search" class="section-title">Search user</div>
+<div class="search-bar">
     <input type="text" id="search-input" placeholder="Username or ID..." autocomplete="off">
     <div class="search-results" id="search-results" style="display:none;"></div>
 </div>
 
 {# ── Общая статистика ────────────────────────────────────────── #}
-<div class="section-title">Overall stats</div>
+<div id="stats" class="section-title">Overall stats <a class="anchor" href="#stats">#</a></div>
 <div class="stat-grid">
     <div class="stat-card">
         <div class="label">Total</div>
@@ -20,26 +30,34 @@
     </div>
     <div class="stat-card">
         <div class="label">Mutes</div>
-        <div class="value" style="color: var(--warn);">{{ total_stats.get('mute', 0) }}</div>
+        <div class="value warn">{{ total_stats.get('mute', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Warns</div>
-        <div class="value" style="color: var(--info);">{{ total_stats.get('warn', 0) }}</div>
+        <div class="value info">{{ total_stats.get('warn', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Bans</div>
-        <div class="value" style="color: var(--danger);">{{ total_stats.get('ban', 0) }}</div>
+        <div class="value danger">{{ total_stats.get('ban', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Unmutes</div>
-        <div class="value" style="color: var(--accent);">{{ total_stats.get('unmute', 0) }}</div>
+        <div class="value accent">{{ total_stats.get('unmute', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unwarns</div>
+        <div class="value accent">{{ total_stats.get('unwarn', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unbans</div>
+        <div class="value accent">{{ total_stats.get('unban', 0) }}</div>
     </div>
 </div>
 
 {# ── Топ нарушителей + модераторов ──────────────────────────── #}
-<div class="two-col">
+<div id="top" class="two-col">
 <div>
-    <div class="section-title">Top offenders / 30d</div>
+    <div class="section-title">Top offenders / 30d <a class="anchor" href="#top">#</a></div>
     <div class="stat-grid">
         {% for off in top_offenders %}
         <div class="stat-card">
@@ -54,7 +72,7 @@
         {% if not top_offenders %}
         <div class="stat-card">
             <div class="label">No data</div>
-            <div class="value">—</div>
+            <div class="value dim">—</div>
         </div>
         {% endif %}
     </div>
@@ -73,15 +91,16 @@
         {% if not top_moderators %}
         <div class="stat-card">
             <div class="label">No data</div>
-            <div class="value">—</div>
+            <div class="value dim">—</div>
         </div>
         {% endif %}
     </div>
 </div>
 </div>
 
-{# ── Настройки чатов: per-chat + default report_chat_id ─────── #}
-<div class="section-title">Chat settings</div>
+{# ── Настройки чатов ─────────────────────────────────────────── #}
+<div id="chat-settings" class="section-title">Chat settings <a class="anchor" href="#chat-settings">#</a></div>
+<div class="table-wrap">
 <table>
     <thead>
         <tr>
@@ -98,20 +117,19 @@
         {# Сначала глобальный default (chat_id=0) ── всегда первая строка #}
         <tr style="background: var(--bg3);">
             <td><span class="dim">default</span></td>
-            <td><span class="badge" style="color: var(--accent); border-color: var(--accent); background: rgba(0,204,102,.1);">GLOBAL</span></td>
+            <td><span class="badge" style="color: var(--accent); border-color: var(--accent); background: rgba(0,204,102,.12);">GLOBAL</span></td>
             <td class="dim">—</td>
             <td>
                 {% if default_report_chat_id %}
                     <code>{{ default_report_chat_id }}</code>
                 {% else %}
-                    <span class="dim" style="color: var(--danger);">not set (reports disabled)</span>
+                    <span class="danger-text">not set (reports disabled)</span>
                 {% endif %}
             </td>
             <td class="dim">—</td>
             <td class="dim">—</td>
             <td class="dim">—</td>
         </tr>
-        {# Per-chat настройки ── всё, что есть в ChatSettings кроме chat_id=0 #}
         {% set per_chat_settings = chat_settings | rejectattr('chat_id', 'equalto', 0) | list %}
         {% for cs in per_chat_settings %}
         <tr>
@@ -131,23 +149,61 @@
         </tr>
         {% endfor %}
         {% if not per_chat_settings and not default_report_chat_id %}
-        {# Никаких настроек нет — показываем подсказку #}
-        <tr><td colspan="7" class="dim" style="text-align:center; padding:16px;">
+        <tr class="empty-row"><td colspan="7">
             No report chat configured. Use <code>/setreport default &lt;chat_id&gt;</code> in bot PM to enable reports globally.
         </td></tr>
         {% elif not per_chat_settings %}
-        {# Default есть, но per-chat override'ов нет #}
-        <tr><td colspan="7" class="dim" style="text-align:center; padding:12px;">
+        <tr class="empty-row"><td colspan="7">
             No per-chat overrides. All chats use the global default report chat.
             Use <code>/setreport &lt;chat_id&gt; &lt;report_chat_id&gt;</code> for per-chat override.
         </td></tr>
         {% endif %}
     </tbody>
 </table>
+</div>
 
 {# ── Глобальный лог ──────────────────────────────────────────── #}
-<div class="section-title">Recent sanctions / page {{ page }} of {{ total_pages }}</div>
+<div id="recent" class="section-title">Recent sanctions / page {{ page }} of {{ total_pages }} <a class="anchor" href="#recent">#</a></div>
 
+{# ── Фильтры: action + revoked + sort ─────────────────────────── #}
+{% set q = {} %}
+{% set _ = q.update({'action': action_filter, 'rev': rev_filter, 'sort': sort}) %}
+<div class="filter-row">
+    <div class="filter-tabs">
+        <a href="/dashboard?rev={{ rev_filter }}&sort={{ sort }}{% if action_filter %}&action={% endif %}" class="{% if not action_filter %}active{% endif %}">All</a>
+        <a href="/dashboard?action=mute&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'mute' %}active{% endif %}">Mute</a>
+        <a href="/dashboard?action=warn&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'warn' %}active{% endif %}">Warn</a>
+        <a href="/dashboard?action=ban&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'ban' %}active{% endif %}">Ban</a>
+        <a href="/dashboard?action=unmute&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'unmute' %}active{% endif %}">Unmute</a>
+        <a href="/dashboard?action=unwarn&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'unwarn' %}active{% endif %}">Unwarn</a>
+        <a href="/dashboard?action=unban&rev={{ rev_filter }}&sort={{ sort }}" class="{% if action_filter == 'unban' %}active{% endif %}">Unban</a>
+    </div>
+    <div class="filter-tabs">
+        <a href="/dashboard?action={{ action_filter }}&sort={{ sort }}" class="{% if not rev_filter or rev_filter == '' %}active{% endif %}">All</a>
+        <a href="/dashboard?action={{ action_filter }}&rev=active&sort={{ sort }}" class="{% if rev_filter == 'active' %}active{% endif %}">Active</a>
+        <a href="/dashboard?action={{ action_filter }}&rev=revoked&sort={{ sort }}" class="{% if rev_filter == 'revoked' %}active{% endif %}">Revoked</a>
+    </div>
+    <div class="filter-tabs">
+        <a href="/dashboard?action={{ action_filter }}&rev={{ rev_filter }}&sort=new" class="{% if sort == 'new' or not sort %}active{% endif %}">Newest</a>
+        <a href="/dashboard?action={{ action_filter }}&rev={{ rev_filter }}&sort=old" class="{% if sort == 'old' %}active{% endif %}">Oldest</a>
+        <a href="/dashboard?action={{ action_filter }}&rev={{ rev_filter }}&sort=type" class="{% if sort == 'type' %}active{% endif %}">By type</a>
+        <a href="/dashboard?action={{ action_filter }}&rev={{ rev_filter }}&sort=user" class="{% if sort == 'user' %}active{% endif %}">By user</a>
+    </div>
+</div>
+
+{# ── Autorefresh indicator (only on page 1, no filters, sort=new) ── #}
+{% if page == 1 and not action_filter and (not rev_filter or rev_filter == '') and (not sort or sort == 'new') %}
+<div class="autorefresh-bar">
+    <span class="left">
+        <span class="pulse"></span>
+        Auto-refresh every 15s
+    </span>
+    <span class="toggle">pause</span>
+</div>
+{% set autorefresh = true %}
+{% endif %}
+
+<div class="table-wrap">
 <table>
     <thead>
         <tr>
@@ -163,10 +219,15 @@
     </thead>
     <tbody>
         {% for punishment, user, moderator in rows %}
-        <tr>
+        <tr class="{% if punishment.is_revoked %}row-revoked{% endif %}">
             <td class="dim">{{ punishment.id }}</td>
             <td class="dim">{{ punishment.created_at | msk }}</td>
-            <td><span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span></td>
+            <td>
+                <span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span>
+                {% if punishment.is_revoked %}
+                <span class="badge badge-revoked">↩ revoked</span>
+                {% endif %}
+            </td>
             <td>
                 <a href="/user/{{ user.user_id }}">
                     {{ user.username or user.first_name or user.user_id }}
@@ -185,7 +246,7 @@
             <td>{{ punishment.reason or '—' }}</td>
             <td>
                 {% if punishment.message_text %}
-                    <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;" title="{{ punishment.message_text }}">{{ punishment.message_text }}</span>
+                    <span class="dim truncate" title="{{ punishment.message_text }}">{{ punishment.message_text }}</span>
                 {% else %}
                     <span class="dim">—</span>
                 {% endif %}
@@ -193,16 +254,17 @@
         </tr>
         {% endfor %}
         {% if not rows %}
-        <tr><td colspan="8" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
+        <tr class="empty-row"><td colspan="8">No records</td></tr>
         {% endif %}
     </tbody>
 </table>
+</div>
 
 {# ── Пагинация ────────────────────────────────────────────────── #}
 {% if total_pages > 1 %}
 <div class="pagination">
     {% if page > 1 %}
-    <a href="/dashboard?page={{ page - 1 }}" class="prev">← Prev</a>
+    <a href="/dashboard?page={{ page - 1 }}&action={{ action_filter }}&rev={{ rev_filter }}&sort={{ sort }}">← Prev</a>
     {% else %}
     <span class="disabled">← Prev</span>
     {% endif %}
@@ -211,14 +273,14 @@
         {% if p == page %}
         <span class="current">{{ p }}</span>
         {% elif p <= 3 or p >= total_pages - 2 or abs(p - page) <= 1 %}
-        <a href="/dashboard?page={{ p }}">{{ p }}</a>
+        <a href="/dashboard?page={{ p }}&action={{ action_filter }}&rev={{ rev_filter }}&sort={{ sort }}">{{ p }}</a>
         {% elif p == 4 or p == total_pages - 3 %}
-        <span class="dim">...</span>
+        <span class="ellipsis">…</span>
         {% endif %}
     {% endfor %}
 
     {% if page < total_pages %}
-    <a href="/dashboard?page={{ page + 1 }}" class="next">Next →</a>
+    <a href="/dashboard?page={{ page + 1 }}&action={{ action_filter }}&rev={{ rev_filter }}&sort={{ sort }}">Next →</a>
     {% else %}
     <span class="disabled">Next →</span>
     {% endif %}

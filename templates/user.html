@@ -4,52 +4,92 @@
 
 {% block content %}
 
+{# ── In-page anchor nav ──────────────────────────────────────────── #}
+<div class="anchor-nav">
+    <span class="label">Jump:</span>
+    <a href="#profile">Profile</a>
+    <a href="#counters">Counters</a>
+    <a href="#history">History</a>
+</div>
+
 {# ── Профиль ─────────────────────────────────────────────────── #}
-<div class="section-title">Profile</div>
-<table style="margin-bottom: 24px;">
-    <tr><td class="dim" style="width:120px;">ID</td><td>{{ user.user_id }}</td></tr>
-    <tr><td class="dim">Username</td><td>@{{ user.username or '—' }}</td></tr>
-    <tr><td class="dim">First name</td><td>{{ user.first_name or '—' }}</td></tr>
-    <tr><td class="dim">Last name</td><td>{{ user.last_name or '—' }}</td></tr>
-    <tr><td class="dim">Last seen</td><td>{{ user.last_seen | msk }}</td></tr>
-</table>
+<div id="profile" class="section-title">Profile <a class="anchor" href="#profile">#</a></div>
+<div class="profile-table">
+    <table>
+        <tr><td>ID</td><td>{{ user.user_id }}</td></tr>
+        <tr><td>Username</td><td>@{{ user.username or '—' }}</td></tr>
+        <tr><td>First name</td><td>{{ user.first_name or '—' }}</td></tr>
+        <tr><td>Last name</td><td>{{ user.last_name or '—' }}</td></tr>
+        <tr><td>Last seen</td><td>{{ user.last_seen | msk }}</td></tr>
+    </table>
+</div>
 
 {# ── Счётчики ───────────────────────────────────────────────── #}
-<div class="section-title">Counters</div>
+<div id="counters" class="section-title">Counters <a class="anchor" href="#counters">#</a></div>
 <div class="stat-grid">
     <div class="stat-card">
         <div class="label">Current warn points</div>
-        <div class="value" style="color: {% if current_warns >= 3 %}var(--danger){% elif current_warns >= 1 %}var(--info){% else %}var(--accent){% endif %};">{{ current_warns }}</div>
+        <div class="value {% if current_warns >= 3 %}danger{% elif current_warns >= 1 %}info{% else %}accent{% endif %}">{{ current_warns }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Mutes</div>
-        <div class="value" style="color: var(--warn);">{{ counters.get('mute', 0) }}</div>
+        <div class="value warn">{{ counters.get('mute', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Warns (total)</div>
-        <div class="value" style="color: var(--info);">{{ counters.get('warn', 0) }}</div>
+        <div class="value info">{{ counters.get('warn', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Bans</div>
-        <div class="value" style="color: var(--danger);">{{ counters.get('ban', 0) }}</div>
+        <div class="value danger">{{ counters.get('ban', 0) }}</div>
     </div>
     <div class="stat-card">
         <div class="label">Unmutes</div>
-        <div class="value" style="color: var(--accent);">{{ counters.get('unmute', 0) }}</div>
+        <div class="value accent">{{ counters.get('unmute', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unwarns</div>
+        <div class="value accent">{{ counters.get('unwarn', 0) }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unbans</div>
+        <div class="value accent">{{ counters.get('unban', 0) }}</div>
     </div>
 </div>
 
 {# ── Фильтры ────────────────────────────────────────────────── #}
-<div class="section-title">History</div>
-<div class="filter-tabs">
-    <a href="/user/{{ user.user_id }}" class="{% if not action_filter %}active{% endif %}">ALL</a>
-    <a href="/user/{{ user.user_id }}?action=mute" class="{% if action_filter == 'mute' %}active{% endif %}">MUTE</a>
-    <a href="/user/{{ user.user_id }}?action=warn" class="{% if action_filter == 'warn' %}active{% endif %}">WARN</a>
-    <a href="/user/{{ user.user_id }}?action=ban" class="{% if action_filter == 'ban' %}active{% endif %}">BAN</a>
-    <a href="/user/{{ user.user_id }}?action=unmute" class="{% if action_filter == 'unmute' %}active{% endif %}">UNMUTE</a>
+<div id="history" class="section-title">History <a class="anchor" href="#history">#</a></div>
+<div class="filter-row">
+    <div class="filter-tabs">
+        <a href="/user/{{ user.user_id }}?rev={{ rev_filter }}" class="{% if not action_filter %}active{% endif %}">All</a>
+        <a href="/user/{{ user.user_id }}?action=mute&rev={{ rev_filter }}" class="{% if action_filter == 'mute' %}active{% endif %}">Mute</a>
+        <a href="/user/{{ user.user_id }}?action=warn&rev={{ rev_filter }}" class="{% if action_filter == 'warn' %}active{% endif %}">Warn</a>
+        <a href="/user/{{ user.user_id }}?action=ban&rev={{ rev_filter }}" class="{% if action_filter == 'ban' %}active{% endif %}">Ban</a>
+        <a href="/user/{{ user.user_id }}?action=unmute&rev={{ rev_filter }}" class="{% if action_filter == 'unmute' %}active{% endif %}">Unmute</a>
+        <a href="/user/{{ user.user_id }}?action=unwarn&rev={{ rev_filter }}" class="{% if action_filter == 'unwarn' %}active{% endif %}">Unwarn</a>
+        <a href="/user/{{ user.user_id }}?action=unban&rev={{ rev_filter }}" class="{% if action_filter == 'unban' %}active{% endif %}">Unban</a>
+    </div>
+    <div class="filter-tabs">
+        <a href="/user/{{ user.user_id }}?action={{ action_filter }}" class="{% if not rev_filter or rev_filter == '' %}active{% endif %}">All</a>
+        <a href="/user/{{ user.user_id }}?action={{ action_filter }}&rev=active" class="{% if rev_filter == 'active' %}active{% endif %}">Active</a>
+        <a href="/user/{{ user.user_id }}?action={{ action_filter }}&rev=revoked" class="{% if rev_filter == 'revoked' %}active{% endif %}">Revoked</a>
+    </div>
 </div>
 
+{# ── Autorefresh (no filter / no rev filter) ── #}
+{% if not action_filter and (not rev_filter or rev_filter == '') %}
+<div class="autorefresh-bar">
+    <span class="left">
+        <span class="pulse"></span>
+        Auto-refresh every 15s
+    </span>
+    <span class="toggle">pause</span>
+</div>
+{% set autorefresh = true %}
+{% endif %}
+
 {# ── Хронология ─────────────────────────────────────────────── #}
+<div class="table-wrap">
 <table>
     <thead>
         <tr>
@@ -64,10 +104,15 @@
     </thead>
     <tbody>
         {% for punishment, moderator in punishments %}
-        <tr>
+        <tr class="{% if punishment.is_revoked %}row-revoked{% endif %}">
             <td class="dim">{{ punishment.id }}</td>
             <td class="dim">{{ punishment.created_at | msk }}</td>
-            <td><span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span></td>
+            <td>
+                <span class="badge badge-{{ punishment.action_type }}">{{ punishment.action_type }}</span>
+                {% if punishment.is_revoked %}
+                <span class="badge badge-revoked">↩ revoked</span>
+                {% endif %}
+            </td>
             <td class="dim">{{ moderator.username or moderator.first_name or moderator.mod_id }}</td>
             <td>
                 {% if punishment.action_type == 'warn' %}
@@ -81,7 +126,7 @@
             <td>{{ punishment.reason or '—' }}</td>
             <td>
                 {% if punishment.message_text %}
-                    <span class="dim" style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:inline-block;" title="{{ punishment.message_text }}">{{ punishment.message_text }}</span>
+                    <span class="dim truncate" title="{{ punishment.message_text }}">{{ punishment.message_text }}</span>
                 {% else %}
                     <span class="dim">—</span>
                 {% endif %}
@@ -89,9 +134,10 @@
         </tr>
         {% endfor %}
         {% if not punishments %}
-        <tr><td colspan="8" class="dim" style="text-align:center; padding:24px;">No records</td></tr>
+        <tr class="empty-row"><td colspan="7">No records</td></tr>
         {% endif %}
     </tbody>
 </table>
+</div>
 
 {% endblock %}

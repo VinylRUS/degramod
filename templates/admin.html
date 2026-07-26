@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Admins — Дедушка Вобжак{% endblock %}
+
+{% block content %}
+
+<div class="anchor-nav">
+    <span class="label">Jump:</span>
+    <a href="#create">Create</a>
+    <a href="#list">List</a>
+</div>
+
+{# ── Flash message ───────────────────────────────────────────── #}
+{% if flash %}
+<div style="background: rgba(204,51,51,.1); border: 1px solid var(--danger); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--danger); font-size: 12px;">
+    <strong>Error:</strong> {{ flash }}
+</div>
+{% endif %}
+
+{# ── Create new admin ────────────────────────────────────────── #}
+<div id="create" class="section-title">Create admin <a class="anchor" href="#create">#</a></div>
+<div style="max-width: 480px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5);">
+    <form method="post" action="/admin/users/create">
+        <div style="margin-bottom: var(--sp-4);">
+            <label for="username" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Username</label>
+            <input type="text" id="username" name="username" required minlength="3" maxlength="32"
+                   pattern="[a-zA-Z0-9_\-]+" placeholder="moderator1"
+                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
+                   autocomplete="off">
+            <small style="display: block; margin-top: 4px; color: var(--text-dim); font-size: 10px;">3–32 chars: a-z, 0-9, _ or -</small>
+        </div>
+        <div style="margin-bottom: var(--sp-4);">
+            <label for="password" style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-dim); margin-bottom: 6px; font-weight: 600;">Password</label>
+            <input type="password" id="password" name="password" required minlength="6"
+                   placeholder="at least 6 chars"
+                   style="width: 100%; padding: 9px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px; outline: none;"
+                   autocomplete="new-password">
+        </div>
+        <button type="submit"
+                style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s;">
+            Create
+        </button>
+    </form>
+</div>
+
+{# ── Existing admins ─────────────────────────────────────────── #}
+<div id="list" class="section-title">Existing admins <a class="anchor" href="#list">#</a></div>
+<div class="table-wrap">
+<table>
+    <thead>
+        <tr>
+            <th>#</th>
+            <th>Username</th>
+            <th>Role</th>
+            <th>Status</th>
+            <th>Created by</th>
+            <th>Created at</th>
+            <th>Last login</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for wu in web_users %}
+        <tr>
+            <td class="dim">{{ wu.id }}</td>
+            <td>
+                <strong>{{ wu.username }}</strong>
+                {% if wu.is_su %}<span class="badge badge-active" style="margin-left: 6px;">SU</span>{% endif %}
+            </td>
+            <td>
+                {% if wu.is_su %}
+                <span class="dim">super-user</span>
+                {% else %}
+                <span class="dim">admin</span>
+                {% endif %}
+            </td>
+            <td>
+                {% if wu.is_active %}
+                <span class="badge badge-active">active</span>
+                {% else %}
+                <span class="badge badge-revoked">disabled</span>
+                {% endif %}
+            </td>
+            <td class="dim">{{ wu.created_by or '—' }}</td>
+            <td class="dim">{{ wu.created_at | msk }}</td>
+            <td class="dim">{{ wu.last_login_at | msk }}</td>
+            <td>
+                {% if wu.is_su %}
+                    <span class="dim">—</span>
+                {% else %}
+                    <form method="post" action="/admin/users/{{ wu.id }}/toggle" style="display: inline;">
+                        <button type="submit"
+                                style="background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            {% if wu.is_active %}Disable{% else %}Enable{% endif %}
+                        </button>
+                    </form>
+                    <button type="button" onclick="var el = document.getElementById('reset-{{ wu.id }}'); el.style.display = (el.style.display === 'none' || !el.style.display) ? 'table-row' : 'none';"
+                            style="background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; margin-left: 4px;">
+                        Reset pw
+                    </button>
+                    <form method="post" action="/admin/users/{{ wu.id }}/delete" style="display: inline; margin-left: 4px;"
+                          onsubmit="return confirm('Delete admin {{ wu.username }}?');">
+                        <button type="submit"
+                                style="background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            Delete
+                        </button>
+                    </form>
+                {% endif %}
+            </td>
+        </tr>
+        {% if not wu.is_su %}
+        <tr id="reset-{{ wu.id }}" style="display: none; background: var(--bg3);">
+            <td colspan="8" style="padding: var(--sp-3) var(--sp-4);">
+                <form method="post" action="/admin/users/{{ wu.id }}/reset" style="display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap;">
+                    <strong style="color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: var(--sp-2);">New password:</strong>
+                    <input type="password" name="password" required minlength="6" placeholder="at least 6 chars"
+                           style="flex: 1; min-width: 200px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none;">
+                    <button type="submit"
+                            style="padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                        Save
+                    </button>
+                    <button type="button" onclick="this.parentElement.parentElement.style.display='none';"
+                            style="padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; border-radius: var(--r-xs);">
+                        Cancel
+                    </button>
+                </form>
+            </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+        {% if not web_users %}
+        <tr class="empty-row"><td colspan="8">No admins found</td></tr>
+        {% endif %}
+    </tbody>
+</table>
+</div>
+
+{% endblock %}
