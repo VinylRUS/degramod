@@ -159,6 +159,31 @@ _CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
 _CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
 
+
+# ── Список всех команд модерации (для ранней проверки, что текст вообще ────
+#    является командой, ДО удаления сообщения модератора). v4.4.8 FIX.
+_ALL_MOD_COMMANDS: tuple[re.Pattern, ...] = (
+    _CMD_MUTE, _CMD_WARN, _CMD_BAN,
+    _CMD_UNMUTE, _CMD_UNBAN, _CMD_UNWARN,
+    _CMD_WARNS, _CMD_RESETWARNS,
+)
+
+
+def _is_moderation_command(text: str) -> bool:
+    """Возвращает True, если текст — это одна из модераторских команд бота.
+
+    Используется как ранняя guard-проверка в handle_group_command, чтобы
+    бот не удалял обычные ответы модератора в чате (только сообщения с командой).
+    """
+    # Быстрый short-circuit: команды начинаются с '!'. Если не начинается —
+    # точно не команда, не трогаем сообщение.
+    stripped = text.lstrip()
+    if not stripped.startswith("!"):
+        return False
+    # Точное соответствие одному из зарегистрированных паттернов.
+    return any(p.match(stripped) for p in _ALL_MOD_COMMANDS)
+
+
 # ── Permissions snapshot ───────────────────────────────────────────────────
 _PERM_FIELDS = [
     "can_send_messages",
@@ -1031,6 +1056,14 @@ async def handle_group_command(message: types.Message) -> None:
     """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах."""
     text = message.text
     if not text:
+        return
+
+    # ── v4.4.8 FIX: не трогаем сообщения модератора, если это не команда ──
+    # Раньше бот удалял ЛЮБОЙ ответ модератора в чате (т.к. удаление шло
+    # ДО проверки на соответствие команде). Теперь сначала проверяем, что
+    # текст реально является одной из модераторских команд — и только тогда
+    # удаляем. Обычные ответы модератора больше не исчезают.
+    if not _is_moderation_command(text):
         return
 
     # Проверяем, что отправитель — админ
