@@ -21,7 +21,9 @@
     Chats are detected automatically when the bot is added to them. For each chat you can:
     set a hashtag (for reports), assign a report chat (where moderation logs go),
     configure warn thresholds, mark a chat as private (admins won't have access, only SU and explicitly-assigned moderators),
-    disable the bot in a chat (it will ignore all commands), or mark one chat as the global report chat.
+    <strong style="color: var(--warn);">disable</strong> the bot in a chat (it will completely ignore <em>everything</em> in the chat — no commands, no logging, no auto-detection; as if the bot isn't there),
+    <strong style="color: var(--danger);">delete</strong> a chat (the bot leaves the chat and all related data — settings, moderators, punishment history — is removed; use for test chats),
+    or mark one chat as the global report chat.
     Chat title is fetched from Telegram; if missing, the bot was probably added without admin rights.
 </div>
 
@@ -89,6 +91,15 @@
                 style="padding: 4px 10px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
             ✎ Settings
         </button>
+        {# ── v4.4.8: Delete chat — бот ливает + чистим БД. Не показываем для chat_id=0. ── #}
+        {# Confirmation dialog показывает сколько наказаний/админов будет удалено. #}
+        <form method="post" action="/admin/chats/{{ c.chat_id }}/delete" style="display: inline;"
+              onsubmit="return confirm('Delete chat {{ c.title or c.chat_id }}?\n\nBot will LEAVE the chat and ALL data will be deleted:\n  • {{ stats.get(c.chat_id, 0) }} punishments\n  • {{ mod_counts.get(c.chat_id, 0) }} moderators\n  • chat settings\n\nThis cannot be undone.');">
+            <button type="submit"
+                    style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                ✕ Delete
+            </button>
+        </form>
     </div>
     {% endif %}
 

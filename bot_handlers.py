@@ -4,9 +4,31 @@ bot_handlers.py — Дедушка Вобжак: скрытый модерато
 ★★★ СТЕЛС-РЕЖИМ: бот НЕ реагирует ни на какие команды от обычных юзеров.
 Ни /start, ни /help, ни любые другие — молча игнорируются.
 Только ADMIN_IDS и ChatAdmin могут использовать команды.
-Нарушитель НИКОГДА не получает уведомлений от бота — он не должен
-догадываться о его существовании. Эphemeral-подтверждения получают
-только модераторы (видны только им в группе, через receiver_user_id). ★★★
+Нарушитель НЕ получает публичных уведомлений от бота — он не должен
+догадываться о его существовании. Ephemeral-подтверждения получают
+только модераторы (видны только им в группе, через receiver_user_id).
+
+v4.4.9 ИСКЛЮЧЕНИЕ: при !warn нарушитель получает ephemeral-сообщение
+(видно только ему через receiver_user_id=target.id) с причиной варна и
+текущим счётчиком. Без этого варн был бесполезной санкцией — юзер даже
+не знал, что его предупредили. Остальные участники чата этого сообщения
+не видят, стелс для всех кроме наказанного сохраняется. ★★★
+
+v4.4.10 РЕДИЗАЙН ОТЧЁТА В РЕПОРТ-ЧАТЕ:
+• Структура: SectionHeading → Divider → List (нарушитель/причина/веб-профиль)
+  → Divider → Details «📎 Показать медиа» (медиа под спойлером, по умолчанию
+  свёрнуто) → Divider → Details «Доп. инфо» → Divider → Footer.
+• Модератор перенесён в Footer (кликабельное имя, без приписки «Модератор:»)
+  — раньше он был отдельным параграфом с эмодзи 👮, теперь компактнее.
+• Длинный URL веб-профиля спрятан под коротким текстом «Открыть профиль →»
+  через RichTextUrl — больше URL не ломается посередине на мобиле.
+• ID нарушителя оформлен как inline-код (моноширинный) — выделяется визуально,
+  легко копируется долгим тапом на мобильном.
+• Медиа обёрнуто в Details (сворачиваемый блок) — не торчит открыто, чтобы
+  модератор случайно не увидел шок-контент. По тапу на «📎 Показать медиа»
+  разворачивается.
+• Divider'ы (горизонтальные линии) визуально разделяют секции — на мобиле
+  больше не «стена текста», а чёткие блоки. ★★★
 
 Команды в группах (reply на сообщение нарушителя):
   !mute <1d/2h/30m> <причина>  — замьютить (полный мьют — все виды отправки)
@@ -39,7 +61,7 @@ import re
 import logging
 from datetime import datetime, timezone, timedelta
 
-from aiogram import Router, types, F
+from aiogram import Router, types, F, BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
@@ -54,6 +76,9 @@ from aiogram.types import (
     InputRichBlockAnimation,
     InputRichBlockAudio,
     InputRichBlockVoiceNote,
+    InputRichBlockList,
+    InputRichBlockListItem,
+    InputRichBlockDivider,
     InputMediaPhoto,
     InputMediaVideo,
     InputMediaAnimation,
@@ -61,6 +86,7 @@ from aiogram.types import (
     InputMediaVoiceNote,
     RichTextUrl,
     RichTextBold,
+    RichTextCode,
 )
 from sqlalchemy import select, desc, func
 
@@ -182,6 +208,63 @@ def _is_moderation_command(text: str) -> bool:
         return False
     # Точное соответствие одному из зарегистрированных паттернов.
     return any(p.match(stripped) for p in _ALL_MOD_COMMANDS)
+
+
+# ── v4.4.8: middleware для полной блокировки disabled-чатов ──────────────
+# Когда в /admin/chats ставят метку Disable (is_enabled=False), бот должен
+# ПЕРЕСТАТЬ ВОСПРИНИМАТЬ ВООБЩЕ ВСЁ в этом чате: ни команды модераторов,
+# ни авто-создание chat_settings, ни catchall-обработку. Просто молча
+# игнорируем каждое сообщение, как будто бота там нет.
+#
+# Это outer_middleware — выполняется ДО любых фильтров и хэндлеров router.message.
+# На my_chat_member не распространяется (нам важно по-прежнему ловить добавление
+# бота обратно в чат, чтобы можно было его снова включить).
+class _DisabledChatMiddleware(BaseMiddleware):
+    """v4.4.8: полностью игнорирует сообщения в чатах с is_enabled=False.
+
+    Логика:
+      • Личные сообщения пропускает как есть (у них нет chat_settings).
+      • Для group/supergroup — проверяем chat_settings.is_enabled.
+        - Если settings нет — пропускаем (catchall сам создаст).
+        - Если settings есть и is_enabled=False — молча return (short-circuit).
+        - Если is_enabled=True — пропускаем к хэндлерам.
+      • Любая ошибка БД — логируем и пропускаем (fail-open, чтобы не положить
+        бота целиком из-за сбоя БД; модераторские команды всё равно проверят
+        is_enabled через _is_admin).
+    """
+
+    async def __call__(self, handler, event: types.Message, data: dict):
+        # Только для групп; личные сообщения не фильтруем.
+        chat_type = event.chat.type if event.chat else None
+        if chat_type not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        try:
+            async with async_session() as session:
+                settings = (await session.execute(
+                    select(ChatSettings).where(ChatSettings.chat_id == event.chat.id)
+                )).scalar_one_or_none()
+        except Exception as e:
+            logger.warning(
+                "DisabledChatMiddleware: DB check failed for chat_id=%s: %s — fail-open",
+                event.chat.id, e,
+            )
+            return await handler(event, data)
+
+        # Нет настроек — чат ещё не зарегистрирован. Пропускаем, чтобы
+        # stealth_catchall_group мог его создать (это не disabled-чат).
+        if settings is None:
+            return await handler(event, data)
+
+        # Чат выключен — полностью игнорируем сообщение.
+        if not settings.is_enabled:
+            return  # short-circuit: не вызываем handler
+
+        return await handler(event, data)
+
+
+# Регистрируем middleware как outer — обрабатывает ВСЕ router.message события.
+router.message.outer_middleware(_DisabledChatMiddleware())
 
 
 # ── Permissions snapshot ───────────────────────────────────────────────────
@@ -629,20 +712,26 @@ async def _send_report(
     Приоритет репорт-чата: per-chat override → default (chat_id=0) → disabled.
     Если репорт-чат не задан — молча ничего не делает.
 
-    Структура Rich-сообщения:
+    v4.4.10 Структура Rich-сообщения (редизайн под мобильный вид):
       1. SectionHeading — 🔇 МУТ / 🚫 БАН / ⚠️ ВАРН / 🔊 РАЗМУТ
-      2. Paragraph      — Нарушитель (кликабельное имя → tg://user?id=…,
-                          @username если есть, ID)
-      3. Paragraph      — Модератор (если передан mod): кликабельное имя
-      4. Paragraph      — Веб-профиль нарушителя (если задан WEB_PUBLIC_URL):
-                          кликабельная ссылка на /user/<id>
-      5. Paragraph      — Причина (если есть)
-      6. BlockQuotation — Текст/caption сообщения нарушителя
-      7. Photo/Video/…  — Inline-медиа (вместо forward_message)
-      8. Details        — Доп. инфо (chat_id, длительность, варны всего) — сворачиваемо
-      9. Footer         — Время МСК + хэштег чата
+      2. Divider        — горизонтальная линия
+      3. List           — список ключевых полей (нарушитель/причина/веб-профиль).
+                          Каждый пункт — ListItem с Paragraph внутри. Эмодзи-маркеры
+                          выровнены нативным списком, URL «Веб-профиль» спрятан под
+                          коротким текстом «Открыть профиль →» — больше не ломается.
+                          ID нарушителя оформлен как inline-код (моноширинный).
+      4. Divider        — разделитель
+      5. Details        — «📎 Показать медиа» (is_open=False): сворачиваемый блок с
+                          фото/видео/гиф из сообщения нарушителя. По умолчанию скрыт
+                          (защита от шок-контента), разворачивается по тапу.
+                          Если есть text_content — он идёт первым пунктом внутри Details.
+      6. Divider        — разделитель
+      7. Details        — «Доп. инфо» (чат/длительность/варнов всего) — сворачиваемо
+      8. Divider        — разделитель
+      9. Footer         — время МСК + хэштег чата + кликабельное имя модератора
+                          (без приписки «Модератор:», просто имя).
 
-    Returns: None (медиа теперь inline в rich message, report_message_id больше не нужен).
+    Returns: None (медиа теперь inline в Details-блоке rich message).
     """
     # ── Определяем репорт-чат ──────────────────────────────────
     async with async_session() as session:
@@ -671,24 +760,10 @@ async def _send_report(
     action_label = action_labels.get(action_type, action_type.upper())
 
     # ── Нарушитель: имя кликабельно → tg://user?id=… ───────────
-    # RichTextUrl оборачивает имя нарушителя в inline-ссылку на его профиль
-    # в Telegram. Клик по имени открывает профиль — это работает даже если
-    # у нарушителя нет @username (тогда ссылка — единственный способ быстро
-    # перейти к его профилю из репорт-чата).
     full_name = (target.first_name or "") + (
         f" {target.last_name}" if target.last_name else ""
     )
     display_name = full_name.strip() or "(без имени)"
-    offender_text: list = [
-        "👤 ",
-        RichTextUrl(
-            text=display_name,
-            url=f"tg://user?id={target.id}",
-        ),
-    ]
-    if target.username:
-        offender_text.append(f"\n   @{target.username}")
-    offender_text.append(f"\n   ID: {target.id}")
 
     # ── Контент нарушителя ─────────────────────────────────────
     text_content: str | None = None
@@ -696,64 +771,91 @@ async def _send_report(
     sticker_file_id: str | None = None
     if reply_to_message is not None:
         text_content = reply_to_message.text or reply_to_message.caption
-        # Если есть только caption без отдельного текста — это и есть контент
         media_block = _build_media_block(reply_to_message)
-        # Стикер: нет inline-блока в Rich Messages, отправим отдельным
-        # сообщением после rich-отчёта (через bot.send_sticker).
         if reply_to_message.sticker is not None:
             sticker_file_id = reply_to_message.sticker.file_id
-        # Для медиа-типов без inline-блока (стикер/документ/кружок) добавим
-        # текстовое описание, чтобы было что показать
         if media_block is None and text_content is None:
             desc = _get_message_content_desc(reply_to_message)
             if desc:
                 text_content = desc
 
-    # ── Список блоков ──────────────────────────────────────────
+    # ── Список блоков (v4.4.10 редизайн) ───────────────────────
     blocks: list = []
     blocks.append(InputRichBlockSectionHeading(text=action_label, size=2))
-    blocks.append(InputRichBlockParagraph(text=offender_text))
+    blocks.append(InputRichBlockDivider())
 
-    # ── Модератор: кто применил санкцию ────────────────────────
-    if mod is not None:
-        mod_name = _user_display_name(mod)
-        blocks.append(
-            InputRichBlockParagraph(
-                text=[
-                    "👮 Модератор: ",
-                    RichTextUrl(
-                        text=mod_name,
-                        url=f"tg://user?id={mod.id}",
-                    ),
-                ]
+    # ── List: нарушитель / причина / веб-профиль ───────────────
+    # Каждый ListItem — отдельный пункт с нативным буллетом. Эмодзи-маркеры
+    # выровнены самим Telegram, не «плывут» как в наборе отдельных Paragraph'ов.
+    list_items: list[InputRichBlockListItem] = []
+
+    # Пункт 1: нарушитель (имя кликабельно + @username + ID моноширинно)
+    offender_item_text: list = [
+        "👤 ",
+        RichTextUrl(
+            text=display_name,
+            url=f"tg://user?id={target.id}",
+        ),
+    ]
+    if target.username:
+        offender_item_text.append(f"  @{target.username}")
+    # ID оформлен как inline-код (моноширинный) — выделяется визуально,
+    # легко копируется на мобильном (долгий тап → Copy).
+    offender_item_text.append("  ")
+    offender_item_text.append(RichTextCode(text=f"ID: {target.id}"))
+    list_items.append(
+        InputRichBlockListItem(
+            blocks=[InputRichBlockParagraph(text=offender_item_text)]
+        )
+    )
+
+    # Пункт 2: причина (если есть)
+    if reason:
+        list_items.append(
+            InputRichBlockListItem(
+                blocks=[InputRichBlockParagraph(text=f"📝 {reason}")]
             )
         )
 
-    # ── Веб-профиль нарушителя (если задан WEB_PUBLIC_URL) ─────
+    # Пункт 3: веб-профиль — короткий текст вместо длинного URL
     if WEB_PUBLIC_URL:
         web_url = f"{WEB_PUBLIC_URL}/user/{target.id}"
-        blocks.append(
-            InputRichBlockParagraph(
-                text=[
-                    "🌐 Веб-профиль: ",
-                    RichTextUrl(text=web_url, url=web_url),
-                ]
+        list_items.append(
+            InputRichBlockListItem(
+                blocks=[InputRichBlockParagraph(
+                    text=[
+                        "🌐 ",
+                        RichTextUrl(text="Открыть профиль →", url=web_url),
+                    ]
+                )]
             )
         )
 
-    if reason:
-        blocks.append(InputRichBlockParagraph(text=f"📝 Причина: {reason}"))
+    blocks.append(InputRichBlockList(items=list_items))
 
-    if text_content:
-        # BlockQuotation содержит вложенные блоки (paragraph)
+    # ── Details: медиа под спойлером ───────────────────────────
+    # Все медиа (фото/видео/гиф) обёрнуты в сворачиваемый Details.
+    # По умолчанию is_open=False — модератор не видит содержимое, пока не тапнет
+    # «📎 Показать медиа». Защита от шок-контента, который иначе сразу бросается
+    # в глаза при открытии репорт-чата.
+    if media_block is not None or text_content:
+        media_details_blocks: list = []
+        if text_content:
+            media_details_blocks.append(
+                InputRichBlockBlockQuotation(
+                    blocks=[InputRichBlockParagraph(text=text_content)]
+                )
+            )
+        if media_block is not None:
+            media_details_blocks.append(media_block)
+        blocks.append(InputRichBlockDivider())
         blocks.append(
-            InputRichBlockBlockQuotation(
-                blocks=[InputRichBlockParagraph(text=text_content)]
+            InputRichBlockDetails(
+                summary="📎 Показать медиа",
+                is_open=False,
+                blocks=media_details_blocks,
             )
         )
-
-    if media_block is not None:
-        blocks.append(media_block)
 
     # ── Details: доп. инфо (сворачиваемое) ─────────────────────
     details_lines: list[str] = [f"Чат: {chat_id}"]
@@ -761,6 +863,7 @@ async def _send_report(
         details_lines.append(f"Длительность: {_format_duration(duration_seconds)}")
     if total_warns is not None:
         details_lines.append(f"Варнов всего: {total_warns}")
+    blocks.append(InputRichBlockDivider())
     blocks.append(
         InputRichBlockDetails(
             summary="Доп. инфо",
@@ -768,20 +871,28 @@ async def _send_report(
         )
     )
 
-    # ── Footer: время МСК + хэштег ─────────────────────────────
+    # ── Footer: время МСК + хэштег + кликабельное имя модератора ─
+    # v4.4.10: модератор перенесён из отдельного параграфа в Footer.
+    # Имя кликабельное (tg://user?id=…), приписки «Модератор:» нет —
+    # экономит место, выглядит чище. Если модератор не передан (action
+    # выполнен автоматически) — просто время + хэштег.
     now_msk = datetime.now(MSK)
     time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
-    footer_text = f"🕐 {time_str}"
+    footer_text: list = [f"🕐 {time_str}"]
     if hashtag:
-        footer_text += f" | {hashtag}"
+        footer_text.append(f" | {hashtag}")
+    if mod is not None:
+        mod_name = _user_display_name(mod)
+        footer_text.append(" | ")
+        footer_text.append(
+            RichTextUrl(text=mod_name, url=f"tg://user?id={mod.id}")
+        )
+    blocks.append(InputRichBlockDivider())
     blocks.append(InputRichBlockFooter(text=footer_text))
 
     rich_msg = InputRichMessage(blocks=blocks)
 
-    # ── Plain-text версия нарушителя для fallback'а ────────────
-    # Rich Messages редко падают, но если упадут — отправим обычный текст.
-    # В plain text ссылки не нужны (Telegram сам распознает URL'ы), поэтому
-    # собираем простую строку.
+    # ── Plain-text версия для fallback'а ───────────────────────
     offender_lines_plain: list[str] = [f"👤 {display_name}"]
     if target.username:
         offender_lines_plain.append(f"   @{target.username}")
@@ -790,11 +901,12 @@ async def _send_report(
 
     mod_text_plain: str | None = None
     if mod is not None:
+        # В fallback'е имя модератора идёт в конце (как в rich-версии),
+        # но с припиской для ясности (plain text не позволяет кликать).
         mod_name = _user_display_name(mod)
-        mod_text_plain = f"👮 Модератор: {mod_name}"
+        mod_text_plain = f"{mod_name}"
         if mod.username:
             mod_text_plain += f" @{mod.username}"
-        mod_text_plain += f" (ID: {mod.id})"
 
     web_url_plain: str | None = None
     if WEB_PUBLIC_URL:
@@ -825,7 +937,9 @@ async def _send_report(
 
     # ── Стикер: отправляем отдельным сообщением после rich-отчёта ──
     # Rich Messages не имеют inline-блока для стикеров, поэтому крепим его
-    # отдельным send_sticker — так модератор в репорт-чате видит сам стикер.
+    # отдельным send_sticker. Стикеры редко бывают шок-контентом, поэтому
+    # без has_spoiler — но всё равно после основного отчёта, чтобы не
+    # заслонять его превью в списке сообщений.
     if sticker_file_id:
         try:
             await bot.send_sticker(chat_id=report_dest, sticker=sticker_file_id)
@@ -857,6 +971,9 @@ async def _send_report_plain_fallback(
     остаётся кликабельной. tg://user?id=… в plain text НЕ распознаётся,
     поэтому кликабельные упоминания нарушителя/модератора опускаем —
     только текстовая информация.
+
+    v4.4.10: Структура повторяет rich-версию — модератор идёт в самом конце
+    (после времени), без приписки «Модератор:», просто имя.
     """
     parts: list[str] = []
     if hashtag:
@@ -864,12 +981,10 @@ async def _send_report_plain_fallback(
     parts.append(action_label)
     parts.append("")
     parts.append(offender_text)
-    if mod_text:
-        parts.append(mod_text)
-    if web_url:
-        parts.append(f"🌐 Веб-профиль: {web_url}")
     if reason:
-        parts.append(f"📝 Причина: {reason}")
+        parts.append(f"📝 {reason}")
+    if web_url:
+        parts.append(f"🌐 Открыть профиль: {web_url}")
     if text_content:
         parts.append(f"💬 Контент: {text_content[:500]}")
     if duration_seconds:
@@ -877,6 +992,8 @@ async def _send_report_plain_fallback(
     if total_warns is not None:
         parts.append(f"⚠️ Варнов всего: {total_warns}")
     parts.append(f"🕐 {time_str}")
+    if mod_text:
+        parts.append(f" | {mod_text}")
     await bot.send_message(chat_id=report_dest, text="\n".join(parts))
 
 
@@ -915,6 +1032,83 @@ async def _send_ephemeral(
         )
     except Exception as e:
         logger.warning("Ephemeral message unexpected error: %s", e)
+
+
+# ── v4.4.9: уведомление НАРУШИТЕЛЮ при !warn (видно только ему) ──────────
+# Bot API 10.2 (aiogram 3.30) позволяет отправлять сообщение в группу так,
+# чтобы его видел только один конкретный юзер (через receiver_user_id).
+# Раньше нарушитель вообще не знал, что ему выдали варн — это делало варн
+# бесполезным как воспитательную меру. Теперь нарушитель видит:
+#   • что ему выдали варн
+#   • причину
+#   • текущее кол-во варнов
+#   • пороги мьюта/бана (если настроены)
+# Остальные участники чата этого сообщения НЕ видят — стелс бота для всех
+# кроме нарушителя сохраняется. Сам факт существования бота раскрывается
+# только тому, кого наказали, и только когда наказание — варн (не мьют/бан).
+async def _send_user_warn_notification(
+    *,
+    bot: types.Bot,
+    chat_id: int,
+    target: types.User,
+    reason: str,
+    total_warns: int,
+    settings: ChatSettings,
+) -> None:
+    """Отправляет нарушителю ephemeral-сообщение о выданном варне.
+
+    Сообщение видно ТОЛЬКО target-юзеру (``receiver_user_id=target.id``).
+    Остальные участники чата его не видят. Если отправка не удалась
+    (юзер заблокировал бота или ограничил ephemeral-сообщения) —
+    тихо логируем и продолжаем; варн в БД уже сохранён.
+    """
+    reason_safe = html.escape(reason, quote=False) if reason else "(не указана)"
+
+    # Пороговая информация (показываем только если хоть один порог > 0)
+    # Защищаемся от None (на случай если ChatSettings создан без дефолтов).
+    wtm = settings.warns_to_mute or 0
+    wtb = settings.warns_to_ban or 0
+    threshold_lines: list[str] = []
+    if wtm > 0 or wtb > 0:
+        parts: list[str] = []
+        if wtm > 0:
+            parts.append(f"мьют при {wtm}")
+        if wtb > 0:
+            parts.append(f"бан при {wtb}")
+        threshold_lines.append("Лимиты: " + ", ".join(parts) + ".")
+
+        # Дополнительное предупреждение, если юзер подошёл к границе
+        if wtb > 0 and total_warns == wtb - 1:
+            threshold_lines.append("⚠️ Следующий варн — бан.")
+        elif wtm > 0 and total_warns == wtm - 1:
+            threshold_lines.append("⚠️ Следующий варн — мьют.")
+        elif wtb > 0 and total_warns >= wtb:
+            threshold_lines.append("Вы превысили лимит варнов — возможен бан.")
+
+    threshold_str = "\n".join(threshold_lines)
+
+    text = (
+        f"⚠️ <b>Вам выдано предупреждение</b>\n\n"
+        f"<b>Причина:</b> {reason_safe}\n"
+        f"<b>Всего предупреждений:</b> {total_warns}"
+        + (f"\n\n{threshold_str}" if threshold_str else "")
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            receiver_user_id=target.id,
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest as e:
+        logger.info(
+            "Warn notification to user %s in chat %s failed: %s "
+            "(this is normal if user restricted ephemeral messages)",
+            target.id, chat_id, e,
+        )
+    except Exception as e:
+        logger.warning("Warn notification to user unexpected error: %s", e)
 
 
 # ── Авто-санкция при превышении порога варнов ──────────────────────────────
@@ -1174,6 +1368,8 @@ async def handle_group_command(message: types.Message) -> None:
                 "warn", 1, reason, target_content,
             )
             total_warns_now = await _count_warns(session, target.id, chat_id)
+            # Подтягиваем настройки чата — нужны пороги для уведомления нарушителю
+            chat_settings = await _get_chat_settings(session, chat_id)
 
         # Удаляем сообщение нарушителя, за которое выдан варн
         try:
@@ -1189,8 +1385,18 @@ async def handle_group_command(message: types.Message) -> None:
             reply_to_message=message.reply_to_message,
         )
 
+        # ── v4.4.9: Уведомление НАРУШИТЕЛЮ (видно только ему) ────────
+        # Раньше варн был невидим для нарушителя — бесполезная санкция.
+        # Теперь через receiver_user_id=target.id отправляем ему ephemeral
+        # с причиной + текущим кол-вом варнов + порогами мьюта/бана.
+        # Остальные участники чата этого сообщения НЕ видят.
+        await _send_user_warn_notification(
+            bot=message.bot, chat_id=chat_id, target=target,
+            reason=reason, total_warns=total_warns_now,
+            settings=chat_settings,
+        )
+
         # ── Ephemeral-подтверждение модератору (видно только ему) ────
-        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
         reason_safe = html.escape(reason, quote=False) if reason else ""
         await _send_ephemeral(
             bot=message.bot, chat_id=chat_id, recipient=mod,

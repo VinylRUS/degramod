@@ -1488,6 +1488,112 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
 
     # ──────────────────────────────────────────────────────────────────
+    #  /admin/chats/{chat_id}/delete — v4.4.8: удалить чат полностью.
+    #
+    #  Бот ЛИВАЕТ из чата через bot.leave_chat (best-effort — если бот уже
+    #  не в чате,_telegram вернёт ошибку, мы её просто логируем).
+    #  Из БД удаляются:
+    #    • chat_settings — настройки чата
+    #    • chat_admins — связи модераторов с этим чатом
+    #    • punishments — история наказаний в этом чате
+    #
+    #  Ограничения:
+    #    • Нельзя удалить chat_id=0 (глобальные дефолтные настройки).
+    #    • Доступ: require_admin (как и остальные /admin/chats/* маршруты).
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/chats/{chat_id_str}/delete")
+    async def admin_chats_delete(
+        chat_id_str: str,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.4.8: полностью удаляет чат. Бот ливает, записи из БД чистятся."""
+        try:
+            chat_id = int(chat_id_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+chat_id",
+                status_code=303,
+            )
+
+        # Защита: chat_id=0 — это глобальный дефолт, его нельзя удалять.
+        if chat_id == 0:
+            return RedirectResponse(
+                url="/admin/chats?flash=Cannot+delete+default+settings+(chat_id=0)",
+                status_code=303,
+            )
+
+        # Считаем что будем удалять (для лога и флэша).
+        async with async_session() as session:
+            cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            )).scalar_one_or_none()
+            if cs is None:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
+                    status_code=303,
+                )
+
+            pun_count = (await session.execute(
+                select(func.count(Punishment.id)).where(Punishment.chat_id == chat_id)
+            )).scalar() or 0
+            ca_count = (await session.execute(
+                select(func.count(ChatAdmin.id)).where(ChatAdmin.chat_id == chat_id)
+            )).scalar() or 0
+
+            chat_title = cs.title or "(no title)"
+
+            # 1. Удаляем punishments для этого чата.
+            if pun_count:
+                await session.execute(
+                    Punishment.__table__.delete().where(Punishment.chat_id == chat_id)
+                )
+            # 2. Удаляем chat_admins для этого чата.
+            if ca_count:
+                await session.execute(
+                    ChatAdmin.__table__.delete().where(ChatAdmin.chat_id == chat_id)
+                )
+            # 3. Удаляем саму chat_settings.
+            await session.execute(
+                ChatSettings.__table__.delete().where(ChatSettings.chat_id == chat_id)
+            )
+            await session.commit()
+
+        # 4. Лучше-эффорт: бот ливает из чата.
+        #    Если бот уже не в чате / нет прав / chat_id невалидный —
+        #    Telegram вернёт BadRequest, мы его просто логируем.
+        leave_msg = ""
+        if bot is not None:
+            try:
+                await bot.leave_chat(chat_id=chat_id)
+                leave_msg = "+bot+left"
+                _req_logger.info("admin_chats_delete: bot left chat_id=%s", chat_id)
+            except TelegramBadRequest as e:
+                _req_logger.warning(
+                    "admin_chats_delete: bot.leave_chat(%s) failed: %s",
+                    chat_id, e,
+                )
+                leave_msg = "+bot+leave+failed+(already+not+in+chat?)"
+            except Exception as e:
+                _req_logger.warning(
+                    "admin_chats_delete: bot.leave_chat(%s) unexpected error: %s",
+                    chat_id, e,
+                )
+                leave_msg = "+bot+leave+error"
+        else:
+            leave_msg = "+no+bot+instance"
+
+        msg = (
+            f"Chat+{chat_id}+({chat_title.replace(' ', '+')})+deleted+"
+            f"({pun_count}+punishments,+{ca_count}+admins){leave_msg}"
+        )
+        _req_logger.info(
+            "admin_chats_delete: chat_id=%s title='%s' by=%s "
+            "(punishments=%s, chat_admins=%s, leave=%s)",
+            chat_id, chat_title, _auth.username, pun_count, ca_count, leave_msg,
+        )
+        return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
+
+    # ──────────────────────────────────────────────────────────────────
     #  /admin/cleanup — безопасная очистка тестовых данных (v4.4.5)
     #
     #  SU-only. Позволяет одним кликом очистить тестовый мусор из БД:
