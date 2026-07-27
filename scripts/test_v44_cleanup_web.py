@@ -97,8 +97,8 @@ def _seed_test_data() -> None:
     conn.execute("INSERT INTO chat_admins (chat_id, user_id, added_by) VALUES (999, 200001, 100001)")
     conn.execute("INSERT INTO chat_admins (chat_id, user_id, added_by) VALUES (999, 200002, 100001)")
     # Chat settings
-    conn.execute("INSERT INTO chat_settings (chat_id, hashtag, warns_to_mute, warns_to_ban) "
-                 "VALUES (999, '#Test', 3, 5)")
+    conn.execute("INSERT INTO chat_settings (chat_id, hashtag, warns_to_mute, warns_to_ban, is_enabled, is_private, is_report_chat) "
+                 "VALUES (999, '#Test', 3, 5, 1, 0, 0)")
     conn.commit()
     conn.close()
 

@@ -125,7 +125,7 @@ async def lifespan(app):
         try:
             await bot.set_webhook(
                 url=WEBHOOK_URL,
-                allowed_updates=["message"],
+                allowed_updates=["message", "my_chat_member"],
             )
             info = await bot.get_webhook_info()
             logger.info("Webhook set to %s (info.url=%s)", WEBHOOK_URL, info.url)

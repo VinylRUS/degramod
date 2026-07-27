@@ -120,16 +120,31 @@ class ChatAdmin(Base):
 
 
 class ChatSettings(Base):
-    """Настройки чата: пороги варнов, хэштег, репорт-чат и т.д."""
+    """Настройки чата: пороги варнов, хэштег, репорт-чат и т.д.
+
+    v4.4.7: добавлены поля для авто-обнаружения чатов и управления доступом:
+      • title         — название чата из Telegram (для отображения в веб-панели)
+      • is_enabled    — если False, бот полностью игнорирует чат (никакие команды)
+      • is_private    — закрытый чат (напр. платный контент-чат): админ-уровень
+                        туда не имеет доступа, только SU и явно привязанные модераторы
+      • is_report_chat — если True, этот чат используется как склад отчётов по умолчанию
+                         (заменяет env REPORT_CHAT_ID; чат может быть одновременно
+                         и обычным чатом для модерации, и репорт-чатом — неважно)
+    """
     __tablename__ = "chat_settings"
 
     chat_id = Column(BigInteger, primary_key=True)
     hashtag = Column(String(64), nullable=True)              # хэштег чата (#Бэбэй, #Деградач)
-    report_chat_id = Column(BigInteger, nullable=True)       # чат для отчётов (NULL = использовать env REPORT_CHAT_ID)
+    report_chat_id = Column(BigInteger, nullable=True)       # чат для отчётов (NULL = global default)
     warns_to_mute = Column(Integer, default=3)               # варнов до мьюта (0 = отключено)
     mute_duration_seconds = Column(Integer, default=3600)    # длительность мьюта по умолчанию (1ч)
     warns_to_ban = Column(Integer, default=5)                # варнов до бана (0 = отключено)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # ── v4.4.7 ──────────────────────────────────────────────────────────
+    title = Column(String(255), nullable=True)               # название чата (из TG, snapshot)
+    is_enabled = Column(Boolean, default=True, nullable=False)  # False = бот игнорирует чат
+    is_private = Column(Boolean, default=False, nullable=False)  # закрытый чат (админ не лезет)
+    is_report_chat = Column(Boolean, default=False, nullable=False)  # склад отчётов
 
 
 class WebUser(Base):
@@ -255,6 +270,30 @@ async def init_db() -> None:
             # Помечаем SU-аккаунты role='su'
             await conn.execute(text(
                 "UPDATE web_users SET role='su' WHERE is_su=1"
+            ))
+
+    # ── Миграция: расширение chat_settings (v4.4.7) ─────────────────────
+    # title / is_enabled / is_private / is_report_chat — для авто-обнаружения
+    # чатов и управления доступом. Все новые поля имеют дефолты, миграция
+    # идемпотентна (IF NOT EXISTS через PRAGMA check).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "title" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN title VARCHAR(255) NULL"
+            ))
+        if "is_enabled" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN is_enabled BOOLEAN NOT NULL DEFAULT 1"
+            ))
+        if "is_private" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN is_private BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "is_report_chat" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN is_report_chat BOOLEAN NOT NULL DEFAULT 0"
             ))
 
     # ── Seed: гарантируем что SU-аккаунт существует в web_users ──────────

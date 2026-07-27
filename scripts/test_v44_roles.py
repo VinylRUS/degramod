@@ -405,7 +405,7 @@ async def test_admin_chats_access():
                                 follow_redirects=False)
         check("SU: GET /admin/chats → 200", resp.status_code == 200, f"got {resp.status_code}")
         check("HTML содержит '#Test'", "#Test" in resp.text)
-        check("HTML содержит 'Edit'", "Edit" in resp.text)
+        check("HTML содержит 'Settings'", "Settings" in resp.text)
         check("HTML содержит form action", 'action="/admin/chats/-100123/update"' in resp.text)
 
         # admin
@@ -577,7 +577,7 @@ async def test_welcome_text_per_role():
 # 13. Nav: moderator видит только Dashboard
 # ──────────────────────────────────────────────────────────────────────────
 async def test_nav_visibility_per_role():
-    print("\n[13] Nav: moderator видит только Dashboard; admin видит Mod/Chats; SU видит всё")
+    print("\n[13] Nav: moderator видит только Dashboard; admin видит Chats; SU видит всё")
     from web_app import create_app
     from httpx import AsyncClient, ASGITransport
 
@@ -590,9 +590,8 @@ async def test_nav_visibility_per_role():
         su_cookie = await _su_login(client)
         resp = await client.get("/dashboard", cookies={"sl_session": su_cookie})
         check("SU видит Dashboard", 'href="/dashboard"' in resp.text)
-        check("SU видит Moderators", 'href="/admin/moderators"' in resp.text)
         check("SU видит Chats", 'href="/admin/chats"' in resp.text)
-        check("SU видит Admins", 'href="/admin/users"' in resp.text)
+        check("SU видит Users", 'href="/admin/users"' in resp.text)
         check("SU видит Cleanup", 'href="/admin/cleanup"' in resp.text)
         check("SU видит 'SU' chip", ">SU<" in resp.text)
 
@@ -603,9 +602,8 @@ async def test_nav_visibility_per_role():
         adm_cookie = resp.cookies.get("sl_session")
         resp = await client.get("/dashboard", cookies={"sl_session": adm_cookie})
         check("admin видит Dashboard", 'href="/dashboard"' in resp.text)
-        check("admin видит Moderators", 'href="/admin/moderators"' in resp.text)
         check("admin видит Chats", 'href="/admin/chats"' in resp.text)
-        check("admin НЕ видит Admins", 'href="/admin/users"' not in resp.text)
+        check("admin НЕ видит Users", 'href="/admin/users"' not in resp.text)
         check("admin НЕ видит Cleanup", 'href="/admin/cleanup"' not in resp.text)
         check("admin видит 'ADMIN' chip", ">ADMIN<" in resp.text)
 
@@ -616,7 +614,6 @@ async def test_nav_visibility_per_role():
         mod_cookie = resp.cookies.get("sl_session")
         resp = await client.get("/dashboard", cookies={"sl_session": mod_cookie})
         check("moderator видит Dashboard", 'href="/dashboard"' in resp.text)
-        check("moderator НЕ видит Moderators", 'href="/admin/moderators"' not in resp.text)
         check("moderator НЕ видит Chats", 'href="/admin/chats"' not in resp.text)
         check("moderator НЕ видит Admins", 'href="/admin/users"' not in resp.text)
         check("moderator НЕ видит Cleanup", 'href="/admin/cleanup"' not in resp.text)

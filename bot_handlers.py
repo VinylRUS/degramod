@@ -64,7 +64,7 @@ from aiogram.types import (
 )
 from sqlalchemy import select, desc, func
 
-from db import async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings
+from db import async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser
 
 logger = logging.getLogger("shadow_logger.bot_handlers")
 
@@ -234,15 +234,57 @@ async def _get_chat_settings(session, chat_id: int) -> ChatSettings:
 
 
 async def _is_admin(session, chat_id: int, user_id: int) -> bool:
-    """Проверяет, является ли юзер админом чата (из ADMIN_IDS или из ChatAdmin)."""
+    """v4.4.7: унифицированная проверка прав на модеративные команды в чате.
+
+    Логика:
+      • ADMIN_IDS env (глобальные супер-админы) — всегда True.
+      • Чат выключен (chat_settings.is_enabled=False) — всегда False.
+      • SU (web_users.role='su', привязан к TG ID) — True во всех чатах.
+      • Admin (web_users.role='admin') — True в обычных чатах; False в приватных.
+      • Moderator (web_users.role='moderator') — True только если есть запись
+        в chat_admins (явная привязка к этому чату).
+      • Активен только если web_users.is_active=True.
+      • Если нет веб-аккаунта, но есть запись в chat_admins (старый сценарий) — True.
+        Это сохраняет обратную совместимость с TG-only модераторами, добавленными
+        через /addadmin без создания веб-профиля.
+    """
+    # 1. Глобальные супер-админы из env
     if user_id in ADMIN_IDS:
         return True
-    stmt = select(ChatAdmin).where(
-        ChatAdmin.chat_id == chat_id,
-        ChatAdmin.user_id == user_id,
-    )
-    result = await session.execute(stmt)
-    return result.scalar_one_or_none() is not None
+
+    # 2. Настройки чата — может быть чат выключен
+    settings = await _get_chat_settings(session, chat_id)
+    if not settings.is_enabled:
+        return False
+
+    # 3. Ищем веб-профиль по TG ID
+    wu = (await session.execute(
+        select(WebUser).where(WebUser.tg_user_id == user_id)
+    )).scalar_one_or_none()
+    if wu and wu.is_active:
+        if wu.role == "su":
+            return True
+        if wu.role == "admin":
+            # админ не лезет в приватные чаты
+            return not settings.is_private
+        if wu.role == "moderator":
+            # модератор — только если явно привязан к этому чату
+            ca = (await session.execute(
+                select(ChatAdmin).where(
+                    ChatAdmin.chat_id == chat_id,
+                    ChatAdmin.user_id == user_id,
+                )
+            )).scalars().first()
+            return ca is not None
+
+    # 4. Fallback: TG-only модератор (нет веб-аккаунта, но есть chat_admins)
+    ca = (await session.execute(
+        select(ChatAdmin).where(
+            ChatAdmin.chat_id == chat_id,
+            ChatAdmin.user_id == user_id,
+        )
+    )).scalars().first()
+    return ca is not None
 
 
 async def _get_chat_admins(session, chat_id: int) -> list[ChatAdmin]:
@@ -250,6 +292,65 @@ async def _get_chat_admins(session, chat_id: int) -> list[ChatAdmin]:
     stmt = select(ChatAdmin).where(ChatAdmin.chat_id == chat_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+# ── v4.4.7: авто-обнаружение чатов ─────────────────────────────────────────
+async def _ensure_chat_settings(
+    session, chat_id: int, title: str | None = None,
+) -> tuple[ChatSettings, bool]:
+    """Создаёт chat_settings для чата, если её ещё нет.
+
+    Возвращает (settings, created). Если created=True и у SU привязан TG ID —
+    вызывающий код должен отправить SU уведомление (через _notify_su_about_chat).
+    """
+    stmt = select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+    settings = (await session.execute(stmt)).scalar_one_or_none()
+    if settings is None:
+        settings = ChatSettings(chat_id=chat_id, title=title)
+        if chat_id in _CHAT_HASHTAGS:
+            settings.hashtag = _CHAT_HASHTAGS[chat_id]
+        session.add(settings)
+        await session.flush()
+        return settings, True
+    # Обновляем title если он изменился и новый передан
+    if title and settings.title != title:
+        settings.title = title
+    return settings, False
+
+
+async def _notify_su_about_chat(bot, chat_id: int, chat_title: str | None) -> None:
+    """Отправляет SU в ЛС уведомление о новом чате (best-effort).
+
+    Находит всех SU-юзеров с привязанным tg_user_id и шлёт им сообщение.
+    Ошибки игнорируются (это уведомление, не критично).
+    """
+    try:
+        async with async_session() as session:
+            sus = (await session.execute(
+                select(WebUser).where(
+                    WebUser.role == "su",
+                    WebUser.is_active.is_(True),
+                    WebUser.tg_user_id.is_not(None),
+                )
+            )).scalars().all()
+        if not sus:
+            return
+        title_display = chat_title or "(без названия)"
+        text = (
+            f"🆕 Бот добавлен в новый чат:\n"
+            f"   <b>{html.escape(title_display, quote=False)}</b>\n"
+            f"   ID: <code>{chat_id}</code>\n\n"
+            f"Настройте чат в веб-панели: Chats → выберите этот чат.\n"
+            f"Можно: задать хэштег, выбрать чат для отчётов, "
+            f"пометить как приватный, выключить бота в чате."
+        )
+        for su in sus:
+            try:
+                await bot.send_message(chat_id=su.tg_user_id, text=text, parse_mode="HTML")
+            except Exception as e:
+                logger.info("notify_su_about_chat: failed for su tg=%s: %s", su.tg_user_id, e)
+    except Exception as e:
+        logger.warning("notify_su_about_chat: %s", e)
 
 
 # ── Helpers: upsert ────────────────────────────────────────────────────────
@@ -455,24 +556,35 @@ def _build_media_block(msg: types.Message):
 
 
 async def _get_report_chat_id(session, chat_id: int) -> int | None:
-    """Возвращает ID чата для отчётов.
+    """Возвращает ID чата для отчётов (v4.4.7).
 
     Приоритет:
       1. Per-chat override (ChatSettings.report_chat_id для данного chat_id)
-      2. Глобальный default (ChatSettings.report_chat_id для chat_id=0)
-      3. None (отчёты отключены)
+      2. Любой чат с пометкой is_report_chat=True (выбирается первый попавшийся)
+      3. Глобальный default (ChatSettings.report_chat_id для chat_id=0)
+      4. None (отчёты отключены)
     """
     # 1. Per-chat override
     settings = await _get_chat_settings(session, chat_id)
     if settings.report_chat_id is not None and settings.report_chat_id != 0:
         return settings.report_chat_id
 
-    # 2. Глобальный default (chat_id=0)
+    # 2. Любой чат с is_report_chat=True
+    rc = (await session.execute(
+        select(ChatSettings.chat_id).where(
+            ChatSettings.is_report_chat.is_(True),
+            ChatSettings.chat_id != 0,
+        ).limit(1)
+    )).scalars().first()
+    if rc is not None:
+        return rc
+
+    # 3. Глобальный default (chat_id=0) — legacy
     default_settings = await _get_chat_settings(session, 0)
     if default_settings.report_chat_id is not None and default_settings.report_chat_id != 0:
         return default_settings.report_chat_id
 
-    # 3. Disabled
+    # 4. Disabled
     return None
 
 
@@ -1717,5 +1829,67 @@ async def stealth_catchall_group(message: types.Message) -> None:
     """Стелс: молча игнорируем все сообщения в группах,
     которые не были обработаны модераторскими командами.
     Сюда попадают: обычные сообщения, /start, /help и т.д.
+
+    v4.4.7: Побочный эффект — при первом сообщении в чате создаём
+    chat_settings (если ещё нет) и уведомляем SU. Это надёжнее, чем
+    my_chat_member, т.к. Telegram не всегда присылает my_chat_member
+    при добавлении бота (зависит от прав).
     """
+    # v4.4.7: создаём chat_settings для чата, если ещё нет
+    try:
+        async with async_session() as session:
+            settings, created = await _ensure_chat_settings(
+                session,
+                chat_id=message.chat.id,
+                title=message.chat.title,
+            )
+            if created:
+                await session.commit()
+                _new_chat_id = settings.chat_id
+                _new_chat_title = settings.title or message.chat.title
+                # Уведомляем SU вне сессии (best-effort)
+                asyncio.create_task(
+                    _notify_su_about_chat(message.bot, _new_chat_id, _new_chat_title)
+                )
+                logger.info(
+                    "Auto-detected new chat: id=%s title='%s' — notified SU",
+                    _new_chat_id, _new_chat_title,
+                )
+    except Exception as e:
+        logger.warning("stealth_catchall_group: ensure_chat_settings failed: %s", e)
     return
+
+
+# ── v4.4.7: my_chat_member — обработка добавления/удаления бота ──────────
+@router.my_chat_member()
+async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
+    """Срабатывает, когда бота добавляют/удаляют из чата, повышают/понижают права.
+
+    Используется для авто-обнаружения чатов: при добавлении бота в чат
+    создаём chat_settings и уведомляем SU. my_chat_member более надёжен,
+    чем stealth_catchall_group, т.к. срабатывает сразу при добавлении,
+    а не при первом сообщении.
+    """
+    new_status = event.new_chat_member.status if event.new_chat_member else None
+    old_status = event.old_chat_member.status if event.old_chat_member else None
+
+    # Был добавлен в чат (или повышен с left/member до administrator)
+    if new_status in ("member", "administrator") and new_status != old_status:
+        try:
+            async with async_session() as session:
+                settings, created = await _ensure_chat_settings(
+                    session,
+                    chat_id=event.chat.id,
+                    title=event.chat.title,
+                )
+                if created:
+                    await session.commit()
+                    asyncio.create_task(
+                        _notify_su_about_chat(event.bot, event.chat.id, event.chat.title)
+                    )
+                    logger.info(
+                        "my_chat_member: bot added to chat id=%s title='%s'",
+                        event.chat.id, event.chat.title,
+                    )
+        except Exception as e:
+            logger.warning("on_my_chat_member: failed: %s", e)

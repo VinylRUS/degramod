@@ -1,14 +1,133 @@
 # Дедушка Вобжак — TODO / Что осталось доделать
 
 ## Статус проекта
-**Версия**: v4.4.6 (рабочий бот с per-chat report_chat_id, **ролевая модель SU/admin/moderator в веб-панели**, автообновление, стелс-режим, Rich Messages с кликабельным нарушителем/модератором/веб-ссылкой, welcome-сообщение новому админу/модератору в ЛС с паролем под спойлером, управление модераторами чатов через веб-панель (команды /addadmin, /deladmin — как fallback), **управление настройками чатов через /admin/chats**, Ephemeral-подтверждения модератору, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля, очистка тестовых данных из БД через кнопку в веб-панели SU)
-**Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`)
-**Архитектура репорт-чата**: per-chat override → default (chat_id=0) → disabled
+**Версия**: v4.4.7 (рабочий бот с **объединённой ролевой моделью SU/admin/moderator** (одна сущность WebUser, админ = права во всех публичных чатах, модератор = права только в привязанных чатах), **авто-обнаружение чатов** (bot создаёт chat_settings при добавлении в чат + DM SU), **toggles для чатов** (is_enabled / is_private / is_report_chat — через карточки в /admin/chats), **привязка TG ID к SU** (для получения DM о новых чатах), **edit-chats у модератора** (мультивыбор чатов — не только при создании, но и постфактум), **change-role moderator↔admin** (с авто-очисткой chat_admins при повышении), **удалённая отдельная вкладка Moderators** (объединена с Admins в единую Users), автообновление, стелс-режим, Rich Messages, welcome-DM новому админу/модератору, Ephemeral-подтверждения, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля, очистка тестовых данных из БД через кнопку в веб-панели SU)
+**Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`, `my_chat_member`)
+**Архитектура репорт-чата**: per-chat override → is_report_chat flag → default (chat_id=0) → disabled
 **Стелс-режим**: нарушитель НИКОГДА не получает уведомлений от бота; ephemeral видят только модераторы
 **Санкции**: !mute / !warn / !ban / !unmute / !unban / !unwarn [N] / !warns / !resetwarns
-**Веб-панель**: SU (env WEB_PASSWORD) + мульти-админ (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи
+**Веб-панель**: SU (env WEB_PASSWORD) + мульти-юзер (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи
 **v4.4 web-админы**: создаются SU по TGID, профиль подтягивается из Telegram (`bot.get_chat`), пароль автогенерируется и показывается SU один раз, юзер сам меняет пароль через /dashboard
 **v4.4.3 модераторы**: SU может добавлять/удалять модераторов чатов через `/admin/moderators` (SU-only). Команды `/addadmin`, `/deladmin` в боте остаются как fallback. Профиль модератора (имя, @username) подтягивается через `bot.get_chat` best-effort.
+
+---
+
+## ✅ Готово — v4.4.7 (объединённая ролевая модель + авто-обнаружение чатов)
+
+### 28 ✅ Объединение Admins + Moderators в единую вкладку Users
+
+**Проблема v4.4.6**: вкладки "Admins" (`/admin/users`) и "Moderators" (`/admin/moderators`) дублировали функционал и создавали путаницу. Создавались две разные сущности — веб-логин (WebUser) и TG-модератор чата (ChatAdmin), хотя по сути это один и тот же человек с разными правами.
+
+**Что сделано**:
+- Удалены роуты `/admin/moderators/*` (GET, POST create, POST delete) и файл `templates/admin_moderators.html`.
+- Вкладка "Admins" переименована в "Users" (в навигации SU).
+- При создании веб-юзера с ролью `moderator` — добавлен **мультивыбор чатов** (чекбоксы). Для каждого выбранного чата создаётся запись в `chat_admins`, дающая модератору право на `!warn/!mute/!ban` в этих чатах.
+- При создании с ролью `admin` — список чатов игнорируется (админ имеет права во всех публичных чатах автоматически).
+- Добавлен **edit-chats** — инлайн-форма на странице Users для изменения списка чатов модератора в любой момент (не только при создании).
+- Добавлен **change-role** moderator↔admin одной кнопкой. При повышении moderator→admin — автоматически удаляются все его записи из `chat_admins` (они больше не нужны). При понижении admin→moderator — `chat_admins` не трогаются (модератор должен будет сам указать чаты через edit-chats).
+- На странице Users появилась отдельная секция "TG-only moderators" — показывает записи `chat_admins` без веб-аккаунта (старый сценарий `/addadmin`). Чтобы дать им веб-доступ — SU создаёт юзера с тем же TG ID, и они автоматически связываются.
+- `user_chats` словарь подгружается для каждого moderator-юзера (LEFT JOIN chat_admins + chat_settings) — отображается прямо в таблице юзеров.
+
+### 29 ✅ Унификация прав _is_admin (role × private × enabled)
+
+**Старая логика** (`v4.4.6`):
+```python
+async def _is_admin(session, chat_id, user_id):
+    if user_id in ADMIN_IDS: return True
+    return db.is_chat_admin(chat_id, user_id)  # только chat_admins
+```
+
+**Новая логика** (`v4.4.7`):
+```python
+async def _is_admin(session, chat_id, user_id):
+    if user_id in ADMIN_IDS: return True            # env глобальные супер-админы
+    settings = await _get_chat_settings(session, chat_id)
+    if not settings.is_enabled: return False         # чат выключен — никто не модерит
+    wu = await get_web_user_by_tg_id(user_id)
+    if wu and wu.is_active:
+        if wu.role == "su":       return True                    # SU — везде
+        if wu.role == "admin":    return not settings.is_private # админ не лезет в private
+        if wu.role == "moderator": return db.is_chat_admin(...)  # только привязка
+    # Fallback: TG-only модератор (chat_admins без веб-аккаунта) — обратная совместимость
+    return db.is_chat_admin(chat_id, user_id)
+```
+
+Тесты покрывают все 10 комбинаций: SU×{public, private, disabled} + admin×{public, private, disabled} + moderator×{привязанный, непривязанный, disabled} + moderator без чатов.
+
+### 30 ✅ Авто-обнаружение чатов (my_chat_member + stealth catchall)
+
+**Проблема**: раньше SU должен был вручную добавить чат в `chat_settings` (через `/sethashtag` или веб-панель) — иначе бот работал, но в `/admin/chats` чат не отображался.
+
+**Что сделано в `bot_handlers.py`**:
+- Добавлен обработчик `@router.my_chat_member()` — срабатывает, когда бота добавляют/удаляют из чата или повышают/понижают права. При добавлении — создаётся `chat_settings` (если ещё нет) с `title` из TG, флаг `is_enabled=True`, `is_private=False`.
+- Дополнительно: `stealth_catchall_group` (catchall для всех сообщений в группах) теперь тоже проверяет наличие `chat_settings` и создаёт при первом сообщении. Это страховка на случай если `my_chat_member` не пришёл (зависит от прав бота).
+- Если у SU привязан TG ID — после обнаружения нового чата бот отправляет ему DM: "🆕 Бот добавлен в новый чат: <title> (id). Настройте его в веб-панели."
+- `_ensure_chat_settings(session, chat_id, title)` — хелпер, идемпотентный. Возвращает `(settings, created)`. Обновляет `title` если чат переименовали.
+
+**В `bot.py`**: `allowed_updates=["message", "my_chat_member"]` — чтобы Telegram присылал обновления `my_chat_member` на вебхук.
+
+### 31 ✅ Toggles для чатов (is_enabled / is_private / is_report_chat)
+
+**Новые колонки в `chat_settings`**:
+| Колонка | Тип | Default | Назначение |
+|---------|-----|---------|-----------|
+| `title` | String(255), nullable | NULL | Название чата из TG (snapshot) |
+| `is_enabled` | Boolean, NOT NULL | True | False = бот полностью игнорирует чат (никакие команды) |
+| `is_private` | Boolean, NOT NULL | False | True = закрытый чат (админ-уровень туда не имеет доступа, только SU и привязанные модераторы) |
+| `is_report_chat` | Boolean, NOT NULL | False | True = этот чат используется как склад отчётов по умолчанию |
+
+**Новый роут** `POST /admin/chats/{chat_id_str}/toggle` — принимает form-поле `field=enabled|private|report_chat`. Для `report_chat` — автоматически снимает флаг с других чатов (репорт-чат может быть только один).
+
+**Переделанный UI `/admin/chats`**: вместо таблицы с инлайн-формами — сетка карточек. На каждой карточке: название + ID + бейджи (DISABLED / PRIVATE / REPORT + hashtag), статистика (кол-во наказаний + модераторов), 4 кнопки:
+- ■ Disable / □ Enable (toggle is_enabled)
+- 🔒 Private / 🔓 Public (toggle is_private)
+- ★ Report chat / ☆ Make report (toggle is_report_chat)
+- ✎ Settings (раскрывает инлайн-форму для hashtag / report_chat_id / thresholds)
+
+Подсказка "⚠ New chat — configure it" для неполностью настроенных чатов.
+
+### 32 ✅ Привязка TG ID к SU
+
+**Проблема**: SU был веб-юзером без TG ID — бот не мог отправлять ему DM о новых чатах.
+
+**Что сделано**:
+- Новый роут `POST /admin/users/{user_id}/bind-tg` — принимает form-поле `tg_user_id`. Работает для любого юзера (включая SU).
+- Если `tg_user_id` пустой — отвязывает (TG ID = NULL).
+- Best-effort: `bot.get_chat(tg_id)` подтягивает `first_name / last_name / @username` и обновляет профиль.
+- Проверка уникальности: TG ID не может быть привязан к двум юзерам.
+- На странице Users у SU появляется кнопка "Bind TG" (вместо disable/reset/delete).
+
+### 33 ✅ Удаление REPORT_CHAT_ID env зависимости
+
+Раньше приоритет репорт-чата был: per-chat override → default (chat_id=0) → env REPORT_CHAT_ID.
+Теперь: per-chat override → any chat with `is_report_chat=True` → default (chat_id=0) → disabled.
+Env `REPORT_CHAT_ID` больше не нужен (но остаётся как legacy fallback в коде — на случай если кто-то не мигрировал).
+
+### 34 ✅ Тесты v4.4.7
+
+**Новый файл**: `scripts/test_v44_users_web.py` (64 checks):
+1. GET /admin/users — страница содержит radio buttons + chatsBlock
+2. POST /admin/users/create — moderator с chat_ids (создаёт WebUser + 2 chat_admins)
+3. POST /admin/users/create — admin (chat_ids игнорируется)
+4. POST /admin/users/{id}/edit-chats — обновление списка чатов модератора
+5. POST /admin/users/{id}/role — moderator→admin чистит chat_admins
+6. POST /admin/users/{id}/bind-tg — привязка TG к SU
+7. Старые роуты /admin/moderators/* возвращают 404
+8. Nav: только SU видит Users
+9. /admin/users access control (SU OK; admin/moderator → redirect)
+10. TG-only модераторы отображаются отдельной секцией
+11. POST /admin/users/{id}/toggle — disable/enable
+12. SU нельзя заблокировать через toggle
+13. /admin/chats/{id}/toggle — enabled/private/report_chat (со снятием флага с других)
+14. _is_admin — унифицированная проверка прав (10 комбинаций role × private × enabled)
+15. Welcome DM отправляется новому moderator
+
+**Обновлённые тесты**:
+- `test_v44_roles.py` — поправлен nav (теперь без Moderators), `Edit` → `Settings`.
+- `test_v44_cleanup_web.py` — INSERT в chat_settings добавлены новые NOT NULL колонки.
+- `test_v44_moderators_web.py` — удалён (функционал перенесён в `test_v44_users_web.py`).
+
+**Итого**: 354 проверки, 0 ошибок (67 cleanup_web + 29 rich_report + 67 roles + 82 tgid_create + 64 users_web + 38 welcome + 7 cleanup_test_data pytest).
 
 ---
 

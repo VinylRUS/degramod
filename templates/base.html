@@ -548,11 +548,10 @@
         <span class="brand">ДЕДУШКА ВОБЖАК</span>
         <a href="/dashboard" class="nav-link {% if request.url.path == '/dashboard' %}active{% endif %}">Dashboard</a>
         {% if auth_user and auth_user.role in ('su', 'admin') %}
-        <a href="/admin/moderators" class="nav-link {% if request.url.path.startswith('/admin/moderators') %}active{% endif %}">Moderators</a>
         <a href="/admin/chats" class="nav-link {% if request.url.path.startswith('/admin/chats') %}active{% endif %}">Chats</a>
         {% endif %}
         {% if auth_user and auth_user.role == 'su' %}
-        <a href="/admin/users" class="nav-link {% if request.url.path.startswith('/admin/users') %}active{% endif %}">Admins</a>
+        <a href="/admin/users" class="nav-link {% if request.url.path.startswith('/admin/users') %}active{% endif %}">Users</a>
         <a href="/admin/cleanup" class="nav-link {% if request.url.path.startswith('/admin/cleanup') %}active{% endif %}">Cleanup</a>
         {% endif %}
         <span class="spacer"></span>

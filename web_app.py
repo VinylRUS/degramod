@@ -763,17 +763,21 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         ])
 
     # ──────────────────────────────────────────────────────────────────
-    #  /admin/users — управление админ-аккаунтами (только SU)
-    #  v4.4: создание через TGID с автозаполнением профиля из Telegram.
+    #  /admin/users — управление всеми пользователями (v4.4.7)
+    #
+    #  v4.4.7: Объединяет бывш. Admins + Moderators. Создаётся одна
+    #  сущность WebUser с ролью admin/moderator; модераторам при
+    #  создании можно сразу назначить чаты (мультивыбор).
+    #
+    #  Доступ: только SU. (Admin не может создавать других юзеров.)
     # ──────────────────────────────────────────────────────────────────
     @app.get("/admin/users", response_class=HTMLResponse)
     async def admin_users_page(
         request: Request,
         flash: str = "",
-        created: str = "",       # v4.4: signed-flash с паролем нового админа
+        created: str = "",
         _auth: AuthUser = Depends(require_su),
     ):
-        # Если есть created-токен — пробуем верифицировать подпись и свежесть.
         created_info = None
         if created:
             payload = _verify_flash(created, max_age_seconds=180)
@@ -782,9 +786,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     "username": payload["u"],
                     "password": payload["p"],
                     "tg_user_id": payload.get("tg"),
-                    # w=1 → бот доставил приветствие с паролем в ЛС юзеру
-                    # w=0 (или нет ключа) → бот не смог отправить (юзер заблокировал),
-                    # SU должен передать пароль вручную
                     "welcome_sent": bool(payload.get("w", 0)),
                 }
 
@@ -792,9 +793,60 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             users = (await session.execute(
                 select(WebUser).order_by(WebUser.is_su.desc(), WebUser.created_at.asc())
             )).scalars().all()
+
+            # Для каждого moderator-юзера подгружаем список привязанных чатов
+            user_chats: dict[int, list[tuple[int, str | None, str | None]]] = {}
+            # {web_user.tg_user_id: [(chat_id, chat_title, hashtag), ...]}
+            if users:
+                tg_ids = [u.tg_user_id for u in users if u.tg_user_id]
+                if tg_ids:
+                    rows = (await session.execute(
+                        select(
+                            ChatAdmin.user_id,
+                            ChatAdmin.chat_id,
+                            ChatSettings.title,
+                            ChatSettings.hashtag,
+                        )
+                        .outerjoin(ChatSettings, ChatAdmin.chat_id == ChatSettings.chat_id)
+                        .where(ChatAdmin.user_id.in_(tg_ids))
+                        .order_by(ChatAdmin.user_id, ChatAdmin.chat_id)
+                    )).all()
+                    for r in rows:
+                        user_chats.setdefault(r[0], []).append((r[1], r[2], r[3]))
+
+            # Список всех чатов для мультивыбора (исключая default chat_id=0)
+            all_chats = (await session.execute(
+                select(ChatSettings.chat_id, ChatSettings.title, ChatSettings.hashtag)
+                .where(ChatSettings.chat_id != 0)
+                .order_by(ChatSettings.title.asc(), ChatSettings.chat_id.asc())
+            )).all()
+
+            # Также подгружаем TG-only модераторов (chat_admins без веб-аккаунта)
+            tg_only_moderators = []
+            if users:
+                web_tg_ids = {u.tg_user_id for u in users if u.tg_user_id}
+                ca_rows = (await session.execute(
+                    select(
+                        ChatAdmin.id,
+                        ChatAdmin.chat_id,
+                        ChatAdmin.user_id,
+                        ChatAdmin.created_at,
+                        ChatSettings.title.label("chat_title"),
+                        ChatSettings.hashtag.label("chat_hashtag"),
+                    )
+                    .outerjoin(ChatSettings, ChatAdmin.chat_id == ChatSettings.chat_id)
+                    .order_by(ChatAdmin.chat_id.asc(), ChatAdmin.user_id.asc())
+                )).all()
+                for r in ca_rows:
+                    if r[2] not in web_tg_ids:
+                        tg_only_moderators.append(r)
+
         return templates.TemplateResponse("admin.html", {
             "request": request,
             "web_users": users,
+            "user_chats": user_chats,
+            "all_chats": all_chats,
+            "tg_only_moderators": tg_only_moderators,
             "auth_user": _auth,
             "flash": flash or None,
             "created_info": created_info,
@@ -805,18 +857,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         request: Request,
         tg_user_id: str = Form(...),
         role: str = Form("admin"),
+        chat_ids: list[str] = Form(None),
         _auth: AuthUser = Depends(require_su),
     ):
-        """v4.4: создаёт веб-админа по Telegram ID. v4.4.6: добавлен выбор роли.
+        """v4.4.7: создаёт веб-пользователя по Telegram ID с ролью admin/moderator.
 
-        role: 'admin' (по умолчанию) или 'moderator'.
-          • admin     — управление чатами/модераторами + просмотр логов
-          • moderator — только просмотр логов
-
-        Логин = @username из TG (без @, lowercase). Если у юзера нет username — отказ.
-        Пароль автогенерируется, показывается SU один раз через signed-flash в query.
-        Профиль (first_name / last_name / username) берётся из bot.get_chat(user_id).
-        Welcome-сообщение в ЛС адаптируется под роль.
+        role=moderator: дополнительно принимает список chat_ids (мультивыбор) —
+        для каждого выбранного чата создаётся запись в chat_admins, что даёт
+        модератору право использовать !warn/!mute/!ban в этих чатах.
+        role=admin: chat_ids игнорируются (админ имеет права во всех публичных
+        чатах автоматически).
         """
         # ── 0. Валидация role ──────────────────────────────────────────
         role = (role or "admin").strip().lower()
@@ -841,7 +891,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # ── 2. bot должен быть передан (иначе эндпоинт бесполезен) ──────
+        # ── 2. bot должен быть передан ──────────────────────────────────
         if bot is None:
             _req_logger.error("admin_users_create: bot is None — create_app called without bot?")
             return RedirectResponse(
@@ -849,9 +899,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # ── 3. Дёргаем Telegram: bot.get_chat(user_id) ─────────────────
-        # Работает только если юзер уже хоть раз общался с ботом (или бот админ
-        # в чате, где юзер состоит). Иначе — TelegramBadRequest.
+        # ── 3. bot.get_chat ─────────────────────────────────────────────
         try:
             chat = await bot.get_chat(chat_id=tg_id)
         except Exception as e:
@@ -863,23 +911,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # ── 4. Извлекаем профиль из Chat объекта ────────────────────────
-        # Для приватных чатов: type='private', first_name, last_name, username.
+        # ── 4. Профиль из Chat ──────────────────────────────────────────
         tg_username = getattr(chat, "username", None)
         tg_first_name = getattr(chat, "first_name", None)
         tg_last_name = getattr(chat, "last_name", None)
-
         if not tg_username:
             return RedirectResponse(
                 url=f"/admin/users?flash=User+{tg_id}+has+no+%40username+in+Telegram.+"
                     "Cannot+create+login+without+it.",
                 status_code=303,
             )
-
-        # Логин = @username (без @, lowercase). Telegram usernames: 5-32 chars, [a-zA-Z0-9_].
         login = tg_username.strip().lstrip("@").lower()
-        # 'su' reserved — проверяем ПЕРВЫМ, чтобы @username='su' (даже если бы такое было
-        # возможно в TG) не падало с ошибкой длины, а давало понятный 'reserved'.
         if login == "su":
             return RedirectResponse(
                 url="/admin/users?flash=%27su%27+is+reserved",
@@ -892,13 +934,25 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # ── 5. Генерируем пароль ────────────────────────────────────────
+        # ── 5. Парсим выбранные чаты (только для moderator) ─────────────
+        chosen_chat_ids: list[int] = []
+        if role == "moderator" and chat_ids:
+            for raw in chat_ids:
+                raw = (raw or "").strip()
+                if not raw:
+                    continue
+                try:
+                    cid = int(raw)
+                    if cid != 0 and cid not in chosen_chat_ids:
+                        chosen_chat_ids.append(cid)
+                except (ValueError, TypeError):
+                    pass
+
+        # ── 6. Генерация пароля ─────────────────────────────────────────
         password = _generate_password()
 
-        # ── 6. Сохраняем в БД ───────────────────────────────────────────
+        # ── 7. Сохранение ───────────────────────────────────────────────
         async with async_session() as session:
-            # Проверка уникальности TGID — ПЕРВОЙ, т.к. SU ввёл именно TGID.
-            # Если TGID уже привязан — нет смысла идти дальше.
             existing_by_tg = (await session.execute(
                 select(WebUser).where(WebUser.tg_user_id == tg_id)
             )).scalar_one_or_none()
@@ -908,7 +962,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                         f"admin+%27{existing_by_tg.username}%27",
                     status_code=303,
                 )
-            # Проверка уникальности логина
             existing_by_login = (await session.execute(
                 select(WebUser).where(WebUser.username == login)
             )).scalar_one_or_none()
@@ -927,30 +980,39 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 tg_user_id=tg_id,
                 tg_first_name=tg_first_name,
                 tg_last_name=tg_last_name,
-                tg_username=login,  # храним без @, lowercase — синхронно с полем username
+                tg_username=login,
                 role=role,
             ))
+            await session.flush()
+
+            # Для moderator — создаём записи в chat_admins
+            if role == "moderator" and chosen_chat_ids:
+                for cid in chosen_chat_ids:
+                    # Проверяем что ещё нет такой записи
+                    existing_ca = (await session.execute(
+                        select(ChatAdmin).where(
+                            ChatAdmin.chat_id == cid,
+                            ChatAdmin.user_id == tg_id,
+                        )
+                    )).scalars().first()
+                    if existing_ca is None:
+                        session.add(ChatAdmin(
+                            chat_id=cid,
+                            user_id=tg_id,
+                            added_by=None,
+                        ))
             await session.commit()
 
         _req_logger.info(
-            "admin_users_create: created web_user username=%s tg_user_id=%s role=%s by=%s",
-            login, tg_id, role, _auth.username,
+            "admin_users_create: created web_user username=%s tg_user_id=%s role=%s chats=%s by=%s",
+            login, tg_id, role, chosen_chat_ids if role == "moderator" else "(all)",
+            _auth.username,
         )
 
-        # ── 7. Welcome-сообщение новому админу/модератору в ЛС ───────────
-        # Бот уже может написать юзеру — раз bot.get_chat() сработал, значит
-        # диалог открыт. Отправляем Rich-сообщение со ссылкой на веб-панель
-        # и данными для входа (пароль под спойлером).
-        # Если отправка упала (юзер успел заблокировать бота) — SU всё равно
-        # увидит пароль в зелёном блоке one-time, так что юзер не останется
-        # без доступа. Просто покажем SU предупреждение.
+        # ── 8. Welcome-DM ───────────────────────────────────────────────
         welcome_ok, welcome_err = await _send_admin_welcome(
-            bot=bot,
-            tg_user_id=tg_id,
-            login=login,
-            password=password,
-            first_name=tg_first_name,
-            role=role,
+            bot=bot, tg_user_id=tg_id, login=login, password=password,
+            first_name=tg_first_name, role=role,
         )
         if welcome_ok:
             _req_logger.info(
@@ -959,25 +1021,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         else:
             _req_logger.warning(
-                "admin_users_create: welcome FAILED for tg_user_id=%s "
-                "(login=%s): %s — SU must deliver credentials manually",
+                "admin_users_create: welcome FAILED for tg_user_id=%s (login=%s): %s",
                 tg_id, login, welcome_err,
             )
 
-        # ── 8. Signed-flash с паролем для показа один раз ──────────────
         flash_token = _sign_flash({
-            "u": login,
-            "p": password,
-            "tg": tg_id,
+            "u": login, "p": password, "tg": tg_id,
             "t": int(time.time()),
-            # Добавляем флаг welcome-статуса, чтобы SU видел в зелёном блоке
-            # было отправлено сообщение в ЛС или нет.
             "w": 1 if welcome_ok else 0,
         })
-        return RedirectResponse(
-            url=f"/admin/users?created={flash_token}",
-            status_code=303,
-        )
+        return RedirectResponse(url=f"/admin/users?created={flash_token}", status_code=303)
 
     @app.post("/admin/users/{user_id:int}/toggle")
     async def admin_users_toggle(
@@ -991,7 +1044,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             if wu is None:
                 return RedirectResponse(url="/admin/users", status_code=303)
             if wu.is_su:
-                return RedirectResponse(url="/admin/users", status_code=303)  # SU нельзя блокировать
+                return RedirectResponse(url="/admin/users", status_code=303)
             wu.is_active = not wu.is_active
             await session.commit()
         return RedirectResponse(url="/admin/users", status_code=303)
@@ -1003,7 +1056,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         password: str = Form(...),
         _auth: AuthUser = Depends(require_su),
     ):
-        """SU вручную сбрасывает пароль любого админа (кроме SU)."""
         if len(password) < 6:
             return RedirectResponse(url="/admin/users?flash=Password+must+be+at+least+6+chars", status_code=303)
         async with async_session() as session:
@@ -1016,12 +1068,212 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             await session.commit()
         return RedirectResponse(url="/admin/users", status_code=303)
 
+    @app.post("/admin/users/{user_id:int}/role")
+    async def admin_users_change_role(
+        user_id: int,
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.4.7: меняет роль пользователя admin↔moderator.
+
+        При повышении moderator→admin: удаляем все его записи из chat_admins
+        (они больше не нужны — админ имеет права во всех публичных чатах).
+        При понижении admin→moderator: записи в chat_admins не трогаем —
+        модератор должен будет сам указать чаты через edit-chats (или останется
+        с теми чатами, что успел получить до понижения; если их не было —
+        он не сможет модерировать ничего, пока SU не привяжет его к чатам).
+        """
+        form = await request.form()
+        new_role = (form.get("role") or "").strip().lower()
+        if new_role not in ("admin", "moderator"):
+            return RedirectResponse(
+                url="/admin/users?flash=Invalid+role",
+                status_code=303,
+            )
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.id == user_id)
+            )).scalar_one_or_none()
+            if wu is None or wu.is_su:
+                return RedirectResponse(url="/admin/users", status_code=303)
+            old_role = wu.role
+            if old_role == new_role:
+                return RedirectResponse(url="/admin/users", status_code=303)
+            wu.role = new_role
+            # Повышение moderator→admin: чистим chat_admins
+            if old_role == "moderator" and new_role == "admin" and wu.tg_user_id:
+                await session.execute(
+                    select(ChatAdmin).where(ChatAdmin.user_id == wu.tg_user_id)
+                )
+                # Удаляем все записи chat_admins для этого юзера
+                for ca in (await session.execute(
+                    select(ChatAdmin).where(ChatAdmin.user_id == wu.tg_user_id)
+                )).scalars().all():
+                    await session.delete(ca)
+            await session.commit()
+        _req_logger.info(
+            "admin_users_change_role: user_id=%s %s→%s by=%s",
+            user_id, old_role, new_role, _auth.username,
+        )
+        return RedirectResponse(
+            url=f"/admin/users?flash=Role+changed%3A+{old_role}+%E2%86%92+{new_role}",
+            status_code=303,
+        )
+
+    @app.post("/admin/users/{user_id:int}/edit-chats")
+    async def admin_users_edit_chats(
+        user_id: int,
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.4.7: редактирует список чатов, к которым привязан модератор.
+
+        Принимает form-поле chat_ids (множественный выбор). Все ранее привязанные
+        чаты, которых нет в новом списке, удаляются. Все новые — добавляются.
+        Работает только для пользователей с role=moderator (для admin/SU игнорируется).
+        """
+        form = await request.form()
+        # Получаем список выбранных chat_ids (Form может прийти как list или scalar)
+        raw_chats = form.getlist("chat_ids")
+        chosen: set[int] = set()
+        for raw in raw_chats:
+            raw = (raw or "").strip()
+            if not raw:
+                continue
+            try:
+                cid = int(raw)
+                if cid != 0:
+                    chosen.add(cid)
+            except (ValueError, TypeError):
+                pass
+
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.id == user_id)
+            )).scalar_one_or_none()
+            if wu is None or wu.is_su:
+                return RedirectResponse(url="/admin/users", status_code=303)
+            if wu.role != "moderator" or not wu.tg_user_id:
+                return RedirectResponse(
+                    url="/admin/users?flash=Edit+chats+only+for+moderator+role",
+                    status_code=303,
+                )
+            # Текущие привязки
+            existing = (await session.execute(
+                select(ChatAdmin).where(ChatAdmin.user_id == wu.tg_user_id)
+            )).scalars().all()
+            existing_cids = {ca.chat_id for ca in existing}
+
+            # Удалить те, которых нет в новом списке
+            for ca in existing:
+                if ca.chat_id not in chosen:
+                    await session.delete(ca)
+            # Добавить новые
+            for cid in chosen:
+                if cid not in existing_cids:
+                    session.add(ChatAdmin(
+                        chat_id=cid, user_id=wu.tg_user_id, added_by=None,
+                    ))
+            await session.commit()
+        _req_logger.info(
+            "admin_users_edit_chats: user_id=%s new_chats=%s by=%s",
+            user_id, sorted(chosen), _auth.username,
+        )
+        return RedirectResponse(
+            url=f"/admin/users?flash=Chats+updated+for+user+{wu.username}",
+            status_code=303,
+        )
+
+    @app.post("/admin/users/{user_id:int}/bind-tg")
+    async def admin_users_bind_tg(
+        user_id: int,
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.4.7: привязывает/отвязывает TG ID для существующего пользователя.
+
+        Используется SU чтобы привязать свой собственный TG ID к SU-аккаунту
+        (для получения DM о новых чатах), либо чтобы перепривязать TG ID
+        другого пользователя (если сменил аккаунт).
+        """
+        form = await request.form()
+        tg_raw = (form.get("tg_user_id") or "").strip()
+        if not tg_raw:
+            # Пустое значение = отвязать
+            async with async_session() as session:
+                wu = (await session.execute(
+                    select(WebUser).where(WebUser.id == user_id)
+                )).scalar_one_or_none()
+                if wu is None:
+                    return RedirectResponse(url="/admin/users", status_code=303)
+                if wu.is_su and wu.role == "su":
+                    # SU можно отвязать (но тогда он не будет получать DM)
+                    pass
+                wu.tg_user_id = None
+                await session.commit()
+            return RedirectResponse(
+                url="/admin/users?flash=TG+ID+unbound",
+                status_code=303,
+            )
+        try:
+            tg_id = int(tg_raw)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/users?flash=TG+ID+must+be+a+number",
+                status_code=303,
+            )
+        if tg_id <= 0:
+            return RedirectResponse(
+                url="/admin/users?flash=TG+ID+must+be+positive",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.id == user_id)
+            )).scalar_one_or_none()
+            if wu is None:
+                return RedirectResponse(url="/admin/users", status_code=303)
+            # Проверка что TG ID не занят другим пользователем
+            other = (await session.execute(
+                select(WebUser).where(
+                    WebUser.tg_user_id == tg_id,
+                    WebUser.id != user_id,
+                )
+            )).scalar_one_or_none()
+            if other:
+                return RedirectResponse(
+                    url=f"/admin/users?flash=TG+ID+{tg_id}+already+bound+to+"
+                        f"%27{other.username}%27",
+                    status_code=303,
+                )
+            wu.tg_user_id = tg_id
+            # Best-effort: обновляем профиль из TG
+            if bot is not None:
+                try:
+                    chat = await bot.get_chat(chat_id=tg_id)
+                    wu.tg_first_name = getattr(chat, "first_name", None)
+                    wu.tg_last_name = getattr(chat, "last_name", None)
+                    tg_un = getattr(chat, "username", None)
+                    if tg_un:
+                        wu.tg_username = tg_un.strip().lstrip("@").lower()
+                except Exception as e:
+                    _req_logger.info("bind-tg: bot.get_chat failed (non-critical): %s", e)
+            await session.commit()
+        _req_logger.info(
+            "admin_users_bind_tg: user_id=%s tg_id=%s by=%s",
+            user_id, tg_id, _auth.username,
+        )
+        return RedirectResponse(
+            url=f"/admin/users?flash=TG+ID+{tg_id}+bound+to+{wu.username}",
+            status_code=303,
+        )
+
     @app.post("/admin/users/{user_id:int}/delete")
     async def admin_users_delete(
         user_id: int,
         _auth: AuthUser = Depends(require_su),
     ):
-        """Удаляет веб-админа. SU удалить нельзя. Привязка к TGID очищается автоматически."""
         async with async_session() as session:
             wu = (await session.execute(
                 select(WebUser).where(WebUser.id == user_id)
@@ -1037,218 +1289,13 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         return RedirectResponse(url="/admin/users", status_code=303)
 
     # ──────────────────────────────────────────────────────────────────
-    #  /admin/moderators — управление модераторами чатов (v4.4.3)
+    #  /admin/chats — управление настройками чатов (v4.4.7)
     #
-    #  Модераторы = дополнительные (помимо ADMIN_IDS env) пользователи,
-    #  которые могут использовать команды бота (!mute/!warn/!ban/...) в
-    #  конкретном чате. Хранятся в таблице `chat_admins` (chat_id, user_id).
-    #
-    #  Доступ: SU и admin (require_admin). Moderator → redirect на /dashboard.
-    #  Команды /addadmin и /deladmin в боте остаются как fallback — на случай
-    #  если веб-панель недоступна или неудобна с телефона.
-    # ──────────────────────────────────────────────────────────────────
-    @app.get("/admin/moderators", response_class=HTMLResponse)
-    async def admin_moderators_page(
-        request: Request,
-        flash: str = "",
-        _auth: AuthUser = Depends(require_admin),
-    ):
-        """Страница управления модераторами чатов.
-
-        Показывает:
-          - Форму добавления модератора (chat_id + user_id)
-          - Список существующих модераторов (присоединённый к Moderator
-            и ChatSettings для отображения имён/хэштегов)
-          - Кнопку удаления для каждой записи
-        """
-        async with async_session() as session:
-            # Список всех ChatAdmin с LEFT JOIN к Moderator (для имени) и
-            # ChatSettings (для хэштега). LEFT JOIN — потому что модератор
-            # мог быть добавлен, но ни разу не использовал команды бота
-            # (значит, записи в `moderators` ещё нет).
-            stmt = (
-                select(
-                    ChatAdmin.id,
-                    ChatAdmin.chat_id,
-                    ChatAdmin.user_id,
-                    ChatAdmin.added_by,
-                    ChatAdmin.created_at,
-                    Moderator.username.label("mod_username"),
-                    Moderator.first_name.label("mod_first_name"),
-                    ChatSettings.hashtag.label("chat_hashtag"),
-                )
-                .outerjoin(Moderator, ChatAdmin.user_id == Moderator.mod_id)
-                .outerjoin(ChatSettings, ChatAdmin.chat_id == ChatSettings.chat_id)
-                .order_by(ChatAdmin.chat_id.asc(), ChatAdmin.user_id.asc())
-            )
-            rows = (await session.execute(stmt)).all()
-
-            # Известные чаты (для подсказки в форме) — берём из ChatSettings,
-            # исключая default (chat_id=0).
-            known_chats = (await session.execute(
-                select(ChatSettings.chat_id, ChatSettings.hashtag)
-                .where(ChatSettings.chat_id != 0)
-                .order_by(ChatSettings.chat_id.asc())
-            )).all()
-
-        return templates.TemplateResponse("admin_moderators.html", {
-            "request": request,
-            "moderators": rows,
-            "known_chats": known_chats,
-            "auth_user": _auth,
-            "flash": flash or None,
-        })
-
-    @app.post("/admin/moderators/create")
-    async def admin_moderators_create(
-        request: Request,
-        chat_id: str = Form(""),
-        user_id: str = Form(""),
-        _auth: AuthUser = Depends(require_admin),
-    ):
-        """Добавляет модератора в чат.
-
-        Логика:
-          1. Валидирует chat_id и user_id (должны быть положительными числами).
-          2. Проверяет, что связка (chat_id, user_id) ещё не существует.
-          3. Сохраняет в `chat_admins` (added_by = None — веб-SU не имеет
-             Telegram ID в этой сессии).
-          4. Best-effort: если передан `bot` и `bot.get_chat(user_id)` успешен —
-             upsert модератора в таблицу `moderators` (чтобы сразу отображалось
-             имя/@username). Если падает — игнорируем (запись всё равно создаётся,
-             профиль подтянется при первой же команде бота).
-
-        Команда /addadmin остаётся как fallback.
-        """
-        # ── 1. Валидация ───────────────────────────────────────────────
-        chat_raw = (chat_id or "").strip()
-        user_raw = (user_id or "").strip()
-        try:
-            chat_id_int = int(chat_raw)
-            user_id_int = int(user_raw)
-        except (ValueError, TypeError):
-            return RedirectResponse(
-                url="/admin/moderators?flash=chat_id+and+user_id+must+be+numbers",
-                status_code=303,
-            )
-        if chat_id_int == 0:
-            return RedirectResponse(
-                url="/admin/moderators?flash=chat_id+cannot+be+0",
-                status_code=303,
-            )
-        if user_id_int <= 0:
-            return RedirectResponse(
-                url="/admin/moderators?flash=user_id+must+be+positive",
-                status_code=303,
-            )
-
-        # ── 2. Сохранение в БД ──────────────────────────────────────────
-        async with async_session() as session:
-            # Используем .first() вместо .scalar_one_or_none() — т.к. на уровне БД
-            # нет UNIQUE constraint на (chat_id, user_id), теоретически может быть
-            # несколько строк (если /addadmin и web создали дубликат до проверки
-            # приложением). Нам достаточно знать, что хотя бы одна существует.
-            existing = (await session.execute(
-                select(ChatAdmin).where(
-                    ChatAdmin.chat_id == chat_id_int,
-                    ChatAdmin.user_id == user_id_int,
-                )
-            )).scalars().first()
-            if existing:
-                return RedirectResponse(
-                    url=f"/admin/moderators?flash=User+{user_id_int}+is+already+"
-                        f"a+moderator+in+chat+{chat_id_int}",
-                    status_code=303,
-                )
-
-            session.add(ChatAdmin(
-                chat_id=chat_id_int,
-                user_id=user_id_int,
-                added_by=None,  # веб-SU не имеет TGID в этой сессии
-            ))
-            await session.commit()
-
-        _req_logger.info(
-            "admin_moderators_create: added chat_id=%s user_id=%s by=%s",
-            chat_id_int, user_id_int, _auth.username,
-        )
-
-        # ── 3. Best-effort: подтянуть профиль из Telegram ──────────────
-        # Если бот доступен — пробуем получить имя/username модератора,
-        # чтобы сразу отобразить их в списке. Профиль сохраняется в
-        # таблицу `moderators` (тот же upsert, что использует бот при
-        # первой команде). Ошибки игнорируем — запись в `chat_admins`
-        # уже создана, профиль подтянется позже.
-        if bot is not None:
-            try:
-                chat = await bot.get_chat(chat_id=user_id_int)
-                tg_username = getattr(chat, "username", None)
-                tg_first_name = getattr(chat, "first_name", None)
-                async with async_session() as session:
-                    existing_mod = (await session.execute(
-                        select(Moderator).where(Moderator.mod_id == user_id_int)
-                    )).scalar_one_or_none()
-                    if existing_mod is None:
-                        session.add(Moderator(
-                            mod_id=user_id_int,
-                            username=tg_username,
-                            first_name=tg_first_name,
-                        ))
-                    else:
-                        if tg_username:
-                            existing_mod.username = tg_username
-                        if tg_first_name:
-                            existing_mod.first_name = tg_first_name
-                    await session.commit()
-            except Exception as e:
-                # Не падаем — профиль подтянется при первой команде бота.
-                _req_logger.info(
-                    "admin_moderators_create: bot.get_chat(%s) failed (non-critical): %s",
-                    user_id_int, e,
-                )
-
-        return RedirectResponse(
-            url=f"/admin/moderators?flash=Added+moderator+{user_id_int}+to+chat+{chat_id_int}",
-            status_code=303,
-        )
-
-    @app.post("/admin/moderators/{chat_admin_id:int}/delete")
-    async def admin_moderators_delete(
-        chat_admin_id: int,
-        _auth: AuthUser = Depends(require_admin),
-    ):
-        """Удаляет запись о модераторе (ChatAdmin).
-
-        Удаляет только связку (chat_id, user_id) — пользователь остаётся в
-        таблице `moderators` (если он уже успел применить хоть одну санкцию,
-        её история должна сохраниться).
-        """
-        async with async_session() as session:
-            ca = (await session.execute(
-                select(ChatAdmin).where(ChatAdmin.id == chat_admin_id)
-            )).scalar_one_or_none()
-            if ca is None:
-                return RedirectResponse(url="/admin/moderators", status_code=303)
-            await session.delete(ca)
-            await session.commit()
-
-        _req_logger.info(
-            "admin_moderators_delete: deleted chat_admin id=%s by=%s",
-            chat_admin_id, _auth.username,
-        )
-        return RedirectResponse(url="/admin/moderators", status_code=303)
-
-    # ──────────────────────────────────────────────────────────────────
-    #  /admin/chats — управление настройками чатов (v4.4.6)
+    #  v4.4.7: добавлены toggles для is_enabled / is_private / is_report_chat.
+    #  Чаты создаются автоматически (ботом при добавлении в чат), здесь —
+    #  только редактирование настроек.
     #
     #  Доступ: SU + admin (require_admin). Moderator → redirect на /dashboard.
-    #
-    #  Позволяет для каждого чата (где бот работает) настроить:
-    #    • hashtag              — пометка чата (напр. #Деградач)
-    #    • report_chat_id       — куда слать отчёты (NULL = use default; 0 = disabled)
-    #    • warns_to_mute        — варнов до мьюта (0 = отключено)
-    #    • mute_duration_seconds — длительность мьюта по умолчанию
-    #    • warns_to_ban         — варнов до бана (0 = отключено)
     # ──────────────────────────────────────────────────────────────────
     @app.get("/admin/chats", response_class=HTMLResponse)
     async def admin_chats_page(
@@ -1256,34 +1303,43 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         flash: str = "",
         _auth: AuthUser = Depends(require_admin),
     ):
-        """Страница управления настройками чатов."""
+        """Страница управления настройками чатов (v4.4.7)."""
         async with async_session() as session:
-            # Все записи из chat_settings, включая "default" (chat_id=0)
             stmt = (
                 select(ChatSettings)
                 .order_by(ChatSettings.chat_id.asc())
             )
             rows = (await session.execute(stmt)).scalars().all()
 
-            # Считаем кол-во наказаний по каждому чату (для статистики)
+            # Статистика наказаний
             stats: dict[int, int] = {}
             if rows:
                 chat_ids = [r.chat_id for r in rows if r.chat_id != 0]
                 if chat_ids:
                     stat_rows = (await session.execute(
-                        select(
-                            Punishment.chat_id,
-                            func.count(Punishment.id),
-                        )
+                        select(Punishment.chat_id, func.count(Punishment.id))
                         .where(Punishment.chat_id.in_(chat_ids))
                         .group_by(Punishment.chat_id)
                     )).all()
                     stats = {cid: cnt for cid, cnt in stat_rows}
 
+            # Кол-во модераторов (chat_admins) на каждый чат
+            mod_counts: dict[int, int] = {}
+            if rows:
+                chat_ids = [r.chat_id for r in rows if r.chat_id != 0]
+                if chat_ids:
+                    mc_rows = (await session.execute(
+                        select(ChatAdmin.chat_id, func.count(ChatAdmin.id))
+                        .where(ChatAdmin.chat_id.in_(chat_ids))
+                        .group_by(ChatAdmin.chat_id)
+                    )).all()
+                    mod_counts = {cid: cnt for cid, cnt in mc_rows}
+
         return templates.TemplateResponse("admin_chats.html", {
             "request": request,
             "chats": rows,
             "stats": stats,
+            "mod_counts": mod_counts,
             "auth_user": _auth,
             "flash": flash or None,
         })
@@ -1298,15 +1354,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         warns_to_ban: str = Form(""),
         _auth: AuthUser = Depends(require_admin),
     ):
-        """Обновляет настройки конкретного чата.
-
-        Все поля приходят строками (из HTML form). Валидируем и приводим к типам.
-        report_chat_id пустой → NULL (использовать default).
-
-        chat_id_str — строкой (т.к. chat_id может быть отрицательным, а Starlette
-        int-конвертер не парсит минус; парсим вручную).
-        """
-        # Валидация chat_id
+        """Обновляет основные настройки чата (hashtag, thresholds, report_chat_id)."""
         try:
             chat_id = int(chat_id_str)
         except (ValueError, TypeError):
@@ -1315,13 +1363,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # Валидация числовых полей
-        # min_val: для report_chat_id — -10**15 (TG chat_id может быть отрицательным
-        # для groups/supergroups, напр. -1001234567890). Для остальных — 0.
         def _parse_int(raw: str, field_name: str, min_val: int = 0) -> int | None:
             raw = (raw or "").strip()
             if field_name == "report_chat_id" and raw == "":
-                return None  # NULL = use default
+                return None
             try:
                 v = int(raw)
             except (ValueError, TypeError):
@@ -1334,7 +1379,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             wtm = _parse_int(warns_to_mute, "warns_to_mute", 0)
             mdb = _parse_int(mute_duration_seconds, "mute_duration_seconds", 0)
             wtb = _parse_int(warns_to_ban, "warns_to_ban", 0)
-            # report_chat_id: разрешаем отрицательные (TG supergroup IDs = -100...)
             rc = _parse_int(report_chat_id, "report_chat_id", -10**15)
         except ValueError as e:
             return RedirectResponse(
@@ -1342,7 +1386,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # hashtag: обрезаем, разрешаем пустой (NULL)
         ht = (hashtag or "").strip()
         if ht and not ht.startswith("#"):
             ht = "#" + ht
@@ -1378,6 +1421,71 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",
             status_code=303,
         )
+
+    @app.post("/admin/chats/{chat_id_str}/toggle")
+    async def admin_chats_toggle(
+        chat_id_str: str,
+        request: Request,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.4.7: переключает is_enabled / is_private / is_report_chat для чата.
+
+        Поле form: field=enabled|private|report_chat — что переключать.
+        """
+        try:
+            chat_id = int(chat_id_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+chat_id",
+                status_code=303,
+            )
+        form = await request.form()
+        field = (form.get("field") or "").strip().lower()
+        valid_fields = {"enabled", "private", "report_chat"}
+        if field not in valid_fields:
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+toggle+field",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            )).scalar_one_or_none()
+            if cs is None:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
+                    status_code=303,
+                )
+            if field == "enabled":
+                cs.is_enabled = not cs.is_enabled
+                msg = f"Chat+{chat_id}+{'enabled' if cs.is_enabled else 'disabled'}"
+            elif field == "private":
+                cs.is_private = not cs.is_private
+                msg = f"Chat+{chat_id}+{'now+private' if cs.is_private else 'now+public'}"
+            else:  # report_chat
+                if cs.is_report_chat:
+                    cs.is_report_chat = False
+                    msg = f"Chat+{chat_id}+no+longer+report+chat"
+                else:
+                    # Снимаем флаг с других чатов (репорт-чат может быть только один)
+                    others = (await session.execute(
+                        select(ChatSettings).where(
+                            ChatSettings.is_report_chat.is_(True),
+                            ChatSettings.chat_id != chat_id,
+                        )
+                    )).scalars().all()
+                    for o in others:
+                        o.is_report_chat = False
+                    cs.is_report_chat = True
+                    msg = f"Chat+{chat_id}+is+now+the+report+chat"
+            cs.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+        _req_logger.info(
+            "admin_chats_toggle: chat_id=%s field=%s by=%s",
+            chat_id, field, _auth.username,
+        )
+        return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
 
     # ──────────────────────────────────────────────────────────────────
     #  /admin/cleanup — безопасная очистка тестовых данных (v4.4.5)
