@@ -184,6 +184,40 @@ class ChatSettings(Base):
     night_mode_saved_permissions = Column(Text, nullable=True)
     # Флаг: сейчас активен ночной режим (для логирования и веб-панели).
     night_mode_currently_active = Column(Boolean, default=False, nullable=False)
+    # ── v4.5.3: расширенная настройка ночного режима ───────────────────────
+    # IANA timezone (Europe/Moscow, Asia/Yekaterinburg, ...). По умолчанию MSK.
+    # Если зона некорректна — fallback на Europe/Moscow.
+    night_mode_tz = Column(String(64), default="Europe/Moscow", nullable=False)
+    # Отдельное расписание на субботу+воскресенье. NULL = использовать
+    # будничное расписание (start/end).
+    night_mode_weekend_start = Column(String(5), nullable=True)
+    night_mode_weekend_end = Column(String(5), nullable=True)
+    # Отправлять ли сообщение в чат при входе/выходе из ночного режима.
+    night_mode_notify = Column(Boolean, default=False, nullable=False)
+    # Кастомный текст уведомления при входе (NULL = дефолтный шаблон).
+    night_mode_notify_enter_msg = Column(Text, nullable=True)
+    # Кастомный текст уведомления при выходе (NULL = дефолтный шаблон).
+    night_mode_notify_exit_msg = Column(Text, nullable=True)
+
+    # ── v4.5.4: Санитарный день ─────────────────────────────────────────
+    # Список дат/диапазонов, в которые чат переводится в полный lockdown
+    # (ChatPermissions → all False). Модераторов это НЕ касается: их права
+    # выданы через promote_chat_member (Telegram admin rights), которые
+    # override'ят chat-level ChatPermissions. Обычные участники — muted.
+    # В sanitary day ночной режим НЕ дёргает права чата: если sanitary day
+    # начался пока night был активен — night корректно восстанавливает
+    # снапшот (как будто night закончился), потом sanitary берёт управление.
+    # Когда sanitary day заканчивается — восстанавливаем snapshot, и night
+    # mode tick может снова войти в ночной режим если окно всё ещё активно.
+    # Формат: JSON-массив пар [["YYYY-MM-DD","YYYY-MM-DD"], ...].
+    # Однодневный санитарный день — пара с одинаковыми датами.
+    # NULL или "[]" — санитарных дней нет.
+    sanitary_days = Column(Text, nullable=True)
+    # JSON-снапшот прав чата ДО входа в санитарный день — восстанавливается
+    # при выходе из него. Аналог night_mode_saved_permissions.
+    sanitary_days_saved_permissions = Column(Text, nullable=True)
+    # Флаг: сейчас активен санитарный день (для логирования и веб-панели).
+    sanitary_days_currently_active = Column(Boolean, default=False, nullable=False)
 
 
 class WordFilter(Base):
@@ -445,6 +479,44 @@ async def init_db() -> None:
             ("night_mode_currently_active", "BOOLEAN NOT NULL DEFAULT 0"),
         ]
         for col_name, col_type in v452_chat_settings_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
+    # ── Миграция: расширение chat_settings (v4.5.3) ────────────────────
+    # Новые поля для расширенной настройки ночного режима: per-chat tz,
+    # отдельное расписание на выходные, уведомления входа/выхода.
+    # Идемпотентно (PRAGMA check + ALTER TABLE).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v453_chat_settings_cols = [
+            ("night_mode_tz",                 "VARCHAR(64) NOT NULL DEFAULT 'Europe/Moscow'"),
+            ("night_mode_weekend_start",      "VARCHAR(5) NULL"),
+            ("night_mode_weekend_end",        "VARCHAR(5) NULL"),
+            ("night_mode_notify",             "BOOLEAN NOT NULL DEFAULT 0"),
+            ("night_mode_notify_enter_msg",   "TEXT NULL"),
+            ("night_mode_notify_exit_msg",    "TEXT NULL"),
+        ]
+        for col_name, col_type in v453_chat_settings_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
+    # ── Миграция: расширение chat_settings (v4.5.4) ────────────────────
+    # Новые поля для санитарных дней: список дат + snapshot прав + флаг.
+    # Идемпотентно (PRAGMA check + ALTER TABLE).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v454_chat_settings_cols = [
+            ("sanitary_days",                    "TEXT NULL"),
+            ("sanitary_days_saved_permissions",  "TEXT NULL"),
+            ("sanitary_days_currently_active",   "BOOLEAN NOT NULL DEFAULT 0"),
+        ]
+        for col_name, col_type in v454_chat_settings_cols:
             if col_name not in columns:
                 await conn.execute(text(
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"

@@ -75,9 +75,11 @@ MSK = timezone(timedelta(hours=3))
 PAGE_SIZE = 50  # записей на страницу в дашборде
 
 # ── v4.5: Версия приложения ────────────────────────────────────────────────
-# v4.5.2 (29 июля 2026): CAS integration, word/link/sticker filters, auto night
-# mode, warn decay, version display in footer.
-APP_VERSION = "v4.5.2"
+# v4.5.4 (29 июля 2026): Санитарные дни — lockdown чата на заданные даты.
+# ChatPermissions → all False; модераторов не касается (Telegram admin rights
+# override'ят chat-level perms). Ночной режим пропускает чаты в sanitary day.
+# Управление: /sanitary CLI command + веб-панель /admin/chats (textarea).
+APP_VERSION = "v4.5.4"
 APP_RELEASE_DATE = "2026-07-29"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -590,6 +592,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     templates.env.filters["dur"] = _duration_fmt
     templates.env.filters["tglink"] = _telegram_link_base
     templates.env.filters["night_mode_preset_name"] = _night_mode_preset_name
+    # v4.5.3: from_json filter — парсит JSON-строку в dict для шаблона.
+    # Используется в admin_chats.html для чтения night_mode_permissions JSON.
+    templates.env.filters["from_json"] = lambda s: json.loads(s) if s else {}
+    # v4.5.4: format_sanitary_days filter — конвертирует JSON sanitary_days
+    # в multiline-текст для textarea (одна дата/диапазон на строку).
+    try:
+        from bot_handlers import format_sanitary_days_textarea as _fmt_san
+        templates.env.filters["format_sanitary_days"] = _fmt_san
+    except ImportError:
+        templates.env.filters["format_sanitary_days"] = lambda s: ""
     # v4.5.2: глобальные переменные для всех шаблонов (версия в футере)
     templates.env.globals["app_version"] = APP_VERSION
     templates.env.globals["app_release_date"] = APP_RELEASE_DATE
@@ -1623,6 +1635,29 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         night_mode_start: str = Form("23:00"),
         night_mode_end: str = Form("07:00"),
         night_mode_preset: str = Form("text_only"),
+        # v4.5.3: расширенная настройка ночного режима.
+        night_mode_tz: str = Form("Europe/Moscow"),
+        night_mode_weekend_start: str = Form(""),
+        night_mode_weekend_end: str = Form(""),
+        night_mode_notify: str = Form(""),
+        night_mode_notify_enter_msg: str = Form(""),
+        night_mode_notify_exit_msg: str = Form(""),
+        # Custom permissions grid (10 чекбоксов). В HTML unchecked чекбоксы
+        # НЕ отправляются — поэтому "" → False, "on" → True.
+        # Эти поля используются ТОЛЬКО когда night_mode_preset == "custom".
+        perm_can_send_messages: str = Form(""),
+        perm_can_send_audios: str = Form(""),
+        perm_can_send_documents: str = Form(""),
+        perm_can_send_photos: str = Form(""),
+        perm_can_send_videos: str = Form(""),
+        perm_can_send_video_notes: str = Form(""),
+        perm_can_send_voice_notes: str = Form(""),
+        perm_can_send_polls: str = Form(""),
+        perm_can_send_other_messages: str = Form(""),
+        perm_can_add_web_page_previews: str = Form(""),
+        # v4.5.4: sanitary days textarea. Multiline-текст, одна запись на
+        # строку ('YYYY-MM-DD' или 'YYYY-MM-DD - YYYY-MM-DD').
+        sanitary_days_text: str = Form(""),
         _auth: AuthUser = Depends(require_admin),
     ):
         """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -1664,7 +1699,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 url="/admin/chats?flash=Invalid+link_filter_action",
                 status_code=303,
             )
-        if night_mode_preset not in ("text_only", "strict", "none"):
+        if night_mode_preset not in ("text_only", "strict", "none", "custom"):
             return RedirectResponse(
                 url="/admin/chats?flash=Invalid+night_mode_preset",
                 status_code=303,
@@ -1686,6 +1721,37 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
+        # v4.5.3: валидация tz (IANA timezone).
+        nm_tz = (night_mode_tz or "Europe/Moscow").strip()
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(nm_tz)
+        except (ValueError, KeyError):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+night_mode_tz+(use+IANA+name+like+Europe/Moscow)",
+                status_code=303,
+            )
+
+        # v4.5.3: валидация weekend schedule (опционально).
+        # Если одно из полей задано — оба обязательны.
+        nm_wknd_start = (night_mode_weekend_start or "").strip()
+        nm_wknd_end = (night_mode_weekend_end or "").strip()
+        if (nm_wknd_start or nm_wknd_end) and not (nm_wknd_start and nm_wknd_end):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Weekend+schedule+requires+both+start+and+end",
+                status_code=303,
+            )
+        if nm_wknd_start and not _hhmm_re.match(nm_wknd_start):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+night_mode_weekend_start+(use+HH:MM)",
+                status_code=303,
+            )
+        if nm_wknd_end and not _hhmm_re.match(nm_wknd_end):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+night_mode_weekend_end+(use+HH:MM)",
+                status_code=303,
+            )
+
         ht = (hashtag or "").strip()
         if ht and not ht.startswith("#"):
             ht = "#" + ht
@@ -1699,22 +1765,43 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # Импортируем хелпер из bot_handlers (не идеально — web_app зависит от bot_handlers,
         # но это уже было раньше: web_app импортирует from db).
         # Чтобы не тащить aiogram.types в web_app, делаем permissions dict inline.
+        _ALL_PERM_KEYS = (
+            "can_send_messages", "can_send_audios", "can_send_documents",
+            "can_send_photos", "can_send_videos", "can_send_video_notes",
+            "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+            "can_add_web_page_previews", "can_change_info", "can_invite_users",
+            "can_pin_messages",
+        )
         if night_mode_preset == "strict":
-            night_perms_json = json.dumps({k: False for k in (
-                "can_send_messages", "can_send_audios", "can_send_documents",
-                "can_send_photos", "can_send_videos", "can_send_video_notes",
-                "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-                "can_add_web_page_previews", "can_change_info", "can_invite_users",
-                "can_pin_messages",
-            )})
+            night_perms_json = json.dumps({k: False for k in _ALL_PERM_KEYS})
         elif night_mode_preset == "none":
-            night_perms_json = json.dumps({k: True for k in (
-                "can_send_messages", "can_send_audios", "can_send_documents",
-                "can_send_photos", "can_send_videos", "can_send_video_notes",
-                "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-                "can_add_web_page_previews", "can_change_info", "can_invite_users",
-                "can_pin_messages",
-            )})
+            night_perms_json = json.dumps({k: True for k in _ALL_PERM_KEYS})
+        elif night_mode_preset == "custom":
+            # v4.5.3: строим JSON из 10 чекбоксов. can_change_info/invite/pin
+            # не редактируются через UI (для простоты) — берём из текущего
+            # состояния чата, не трогаем. Ставим False если у чата нет preserve.
+            # UI показывает только 10 «отправляемых» прав; остальные 3
+            # (change_info/invite/pin) — копируем из ранее сохранённого JSON,
+            # иначе False.
+            # Это безопасно: ночной режим ограничивает отправку, не админ-права.
+            custom_flags = {
+                "can_send_messages":          perm_can_send_messages == "on",
+                "can_send_audios":            perm_can_send_audios == "on",
+                "can_send_documents":         perm_can_send_documents == "on",
+                "can_send_photos":            perm_can_send_photos == "on",
+                "can_send_videos":            perm_can_send_videos == "on",
+                "can_send_video_notes":       perm_can_send_video_notes == "on",
+                "can_send_voice_notes":       perm_can_send_voice_notes == "on",
+                "can_send_polls":             perm_can_send_polls == "on",
+                "can_send_other_messages":   perm_can_send_other_messages == "on",
+                "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
+                # Эти 3 не редактируются через UI — ставим False (ночной режим
+                # не должен давать обычным юзерам админ-права).
+                "can_change_info":            False,
+                "can_invite_users":           False,
+                "can_pin_messages":           False,
+            }
+            night_perms_json = json.dumps(custom_flags)
         else:  # text_only (default)
             night_perms_json = json.dumps({
                 "can_send_messages": True,
@@ -1726,6 +1813,32 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 "can_change_info": False, "can_invite_users": False,
                 "can_pin_messages": False,
             })
+
+        # v4.5.4: парсим sanitary_days textarea. Поддерживаем:
+        #   'YYYY-MM-DD'              — однодневный санитарный день
+        #   'YYYY-MM-DD:YYYY-MM-DD'   — диапазон
+        #   'YYYY-MM-DD - YYYY-MM-DD' — диапазон с пробелами
+        # Строки с '#' в начале — комментарии. Пустые строки игнорируются.
+        # Невалидные строки → redirect с ошибкой (вместо тихого пропуска),
+        # чтобы SU видел что именно не так.
+        try:
+            from bot_handlers import (
+                parse_sanitary_days_textarea, serialize_sanitary_days,
+            )
+        except ImportError:
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Server+error+(bot_handlers+import+failed)",
+                status_code=303,
+            )
+        san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
+        if san_errors:
+            # Беру первую ошибку — для flash-сообщения.
+            first_err = san_errors[0].replace(" ", "+")
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Sanitary+days:+{first_err}",
+                status_code=303,
+            )
+        sanitary_days_json = serialize_sanitary_days(san_pairs) if san_pairs else None
 
         async with async_session() as session:
             cs = (await session.execute(
@@ -1762,15 +1875,33 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             cs.night_mode_start = nm_start
             cs.night_mode_end = nm_end
             cs.night_mode_permissions = night_perms_json
+            # v4.5.3: расширенная настройка ночного режима.
+            cs.night_mode_tz = nm_tz
+            cs.night_mode_weekend_start = nm_wknd_start or None
+            cs.night_mode_weekend_end = nm_wknd_end or None
+            cs.night_mode_notify = (night_mode_notify == "on")
+            # Пустая строка из формы → None (дефолтный шаблон).
+            enter_msg = (night_mode_notify_enter_msg or "").strip()
+            exit_msg = (night_mode_notify_exit_msg or "").strip()
+            cs.night_mode_notify_enter_msg = enter_msg or None
+            cs.night_mode_notify_exit_msg = exit_msg or None
+            # v4.5.4: sanitary days. Сохраняем JSON (или None если пусто).
+            # Не сбрасываем sanitary_days_currently_active/saved_permissions
+            # здесь — это делает _sanitary_day_tick при выходе из sanitary day.
+            cs.sanitary_days = sanitary_days_json
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
         _req_logger.info(
             "admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, "
             "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
-            "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s])",
+            "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
+            "weekend=%s-%s, notify=%s, sanitary=%s)",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
             decay, link_filter_action, nm_start, nm_end, night_mode_preset,
+            nm_tz, nm_wknd_start or "-", nm_wknd_end or "-",
+            night_mode_notify == "on",
+            len(san_pairs) if san_pairs else 0,
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",

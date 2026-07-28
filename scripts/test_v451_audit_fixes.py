@@ -820,9 +820,9 @@ class TestEnvExampleWebhookSecret(unittest.TestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_app_version_is_452(self):
-        """v4.5.2: версия обновлена до v4.5.2 (CAS, filters, night mode, warn decay)."""
+        """v4.5.4: версия обновлена до v4.5.4 (sanitary days)."""
         import web_app
-        self.assertEqual(web_app.APP_VERSION, "v4.5.2")
+        self.assertEqual(web_app.APP_VERSION, "v4.5.4")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

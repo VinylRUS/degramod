@@ -634,17 +634,18 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
-                <p><strong>v4.5.2</strong> — 29 июля 2026</p>
+                <p><strong>v4.5.4</strong> — 29 июля 2026</p>
                 <ul>
-                    <li>CAS integration (per-chat toggle): new members checked against <code>api.cas.chat</code>, auto-ban on match.</li>
-                    <li>Word filter (regex/simple) with configurable action (warn/mute/ban/delete). Off by default; per-chat.</li>
-                    <li>Link filter with global + per-chat allowlist. Per-chat toggle.</li>
-                    <li>Banned sticker packs: auto-add on <code>!ban</code> of sticker, manual via <code>!bansticker</code> in DM, web panel page. Punishment choice: ban/mute/warn/delete.</li>
-                    <li>Auto night mode: per-chat schedule (start/end time + permissions), background task applies and restores.</li>
-                    <li>Warn decay: per-chat <code>warn_decay_days</code>; old warns no longer count toward thresholds.</li>
-                    <li>Version display in footer (this modal).</li>
+                    <li><strong>Sanitary days</strong>: schedule full chat lockdown (ChatPermissions → all False) on specific dates. One API call per chat — efficient even for 19k-member chats.</li>
+                    <li><strong>Moderators unaffected</strong>: Telegram admin rights (set via promote_chat_member) override chat-level ChatPermissions, so mods can still post during lockdown.</li>
+                    <li><strong>Night mode integration</strong>: when sanitary day starts, night mode is skipped (snapshot already preserved); when sanitary day ends, night mode re-enters if window is still active.</li>
+                    <li><strong>/sanitary CLI</strong>: <code>add</code>, <code>remove</code>, <code>clear</code>, <code>toggle</code> (manual test), <code>list</code> subcommands. Date format: <code>YYYY-MM-DD</code> or <code>YYYY-MM-DD:YYYY-MM-DD</code>.</li>
+                    <li><strong>Web panel</strong>: textarea in /admin/chats (one date/range per line, <code>#</code> comments allowed). Live <code>SAN</code> badge in chat header turns red when lockdown is active.</li>
+                    <li><strong>Timezone-aware</strong>: sanitary date boundaries use chat's <code>night_mode_tz</code>.</li>
                 </ul>
-                <p style="margin-top:12px;color:var(--text-dim);font-size:11px;">Previous: v4.5.1 (audit fixes — consumed warns, webhook secret, login rate-limit, POST logout, report chat validation, multi-report-chat, WAL checkpoint, !unwarn cap, !resetwarns SU/admin-only, friendly-fire protection).</p>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.5.3</strong> — /help cleanup, Night mode — per-chat timezone, Night mode — weekend schedule, Night mode — custom permissions, Night mode — enter/exit notifications, /nightmode subcommands.</p>
+                <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.2</strong> — CAS integration, word/link/sticker filters, auto night mode, warn decay, version display.</p>
+                <p style="color:var(--text-dim);font-size:11px;">Previous: v4.5.1 (audit fixes — consumed warns, webhook secret, login rate-limit, POST logout, report chat validation, multi-report-chat, WAL checkpoint, !unwarn cap, !resetwarns SU/admin-only, friendly-fire protection).</p>
             </div>
         </div>
     </div>

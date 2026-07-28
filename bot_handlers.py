@@ -81,7 +81,7 @@ import json
 import os
 import re
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 from urllib.parse import urlparse
 
 import aiohttp
@@ -1042,11 +1042,14 @@ def _parse_night_mode_permissions(json_str: str | None) -> types.ChatPermissions
         return _night_mode_permissions_preset("text_only")
 
 
-def _time_str_in_range(now: datetime, start: str, end: str) -> bool:
-    """Проверяет, находится ли текущее МСК-время в диапазоне [start, end).
+def _time_str_in_range(now: datetime, start: str, end: str, tz_name: str | None = None) -> bool:
+    """Проверяет, находится ли текущее время (в заданной зоне) в диапазоне [start, end).
 
     start/end в формате 'HH:MM'. Если end <= start — диапазон пересекает полночь
     (например 23:00 → 07:00 = с 23:00 до 07:00 следующего дня).
+
+    v4.5.3: tz_name — IANA timezone (Europe/Moscow, Asia/Yekaterinburg, ...).
+    Если None или некорректна — fallback на MSK (Europe/Moscow).
     """
     def _parse_hhmm(s: str) -> tuple[int, int]:
         parts = s.split(":")
@@ -1057,8 +1060,18 @@ def _time_str_in_range(now: datetime, start: str, end: str) -> bool:
         except ValueError:
             return (0, 0)
 
-    now_msk = now.astimezone(MSK)
-    now_min = now_msk.hour * 60 + now_msk.minute
+    # v4.5.3: выбор часового пояса. zoneinfo доступен в Python 3.9+.
+    tz = MSK
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except (ValueError, KeyError, ImportError):
+            # Некорректная зона — fallback на MSK.
+            tz = MSK
+
+    now_local = now.astimezone(tz)
+    now_min = now_local.hour * 60 + now_local.minute
     sh, sm = _parse_hhmm(start)
     eh, em = _parse_hhmm(end)
     start_min = sh * 60 + sm
@@ -1068,6 +1081,243 @@ def _time_str_in_range(now: datetime, start: str, end: str) -> bool:
     else:
         # Пересекает полночь: активен если now >= start ИЛИ now < end
         return now_min >= start_min or now_min < end_min
+
+
+def _night_mode_in_window(
+    now: datetime,
+    weekday_start: str,
+    weekday_end: str,
+    weekend_start: str | None,
+    weekend_end: str | None,
+    tz_name: str | None = None,
+) -> bool:
+    """v4.5.3: Проверяет, находится ли текущее время в окне ночного режима.
+
+    Учитывает отдельное расписание на сб/вс если оно задано (не None).
+    Если weekend_start/end = None — используется будничное расписание каждый день.
+
+    Суббота и воскресенье трактуются как "выходные" (ISO weekday 6 и 7).
+    Это покрывает большинство русскоязычных чатов; если нужна другая логика
+    (например, пятница как выходной) — это можно вынести в настройки в будущих
+    версиях.
+    """
+    # Выбор tz
+    tz = MSK
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except (ValueError, KeyError, ImportError):
+            tz = MSK
+    now_local = now.astimezone(tz)
+    is_weekend = now_local.weekday() >= 5  # 5 = Sat, 6 = Sun
+
+    if is_weekend and weekend_start and weekend_end:
+        return _time_str_in_range(now, weekend_start, weekend_end, tz_name=tz_name)
+    return _time_str_in_range(now, weekday_start, weekday_end, tz_name=tz_name)
+
+
+# v4.5.3: Карта коротких алиасов прав (для /nightmode custom) → полных имён.
+_NIGHT_PERM_ALIASES: dict[str, str] = {
+    "msgs": "can_send_messages",
+    "audios": "can_send_audios",
+    "docs": "can_send_documents",
+    "photos": "can_send_photos",
+    "videos": "can_send_videos",
+    "vnotes": "can_send_video_notes",
+    "voices": "can_send_voice_notes",
+    "polls": "can_send_polls",
+    "other": "can_send_other_messages",
+    "links": "can_add_web_page_previews",
+}
+
+
+def _build_custom_night_permissions(
+    base_preset: str,
+    overrides: dict[str, bool],
+) -> types.ChatPermissions:
+    """v4.5.3: строит ChatPermissions из базового preset + точечных override'ов.
+
+    base_preset: 'strict' | 'text_only' | 'none' — стартовая точка.
+    overrides: dict[alias_or_full_name, bool] — точечные изменения.
+       Алиасы: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links.
+       Полные имена тоже принимаются (can_send_messages и т.д.).
+    """
+    perms = _night_mode_permissions_preset(base_preset)
+    for key, value in overrides.items():
+        full_name = _NIGHT_PERM_ALIASES.get(key, key)
+        if hasattr(perms, full_name):
+            setattr(perms, full_name, bool(value))
+    return perms
+
+
+# ── v4.5.4: Санитарные дни (mute all non-moderators) ────────────────────────
+
+# Регэксп для парсинга даты "YYYY-MM-DD". Валидацию диапазона (день 1-31,
+# месяц 1-12) делаем в _parse_sanitary_date; regex ловит только формат.
+import re as _san_re
+_SAN_DATE_RE = _san_re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def _parse_sanitary_date(s: str) -> date | None:
+    """Парсит 'YYYY-MM-DD' в date. Возвращает None при невалидной дате."""
+    s = (s or "").strip()
+    m = _SAN_DATE_RE.match(s)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return date(y, mo, d)
+    except ValueError:
+        return None
+
+
+def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
+    """v4.5.4: парсит JSON sanitary_days в list пар [start_iso, end_iso].
+
+    Невалидные записи пропускаются. Возвращает [] для пустого/битого JSON.
+    Каждая запись должна быть массивом из 2 строк 'YYYY-MM-DD'.
+    end < start трактуется как однодневный санитарный день на start.
+    """
+    if not json_str:
+        return []
+    try:
+        data = json.loads(json_str)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[list[str]] = []
+    for entry in data:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            continue
+        s, e = entry[0], entry[1]
+        if not isinstance(s, str) or not isinstance(e, str):
+            continue
+        ds = _parse_sanitary_date(s)
+        de = _parse_sanitary_date(e)
+        if ds is None or de is None:
+            continue
+        # Нормализуем: end < start → однодневный.
+        if de < ds:
+            de = ds
+        out.append([ds.isoformat(), de.isoformat()])
+    return out
+
+
+def serialize_sanitary_days(pairs: list[list[str]]) -> str:
+    """v4.5.4: сериализует list пар [start_iso, end_iso] в JSON-строку.
+
+    Каждая пара должна быть [start, end] ISO-строками; имена валидируются
+    через _parse_sanitary_date (невалидные пропускаются).
+    """
+    norm: list[list[str]] = []
+    for p in pairs:
+        if not isinstance(p, (list, tuple)) or len(p) != 2:
+            continue
+        ds = _parse_sanitary_date(str(p[0]))
+        de = _parse_sanitary_date(str(p[1]))
+        if ds is None or de is None:
+            continue
+        if de < ds:
+            de = ds
+        norm.append([ds.isoformat(), de.isoformat()])
+    return json.dumps(norm)
+
+
+def is_sanitary_day_today(
+    pairs: list[list[str]] | str | None,
+    today: date | None = None,
+) -> bool:
+    """v4.5.4: проверяет, попадает ли today (по умолчанию сегодня UTC) в одну
+    из пар санитарных дней.
+
+    Принимает как уже распарсенный list пар, так и сырую JSON-строку.
+    Диапазон inclusive по обеим датам: [start, end].
+    """
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    if isinstance(pairs, str):
+        pairs = parse_sanitary_days_json(pairs)
+    if not pairs:
+        return False
+    for s, e in pairs:
+        ds = _parse_sanitary_date(s)
+        de = _parse_sanitary_date(e)
+        if ds is None or de is None:
+            continue
+        if ds <= today <= de:
+            return True
+    return False
+
+
+def parse_sanitary_days_textarea(
+    text: str,
+) -> tuple[list[list[str]], list[str]]:
+    """v4.5.4: парсит textarea (одна запись на строку) в list пар.
+
+    Принимает строки вида:
+      'YYYY-MM-DD'              — однодневный санитарный день
+      'YYYY-MM-DD:YYYY-MM-DD'   — диапазон (включая обе даты)
+      'YYYY-MM-DD - YYYY-MM-DD' — диапазон с пробелами вокруг '-'
+
+    Возвращает (pairs, errors). errors — список строк с описанием проблем
+    (используется для feedback пользователю).
+    """
+    pairs: list[list[str]] = []
+    errors: list[str] = []
+    text = (text or "").strip()
+    if not text:
+        return pairs, errors
+    for i, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Поддерживаем разделители ':' и ' - ' и ' to '.
+        sep = None
+        for cand in (" - ", " to ", " — ", " – ", ":"):
+            if cand in line:
+                sep = cand
+                break
+        if sep:
+            parts = line.split(sep, 1)
+            ds = _parse_sanitary_date(parts[0].strip())
+            de = _parse_sanitary_date(parts[1].strip())
+            if ds is None:
+                errors.append(f"Строка {i}: невалидная дата начала '{parts[0].strip()}'")
+                continue
+            if de is None:
+                errors.append(f"Строка {i}: невалидная дата конца '{parts[1].strip()}'")
+                continue
+            if de < ds:
+                de = ds
+            pairs.append([ds.isoformat(), de.isoformat()])
+        else:
+            d = _parse_sanitary_date(line)
+            if d is None:
+                errors.append(f"Строка {i}: невалидная дата '{line}' (нужен YYYY-MM-DD)")
+                continue
+            pairs.append([d.isoformat(), d.isoformat()])
+    return pairs, errors
+
+
+def format_sanitary_days_textarea(pairs: list[list[str]] | str | None) -> str:
+    """v4.5.4: форматирование списка пар в textarea-строки (для UI).
+
+    Однодневные пары (start == end) выводятся одной датой.
+    Многодневные — через ' - '.
+    """
+    if isinstance(pairs, str):
+        pairs = parse_sanitary_days_json(pairs)
+    if not pairs:
+        return ""
+    lines: list[str] = []
+    for s, e in pairs:
+        if s == e:
+            lines.append(s)
+        else:
+            lines.append(f"{s} - {e}")
+    return "\n".join(lines)
 
 
 # ── Отправка отчёта в чат (Rich Messages, Bot API 10.2) ─────────────────────
@@ -2029,7 +2279,9 @@ async def handle_group_command(message: types.Message) -> None:
         # в BannedStickerPack (per-chat, punishment=ban — чтобы следующий
         # юзер с этим же паком тоже был забанен автоматически). Это избавляет
         # модератора от необходимости отдельно выполнять !bansticker.
-        sticker = message.reply_to_message.sticker
+        # v4.5.3: используем getattr для безопасности (mock objects в тестах
+        # могут не иметь атрибута 'sticker' — это нормально, просто пропустим).
+        sticker = getattr(message.reply_to_message, "sticker", None)
         if sticker and sticker.set_name:
             try:
                 async with async_session() as session:
@@ -3203,21 +3455,39 @@ async def cmd_cas(message: types.Message) -> None:
 
 @router.message(F.chat.type == "private", Command("nightmode"))
 async def cmd_nightmode(message: types.Message) -> None:
-    """v4.5.2 (#29-33): /nightmode chat_id <start> <end> [permissions]
-    или /nightmode chat_id off — выключить ночной режим.
+    """v4.5.3: расширенная настройка ночного режима.
 
-    permissions: strict|text_only|none (default: text_only).
+    Поддерживаемые формы:
+      /nightmode chat_id <start> <end> [strict|text_only|none]   — базовая настройка
+      /nightmode chat_id off                                     — выключить
+      /nightmode chat_id tz <Europe/Moscow>                      — сменить часовой пояс
+      /nightmode chat_id weekend <start> <end>                   — расписание на сб/вс
+      /nightmode chat_id weekend off                             — сбросить (использовать будничное)
+      /nightmode chat_id notify on [custom_enter_text]           — включить уведомления
+      /nightmode chat_id notify off                              — выключить уведомления
+      /nightmode chat_id notify_text enter <text>                — только текст входа
+      /nightmode chat_id notify_text exit <text>                 — только текст выхода
+      /nightmode chat_id custom <perm>=0|1 <perm>=0|1 ...        — точечные права
+
+    Алиасы perms для custom: msgs, audios, docs, photos, videos,
+      vnotes, voices, polls, other, links.
     """
     if message.from_user.id not in ADMIN_IDS:
         return
-    parts = message.text.split(maxsplit=4)
+    # Не ограничиваем split — для notify с кастомным текстом может быть много слов.
+    raw = message.text or ""
+    parts = raw.split(maxsplit=3)
     if len(parts) < 3:
         await message.reply(
             "📋 Формат:\n"
             "  /nightmode chat_id <start> <end> [strict|text_only|none]\n"
             "  /nightmode chat_id off\n"
-            "💡 Время в формате HH:MM (МСК)\n"
-            "💡 strict — полный мьют; text_only — только текст (default); none — без ограничений",
+            "  /nightmode chat_id tz <Europe/Moscow>\n"
+            "  /nightmode chat_id weekend <start> <end> | off\n"
+            "  /nightmode chat_id notify on [custom_text] | off\n"
+            "  /nightmode chat_id notify_text enter|exit <text>\n"
+            "  /nightmode chat_id custom <perm>=0|1 ...\n"
+            "💡 perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links",
             parse_mode=None,
         )
         return
@@ -3229,6 +3499,8 @@ async def cmd_nightmode(message: types.Message) -> None:
         return
 
     arg2 = parts[2].lower().strip()
+
+    # ── SUBCOMMAND: off ──────────────────────────────────────────────
     if arg2 == "off":
         async with async_session() as session:
             settings = await _get_chat_settings(session, chat_id)
@@ -3241,16 +3513,270 @@ async def cmd_nightmode(message: types.Message) -> None:
         )
         return
 
-    if len(parts) < 4:
+    # ── SUBCOMMAND: tz ───────────────────────────────────────────────
+    if arg2 == "tz":
+        if len(parts) < 4:
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat_id)
+                current_tz = settings.night_mode_tz or "Europe/Moscow"
+            await message.reply(
+                f"🌍 Текущий tz чата {chat_id}: <b>{current_tz}</b>\n"
+                "💡 /nightmode chat_id tz Europe/Moscow\n"
+                "💡 /nightmode chat_id tz Asia/Yekaterinburg\n"
+                "Полный список: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones",
+                parse_mode="HTML",
+            )
+            return
+        tz_name = parts[3].strip()
+        try:
+            from zoneinfo import ZoneInfo
+            ZoneInfo(tz_name)  # validate
+        except (ValueError, KeyError):
+            await message.reply(
+                f"❌ Некорректный tz: '{tz_name}'\n"
+                "💡 Примеры: Europe/Moscow, Europe/Kaliningrad, Asia/Yekaterinburg, Asia/Novosibirsk",
+                parse_mode=None,
+            )
+            return
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            settings.night_mode_tz = tz_name
+            await session.commit()
+        await message.reply(
+            f"✅ Часовой пояс чата {chat_id}: <b>{tz_name}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── SUBCOMMAND: weekend ──────────────────────────────────────────
+    if arg2 == "weekend":
+        if len(parts) < 4:
+            await message.reply(
+                "📋 Формат:\n"
+                "  /nightmode chat_id weekend <start> <end>\n"
+                "  /nightmode chat_id weekend off\n"
+                "💡 /nightmode chat_id weekend 02:00 10:00",
+                parse_mode=None,
+            )
+            return
+        arg3 = parts[3].lower().strip()
+        if arg3 == "off":
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat_id)
+                settings.night_mode_weekend_start = None
+                settings.night_mode_weekend_end = None
+                await session.commit()
+            await message.reply(
+                f"✅ Чат {chat_id}: выходное расписание сброшено (используется будничное)",
+                parse_mode=None,
+            )
+            return
+        # Парсим "start end" — но parts[3] уже содержит "start", нужно ещё и end.
+        # parts делится с maxsplit=3, поэтому parts[3] может содержать "start end extra".
+        sub = (raw.split(maxsplit=4))
+        if len(sub) < 5:
+            await message.reply(
+                "❌ Нужно указать start и end\n"
+                "💡 /nightmode chat_id weekend 02:00 10:00",
+                parse_mode=None,
+            )
+            return
+        wknd_start = sub[3].strip()
+        wknd_end = sub[4].strip()
+        for label, t in (("start", wknd_start), ("end", wknd_end)):
+            tparts = t.split(":")
+            if len(tparts) != 2:
+                await message.reply(f"❌ {label} должен быть HH:MM (получили '{t}')", parse_mode=None)
+                return
+            try:
+                h, m = int(tparts[0]), int(tparts[1])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError()
+            except ValueError:
+                await message.reply(f"❌ {label} некорректное время: '{t}'", parse_mode=None)
+                return
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            settings.night_mode_weekend_start = wknd_start
+            settings.night_mode_weekend_end = wknd_end
+            await session.commit()
+        await message.reply(
+            f"✅ Чат {chat_id}: выходные <b>{wknd_start} → {wknd_end}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── SUBCOMMAND: notify_text ──────────────────────────────────────
+    if arg2 == "notify_text":
+        # /nightmode chat_id notify_text enter <text>
+        # /nightmode chat_id notify_text exit <text>
+        sub = raw.split(maxsplit=4)
+        if len(sub) < 5:
+            await message.reply(
+                "📋 Формат:\n"
+                "  /nightmode chat_id notify_text enter <текст>\n"
+                "  /nightmode chat_id notify_text exit <текст>\n"
+                "💡 В тексте можно использовать плейсхолдеры: {chat_id}, {start}, {end}\n"
+                "💡 '/nightmode chat_id notify_text enter default' — вернуть дефолтный шаблон",
+                parse_mode=None,
+            )
+            return
+        which = sub[3].lower().strip()
+        if which not in ("enter", "exit"):
+            await message.reply(
+                "❌ Первый аргумент notify_text должен быть 'enter' или 'exit'",
+                parse_mode=None,
+            )
+            return
+        text_value = sub[4].strip()
+        if text_value.lower() == "default":
+            text_value = None
+        elif not text_value:
+            await message.reply("❌ Текст не может быть пустым (используйте 'default' для сброса)", parse_mode=None)
+            return
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            if which == "enter":
+                settings.night_mode_notify_enter_msg = text_value
+            else:
+                settings.night_mode_notify_exit_msg = text_value
+            await session.commit()
+        label = "входа" if which == "enter" else "выхода"
+        status = "<b>дефолтный шаблон</b>" if text_value is None else f"кастомный: <code>{html.escape(text_value[:80])}</code>"
+        await message.reply(
+            f"✅ Текст уведомления {label} для чата {chat_id}: {status}",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── SUBCOMMAND: notify ───────────────────────────────────────────
+    if arg2 == "notify":
+        # v4.5.3: parse with maxsplit=4 to separate "on|off" from custom text.
+        # sub = ['/nightmode', chat_id, 'notify', 'on'|'off', 'custom text...']
+        sub = raw.split(maxsplit=4)
+        if len(sub) < 4:
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat_id)
+                current = bool(settings.night_mode_notify)
+            await message.reply(
+                f"🔔 Уведомления ночного режима для чата {chat_id}: "
+                f"<b>{'включены' if current else 'выключены'}</b>\n"
+                "💡 /nightmode chat_id notify on [custom_text]\n"
+                "💡 /nightmode chat_id notify off",
+                parse_mode="HTML",
+            )
+            return
+        arg3 = sub[3].lower().strip()
+        if arg3 not in ("on", "off"):
+            await message.reply(
+                "❌ notify: ожидается 'on' или 'off'",
+                parse_mode=None,
+            )
+            return
+        # Если on + есть кастомный текст — сохраняем его как enter_msg и exit_msg.
+        # Это сокращение для типичного юзкейса: одинаковый текст для входа и выхода.
+        custom_text: str | None = None
+        if arg3 == "on" and len(sub) >= 5 and sub[4].strip().lower() != "default":
+            custom_text = sub[4].strip()
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            settings.night_mode_notify = (arg3 == "on")
+            if arg3 == "on" and custom_text is not None:
+                settings.night_mode_notify_enter_msg = custom_text
+                settings.night_mode_notify_exit_msg = custom_text
+            await session.commit()
+        status = "включены" if arg3 == "on" else "выключены"
+        await message.reply(
+            f"✅ Уведомления ночного режима для чата {chat_id}: <b>{status}</b>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── SUBCOMMAND: custom ───────────────────────────────────────────
+    if arg2 == "custom":
+        # /nightmode chat_id custom <perm>=0|1 <perm>=0|1 ...
+        # perm — алиас или полное имя. Алиасы см. _NIGHT_PERM_ALIASES.
+        sub = raw.split()
+        # sub = ['/nightmode', chat_id, 'custom', 'msgs=1', 'photos=0', ...]
+        if len(sub) < 4:
+            await message.reply(
+                "❌ Укажите хотя бы один override\n"
+                "💡 /nightmode chat_id custom msgs=1 photos=0 videos=0\n"
+                "💡 Алиасы: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links",
+                parse_mode=None,
+            )
+            return
+        overrides: dict[str, bool] = {}
+        for token in sub[3:]:
+            if "=" not in token:
+                await message.reply(
+                    f"❌ Неверный формат: '{token}' (нужно <perm>=0|1)",
+                    parse_mode=None,
+                )
+                return
+            key, _, val = token.partition("=")
+            key = key.strip().lower()
+            val = val.strip()
+            if val not in ("0", "1"):
+                await message.reply(
+                    f"❌ Значение должно быть 0 или 1 (получили '{val}' для '{key}')",
+                    parse_mode=None,
+                )
+                return
+            full_name = _NIGHT_PERM_ALIASES.get(key, key)
+            if full_name not in _PERM_FIELDS:
+                await message.reply(
+                    f"❌ Неизвестный perm: '{key}'\n"
+                    "💡 Алиасы: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links",
+                    parse_mode=None,
+                )
+                return
+            overrides[full_name] = (val == "1")
+        # Базовый preset — текущий сохранённый preset или text_only.
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            current_perms_json = settings.night_mode_permissions
+            base_preset = "text_only"
+            if current_perms_json:
+                try:
+                    data = json.loads(current_perms_json)
+                    # Распознаём preset по значению can_send_messages
+                    if all(data.get(k, False) for k in _PERM_FIELDS):
+                        base_preset = "none"
+                    elif not any(data.get(k, False) for k in (
+                        "can_send_messages", "can_send_audios", "can_send_documents",
+                        "can_send_photos", "can_send_videos", "can_send_video_notes",
+                        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+                    )):
+                        base_preset = "strict"
+                except (ValueError, TypeError):
+                    pass
+            perms = _build_custom_night_permissions(base_preset, overrides)
+            perms_json = json.dumps({k: bool(getattr(perms, k, False)) for k in _PERM_FIELDS})
+            settings.night_mode_permissions = perms_json
+            await session.commit()
+        summary = ", ".join(f"{k}={'1' if v else '0'}" for k, v in overrides.items())
+        await message.reply(
+            f"✅ Точечные права для чата {chat_id} применены (base=<b>{base_preset}</b>):\n"
+            f"<code>{html.escape(summary)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── БАЗОВАЯ ФОРМА: /nightmode chat_id <start> <end> [preset] ─────
+    # arg2 = start (HH:MM). Нужно ещё и end.
+    # Перепарсим с большим maxsplit чтобы получить preset.
+    sub = raw.split(maxsplit=4)
+    # sub = ['/nightmode', chat_id_str, start, end, preset?]
+    if len(sub) < 4:
         await message.reply(
             "❌ Нужно указать start и end\n"
             "💡 /nightmode chat_id 23:00 07:00 [strict|text_only|none]",
             parse_mode=None,
         )
         return
-
-    start = parts[2].strip()
-    end = parts[3].strip()
+    start = sub[2].strip()
+    end = sub[3].strip()
     # Валидация HH:MM
     for label, t in (("start", start), ("end", end)):
         tparts = t.split(":")
@@ -3266,8 +3792,8 @@ async def cmd_nightmode(message: types.Message) -> None:
             return
 
     preset = "text_only"
-    if len(parts) >= 5:
-        preset = parts[4].lower().strip()
+    if len(sub) >= 5:
+        preset = sub[4].lower().strip()
         if preset not in ("strict", "text_only", "none"):
             await message.reply(
                 f"❌ permissions должен быть strict/text_only/none (получили '{preset}')",
@@ -3286,10 +3812,11 @@ async def cmd_nightmode(message: types.Message) -> None:
         settings.night_mode_end = end
         settings.night_mode_permissions = perms_json
         await session.commit()
+        tz_name = settings.night_mode_tz or "Europe/Moscow"
 
     await message.reply(
         f"✅ Ночной режим в чате {chat_id}: <b>включён</b>\n"
-        f"⏰ {start} → {end} (МСК)\n"
+        f"⏰ {start} → {end} ({html.escape(tz_name)})\n"
         f"🔒 Permissions: <b>{preset}</b>",
         parse_mode="HTML",
     )
@@ -3335,6 +3862,222 @@ async def cmd_warndecay(message: types.Message) -> None:
     )
 
 
+@router.message(F.chat.type == "private", Command("sanitary"))
+async def cmd_sanitary(message: types.Message) -> None:
+    """v4.5.4: Управление санитарными днями чата.
+
+    В санитарный день чат переводится в полный lockdown (ChatPermissions
+    → all False). Модераторов это не касается — их Telegram admin rights
+    (выданные через promote_chat_member) override'ят chat-level perms.
+    Ночной режим в санитарный день пропускается (не дёргает права).
+
+    Поддерживаемые формы:
+      /sanitary chat_id                                  — показать список
+      /sanitary chat_id add <YYYY-MM-DD>                 — добавить один день
+      /sanitary chat_id add <YYYY-MM-DD>:<YYYY-MM-DD>    — добавить диапазон
+      /sanitary chat_id remove <YYYY-MM-DD>              — удалить день/диапазон,
+                                                            содержащий эту дату
+      /sanitary chat_id clear                            — очистить весь список
+      /sanitary chat_id toggle                           — вручную войти/выйти
+                                                            (для тестирования)
+    """
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    raw = message.text or ""
+    parts = raw.split(maxsplit=3)
+    if len(parts) < 2:
+        await message.reply(
+            "📋 Формат:\n"
+            "  /sanitary chat_id\n"
+            "  /sanitary chat_id add <YYYY-MM-DD>\n"
+            "  /sanitary chat_id add <YYYY-MM-DD>:<YYYY-MM-DD>\n"
+            "  /sanitary chat_id remove <YYYY-MM-DD>\n"
+            "  /sanitary chat_id clear\n"
+            "  /sanitary chat_id toggle\n"
+            "💡 Санитарный день = полный lockdown чата (модераторы не страдают).",
+            parse_mode=None,
+        )
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ chat_id должен быть числом", parse_mode=None)
+        return
+
+    sub = parts[2].lower().strip() if len(parts) >= 3 else ""
+
+    async with async_session() as session:
+        settings = await _get_chat_settings(session, chat_id)
+
+        # ── LIST (no subcommand) ───────────────────────────────────────
+        if not sub:
+            pairs = parse_sanitary_days_json(settings.sanitary_days)
+            if not pairs:
+                await message.reply(
+                    f"📋 Санитарные дни чата {chat_id}: <b>пусто</b>",
+                    parse_mode="HTML",
+                )
+                return
+            lines = [f"📋 Санитарные дни чата {chat_id}:"]
+            for i, (s, e) in enumerate(pairs, 1):
+                if s == e:
+                    lines.append(f"  {i}. {s}")
+                else:
+                    lines.append(f"  {i}. {s} → {e}")
+            status = " ● АКТИВЕН" if settings.sanitary_days_currently_active else ""
+            lines.append(f"Статус: {'🔒 lockdown' if settings.sanitary_days_currently_active else '⚪ не активен'}{status}")
+            await message.reply(
+                "\n".join(lines),
+                parse_mode="HTML",
+            )
+            return
+
+        # ── CLEAR ──────────────────────────────────────────────────────
+        if sub == "clear":
+            settings.sanitary_days = None
+            settings.sanitary_days_saved_permissions = None
+            settings.sanitary_days_currently_active = False
+            await session.commit()
+            await message.reply(
+                f"✅ Санитарные дни чата {chat_id}: <b>очищены</b>",
+                parse_mode="HTML",
+            )
+            return
+
+        # ── TOGGLE (manual enter/exit for testing) ─────────────────────
+        if sub == "toggle":
+            if not settings.sanitary_days_currently_active:
+                # Импортируем _enter_sanitary_day из bot.py (avoid circular).
+                # Поскольку bot.py импортирует bot_handlers, делаем lazy import.
+                from bot import _enter_sanitary_day, _exit_sanitary_day
+                await _enter_sanitary_day(settings)
+                await message.reply(
+                    f"🔒 Чат {chat_id}: <b>санитарный день включён вручную</b>\n"
+                    "Чат в lockdown. Модераторы могут писать.",
+                    parse_mode="HTML",
+                )
+            else:
+                from bot import _enter_sanitary_day, _exit_sanitary_day
+                await _exit_sanitary_day(settings)
+                await message.reply(
+                    f"🔓 Чат {chat_id}: <b>санитарный день снят вручную</b>\n"
+                    "Права чата восстановлены из снапшота.",
+                    parse_mode="HTML",
+                )
+            return
+
+        # ── ADD / REMOVE ───────────────────────────────────────────────
+        if sub not in ("add", "remove"):
+            await message.reply(
+                "❌ Неизвестная подкоманда. Доступно: add, remove, clear, toggle, "
+                "(пусто — показать список).",
+                parse_mode=None,
+            )
+            return
+        if len(parts) < 4:
+            await message.reply(
+                f"❌ Укажите дату для '{sub}'\n"
+                "💡 /sanitary chat_id add 2026-08-01\n"
+                "💡 /sanitary chat_id add 2026-08-01:2026-08-03\n"
+                "💡 /sanitary chat_id remove 2026-08-01",
+                parse_mode=None,
+            )
+            return
+
+        date_arg = parts[3].strip()
+        # Парсим "start:end" или "start - end" или одну дату.
+        sep = None
+        for cand in (" - ", " to ", " — ", " – ", ":"):
+            if cand in date_arg:
+                sep = cand
+                break
+        if sep:
+            sp = date_arg.split(sep, 1)
+            ds = _parse_sanitary_date(sp[0].strip())
+            de = _parse_sanitary_date(sp[1].strip())
+            if ds is None or de is None:
+                await message.reply(
+                    f"❌ Невалидный диапазон: '{date_arg}'\n"
+                    "💡 Формат: YYYY-MM-DD:YYYY-MM-DD",
+                    parse_mode=None,
+                )
+                return
+            if de < ds:
+                de = ds
+            target_pairs = [[ds.isoformat(), de.isoformat()]]
+            target_label = ds.isoformat() if ds == de else f"{ds.isoformat()} → {de.isoformat()}"
+        else:
+            d = _parse_sanitary_date(date_arg)
+            if d is None:
+                await message.reply(
+                    f"❌ Невалидная дата: '{date_arg}' (нужен YYYY-MM-DD)",
+                    parse_mode=None,
+                )
+                return
+            target_pairs = [[d.isoformat(), d.isoformat()]]
+            target_label = d.isoformat()
+
+        current_pairs = parse_sanitary_days_json(settings.sanitary_days)
+
+        if sub == "add":
+            # Дедуп: не добавляем если точно такая же пара уже есть.
+            for s, e in current_pairs:
+                if s == target_pairs[0][0] and e == target_pairs[0][1]:
+                    await message.reply(
+                        f"⚠️ Диапазон {target_label} уже есть в списке",
+                        parse_mode=None,
+                    )
+                    return
+            current_pairs.append(target_pairs[0])
+            # Сортируем по start дате для удобства.
+            current_pairs.sort(key=lambda p: p[0])
+            settings.sanitary_days = json.dumps(current_pairs)
+            await session.commit()
+            await message.reply(
+                f"✅ Добавлен санитарный день: <b>{target_label}</b>\n"
+                f"Всего записей: {len(current_pairs)}",
+                parse_mode="HTML",
+            )
+            return
+
+        if sub == "remove":
+            # Удаляем все пары, которые содержат указанную дату (или весь
+            # диапазон целиком если передан диапазон и точно совпадает).
+            if sep:
+                # Точное совпадение пары.
+                before = len(current_pairs)
+                current_pairs = [
+                    [s, e] for s, e in current_pairs
+                    if not (s == target_pairs[0][0] and e == target_pairs[0][1])
+                ]
+                removed = before - len(current_pairs)
+            else:
+                # Удаляем все пары, содержащие указанную дату.
+                d = _parse_sanitary_date(target_pairs[0][0])
+                before = len(current_pairs)
+                current_pairs = [
+                    [s, e] for s, e in current_pairs
+                    if not (
+                        _parse_sanitary_date(s) <= d <= _parse_sanitary_date(e)
+                    )
+                ]
+                removed = before - len(current_pairs)
+            if removed == 0:
+                await message.reply(
+                    f"⚠️ Не найдено записей, содержащих {target_label}",
+                    parse_mode=None,
+                )
+                return
+            settings.sanitary_days = json.dumps(current_pairs) if current_pairs else None
+            await session.commit()
+            await message.reply(
+                f"✅ Удалено записей: {removed}\n"
+                f"Осталось: {len(current_pairs)}",
+                parse_mode=None,
+            )
+            return
+
+
 @router.message(F.chat.type == "private", Command("help"))
 async def cmd_help(message: types.Message) -> None:
     """Показывает список команд (только для ADMIN_IDS)."""
@@ -3344,37 +4087,46 @@ async def cmd_help(message: types.Message) -> None:
     text = (
         "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
         "<b>В группах (reply на сообщение):</b>\n"
-        "  !mute 1d2h причина — замьютить (полный мьют; причина опциональна)\n"
-        "  !mute 30м — мьют на 30 минут без причины (рус/англ суффиксы)\n"
-        "  !warn причина — выдать варн (сообщение нарушителя удаляется)\n"
-        "  !ban причина — забанить (если reply на стикер — пак автодобавляется в бан-лист)\n"
-        "  !unmute — размьютить (текущие права чата)\n"
-        "  !unban — разбанить (only_if_banned — безопасный)\n"
-        "  !unwarn [N] — снять N последних варнов (по умолчанию 1; cap = текущее кол-во)\n"
-        "  !warns — показать варны юзера\n"
-        "  !resetwarns — обнулить варны юзера\n\n"
-        "<b>В личке (настройки):</b>\n"
-        "  /addadmin chat_id user_id — добавить админа\n"
-        "  /deladmin chat_id user_id — убрать админа\n"
-        "  /sethashtag chat_id #хэштег — хэштег чата\n"
-        "  /warns_mute chat_id число — варнов до мьюта\n"
-        "  /warns_ban chat_id число — варнов до бана\n"
+        "  !mute [длительность] [причина] — мьют (формат: 1d2h, 30м; без аргументов — перманент)\n"
+        "  !warn [причина] — варн (сообщение нарушителя удаляется)\n"
+        "  !ban [причина] — бан (если reply на стикер — пак автодобавляется в бан-лист)\n"
+        "  !unmute / !unban — снять ограничения\n"
+        "  !unwarn [N] — снять N последних варнов (по умолчанию 1)\n"
+        "  !warns / !resetwarns — показать / обнулить варны\n\n"
+        "<b>В личке (настройки чатов):</b>\n"
+        "  💡 Большинство настроек доступно в веб-панели: /admin/chats\n"
+        "  /settings chat_id — показать настройки\n"
+        "  /sethashtag chat_id #tag — хэштег чата\n"
+        "  /setreport chat_id [report_chat_id] — чат для отчётов (0 = сброс)\n"
+        "  /warns_mute chat_id N / /warns_ban chat_id N — пороги\n"
         "  /mute_duration chat_id 1d2h — длительность мьюта\n"
-        "  /setreport chat_id report_chat_id — чат для отчётов (0 = сбросить)\n"
-        "  /settings chat_id — показать настройки\n\n"
-        "<b>v4.5.2 — фильтры (в личке):</b>\n"
-        "  /bansticker &lt;pack_or_link&gt; [delete|warn|mute|ban] [dur] — забанить стикерпак\n"
-        "  /liststickers [chat_id] — список забаненных паков\n"
-        "  /delsticker &lt;pack_name&gt; [chat_id] — убрать пак из бан-листа\n"
-        "  /addword chat_id &lt;слово&gt; [delete|warn|mute|ban] [is_regex 0/1]\n"
-        "  /delword chat_id &lt;слово&gt; — убрать слово из фильтра\n"
-        "  /listwords [chat_id] — список забаненных слов\n"
-        "  /linkfilter chat_id on|off — включить/выключить link filter\n"
-        "  /linkallow chat_id|global &lt;domain&gt; — добавить домен в allowlist\n"
-        "  /linkallowlist [chat_id] — показать allowlist\n"
-        "  /cas chat_id on|off — включить/выключить CAS-проверку\n"
-        "  /nightmode chat_id &lt;start&gt; &lt;end&gt; [strict|text_only|none]\n"
-        "  /nightmode chat_id off — выключить ночной режим\n"
+        "  /addadmin chat_id user_id / /deladmin chat_id user_id\n\n"
+        "<b>Фильтры (в личке):</b>\n"
+        "  /bansticker &lt;pack|link&gt; [delete|warn|mute|ban] [dur] — забанить стикерпак\n"
+        "  /liststickers [chat_id] / /delsticker &lt;pack&gt; [chat_id]\n"
+        "  /addword chat_id &lt;слово&gt; [action] [is_regex 0/1]\n"
+        "  /delword chat_id &lt;слово&gt; / /listwords [chat_id]\n"
+        "  /linkfilter chat_id on|off — фильтр ссылок\n"
+        "  /linkallow chat_id|global &lt;domain&gt; / /linkallowlist [chat_id]\n"
+        "  /cas chat_id on|off — CAS-проверка новых юзеров\n\n"
+        "<b>Ночной режим (в личке):</b>\n"
+        "  /nightmode chat_id &lt;start&gt; &lt;end&gt; [strict|text_only|none|custom]\n"
+        "  /nightmode chat_id off — выключить\n"
+        "  /nightmode chat_id tz &lt;Europe/Moscow&gt; — часовой пояс\n"
+        "  /nightmode chat_id weekend &lt;start&gt; &lt;end&gt; — расписание на сб/вс\n"
+        "  /nightmode chat_id weekend off — сбросить (использовать будничное)\n"
+        "  /nightmode chat_id notify on|off [custom_text] — уведомления входа/выхода\n"
+        "  /nightmode chat_id custom &lt;perm&gt;=0|1 ... — точечные права\n"
+        "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n\n"
+        "<b>Санитарные дни (в личке):</b>\n"
+        "  /sanitary chat_id — показать список\n"
+        "  /sanitary chat_id add &lt;YYYY-MM-DD&gt; — добавить день\n"
+        "  /sanitary chat_id add &lt;start&gt;:&lt;end&gt; — добавить диапазон\n"
+        "  /sanitary chat_id remove &lt;YYYY-MM-DD&gt; — удалить день/диапазон\n"
+        "  /sanitary chat_id clear — очистить список\n"
+        "  /sanitary chat_id toggle — вручную войти/выйти (для теста)\n"
+        "  💡 Lockdown чата (модераторы не страдают); ночной режим пропускается\n\n"
+        "<b>Прочее:</b>\n"
         "  /warndecay chat_id &lt;days&gt; — срок действия варна (0 = отключено)\n"
     )
     await message.reply(text, parse_mode="HTML")
