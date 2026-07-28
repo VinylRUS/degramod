@@ -10,6 +10,7 @@ FastAPI запускается всегда — для веб-панели (ко
 import asyncio
 import logging
 import os
+import secrets
 import socket
 import time
 from contextlib import asynccontextmanager
@@ -19,10 +20,20 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from sqlalchemy import select
+import fastapi
 
 from bot_handlers import router as mod_router
 from db import init_db, async_session, ChatSettings
 from web_app import create_app
+
+# v4.5.2: helpers для night mode background task (defined in bot_handlers)
+from bot_handlers import (
+    _time_str_in_range, _parse_night_mode_permissions, _snapshot_permissions,
+    _PERM_FIELDS,
+)
+from datetime import datetime, timezone, timedelta
+import json
+from aiogram.exceptions import TelegramBadRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +47,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "3000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 WEBHOOK_PATH = "/webhook" if "/webhook" in WEBHOOK_URL else "/webhook"
+
+# v4.5.1: секрет для webhook — Telegram шлёт его в заголовке
+# X-Telegram-Bot-Api-Secret-Token на каждый запрос. Без проверки
+# кто угодно может POST-нуть фейковый Update на /webhook и заставить
+# бота выполнить команды от имени «админа».
+# Если env не задан — генерируем случайный (перезаписи при рестарте не
+# страшны, так как мы заново делаем set_webhook при старте).
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_hex(16)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env variable is required")
@@ -78,6 +97,129 @@ async def _start_polling():
         logger.error("Polling error: %s", e)
 
 
+# ── v4.5.2: Night mode background task ─────────────────────────────────────
+# Запускается раз в минуту. Проверяет все чаты с night_mode_enabled=True.
+# Если текущее МСК-время попадает в [start, end) и night_mode_currently_active
+# ещё False — делаем snapshot текущих прав чата, применяем ночные права,
+# ставим night_mode_currently_active=True.
+# Если время вышло из диапазона и night_mode_currently_active=True —
+# восстанавливаем snapshot, ставим night_mode_currently_active=False.
+
+
+async def _night_mode_loop():
+    """Background loop: раз в минуту проверяет ночной режим для всех чатов."""
+    # Подождём 30 сек после старта — пусть вебхук/поллинг запустятся.
+    await asyncio.sleep(30)
+    logger.info("Night mode background task started (interval=60s)")
+    while True:
+        try:
+            await _night_mode_tick()
+        except Exception as e:
+            logger.error("Night mode tick error: %s", e)
+        await asyncio.sleep(60)
+
+
+async def _night_mode_tick():
+    """Один проход night mode: для каждого чата с night_mode_enabled=True
+    проверяет текущее время и применяет/снимает ночные ограничения.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with async_session() as session:
+            stmt = select(ChatSettings).where(
+                ChatSettings.night_mode_enabled.is_(True),
+                ChatSettings.chat_id != 0,  # пропускаем global default
+                ChatSettings.is_enabled.is_(True),  # чат активен
+            )
+            chats = (await session.execute(stmt)).scalars().all()
+    except Exception as e:
+        logger.warning("Night mode: DB error loading chats: %s", e)
+        return
+
+    for cs in chats:
+        try:
+            in_window = _time_str_in_range(now, cs.night_mode_start, cs.night_mode_end)
+            if in_window and not cs.night_mode_currently_active:
+                # Вход в ночной режим
+                await _enter_night_mode(cs)
+            elif not in_window and cs.night_mode_currently_active:
+                # Выход из ночного режима
+                await _exit_night_mode(cs)
+        except Exception as e:
+            logger.error("Night mode error for chat %s: %s", cs.chat_id, e)
+
+
+async def _enter_night_mode(cs: ChatSettings) -> None:
+    """Применяет ночные права к чату. Делает snapshot текущих прав."""
+    try:
+        chat_info = await bot.get_chat(chat_id=cs.chat_id)
+        current_perms = chat_info.permissions
+        # Сохраняем snapshot — что восстанавливать при выходе
+        snapshot_data = {}
+        for field in _PERM_FIELDS:
+            snapshot_data[field] = bool(getattr(current_perms, field, True)) if current_perms else True
+        snapshot_json = json.dumps(snapshot_data)
+
+        # Применяем ночные права
+        night_perms = _parse_night_mode_permissions(cs.night_mode_permissions)
+        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=night_perms)
+
+        # Сохраняем snapshot и флаг
+        async with async_session() as session:
+            db_cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+            )).scalar_one_or_none()
+            if db_cs:
+                db_cs.night_mode_saved_permissions = snapshot_json
+                db_cs.night_mode_currently_active = True
+                await session.commit()
+        logger.info(
+            "Night mode ON for chat %s (perms applied, snapshot saved)",
+            cs.chat_id,
+        )
+    except TelegramBadRequest as e:
+        logger.error("Night mode enter failed for chat %s: %s", cs.chat_id, e)
+
+
+async def _exit_night_mode(cs: ChatSettings) -> None:
+    """Восстанавливает права чата из snapshot при выходе из ночного режима."""
+    snapshot_json = cs.night_mode_saved_permissions
+    if not snapshot_json:
+        # Нет snapshot — даём дефолтные "всё разрешено"
+        from aiogram import types as _tg_types
+        restore_perms = _tg_types.ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+            can_add_web_page_previews=True, can_change_info=True, can_invite_users=True,
+            can_pin_messages=True,
+        )
+    else:
+        try:
+            data = json.loads(snapshot_json)
+            from aiogram import types as _tg_types
+            restore_perms = _tg_types.ChatPermissions(
+                **{k: data.get(k, True) for k in _PERM_FIELDS}
+            )
+        except (ValueError, TypeError):
+            from aiogram import types as _tg_types
+            restore_perms = _tg_types.ChatPermissions(can_send_messages=True)
+
+    try:
+        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+        async with async_session() as session:
+            db_cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+            )).scalar_one_or_none()
+            if db_cs:
+                db_cs.night_mode_currently_active = False
+                db_cs.night_mode_saved_permissions = None
+                await session.commit()
+        logger.info("Night mode OFF for chat %s (perms restored)", cs.chat_id)
+    except TelegramBadRequest as e:
+        logger.error("Night mode exit failed for chat %s: %s", cs.chat_id, e)
+
+
 # ── Lifespan ────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app):
@@ -93,6 +235,9 @@ async def lifespan(app):
         logger.info("Bot commands cleared (stealth mode)")
     except Exception as e:
         logger.warning("delete_my_commands failed: %s", e)
+
+    # v4.5.2: запускаем night mode background task
+    night_mode_task = asyncio.create_task(_night_mode_loop())
 
     # ── Проверяем глобальный default репорт-чат из DB (chat_id=0) ──
     try:
@@ -123,12 +268,16 @@ async def lifespan(app):
     # Пробуем установить вебхук
     if WEBHOOK_URL:
         try:
+            # v4.5.1: передаём secret_token — Telegram будет слать его
+            # в заголовке X-Telegram-Bot-Api-Secret-Token на каждый запрос.
+            # Без проверки кто угодно может POST-нуть фейковый Update.
             await bot.set_webhook(
                 url=WEBHOOK_URL,
                 allowed_updates=["message", "my_chat_member"],
+                secret_token=WEBHOOK_SECRET,
             )
             info = await bot.get_webhook_info()
-            logger.info("Webhook set to %s (info.url=%s)", WEBHOOK_URL, info.url)
+            logger.info("Webhook set to %s (info.url=%s, secret_token=set)", WEBHOOK_URL, info.url)
             _webhook_set = True
         except Exception as e:
             logger.error("set_webhook FAILED: %s — falling back to polling", e)
@@ -155,6 +304,12 @@ async def lifespan(app):
             await _polling_task
         except asyncio.CancelledError:
             pass
+    # v4.5.2: отменяем night mode background task
+    night_mode_task.cancel()
+    try:
+        await night_mode_task
+    except asyncio.CancelledError:
+        pass
     try:
         await bot.delete_webhook()
     except Exception:
@@ -171,8 +326,20 @@ app = create_app(lifespan=lifespan, bot=bot)
 
 # ── Webhook endpoint — Telegram шлёт сюда обновления ───────────────────────
 @app.post(WEBHOOK_PATH)
-async def bot_webhook(update: dict):
-    """Telegram отправляет POST с Update на этот эндпоинт."""
+async def bot_webhook(update: dict, request: fastapi.Request):
+    """Telegram отправляет POST с Update на этот эндпоинт.
+
+    v4.5.1: проверяем заголовок X-Telegram-Bot-Api-Secret-Token —
+    Telegram присылает тот secret_token, который мы передали в set_webhook.
+    Если не совпадает — отбрасываем запрос (защита от подделки Update).
+    """
+    # v4.5.1: проверка секретного токена webhook
+    incoming_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not incoming_secret or incoming_secret != WEBHOOK_SECRET:
+        # Не логируем на WARNING — может быть сканер/бот. INFO достаточно.
+        logger.info("webhook: rejected (missing/invalid secret_token) from %s",
+                    request.client.host if request.client else "?")
+        return {"ok": False, "error": "unauthorized"}
     try:
         telegram_update = types.Update.model_validate(update)
         await dp.feed_update(bot=bot, update=telegram_update)

@@ -103,7 +103,7 @@
     <div class="login-box">
         <h1>Дедушка Вобжак</h1>
         {% if error %}
-        <div class="error-msg">ACCESS DENIED</div>
+        <div class="error-msg">{% if error_msg %}{{ error_msg }}{% else %}ACCESS DENIED{% endif %}</div>
         {% endif %}
         <form method="post" action="/login">
             <div class="field">

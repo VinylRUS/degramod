@@ -11,7 +11,7 @@ test_v44_rich_report.py — Smoke-тест нового _send_report с RichText
   7. JSON-сериализация Rich-сообщения не падает (модель корректна)
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_rich_report.py
 """
 from __future__ import annotations

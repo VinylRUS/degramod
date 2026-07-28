@@ -15,7 +15,7 @@ test_v44_welcome.py — Тесты v4.4.2: Welcome-сообщение новом
   - flash-токен содержит поле 'w'
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_welcome.py
 """
 from __future__ import annotations
@@ -62,6 +62,12 @@ async def main() -> None:
     from db import init_db, async_session, WebUser
 
     await init_db()
+
+    # v4.5.1: отключаем rate-limit на /login для тестов
+    try:
+        web_app._check_login_rate_limit = lambda ip: True
+    except ImportError:
+        pass
 
     # ── Тест 1: Базовая отправка welcome ──────────────────────────────
     print("\n[1] _send_admin_welcome: базовая отправка")

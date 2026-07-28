@@ -22,7 +22,7 @@ test_v44_roles.py — Тесты v4.4.6: ролевая модель SU / admin 
   - Существующий web-юзер без role (старая БД) → after init_db → role='admin'
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_roles.py
 """
 from __future__ import annotations
@@ -695,6 +695,12 @@ async def main():
     print("=" * 70)
     print("v4.4.6 tests: role-based access control (SU / admin / moderator)")
     print("=" * 70)
+    # v4.5.1: отключаем rate-limit на /login для тестов
+    try:
+        import web_app
+        web_app._check_login_rate_limit = lambda ip: True
+    except ImportError:
+        pass
     await test_migration_assigns_roles()
     await test_auth_role_from_db()
     await test_require_su()

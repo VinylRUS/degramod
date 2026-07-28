@@ -17,7 +17,7 @@ test_v44_cleanup_web.py — Тесты v4.4.5: очистка тестовых �
   - HTML: preview таблица показывает счётчики
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_cleanup_web.py
 """
 from __future__ import annotations
@@ -601,6 +601,12 @@ async def main():
     print("=" * 70)
     print("v4.4.5 tests: cleanup web feature")
     print("=" * 70)
+    # v4.5.1: отключаем rate-limit на /login для тестов
+    try:
+        import web_app
+        web_app._check_login_rate_limit = lambda ip: True
+    except ImportError:
+        pass
     await test_get_page_su()
     await test_post_apply_no_chat_admins()
     await test_post_apply_with_chat_admins()

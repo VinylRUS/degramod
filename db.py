@@ -103,6 +103,14 @@ class Punishment(Base):
     is_revoked = Column(Boolean, default=False, nullable=False)   # True = санкция снята, не учитывать в счётчиках
     revoked_at = Column(DateTime, nullable=True)                  # когда снята
     revoked_by_mod_id = Column(BigInteger, nullable=True)         # кто из модераторов снял
+    # ── v4.5.1: consumed_by_action — какой авто-действие «погасило» варн ──
+    # 'auto_mute' | 'auto_ban' | NULL. Когда _check_warn_threshold триггерит
+    # автомьют или автобан, все активные варны юзера получают эту метку —
+    # _count_warns их больше не считает, повторный !warn начинает счёт с 0.
+    # is_revoked остаётся False — варн «активен» в логе (видно в веб-панели),
+    # но не влияет на пороги. Так исправляется баг с повторным триггером
+    # автомьюта при каждом следующем !warn.
+    consumed_by_action = Column(String(20), nullable=True)
 
     user = relationship("User", back_populates="punishments", foreign_keys=[user_id])
     moderator = relationship("Moderator", back_populates="punishments", foreign_keys=[mod_id])
@@ -145,6 +153,100 @@ class ChatSettings(Base):
     is_enabled = Column(Boolean, default=True, nullable=False)  # False = бот игнорирует чат
     is_private = Column(Boolean, default=False, nullable=False)  # закрытый чат (админ не лезет)
     is_report_chat = Column(Boolean, default=False, nullable=False)  # склад отчётов
+    # ── v4.5.2 ──────────────────────────────────────────────────────────
+    # CAS integration (#2): проверка каждого нового участника по api.cas.chat.
+    # По умолчанию OFF — включается per-chat через веб-панель или /cas on.
+    cas_check_enabled = Column(Boolean, default=False, nullable=False)
+    # Link filter (#8): блокировка ссылок кроме allowlist. Allowlist хранится
+    # отдельно в link_allowlist (global + per-chat).
+    link_filter_enabled = Column(Boolean, default=False, nullable=False)
+    link_filter_action = Column(String(16), default="delete", nullable=False)  # delete|warn|mute|ban
+    # Auto-delete command messages after execution (#8 user-requested):
+    # если True — бот удаляет сообщение модератора с командой (текущее поведение).
+    # Если False — команда остаётся видимой в чате (полезно для прозрачности).
+    # NULL = использовать глобальную настройку (link_filter_action_default).
+    auto_delete_commands = Column(Boolean, default=True, nullable=False)
+    # Warn decay (#45): варны старше N дней не учитываются в счётчике.
+    # 0 = отключено (варны копятся вечно). Типичное значение: 30 дней.
+    warn_decay_days = Column(Integer, default=0, nullable=False)
+    # Auto night mode (user-requested #29-33): автоматическое включение
+    # ограничительных прав в заданное время. Background-таска в bot.py
+    # проверяет расписание каждую минуту.
+    night_mode_enabled = Column(Boolean, default=False, nullable=False)
+    night_mode_start = Column(String(5), default="23:00", nullable=False)  # HH:MM (МСК)
+    night_mode_end = Column(String(5), default="07:00", nullable=False)    # HH:MM (МСК)
+    # JSON-снапшот прав, применяемых ночью (ChatPermissions). По умолчанию —
+    # запрет всех медиа, оставить только текстовые сообщения.
+    night_mode_permissions = Column(Text, nullable=True)
+    # JSON-снапшот прав ДО ночного режима — восстанавливается при выходе из него.
+    # Заполняется при первом входе в ночной режим; обновляется, если SU меняет
+    # права вручную днём (таска перезаписывает snapshot каждый день при входе).
+    night_mode_saved_permissions = Column(Text, nullable=True)
+    # Флаг: сейчас активен ночной режим (для логирования и веб-панели).
+    night_mode_currently_active = Column(Boolean, default=False, nullable=False)
+
+
+class WordFilter(Base):
+    """v4.5.2: Word filter (#7) — список запрещённых слов/паттернов для чата.
+
+    Хранится отдельно от ChatSettings, т.к. паттернов может быть много.
+    chat_id=0 — глобальные паттерны (применяются ко всем чатам, где word_filter
+    включён — но мы не делаем per-chat toggle для word filter в этой версии;
+    паттерны работают per-chat, для глобального default используется chat_id=0).
+    """
+    __tablename__ = "word_filters"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False, index=True)  # 0 = global default
+    pattern = Column(String(255), nullable=False)             # строка или regex
+    is_regex = Column(Boolean, default=False, nullable=False)  # True — re.search, False — lowercase in
+    action = Column(String(16), default="delete", nullable=False)  # delete|warn|mute|ban
+    mute_duration = Column(Integer, nullable=True)            # сек, для action=mute (NULL = chat default)
+    created_by = Column(BigInteger, nullable=True)            # mod_id создателя
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class LinkAllowlist(Base):
+    """v4.5.2: Link filter (#8) — список разрешённых доменов.
+
+    chat_id=0 — глобальный allowlist (применяется ко всем чатам).
+    Конкретный чат может добавлять свои домены (chat_id=<id>).
+    Сравнение по подстроке домена: 't.me' разрешит все поддомены.
+    """
+    __tablename__ = "link_allowlist"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False, index=True)  # 0 = global
+    domain = Column(String(255), nullable=False)              # без схемы, без пути (напр. 't.me')
+    created_by = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class BannedStickerPack(Base):
+    """v4.5.2: Banned sticker packs (#15).
+
+    Pack идентифицируется по pack_name (то, что в Telegram StickerSet.name).
+    Ссылка вида https://t.me/addstickers/<pack_name> приводится к pack_name.
+
+    Punishment — что делать при использовании стикера из пака:
+      • delete — только удалить сообщение (по умолчанию)
+      • warn   — выдать варн (+ удалить)
+      • mute   — замьютить на mute_duration секунд (+ удалить)
+      • ban    — забанить (+ удалить)
+    """
+    __tablename__ = "banned_sticker_packs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False, index=True)  # 0 = global (all chats)
+    pack_name = Column(String(255), nullable=False)            # Telegram StickerSet.name
+    punishment = Column(String(16), default="delete", nullable=False)  # delete|warn|mute|ban
+    mute_duration = Column(Integer, nullable=True)              # сек, для punishment=mute
+    reason = Column(Text, nullable=True)                       # почему пак забанен (для аудита)
+    added_by_mod_id = Column(BigInteger, nullable=True)        # кто добавил (mod_id)
+    added_via = Column(String(16), default="manual", nullable=False)  # manual | auto_ban | web
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    is_active = Column(Boolean, default=True, nullable=False)
 
 
 class WebUser(Base):
@@ -182,6 +284,12 @@ class WebUser(Base):
     # 'su' / 'admin' / 'moderator'. Для существующих записей при миграции:
     #   is_su=True → role='su'; is_su=False → role='admin'.
     role = Column(String(16), nullable=False, default="admin")
+    # ── v4.5: аватарка из Telegram ───────────────────────────────────────
+    # timestamp последнего успешного обновления аватарки (для инвалидации
+    # кэша в шаблоне через ?v=<ts>). Сама аватарка хранится локально в
+    # <data_dir>/avatars/<tg_user_id>.jpg, чтобы не дёргать TG API на каждом
+    # рендере и не хранить base64 в БД.
+    tg_photo_updated_at = Column(DateTime, nullable=True)
 
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────
@@ -224,6 +332,17 @@ async def init_db() -> None:
         if "revoked_by_mod_id" not in columns:
             await conn.execute(text(
                 "ALTER TABLE punishments ADD COLUMN revoked_by_mod_id BIGINT NULL"
+            ))
+
+    # ── Миграция: consumed_by_action в punishments (v4.5.1) ──────────
+    # Какое авто-действие «погасило» варн: 'auto_mute' | 'auto_ban' | NULL.
+    # См. комментарий в модели Punishment.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(punishments)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "consumed_by_action" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE punishments ADD COLUMN consumed_by_action VARCHAR(20) NULL"
             ))
 
     # ── Миграция: привязка веб-юзеров к Telegram (v4.4) ────────────────
@@ -272,6 +391,16 @@ async def init_db() -> None:
                 "UPDATE web_users SET role='su' WHERE is_su=1"
             ))
 
+    # ── Миграция: tg_photo_updated_at в web_users (v4.5) ───────────────
+    # timestamp последнего обновления аватарки. Сам файл хранится локально.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(web_users)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "tg_photo_updated_at" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN tg_photo_updated_at DATETIME NULL"
+            ))
+
     # ── Миграция: расширение chat_settings (v4.4.7) ─────────────────────
     # title / is_enabled / is_private / is_report_chat — для авто-обнаружения
     # чатов и управления доступом. Все новые поля имеют дефолты, миграция
@@ -295,6 +424,96 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE chat_settings ADD COLUMN is_report_chat BOOLEAN NOT NULL DEFAULT 0"
             ))
+
+    # ── Миграция: расширение chat_settings (v4.5.2) ────────────────────
+    # Новые поля для CAS, link filter, night mode, warn decay, auto-delete cmds.
+    # Все имеют дефолты, миграция идемпотентна.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v452_chat_settings_cols = [
+            ("cas_check_enabled",          "BOOLEAN NOT NULL DEFAULT 0"),
+            ("link_filter_enabled",        "BOOLEAN NOT NULL DEFAULT 0"),
+            ("link_filter_action",         "VARCHAR(16) NOT NULL DEFAULT 'delete'"),
+            ("auto_delete_commands",       "BOOLEAN NOT NULL DEFAULT 1"),
+            ("warn_decay_days",            "INTEGER NOT NULL DEFAULT 0"),
+            ("night_mode_enabled",         "BOOLEAN NOT NULL DEFAULT 0"),
+            ("night_mode_start",           "VARCHAR(5) NOT NULL DEFAULT '23:00'"),
+            ("night_mode_end",             "VARCHAR(5) NOT NULL DEFAULT '07:00'"),
+            ("night_mode_permissions",     "TEXT NULL"),
+            ("night_mode_saved_permissions", "TEXT NULL"),
+            ("night_mode_currently_active", "BOOLEAN NOT NULL DEFAULT 0"),
+        ]
+        for col_name, col_type in v452_chat_settings_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
+    # ── v4.5.2: новые таблицы (word_filters, link_allowlist, banned_sticker_packs)
+    # create_all() выше уже создаст их для новой БД; для существующей БД
+    # добавляем CREATE TABLE IF NOT EXISTS на случай если create_all пропустил.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS word_filters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id BIGINT NOT NULL,
+                pattern VARCHAR(255) NOT NULL,
+                is_regex BOOLEAN NOT NULL DEFAULT 0,
+                action VARCHAR(16) NOT NULL DEFAULT 'delete',
+                mute_duration INTEGER NULL,
+                created_by BIGINT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_word_filters_chat_id ON word_filters (chat_id)"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS link_allowlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id BIGINT NOT NULL,
+                domain VARCHAR(255) NOT NULL,
+                created_by BIGINT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_link_allowlist_chat_id ON link_allowlist (chat_id)"
+        ))
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS banned_sticker_packs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id BIGINT NOT NULL,
+                pack_name VARCHAR(255) NOT NULL,
+                punishment VARCHAR(16) NOT NULL DEFAULT 'delete',
+                mute_duration INTEGER NULL,
+                reason TEXT NULL,
+                added_by_mod_id BIGINT NULL,
+                added_via VARCHAR(16) NOT NULL DEFAULT 'manual',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_banned_sticker_packs_chat_id ON banned_sticker_packs (chat_id)"
+        ))
+
+    # ── v4.5.2: seed глобального allowlist для link filter ─────────────
+    # При первом запуске (или если link_allowlist пуст) добавляем базовый
+    # набор доверенных доменов: t.me, telegram.me, github.com.
+    async with async_session() as session:
+        existing = (await session.execute(
+            select(LinkAllowlist).where(LinkAllowlist.chat_id == 0).limit(1)
+        )).scalar_one_or_none()
+        if existing is None:
+            for domain in ("t.me", "telegram.me", "github.com", "youtu.be", "youtube.com"):
+                session.add(LinkAllowlist(chat_id=0, domain=domain))
+            await session.commit()
+            logger_info = "v4.5.2 init_db: seeded global link allowlist (t.me, telegram.me, github.com, youtu.be, youtube.com)"
+            # Логируем через print, т.к. logging может быть не настроен на момент init_db.
+            print(logger_info)
 
     # ── Seed: гарантируем что SU-аккаунт существует в web_users ──────────
     # SU не имеет password_hash — пароль берётся из env WEB_PASSWORD при логине.

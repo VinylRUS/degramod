@@ -107,13 +107,53 @@
             gap: var(--sp-2);
             font-size: 11px;
             color: var(--text-dim);
-            padding: 4px 10px;
+            padding: 3px 10px 3px 4px;
             background: var(--bg3);
             border-radius: var(--r-md);
+            text-decoration: none;
+            transition: background .15s, border-color .15s;
+            border: 1px solid transparent;
+        }
+        .navbar .user-chip:hover {
+            background: var(--bg4);
+            border-color: var(--border);
+            text-decoration: none;
+        }
+        .navbar .user-chip.active {
+            border-color: var(--accent);
+            background: rgba(0,204,102,.08);
+        }
+        .navbar .user-chip .avatar {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            object-fit: cover;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+        .navbar .user-chip .avatar-placeholder {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 700;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            flex-shrink: 0;
         }
         .navbar .user-chip .name {
             color: var(--text);
             font-weight: 600;
+            max-width: 120px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .navbar .user-chip .su-mark {
             background: var(--accent);
@@ -552,22 +592,144 @@
         {% endif %}
         {% if auth_user and auth_user.role == 'su' %}
         <a href="/admin/users" class="nav-link {% if request.url.path.startswith('/admin/users') %}active{% endif %}">Users</a>
-        <a href="/admin/cleanup" class="nav-link {% if request.url.path.startswith('/admin/cleanup') %}active{% endif %}">Cleanup</a>
+        <a href="/admin/settings" class="nav-link {% if request.url.path.startswith('/admin/settings') %}active{% endif %}">Settings</a>
         {% endif %}
         <span class="spacer"></span>
         {% if auth_user %}
-        <span class="user-chip">
+        <a href="/me" class="user-chip {% if request.url.path == '/me' %}active{% endif %}" title="Profile">
+            {% if auth_user.avatar_url %}
+                <img src="{{ auth_user.avatar_url }}" alt="" class="avatar">
+            {% else %}
+                <span class="avatar-placeholder">{{ auth_user.username[:1]|upper }}</span>
+            {% endif %}
             <span class="name">{{ auth_user.username }}</span>
-            {% if auth_user.role == 'su' %}<span class="su-mark">SU</span>{% elif auth_user.role == 'admin' %}<span class="su-mark" style="background: var(--accent); color: var(--bg);">ADMIN</span>{% else %}<span class="su-mark" style="background: var(--warn); color: var(--bg);">MOD</span>{% endif %}
-        </span>
+            {% if auth_user.role == 'su' %}
+                <span class="su-mark">SU</span>
+            {% elif auth_user.role == 'admin' %}
+                <span class="su-mark" style="background: var(--accent); color: var(--bg);">ADMIN</span>
+            {% else %}
+                <span class="su-mark" style="background: var(--warn); color: var(--bg);">MOD</span>
+            {% endif %}
+        </a>
         {% endif %}
-        <a href="/logout" class="nav-link">Logout</a>
+        <a href="/logout" class="nav-link" onclick="event.preventDefault(); document.getElementById('logout-form').submit();">Logout</a>
+        <form id="logout-form" method="post" action="/logout" style="display: none;"></form>
     </nav>
     {% endblock %}
 
     <div class="container">
         {% block content %}{% endblock %}
     </div>
+
+    {# ── v4.5.2: Version footer — clickable, opens changelog modal ── #}
+    <footer class="version-footer">
+        <span class="version-pill" onclick="document.getElementById('changelog-modal').style.display='block'" title="Click for changelog">
+            {{ app_version }} · build {{ app_release_date }}
+        </span>
+    </footer>
+    <div id="changelog-modal" class="changelog-modal" onclick="if(event.target===this)this.style.display='none'">
+        <div class="changelog-modal-inner">
+            <div class="changelog-modal-head">
+                <span>Changelog · {{ app_version }}</span>
+                <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
+            </div>
+            <div class="changelog-modal-body">
+                <p><strong>v4.5.2</strong> — 29 июля 2026</p>
+                <ul>
+                    <li>CAS integration (per-chat toggle): new members checked against <code>api.cas.chat</code>, auto-ban on match.</li>
+                    <li>Word filter (regex/simple) with configurable action (warn/mute/ban/delete). Off by default; per-chat.</li>
+                    <li>Link filter with global + per-chat allowlist. Per-chat toggle.</li>
+                    <li>Banned sticker packs: auto-add on <code>!ban</code> of sticker, manual via <code>!bansticker</code> in DM, web panel page. Punishment choice: ban/mute/warn/delete.</li>
+                    <li>Auto night mode: per-chat schedule (start/end time + permissions), background task applies and restores.</li>
+                    <li>Warn decay: per-chat <code>warn_decay_days</code>; old warns no longer count toward thresholds.</li>
+                    <li>Version display in footer (this modal).</li>
+                </ul>
+                <p style="margin-top:12px;color:var(--text-dim);font-size:11px;">Previous: v4.5.1 (audit fixes — consumed warns, webhook secret, login rate-limit, POST logout, report chat validation, multi-report-chat, WAL checkpoint, !unwarn cap, !resetwarns SU/admin-only, friendly-fire protection).</p>
+            </div>
+        </div>
+    </div>
+    <style>
+        .version-footer {
+            text-align: center;
+            padding: var(--sp-4) 0 var(--sp-5);
+            border-top: 1px solid var(--border);
+            margin-top: var(--sp-6);
+        }
+        .version-pill {
+            display: inline-block;
+            padding: 4px 12px;
+            font-size: 10px;
+            color: var(--text-dim);
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            border-radius: var(--r-sm);
+            cursor: pointer;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-family: var(--font-mono);
+            transition: color .15s, border-color .15s;
+        }
+        .version-pill:hover {
+            color: var(--accent);
+            border-color: var(--accent);
+        }
+        .changelog-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,.75);
+            z-index: 200;
+            padding: var(--sp-5);
+            overflow-y: auto;
+        }
+        .changelog-modal-inner {
+            max-width: 640px;
+            margin: 60px auto 0;
+            background: var(--bg2);
+            border: 1px solid var(--border);
+            border-radius: var(--r-md);
+            box-shadow: 0 12px 40px rgba(0,0,0,.6);
+        }
+        .changelog-modal-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: var(--sp-3) var(--sp-4);
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text);
+            font-weight: 700;
+        }
+        .changelog-close {
+            cursor: pointer;
+            color: var(--text-dim);
+            font-size: 14px;
+            padding: 0 6px;
+        }
+        .changelog-close:hover { color: var(--danger); }
+        .changelog-modal-body {
+            padding: var(--sp-4) var(--sp-5);
+            font-size: 12px;
+            line-height: 1.7;
+            color: var(--text);
+        }
+        .changelog-modal-body ul {
+            margin: 8px 0 8px 18px;
+            padding: 0;
+        }
+        .changelog-modal-body li {
+            margin-bottom: 6px;
+        }
+        .changelog-modal-body code {
+            font-family: var(--font-mono);
+            background: var(--bg3);
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 11px;
+        }
+    </style>
 
     {% block extra_js %}{% endblock %}
 

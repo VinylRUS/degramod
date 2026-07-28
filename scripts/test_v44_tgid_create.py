@@ -11,7 +11,7 @@ test_v44_tgid_create.py — Тесты v4.4: создание админов ч�
   - web_app.py: DELETE /admin/users/{id} (с привязкой TGID)
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_tgid_create.py
 """
 from __future__ import annotations
@@ -683,6 +683,12 @@ async def main():
     print("=" * 70)
     print("v4.4 tests: TGID creation + password change")
     print("=" * 70)
+    # v4.5.1: отключаем rate-limit на /login для тестов
+    try:
+        import web_app
+        web_app._check_login_rate_limit = lambda ip: True
+    except ImportError:
+        pass
     await test_db_migration()
     await test_tg_user_id_unique()
     test_generate_password()

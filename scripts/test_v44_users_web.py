@@ -17,7 +17,7 @@ test_v44_users_web.py — Тесты v4.4.7: объединённая вклад
   - TG-only модераторы (chat_admins без веб-аккаунта) отображаются отдельной секцией
 
 Запуск:
-    cd /home/z/my-project/v4.4
+    cd /home/z/my-project/v4.5
     python3 scripts/test_v44_users_web.py
 """
 from __future__ import annotations
@@ -59,6 +59,12 @@ async def _su_login(client) -> str:
     # Гарантируем что БД инициализирована (миграции применены, SU засеян)
     from db import init_db
     await init_db()
+    # v4.5.1: отключаем rate-limit на /login для тестов
+    try:
+        import web_app
+        web_app._check_login_rate_limit = lambda ip: True
+    except ImportError:
+        pass
     resp = await client.post("/login", data={"username": "su", "password": "test_su_password_123"},
                              follow_redirects=False)
     assert resp.status_code == 303, f"SU login failed: {resp.status_code}"

@@ -1,11 +1,24 @@
 """
 web_app.py — FastAPI: маршруты, авторизация по кукам (HMAC), Jinja2-шаблоны.
 
+v4.5 — Редизайн дашборда + Profile + Settings:
+  - Дашборд сокращён: Search + 4 stat-карточки (Total/Mutes/Warns/Bans) + Recent sanctions
+    с 4 фильтрами (All/Mute/Warn/Ban). Убраны: top offenders/moderators, chat-settings
+    (дублировал /admin/chats), change-pw (переехал в /me), anchor-nav.
+  - Новый /me (Profile): аватарка из ТГ, инфа об аккаунте, форма смены пароля,
+    Refresh-avatar кнопка. Модераторам — инструкция по смене пароля через DM боту.
+  - Новый /admin/settings (SU-only): Cleanup + Bot info + Backup now + VACUUM.
+    Старый /admin/cleanup делает редирект на /admin/settings#cleanup.
+  - Аватарки веб-юзеров: bot.get_user_profile_photos + bot.download → локальный
+    файл <data_dir>/avatars/<tg_user_id>.jpg. Отдаются через /avatar/<tg_user_id>.
+    Скачиваются при создании юзера, при bind-tg и по кнопке Refresh.
+  - Навбар: у кнопки Logout — микро-аватарка + логин текущего юзера (лаконично).
+
 v4.4 — Создание админов через TGID:
   - SU вводит только Telegram ID пользователя.
   - Бот дёргает bot.get_chat(user_id) и подтягивает first_name / last_name / @username.
   - Логин = @username (без @), пароль автогенерируется (16 chars, показывается SU один раз).
-  - Юзер может сам сменить пароль через блок на /dashboard.
+  - Юзер сам меняет пароль через /me (v4.5: было /dashboard).
 
 v4.3 — Поддержка нескольких админ-аккаунтов:
   - SU (super-user) логинится через env WEB_PASSWORD
@@ -26,7 +39,7 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Form
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func, desc, or_
 
@@ -60,6 +73,68 @@ _SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 MSK = timezone(timedelta(hours=3))
 
 PAGE_SIZE = 50  # записей на страницу в дашборде
+
+# ── v4.5: Версия приложения ────────────────────────────────────────────────
+# v4.5.2 (29 июля 2026): CAS integration, word/link/sticker filters, auto night
+# mode, warn decay, version display in footer.
+APP_VERSION = "v4.5.2"
+APP_RELEASE_DATE = "2026-07-29"
+
+# ── v4.5: Папка для аватарок ───────────────────────────────────────────────
+# Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
+# если data_dir смонтирован как volume). Создаётся при старте.
+_DATA_DIR = os.path.dirname(os.getenv("DB_PATH", "/app/data/shadow_logs.db"))
+AVATARS_DIR = os.path.join(_DATA_DIR, "avatars")
+
+# ── v4.5.1: Rate-limit на /login (in-memory, по IP) ────────────────────────
+# Простая защита от брутфорса паролей админов. Не персистентная (сбрасывается
+# при рестарте процесса) — для нашего сценария достаточно.
+# Параметры: 5 попыток за 5-минутное окно, потом — 429 до конца окна.
+_LOGIN_RATELIMIT_MAX = 5
+_LOGIN_RATELIMIT_WINDOW = 300  # 5 минут
+_login_attempts: dict[str, list[float]] = {}  # {ip: [timestamps]}
+
+
+def _check_login_rate_limit(ip: str) -> bool:
+    """Возвращает True если IP ещё в рамках лимита, False если превысил."""
+    now = time.time()
+    attempts = _login_attempts.get(ip, [])
+    # Чистим старые
+    attempts = [t for t in attempts if now - t < _LOGIN_RATELIMIT_WINDOW]
+    if len(attempts) >= _LOGIN_RATELIMIT_MAX:
+        _login_attempts[ip] = attempts
+        return False
+    attempts.append(now)
+    _login_attempts[ip] = attempts
+    return True
+
+
+def _client_ip(request: Request) -> str:
+    """Достаёт IP клиента из request. Учитывает X-Forwarded-For (за прокси)."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        # Берём первый IP из списка
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _wal_checkpoint() -> None:
+    """v4.5.1: принудительный checkpoint WAL-файла SQLite в основной DB-файл.
+
+    Без этого `shutil.copy2(DB_PATH, ...)` в WAL-режиме копирует только
+    основной файл; свежие записи остаются в -wal файле и в бэкап не попадают.
+    PRAGMA wal_checkpoint(TRUNCATE) сбрасывает всё в основной файл и обнуляет
+    WAL. Дешёвая операция, безопасна для параллельных запросов (SQLite сам
+    разруливает локи). Лучший момент для вызова — прямо перед копированием.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        _req_logger.warning("wal_checkpoint failed: %s (continuing)", e)
 
 # ── Публичный URL веб-панели ────────────────────────────────────────────────
 # Дублируется из bot_handlers.py намеренно (web_app.py не должен зависеть от
@@ -110,19 +185,24 @@ class AuthUser:
     """Информация о текущем пользователе, доступная в обработчиках.
 
     Поля:
-      • username — логин в веб-панели
-      • is_su    — True только для role='su' (для обратной совместимости)
-      • role     — 'su' | 'admin' | 'moderator'
+      • username    — логин в веб-панели
+      • is_su       — True только для role='su' (для обратной совместимости)
+      • role        — 'su' | 'admin' | 'moderator'
+      • tg_user_id  — Telegram user ID (для аватарки; None если не привязан)
+      • avatar_url  — URL аватарки для <img src=...> (None если нет аватарки)
     """
-    __slots__ = ("username", "is_su", "role")
+    __slots__ = ("username", "is_su", "role", "tg_user_id", "avatar_url")
 
-    def __init__(self, username: str, is_su: bool, role: str = "admin"):
+    def __init__(self, username: str, is_su: bool, role: str = "admin",
+                 tg_user_id: int | None = None, avatar_url: str | None = None):
         self.username = username
         self.is_su = is_su
         # Нормализуем: is_su=True → role='su' (на случай если токен старый без 'r')
         if is_su and role != "su":
             role = "su"
         self.role = role
+        self.tg_user_id = tg_user_id
+        self.avatar_url = avatar_url
 
 
 async def require_auth(request: Request) -> AuthUser:
@@ -145,7 +225,14 @@ async def require_auth(request: Request) -> AuthUser:
         # Берём роль из БД (а не из токена) — на случай если SU понизил роль
         # после выдачи токена. Токен лишь подтверждает что пользователь залогинился.
         role = wu.role or ("su" if wu.is_su else "admin")
-    return AuthUser(username=payload["u"], is_su=(role == "su"), role=role)
+        avatar_url = _avatar_url(wu.tg_user_id, wu.tg_photo_updated_at)
+    return AuthUser(
+        username=payload["u"],
+        is_su=(role == "su"),
+        role=role,
+        tg_user_id=wu.tg_user_id,
+        avatar_url=avatar_url,
+    )
 
 
 async def require_su(request: Request, _: AuthUser = Depends(require_auth)) -> AuthUser:
@@ -201,6 +288,42 @@ def _telegram_link_base(chat_id: int) -> str:
         return f"https://t.me/c/{clean_id}"
     else:
         return f"https://t.me/c/{chat_id}"
+
+
+# v4.5.2: фильтр для отображения preset имени ночного режима по JSON-снапшоту
+def _night_mode_preset_name(perms_json: str | None) -> str:
+    """Распознаёт preset ('text_only' / 'strict' / 'none' / 'custom') по JSON-снапшоту прав."""
+    if not perms_json:
+        return "text_only"
+    try:
+        data = json.loads(perms_json)
+    except (ValueError, TypeError):
+        return "text_only"
+    # Все True → none (без ограничений)
+    if all(data.get(k, False) for k in (
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+        "can_add_web_page_previews",
+    )):
+        return "none"
+    # Все False → strict (полный мьют)
+    if not any(data.get(k, False) for k in (
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+    )):
+        return "strict"
+    # can_send_messages=True, остальное False → text_only
+    if data.get("can_send_messages", False) and not any(
+        data.get(k, False) for k in (
+            "can_send_audios", "can_send_documents", "can_send_photos",
+            "can_send_videos", "can_send_video_notes", "can_send_voice_notes",
+            "can_send_polls", "can_send_other_messages",
+        )
+    ):
+        return "text_only"
+    return "custom"
 
 
 # ── v4.4: генерация пароля и signed-flash для показа пароля один раз ────────
@@ -325,8 +448,8 @@ async def _send_admin_welcome(bot, tg_user_id: int, login: str, password: str,
         InputRichBlockParagraph(
             text=[
                 "🔐 После первого входа смените пароль: раздел ",
-                RichTextBold(text="Dashboard"),
-                " → блок ",
+                RichTextBold(text="Profile"),
+                " (ссылка в правом верхнем углу) → блок ",
                 RichTextBold(text="Change my password"),
                 " (нужно указать текущий пароль и новый).",
             ]
@@ -346,6 +469,92 @@ async def _send_admin_welcome(bot, tg_user_id: int, login: str, password: str,
         return False, f"TelegramBadRequest: {e}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+# ── v4.5: Хелперы для аватарок ──────────────────────────────────────────────
+
+def _avatar_path(tg_user_id: int) -> str:
+    """Локальный путь к файлу аватарки данного юзера."""
+    return os.path.join(AVATARS_DIR, f"{tg_user_id}.jpg")
+
+
+def _avatar_url(tg_user_id: int | None, photo_updated_at: datetime | None) -> str | None:
+    """URL для <img src=...>. Возвращает None если аватарки нет (шаблон покажет placeholder).
+
+    Параметр ?v=<ts> — cache-buster: после обновления аватарки timestamp меняется,
+    и браузер перекачивает картинку.
+    """
+    if not tg_user_id:
+        return None
+    if not os.path.exists(_avatar_path(tg_user_id)):
+        return None
+    # Используем photo_updated_at если есть, иначе mtime файла
+    if photo_updated_at is not None:
+        # Нормализуем tz
+        if photo_updated_at.tzinfo is None:
+            photo_updated_at = photo_updated_at.replace(tzinfo=timezone.utc)
+        ts = int(photo_updated_at.timestamp())
+    else:
+        try:
+            ts = int(os.path.getmtime(_avatar_path(tg_user_id)))
+        except OSError:
+            ts = 0
+    return f"/avatar/{tg_user_id}?v={ts}"
+
+
+async def _fetch_and_save_avatar(bot, tg_user_id: int) -> bool:
+    """Скачивает аватарку пользователя из Telegram и сохраняет локально.
+
+    Возвращает True если аватарка успешно скачана и сохранена,
+    False — если у юзера нет аватарки или произошла ошибка.
+    Не бросает исключений (best-effort).
+
+    Использует bot.get_user_profile_photos → берём самый большой размер →
+    bot.get_file → HTTP-GET по file_path. Сохраняем как JPEG.
+    """
+    if bot is None or not tg_user_id:
+        return False
+    try:
+        photos = await bot.get_user_profile_photos(user_id=tg_user_id, limit=1)
+    except Exception as e:
+        _req_logger.info("avatar fetch failed for tg_user_id=%s: %s", tg_user_id, e)
+        return False
+    if not photos or not photos.total_count or not photos.photos:
+        return False
+    # photos.photos[0] — список размеров для последнего фото; берём последний (самый большой)
+    sizes = photos.photos[0]
+    if not sizes:
+        return False
+    biggest = sizes[-1]
+    try:
+        file = await bot.get_file(file_id=biggest.file_id)
+    except Exception as e:
+        _req_logger.info("avatar get_file failed for tg_user_id=%s: %s", tg_user_id, e)
+        return False
+    if not file.file_path:
+        return False
+    try:
+        # bot.download() в aiogram 3.x возвращает bytes при destination=None
+        data = await bot.download(file=file.file_path, destination=None)
+    except Exception as e:
+        _req_logger.info("avatar download failed for tg_user_id=%s: %s", tg_user_id, e)
+        return False
+    if data is None:
+        return False
+    # aiogram 3.x: bot.download может вернуть BytesIO или bytes
+    if hasattr(data, "read"):
+        data = data.read()
+    if not data:
+        return False
+    # Сохраняем
+    try:
+        os.makedirs(AVATARS_DIR, exist_ok=True)
+        with open(_avatar_path(tg_user_id), "wb") as f:
+            f.write(data)
+    except OSError as e:
+        _req_logger.warning("avatar save failed for tg_user_id=%s: %s", tg_user_id, e)
+        return False
+    return True
 
 
 # ── Создание приложения ─────────────────────────────────────────────────────
@@ -380,6 +589,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     templates.env.filters["msk"] = _msk_time
     templates.env.filters["dur"] = _duration_fmt
     templates.env.filters["tglink"] = _telegram_link_base
+    templates.env.filters["night_mode_preset_name"] = _night_mode_preset_name
+    # v4.5.2: глобальные переменные для всех шаблонов (версия в футере)
+    templates.env.globals["app_version"] = APP_VERSION
+    templates.env.globals["app_release_date"] = APP_RELEASE_DATE
+
+    # v4.5: создаём папку для аватарок при старте (если ещё нет)
+    try:
+        os.makedirs(AVATARS_DIR, exist_ok=True)
+    except OSError as e:
+        _req_logger.warning("create_app: cannot create AVATARS_DIR %s: %s", AVATARS_DIR, e)
 
     # ── Health check ─────────────────────────────────────────────────
     @app.get("/health")
@@ -387,8 +606,22 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         return {
             "status": "ok",
             "service": "dedushka-vobzhak",
+            "version": APP_VERSION,
             "time": datetime.now(timezone.utc).isoformat(),
         }
+
+    # ── v4.5: Endpoint для отдачи аватарок ────────────────────────────
+    # Возвращает файл <AVATARS_DIR>/<tg_user_id>.jpg. Если файла нет —
+    # 404 (шаблон должен проверить avatar_url перед рендером <img>).
+    # v4.5.1: добавлена проверка require_auth — чтобы посторонние не могли
+    # перебирать tg_user_id и тащить аватарки. Шаблоны используют тот же
+    # домен, так что браузер автоматически шлёт cookie с сессией.
+    @app.get("/avatar/{tg_user_id:int}")
+    async def get_avatar(tg_user_id: int, _auth: AuthUser = Depends(require_auth)):
+        path = _avatar_path(tg_user_id)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404)
+        return FileResponse(path, media_type="image/jpeg")
 
     # ── Root → редирект на login ────────────────────────────────────────
     @app.get("/")
@@ -403,6 +636,20 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # ── POST /login ─────────────────────────────────────────────────────
     @app.post("/login")
     async def login_submit(request: Request):
+        # v4.5.1: rate-limit по IP — 5 попыток за 5 минут
+        ip = _client_ip(request)
+        if not _check_login_rate_limit(ip):
+            _req_logger.warning("login rate-limited for ip=%s", ip)
+            return templates.TemplateResponse(
+                "login.html",
+                {
+                    "request": request,
+                    "error": True,
+                    "error_msg": "Too many login attempts. Try again in 5 minutes.",
+                },
+                status_code=429,
+            )
+
         form = await request.form()
         username = (form.get("username") or "").strip().lower()
         password = form.get("password", "")
@@ -448,14 +695,31 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
             return response
 
-    # ── GET /logout ─────────────────────────────────────────────────────
-    @app.get("/logout")
+    # ── POST /logout (v4.5.1: было GET, изменили на POST) ──────────────
+    # GET /logout был CSRF-уязвим: любой сайт с <img src=".../logout">
+    # разлогинивал юзера. POST + SameSite=lax cookie полностью закрывают
+    # этот вектор (для POST-запроса с другого origin браузер не шлёт cookie).
+    # Шаблон base.html использует <form method="post" action="/logout">.
+    @app.post("/logout")
     async def logout():
         response = RedirectResponse(url="/login", status_code=303)
         response.delete_cookie(COOKIE_NAME)
         return response
 
+    # GET /logout — редирект на /login (для старых закладок). Не вылогинивает,
+    # просто редиректит — чтобы случайно зашедший по старой ссылке не потерял
+    # сессию без действия.
+    @app.get("/logout")
+    async def logout_legacy():
+        return RedirectResponse(url="/login", status_code=303)
+
     # ── GET /dashboard ──────────────────────────────────────────────────
+    # v4.5: урезанный дашборд. Только:
+    #   • Search user (поиск нарушителя)
+    #   • 4 stat-карточки: Total / Mutes / Warns / Bans
+    #   • Recent sanctions — лог с 4 фильтрами (All/Mute/Warn/Ban)
+    # Убрано: top offenders/moderators, chat-settings (дублировал /admin/chats),
+    # change-pw (переехал в /me), anchor-nav (нечего навигировать).
     @app.get("/dashboard", response_class=HTMLResponse)
     async def dashboard(
         request: Request,
@@ -463,7 +727,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         action: str = "",
         rev: str = "",          # "all" / "active" / "revoked"; по умолчанию ""
         sort: str = "new",      # "new" / "old" / "type" / "user"
-        pw_msg: str = "",       # v4.4: сообщение о смене пароля
+        pw_msg: str = "",       # legacy: оставлен для редиректов от старой /me/password
         _auth: AuthUser = Depends(require_auth),
     ):
         offset = (page - 1) * PAGE_SIZE
@@ -479,43 +743,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             total_stats = {row[0]: row[1] for row in total_result.all()}
             total_all = sum(total_stats.values())
 
-            # ── Топ нарушителей за 30 дней (только активные) ─────────────
-            thirty_days_ago = datetime.now(timezone.utc) - timedelta(days=30)
-            top_stmt = (
-                select(
-                    Punishment.user_id,
-                    User.username,
-                    User.first_name,
-                    User.last_name,
-                    func.count(Punishment.id).label("cnt"),
-                )
-                .join(User, Punishment.user_id == User.user_id)
-                .where(
-                    Punishment.created_at >= thirty_days_ago,
-                    Punishment.is_revoked.is_(False),
-                )
-                .group_by(Punishment.user_id)
-                .order_by(desc("cnt"))
-                .limit(10)
-            )
-            top_offenders = (await session.execute(top_stmt)).all()
-
-            # ── Топ модераторов за 30 дней (все их действия, incl. unwarn) ──
-            mod_stmt = (
-                select(
-                    Punishment.mod_id,
-                    Moderator.username,
-                    Moderator.first_name,
-                    func.count(Punishment.id).label("cnt"),
-                )
-                .join(Moderator, Punishment.mod_id == Moderator.mod_id)
-                .where(Punishment.created_at >= thirty_days_ago)
-                .group_by(Punishment.mod_id)
-                .order_by(desc("cnt"))
-                .limit(10)
-            )
-            top_moderators = (await session.execute(mod_stmt)).all()
-
             # ── Лог санкций: базовый запрос + фильтры ────────────────────
             base = (
                 select(Punishment, User, Moderator)
@@ -523,7 +750,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 .join(Moderator, Punishment.mod_id == Moderator.mod_id)
             )
 
-            # Action filter
+            # Action filter (v4.5: в UI осталось 4 кнопки — All/Mute/Warn/Ban.
+            # URL с action=unmute/unwarn/unban по-прежнему работает для прямых
+            # ссылок, но в дашборде кнопок для этого нет.)
             if action in ("mute", "warn", "ban", "unmute", "unwarn", "unban"):
                 base = base.where(Punishment.action_type == action)
 
@@ -563,33 +792,19 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 base.offset(offset).limit(PAGE_SIZE)
             )).all()
 
-            # ── Чат-настройки ──────────────────────────────────────────────
-            settings_result = await session.execute(select(ChatSettings))
-            chat_settings = settings_result.scalars().all()
-
-            default_rc_row = (
-                await session.execute(
-                    select(ChatSettings).where(ChatSettings.chat_id == 0)
-                )
-            ).scalar_one_or_none()
-            default_report_chat_id = default_rc_row.report_chat_id if default_rc_row else None
-
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "rows": rows,
-            "top_offenders": top_offenders,
-            "top_moderators": top_moderators,
             "total_stats": total_stats,
             "total_all": total_all,
             "page": page,
             "total_pages": total_pages,
             "page_size": PAGE_SIZE,
-            "chat_settings": chat_settings,
-            "default_report_chat_id": default_report_chat_id,
             "action_filter": action,
             "rev_filter": rev,
             "sort": sort,
             "auth_user": _auth,
+            "app_version": APP_VERSION,
             "pw_msg": pw_msg or None,
         })
 
@@ -1009,7 +1224,21 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             _auth.username,
         )
 
-        # ── 8. Welcome-DM ───────────────────────────────────────────────
+        # ── 8. v4.5: Скачиваем аватарку (best-effort) ───────────────────
+        avatar_ok = await _fetch_and_save_avatar(bot, tg_id)
+        if avatar_ok:
+            async with async_session() as session:
+                wu_for_avatar = (await session.execute(
+                    select(WebUser).where(WebUser.tg_user_id == tg_id)
+                )).scalar_one_or_none()
+                if wu_for_avatar is not None:
+                    wu_for_avatar.tg_photo_updated_at = datetime.now(timezone.utc)
+                    await session.commit()
+            _req_logger.info("admin_users_create: avatar saved for tg_user_id=%s", tg_id)
+        else:
+            _req_logger.info("admin_users_create: no avatar for tg_user_id=%s (skipped)", tg_id)
+
+        # ── 9. Welcome-DM ───────────────────────────────────────────────
         welcome_ok, welcome_err = await _send_admin_welcome(
             bot=bot, tg_user_id=tg_id, login=login, password=password,
             first_name=tg_first_name, role=role,
@@ -1260,6 +1489,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 except Exception as e:
                     _req_logger.info("bind-tg: bot.get_chat failed (non-critical): %s", e)
             await session.commit()
+        # v4.5: скачиваем аватарку для привязанного TG ID (best-effort)
+        avatar_ok = await _fetch_and_save_avatar(bot, tg_id)
+        if avatar_ok:
+            async with async_session() as session:
+                wu_for_avatar = (await session.execute(
+                    select(WebUser).where(WebUser.id == user_id)
+                )).scalar_one_or_none()
+                if wu_for_avatar is not None:
+                    wu_for_avatar.tg_photo_updated_at = datetime.now(timezone.utc)
+                    await session.commit()
+            _req_logger.info("admin_users_bind_tg: avatar saved for tg_id=%s", tg_id)
         _req_logger.info(
             "admin_users_bind_tg: user_id=%s tg_id=%s by=%s",
             user_id, tg_id, _auth.username,
@@ -1280,11 +1520,22 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )).scalar_one_or_none()
             if wu is None or wu.is_su:
                 return RedirectResponse(url="/admin/users", status_code=303)
+            # v4.5.1: чистим chat_admins для tg_user_id удаляемого юзера.
+            # Раньше запись оставалась в БД, и _is_admin через fallback
+            # продолжал давать доступ «TG-only модератору» — фактически
+            # удалённый аккаунт сохранял модеративные права.
+            if wu.tg_user_id:
+                cas = (await session.execute(
+                    select(ChatAdmin).where(ChatAdmin.user_id == wu.tg_user_id)
+                )).scalars().all()
+                for ca in cas:
+                    await session.delete(ca)
             await session.delete(wu)
             await session.commit()
         _req_logger.info(
-            "admin_users_delete: deleted web_user id=%s by=%s",
-            user_id, _auth.username,
+            "admin_users_delete: deleted web_user id=%s by=%s "
+            "(also cleared chat_admins for tg_user_id=%s)",
+            user_id, _auth.username, wu.tg_user_id,
         )
         return RedirectResponse(url="/admin/users", status_code=303)
 
@@ -1335,11 +1586,26 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     )).all()
                     mod_counts = {cid: cnt for cid, cnt in mc_rows}
 
+            # v4.5.1: список доступных репорт-чатов (is_report_chat=True)
+            # — для dropdown в шаблоне admin_chats.html вместо свободного
+            # текстового поля. Так SU не может ввести несуществующий chat_id
+            # и удивляться, что отчёты не приходят.
+            report_chat_options = [
+                {
+                    "chat_id": r.chat_id,
+                    "title": r.title or f"(id {r.chat_id})",
+                    "hashtag": r.hashtag,
+                }
+                for r in rows
+                if r.is_report_chat and r.chat_id != 0
+            ]
+
         return templates.TemplateResponse("admin_chats.html", {
             "request": request,
             "chats": rows,
             "stats": stats,
             "mod_counts": mod_counts,
+            "report_chat_options": report_chat_options,
             "auth_user": _auth,
             "flash": flash or None,
         })
@@ -1352,9 +1618,14 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         warns_to_mute: str = Form(""),
         mute_duration_seconds: str = Form(""),
         warns_to_ban: str = Form(""),
+        warn_decay_days: str = Form(""),
+        link_filter_action: str = Form("delete"),
+        night_mode_start: str = Form("23:00"),
+        night_mode_end: str = Form("07:00"),
+        night_mode_preset: str = Form("text_only"),
         _auth: AuthUser = Depends(require_admin),
     ):
-        """Обновляет основные настройки чата (hashtag, thresholds, report_chat_id)."""
+        """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
         try:
             chat_id = int(chat_id_str)
         except (ValueError, TypeError):
@@ -1380,9 +1651,38 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             mdb = _parse_int(mute_duration_seconds, "mute_duration_seconds", 0)
             wtb = _parse_int(warns_to_ban, "warns_to_ban", 0)
             rc = _parse_int(report_chat_id, "report_chat_id", -10**15)
+            decay = _parse_int(warn_decay_days, "warn_decay_days", 0)
         except ValueError as e:
             return RedirectResponse(
                 url=f"/admin/chats?flash={e}",
+                status_code=303,
+            )
+
+        # v4.5.2: валидация link_filter_action и night mode preset
+        if link_filter_action not in ("delete", "warn", "mute", "ban"):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+link_filter_action",
+                status_code=303,
+            )
+        if night_mode_preset not in ("text_only", "strict", "none"):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+night_mode_preset",
+                status_code=303,
+            )
+
+        # v4.5.2: валидация HH:MM для night mode
+        import re as _re
+        _hhmm_re = _re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
+        nm_start = (night_mode_start or "").strip()
+        nm_end = (night_mode_end or "").strip()
+        if not _hhmm_re.match(nm_start):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+night_mode_start+(use+HH:MM)",
+                status_code=303,
+            )
+        if not _hhmm_re.match(nm_end):
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Invalid+night_mode_end+(use+HH:MM)",
                 status_code=303,
             )
 
@@ -1395,6 +1695,38 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
+        # v4.5.2: строим JSON-снапшот permissions по preset
+        # Импортируем хелпер из bot_handlers (не идеально — web_app зависит от bot_handlers,
+        # но это уже было раньше: web_app импортирует from db).
+        # Чтобы не тащить aiogram.types в web_app, делаем permissions dict inline.
+        if night_mode_preset == "strict":
+            night_perms_json = json.dumps({k: False for k in (
+                "can_send_messages", "can_send_audios", "can_send_documents",
+                "can_send_photos", "can_send_videos", "can_send_video_notes",
+                "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+                "can_add_web_page_previews", "can_change_info", "can_invite_users",
+                "can_pin_messages",
+            )})
+        elif night_mode_preset == "none":
+            night_perms_json = json.dumps({k: True for k in (
+                "can_send_messages", "can_send_audios", "can_send_documents",
+                "can_send_photos", "can_send_videos", "can_send_video_notes",
+                "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+                "can_add_web_page_previews", "can_change_info", "can_invite_users",
+                "can_pin_messages",
+            )})
+        else:  # text_only (default)
+            night_perms_json = json.dumps({
+                "can_send_messages": True,
+                "can_send_audios": False, "can_send_documents": False,
+                "can_send_photos": False, "can_send_videos": False,
+                "can_send_video_notes": False, "can_send_voice_notes": False,
+                "can_send_polls": False, "can_send_other_messages": False,
+                "can_add_web_page_previews": False,
+                "can_change_info": False, "can_invite_users": False,
+                "can_pin_messages": False,
+            })
+
         async with async_session() as session:
             cs = (await session.execute(
                 select(ChatSettings).where(ChatSettings.chat_id == chat_id)
@@ -1404,18 +1736,41 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
                     status_code=303,
                 )
+            # v4.5.1: валидация report_chat_id — должен указывать на чат,
+            # помеченный is_report_chat=True (либо None для сброса).
+            if rc is not None:
+                rc_target = (await session.execute(
+                    select(ChatSettings).where(ChatSettings.chat_id == rc)
+                )).scalar_one_or_none()
+                if rc_target is None or not rc_target.is_report_chat:
+                    return RedirectResponse(
+                        url=(
+                            f"/admin/chats?flash=Report+chat+{rc}+is+not+marked+"
+                            "as+report+chat.+Use+the+%E2%98%86+Make+report+button+"
+                            "on+that+chat+first."
+                        ),
+                        status_code=303,
+                    )
             cs.hashtag = ht or None
             cs.report_chat_id = rc
             cs.warns_to_mute = wtm if wtm is not None else 0
             cs.mute_duration_seconds = mdb if mdb is not None else 3600
             cs.warns_to_ban = wtb if wtb is not None else 0
+            # v4.5.2: новые поля
+            cs.warn_decay_days = decay if decay is not None else 0
+            cs.link_filter_action = link_filter_action
+            cs.night_mode_start = nm_start
+            cs.night_mode_end = nm_end
+            cs.night_mode_permissions = night_perms_json
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
         _req_logger.info(
             "admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, "
-            "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s)",
+            "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
+            "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s])",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
+            decay, link_filter_action, nm_start, nm_end, night_mode_preset,
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",
@@ -1429,8 +1784,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         _auth: AuthUser = Depends(require_admin),
     ):
         """v4.4.7: переключает is_enabled / is_private / is_report_chat для чата.
+        v4.5.2: добавлены toggle для cas, link_filter, night_mode.
 
-        Поле form: field=enabled|private|report_chat — что переключать.
+        Поле form: field=enabled|private|report_chat|cas|link_filter|night_mode — что переключать.
         """
         try:
             chat_id = int(chat_id_str)
@@ -1441,7 +1797,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         form = await request.form()
         field = (form.get("field") or "").strip().lower()
-        valid_fields = {"enabled", "private", "report_chat"}
+        valid_fields = {"enabled", "private", "report_chat", "cas", "link_filter", "night_mode"}
         if field not in valid_fields:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Invalid+toggle+field",
@@ -1463,6 +1819,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             elif field == "private":
                 cs.is_private = not cs.is_private
                 msg = f"Chat+{chat_id}+{'now+private' if cs.is_private else 'now+public'}"
+            elif field == "cas":
+                cs.cas_check_enabled = not cs.cas_check_enabled
+                msg = f"Chat+{chat_id}+CAS+{'enabled' if cs.cas_check_enabled else 'disabled'}"
+            elif field == "link_filter":
+                cs.link_filter_enabled = not cs.link_filter_enabled
+                msg = f"Chat+{chat_id}+Link+filter+{'enabled' if cs.link_filter_enabled else 'disabled'}"
+            elif field == "night_mode":
+                cs.night_mode_enabled = not cs.night_mode_enabled
+                if not cs.night_mode_enabled:
+                    cs.night_mode_currently_active = False
+                msg = f"Chat+{chat_id}+Night+mode+{'enabled' if cs.night_mode_enabled else 'disabled'}"
             else:  # report_chat
                 if cs.is_report_chat:
                     cs.is_report_chat = False
@@ -1620,14 +1987,232 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         ).fetchone()[0]
         return c
 
-    @app.get("/admin/cleanup", response_class=HTMLResponse)
-    async def admin_cleanup_page(
+    # ──────────────────────────────────────────────────────────────────
+    #  /me/password — смена своего пароля (v4.4 → v4.5: переехал из /dashboard в /me)
+    #  Доступен всем авторизованным, но SU пароль хранится в env — ему форма
+    #  показывает предупреждение и ничего не делает.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/me/password")
+    async def me_change_password(
+        request: Request,
+        old_password: str = Form(...),
+        new_password: str = Form(...),
+        confirm: str = Form(...),
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        # SU пароль в env — менять через /me нельзя.
+        if _auth.is_su:
+            return RedirectResponse(
+                url="/me?pw_msg=SU+password+is+managed+via+WEB_PASSWORD+env+variable",
+                status_code=303,
+            )
+
+        # Валидация
+        if len(new_password) < 6:
+            return RedirectResponse(
+                url="/me?pw_msg=New+password+must+be+at+least+6+chars",
+                status_code=303,
+            )
+        if new_password != confirm:
+            return RedirectResponse(
+                url="/me?pw_msg=New+password+and+confirmation+do+not+match",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.username == _auth.username)
+            )).scalar_one_or_none()
+            if wu is None or not wu.is_active or not wu.password_hash:
+                return RedirectResponse(
+                    url="/me?pw_msg=Account+not+found",
+                    status_code=303,
+                )
+            # Проверяем старый пароль
+            if not _verify_password(old_password, wu.password_hash):
+                return RedirectResponse(
+                    url="/me?pw_msg=Current+password+is+incorrect",
+                    status_code=303,
+                )
+            # Проверяем, что новый пароль отличается от старого
+            if _verify_password(new_password, wu.password_hash):
+                return RedirectResponse(
+                    url="/me?pw_msg=New+password+must+differ+from+current",
+                    status_code=303,
+                )
+            wu.password_hash = _hash_password(new_password)
+            await session.commit()
+
+        _req_logger.info(
+            "me_change_password: user=%s changed own password",
+            _auth.username,
+        )
+        return RedirectResponse(
+            url="/me?pw_msg=Password+changed+successfully",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  v4.5: /me — личный профиль пользователя
+    #
+    #  Показывает:
+    #    • Аватарку из TG (большая, 96×96) + кнопку Refresh
+    #    • Инфу об аккаунте: логин, роль, TG ID, дата создания, последний логин
+    #    • Для admin/moderator — форму смены пароля
+    #    • Для SU — предупреждение что пароль в env WEB_PASSWORD
+    #    • Для moderator — дополнительно инструкцию по смене пароля через DM боту
+    # ──────────────────────────────────────────────────────────────────
+    @app.get("/me", response_class=HTMLResponse)
+    async def me_profile(
+        request: Request,
+        pw_msg: str = "",
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        async with async_session() as session:
+            wu = (await session.execute(
+                select(WebUser).where(WebUser.username == _auth.username)
+            )).scalar_one_or_none()
+            if wu is None:
+                # Сессия валидна, но юзер пропал — редирект на логин
+                return RedirectResponse(url="/login", status_code=303)
+            # Создаём snapshot со всеми нужными полями (wu может быть удалён из сессии)
+            profile = {
+                "username": wu.username,
+                "role": wu.role or ("su" if wu.is_su else "admin"),
+                "is_su": wu.is_su,
+                "is_active": wu.is_active,
+                "tg_user_id": wu.tg_user_id,
+                "tg_first_name": wu.tg_first_name,
+                "tg_last_name": wu.tg_last_name,
+                "tg_username": wu.tg_username,
+                "created_at": wu.created_at,
+                "last_login_at": wu.last_login_at,
+                "created_by": wu.created_by,
+                "avatar_url": _avatar_url(wu.tg_user_id, wu.tg_photo_updated_at),
+                "photo_updated_at": wu.tg_photo_updated_at,
+            }
+
+        return templates.TemplateResponse("profile.html", {
+            "request": request,
+            "auth_user": _auth,
+            "app_version": APP_VERSION,
+            "profile": profile,
+            "pw_msg": pw_msg or None,
+            "web_public_url": WEB_PUBLIC_URL,
+        })
+
+    @app.post("/me/avatar/refresh")
+    async def me_avatar_refresh(
+        request: Request,
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        """v4.5: принудительно скачивает аватарку из TG и обновляет timestamp."""
+        if not _auth.tg_user_id:
+            return RedirectResponse(
+                url="/me?pw_msg=No+TG+ID+bound+to+your+account",
+                status_code=303,
+            )
+        if bot is None:
+            return RedirectResponse(
+                url="/me?pw_msg=Bot+instance+not+available",
+                status_code=303,
+            )
+        ok = await _fetch_and_save_avatar(bot, _auth.tg_user_id)
+        if ok:
+            async with async_session() as session:
+                wu = (await session.execute(
+                    select(WebUser).where(WebUser.username == _auth.username)
+                )).scalar_one_or_none()
+                if wu is not None:
+                    wu.tg_photo_updated_at = datetime.now(timezone.utc)
+                    await session.commit()
+            _req_logger.info(
+                "me_avatar_refresh: avatar updated for user=%s tg_id=%s",
+                _auth.username, _auth.tg_user_id,
+            )
+            return RedirectResponse(
+                url="/me?pw_msg=Avatar+updated+successfully",
+                status_code=303,
+            )
+        else:
+            return RedirectResponse(
+                url="/me?pw_msg=Could+not+fetch+avatar+(no+profile+photo+or+API+error)",
+                status_code=303,
+            )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  v4.5: /admin/settings — Settings (SU-only)
+    #
+    #  Раздел:
+    #    • Bot info (версия, uptime, чаты, модераторы, наказания)
+    #    • Backup now (создать копию БД вручную)
+    #    • Cleanup (preview + apply — встроенный, как было в /admin/cleanup)
+    #    • VACUUM (оптимизация файла БД без удаления данных)
+    # ──────────────────────────────────────────────────────────────────
+    def _bot_info() -> dict:
+        """Собирает snapshot инфо о боте для страницы Settings."""
+        info = {
+            "version": APP_VERSION,
+            "uptime_seconds": 0,
+            "db_path": DB_PATH,
+            "db_size_bytes": 0,
+            "chats_total": 0,
+            "chats_enabled": 0,
+            "chats_disabled": 0,
+            "moderators_total": 0,
+            "web_users_total": 0,
+            "punishments_total": 0,
+        }
+        # Размер файла БД
+        try:
+            if os.path.exists(DB_PATH):
+                info["db_size_bytes"] = os.path.getsize(DB_PATH)
+        except OSError:
+            pass
+        # Uptime: считаем от времени старта процесса (точнее — от создания app)
+        # Просто используем время старта процесса из env если задано, иначе — 0
+        # (не критично — это всего лишь отображение)
+        try:
+            import psutil
+            info["uptime_seconds"] = int(time.time() - psutil.Process().create_time())
+        except Exception:
+            pass
+        # Счётчики из БД
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                info["chats_total"] = conn.execute(
+                    "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0"
+                ).fetchone()[0]
+                info["chats_enabled"] = conn.execute(
+                    "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0 AND is_enabled=1"
+                ).fetchone()[0]
+                info["chats_disabled"] = conn.execute(
+                    "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0 AND is_enabled=0"
+                ).fetchone()[0]
+                info["moderators_total"] = conn.execute(
+                    "SELECT COUNT(*) FROM moderators"
+                ).fetchone()[0]
+                info["web_users_total"] = conn.execute(
+                    "SELECT COUNT(*) FROM web_users"
+                ).fetchone()[0]
+                info["punishments_total"] = conn.execute(
+                    "SELECT COUNT(*) FROM punishments"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            _req_logger.warning("_bot_info: sqlite error: %s", e)
+        return info
+
+    @app.get("/admin/settings", response_class=HTMLResponse)
+    async def admin_settings_page(
         request: Request,
         flash: str = "",
         _auth: AuthUser = Depends(require_su),
     ):
-        """Страница очистки БД. Показывает live-превью + форму подтверждения."""
-        # Если файла БД нет — рендерим с заглушкой (тесты / dev-режим)
+        """v4.5: страница настроек системы (SU-only)."""
+        # Cleanup preview (live counts из БД)
         if not os.path.exists(DB_PATH):
             counts = {
                 "punishments": 0, "users": 0, "moderators": 0,
@@ -1641,15 +2226,108 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             finally:
                 conn.close()
 
-        return templates.TemplateResponse("admin_cleanup.html", {
+        return templates.TemplateResponse("admin_settings.html", {
             "request": request,
             "auth_user": _auth,
-            "counts": counts,
+            "app_version": APP_VERSION,
             "flash": flash or None,
-            "result": None,
+            "counts": counts,
             "db_path": DB_PATH,
             "db_path_dir": os.path.dirname(DB_PATH) or ".",
+            "bot_info": _bot_info(),
         })
+
+    @app.post("/admin/settings/backup")
+    async def admin_settings_backup(
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.5: создаёт резервную копию БД без удаления данных."""
+        if not os.path.exists(DB_PATH):
+            return RedirectResponse(
+                url="/admin/settings?flash=Database+file+not+found",
+                status_code=303,
+            )
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = f"{DB_PATH}.backup-{ts}.db"
+        backup_filename = os.path.basename(backup_path)
+        # v4.5.1: checkpoint WAL в основной файл перед копированием — иначе
+        # свежие записи (последние несколько секунд) в бэкап не попадут.
+        _wal_checkpoint()
+        try:
+            shutil.copy2(DB_PATH, backup_path)
+        except OSError as e:
+            _req_logger.error("admin_settings_backup: backup failed: %s", e)
+            return RedirectResponse(
+                url=f"/admin/settings?flash=Backup+failed%3A+{e}",
+                status_code=303,
+            )
+        _req_logger.info(
+            "admin_settings_backup: created %s (by=%s)",
+            backup_path, _auth.username,
+        )
+        return RedirectResponse(
+            url=f"/admin/settings?flash=Backup+created%3A+{backup_filename}",
+            status_code=303,
+        )
+
+    @app.post("/admin/settings/vacuum")
+    async def admin_settings_vacuum(
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.5: запускает VACUUM на файле БД (оптимизация без удаления данных)."""
+        if not os.path.exists(DB_PATH):
+            return RedirectResponse(
+                url="/admin/settings?flash=Database+file+not+found",
+                status_code=303,
+            )
+        try:
+            size_before = os.path.getsize(DB_PATH)
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+                conn.isolation_level = ""
+            finally:
+                conn.close()
+            size_after = os.path.getsize(DB_PATH)
+        except sqlite3.Error as e:
+            _req_logger.error("admin_settings_vacuum: VACUUM failed: %s", e)
+            return RedirectResponse(
+                url=f"/admin/settings?flash=VACUUM+failed%3A+{e}",
+                status_code=303,
+            )
+        _req_logger.info(
+            "admin_settings_vacuum: VACUUM done (by=%s) size %d→%d bytes",
+            _auth.username, size_before, size_after,
+        )
+        delta = size_before - size_after
+        return RedirectResponse(
+            url=f"/admin/settings?flash=VACUUM+done.+DB+size%3A+{size_before}+%E2%86%92+{size_after}+bytes+"
+                f"(-{delta}+bytes+freed)",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  v4.5: /admin/cleanup → редирект на /admin/settings#cleanup
+    #  Старый маршрут сохранён для обратной совместимости (закладки, тесты).
+    #  POST /admin/cleanup всё ещё работает как alias к логике cleanup,
+    #  чтобы не ломать существующие тесты.
+    # ──────────────────────────────────────────────────────────────────
+    @app.get("/admin/cleanup", response_class=HTMLResponse)
+    async def admin_cleanup_page_legacy(
+        request: Request,
+        flash: str = "",
+        _auth: AuthUser = Depends(require_su),
+    ):
+        # Редирект на новую страницу Settings (с якорем на блок cleanup).
+        # flash пробрасываем через query string.
+        target = "/admin/settings"
+        if flash:
+            target += f"?flash={flash}"
+        target += "#cleanup"
+        return RedirectResponse(url=target, status_code=303)
 
     @app.post("/admin/cleanup")
     async def admin_cleanup_apply(
@@ -1657,7 +2335,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         include_chat_admins: str = Form(""),
         _auth: AuthUser = Depends(require_su),
     ):
-        """Реальное удаление тестовых данных.
+        """v4.5: реальное удаление тестовых данных (логика не изменилась).
 
         Шаги:
           1. Проверяем что БД существует.
@@ -1672,7 +2350,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         """
         if not os.path.exists(DB_PATH):
             return RedirectResponse(
-                url="/admin/cleanup?flash=Database+file+not+found",
+                url="/admin/settings?flash=Database+file+not+found#cleanup",
                 status_code=303,
             )
 
@@ -1691,22 +2369,23 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 _auth.username,
             )
             return RedirectResponse(
-                url="/admin/cleanup?flash=Refused%3A+no+moderators+and+no+web+users+"
-                    "+present.+Create+at+least+one+admin+before+cleanup.",
+                url="/admin/settings?flash=Refused%3A+no+moderators+and+no+web+users+"
+                    "+present.+Create+at+least+one+admin+before+cleanup.#cleanup",
                 status_code=303,
             )
 
         # ── 3. Backup ───────────────────────────────────────────────
-        # %f — микросекунды, чтобы избежать коллизий при быстрых повторных вызовах
         ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup_path = f"{DB_PATH}.backup-{ts}.db"
         backup_filename = os.path.basename(backup_path)
+        # v4.5.1: checkpoint WAL в основной файл перед копированием.
+        _wal_checkpoint()
         try:
             shutil.copy2(DB_PATH, backup_path)
         except OSError as e:
             _req_logger.error("admin_cleanup: backup failed: %s", e)
             return RedirectResponse(
-                url=f"/admin/cleanup?flash=Backup+failed%3A+{e}",
+                url=f"/admin/settings?flash=Backup+failed%3A+{e}#cleanup",
                 status_code=303,
             )
 
@@ -1747,7 +2426,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 e, backup_path,
             )
             return RedirectResponse(
-                url=f"/admin/cleanup?flash=Deletion+failed%3A+{e}.+Restore+from+{backup_filename}",
+                url=f"/admin/settings?flash=Deletion+failed%3A+{e}.+Restore+from+{backup_filename}#cleanup",
                 status_code=303,
             )
 
@@ -1768,90 +2447,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             backup_filename,
         )
 
-        # Рендерим страницу с блоком результата (не редирект — чтобы
-        # пользователь сразу видел итог)
-        return templates.TemplateResponse("admin_cleanup.html", {
-            "request": request,
-            "auth_user": _auth,
-            "counts": after,
-            "flash": None,
-            "result": {
-                "deleted_punishments": deleted_punishments,
-                "deleted_users": deleted_users,
-                "kept_users": after["users"],
-                "deleted_chat_admins": deleted_chat_admins,
-                "preserved_moderators": after["moderators"],
-                "preserved_web_users": after["web_users"],
-                "preserved_chat_settings": after["chat_settings"],
-                "backup_filename": backup_filename,
-                "backup_path": backup_path,
-            },
-            "db_path": DB_PATH,
-            "db_path_dir": os.path.dirname(DB_PATH) or ".",
-        })
-
-    # ──────────────────────────────────────────────────────────────────
-    #  /me/password — смена своего пароля (v4.4)
-    #  Доступен всем авторизованным, но SU пароль хранится в env — ему форма
-    #  показывает предупреждение и ничего не делает.
-    # ──────────────────────────────────────────────────────────────────
-    @app.post("/me/password")
-    async def me_change_password(
-        request: Request,
-        old_password: str = Form(...),
-        new_password: str = Form(...),
-        confirm: str = Form(...),
-        _auth: AuthUser = Depends(require_auth),
-    ):
-        # SU пароль в env — менять через /me нельзя.
-        if _auth.is_su:
-            return RedirectResponse(
-                url="/dashboard?pw_msg=SU+password+is+managed+via+WEB_PASSWORD+env+variable",
-                status_code=303,
-            )
-
-        # Валидация
-        if len(new_password) < 6:
-            return RedirectResponse(
-                url="/dashboard?pw_msg=New+password+must+be+at+least+6+chars",
-                status_code=303,
-            )
-        if new_password != confirm:
-            return RedirectResponse(
-                url="/dashboard?pw_msg=New+password+and+confirmation+do+not+match",
-                status_code=303,
-            )
-
-        async with async_session() as session:
-            wu = (await session.execute(
-                select(WebUser).where(WebUser.username == _auth.username)
-            )).scalar_one_or_none()
-            if wu is None or not wu.is_active or not wu.password_hash:
-                return RedirectResponse(
-                    url="/dashboard?pw_msg=Account+not+found",
-                    status_code=303,
-                )
-            # Проверяем старый пароль
-            if not _verify_password(old_password, wu.password_hash):
-                return RedirectResponse(
-                    url="/dashboard?pw_msg=Current+password+is+incorrect",
-                    status_code=303,
-                )
-            # Проверяем, что новый пароль отличается от старого
-            if _verify_password(new_password, wu.password_hash):
-                return RedirectResponse(
-                    url="/dashboard?pw_msg=New+password+must+differ+from+current",
-                    status_code=303,
-                )
-            wu.password_hash = _hash_password(new_password)
-            await session.commit()
-
-        _req_logger.info(
-            "me_change_password: user=%s changed own password",
-            _auth.username,
+        flash_msg = (
+            f"Cleanup+complete%3A+{deleted_punishments}+punishments+deleted%2C+"
+            f"{deleted_users}+users+deleted%2C+backup%3A+{backup_filename}"
         )
         return RedirectResponse(
-            url="/dashboard?pw_msg=Password+changed+successfully",
+            url=f"/admin/settings?flash={flash_msg}#cleanup",
             status_code=303,
         )
 

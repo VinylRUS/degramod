@@ -1,14 +1,509 @@
 # Дедушка Вобжак — TODO / Что осталось доделать
 
 ## Статус проекта
-**Версия**: v4.4.10 (рабочий бот с **объединённой ролевой моделью SU/admin/moderator** (одна сущность WebUser, админ = права во всех публичных чатах, модератор = права только в привязанных чатах), **авто-обнаружение чатов** (bot создаёт chat_settings при добавлении в чат + DM SU), **toggles для чатов** (is_enabled / is_private / is_report_chat — через карточки в /admin/chats), **привязка TG ID к SU** (для получения DM о новых чатах), **edit-chats у модератора** (мультивыбор чатов — не только при создании, но и постфактум), **change-role moderator↔admin** (с авто-очисткой chat_admins при повышении), **удалённая отдельная вкладка Moderators** (объединена с Admins в единую Users), автообновление, стелс-режим, Rich Messages, welcome-DM новому админу/модератору, Ephemeral-подтверждения, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля, очистка тестовых данных из БД через кнопку в веб-панели SU, **v4.4.8 фикс: бот больше не удаляет обычные ответы модератора в чате (только реальные команды)**, **v4.4.8 disable-chat middleware: при is_enabled=False бот полностью игнорирует ВСЁ в чате (команды, catchall, авто-обнаружение) — как будто бота там нет**, **v4.4.8 delete-chat: кнопка Delete в /admin/chats — бот сам ливает из чата + чистит chat_settings / chat_admins / punishments; chat_id=0 защищён от удаления**, **v4.4.9: при !warn нарушитель получает ephemeral-уведомление (видно только ему через receiver_user_id) с причиной, текущим кол-вом варнов и порогами мьюта/бана — варн перестал быть невидимой санкцией**, **v4.4.10 редизайн отчёта в репорт-чате: структура SectionHeading → Divider → List (нарушитель/причина/веб-профиль) → Divider → Details «📎 Показать медиа» (медиа под сворачиваемым спойлером) → Divider → Details «Доп. инфо» → Divider → Footer; модератор перенесён в Footer (кликабельное имя без приписки «Модератор:»); длинный URL веб-профиля спрятан под «Открыть профиль →» через RichTextUrl; ID нарушителя оформлен как inline-код (моноширинный); Divider'ы разделяют секции — на мобиле больше не «стена текста»**)
-**Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`, `my_chat_member`)
+**Версия**: v4.5.2 (рабочий бот с **объединённой ролевой моделью SU/admin/moderator** (одна сущность WebUser, админ = права во всех публичных чатах, модератор = права только в привязанных чатах), **авто-обнаружение чатов** (bot создаёт chat_settings при добавлении в чат + DM SU), **toggles для чатов** (is_enabled / is_private / is_report_chat / cas / link_filter / night_mode — через карточки в /admin/chats), **привязка TG ID к SU** (для получения DM о новых чатах), **edit-chats у модератора** (мультивыбор чатов — не только при создании, но и постфактум), **change-role moderator↔admin** (с авто-очисткой chat_admins при повышении), **удалённая отдельная вкладка Moderators** (объединена с Admins в единую Users), автообновление, стелс-режим, Rich Messages, welcome-DM новому админу/модератору, Ephemeral-подтверждения, стикеры в отчётах, команды !unwarn/!unban, удаление сообщения при !warn, self-service смена пароля, очистка тестовых данных из БД через кнопку в веб-панели SU, **v4.4.8 фикс: бот больше не удаляет обычные ответы модератора в чате (только реальные команды)**, **v4.4.8 disable-chat middleware: при is_enabled=False бот полностью игнорирует ВСЁ в чате (команды, catchall, авто-обнаружение) — как будто бота там нет**, **v4.4.8 delete-chat: кнопка Delete в /admin/chats — бот сам ливает из чата + чистит chat_settings / chat_admins / punishments; chat_id=0 защищён от удаления**, **v4.4.9: при !warn нарушитель получает ephemeral-уведомление (видно только ему через receiver_user_id) с причиной, текущим кол-вом варнов и порогами мьюта/бана — варн перестал быть невидимой санкцией**, **v4.4.10 редизайн отчёта в репорт-чате: структура SectionHeading → Divider → List (нарушитель/причина/веб-профиль) → Divider → Details «📎 Показать медиа» (медиа под сворачиваемым спойлером) → Divider → Details «Доп. инфо» → Divider → Footer; модератор перенесён в Footer (кликабельное имя без приписки «Модератор:»); длинный URL веб-профиля спрятан под «Открыть профиль →» через RichTextUrl; ID нарушителя оформлен как inline-код (моноширинный); Divider'ы разделяют секции — на мобиле больше не «стена текста»**, **v4.5.0 редизайн веб-панели: дашборд сокращён до Search + 4 stat-карточки (Total/Mutes/Warns/Bans) + Recent sanctions с 4 фильтрами (All/Mute/Warn/Ban); убраны top offenders/moderators, chat-settings (дублировал /admin/chats), change-pw (переехал в /me); новый маршрут /me (Profile) — аватарка из TG + Refresh + форма смены пароля + инструкция для модераторов; новый маршрут /admin/settings (SU-only) — Bot info + Backup now + Cleanup + VACUUM; навбар: у Logout — микро-аватарка + логин текущего юзера; аватарки хранятся локально в <data_dir>/avatars/<tg_user_id>.jpg, скачиваются при создании/привязке TG ID и по кнопке Refresh**, **v4.5.1 генеральный аудит + фиксы: правильная логика банов/мутов (варны «гасятся» после авто-действия через consumed_by_action — повторный !warn не триггерит мьют повторно); деактивированный модератор больше не сохраняет доступ через fallback chat_admins; webhook защищён secret_token; /avatar требует auth; rate-limit на /login (5 попыток / 5 минут по IP); /logout переведён на POST (анти-CSRF); report_chat_id валидируется (только чаты с пометкой is_report_chat); WAL checkpoint перед backup/cleanup; admin_users_delete чистит chat_admins; !resetwarns переписан на is_revoked + audit в репорт-чат + role check (только SU/admin); !unwarn cap = текущее кол-во варнов; защита от самонаказания и friendly-fire (!mute/!warn/!ban на себе/коллегах); audit-сообщения в репорт-чат для всех снятий (!unmute/!unban/!unwarn/!resetwarns)**, **v4.5.2 новые фичи: CAS integration (per-chat toggle, проверка новых участников через api.cas.chat, автобан); word filter (regex/substring, configurable action delete/warn/mute/ban, off by default — без паттернов = off); link filter (global + per-chat allowlist, пер-chat toggle, configurable action); banned sticker packs (автодобавление пака при !ban за стикер, ручное через /bansticker в DM, выбор наказания delete/warn/mute/ban); auto night mode (per-chat schedule HH:MM, background task применяет/восстанавливает права, presets strict/text_only/none); warn decay (per-chat warn_decay_days, варны старше N дней не учитываются в счётчике); version display в футере веб-панели (кликабельный → модалка с changelog)**)
+**Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`, `my_chat_member`, `get_user_profile_photos`)
+**aiohttp**: 3.13.3 (для CAS API запросов)
 **Архитектура репорт-чата**: per-chat override → is_report_chat flag → default (chat_id=0) → disabled
 **Стелс-режим**: нарушитель НИКОГДА не получает уведомлений от бота; ephemeral видят только модераторы
 **Санкции**: !mute / !warn / !ban / !unmute / !unban / !unwarn [N] / !warns / !resetwarns
-**Веб-панель**: SU (env WEB_PASSWORD) + мульти-юзер (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи
-**v4.4 web-админы**: создаются SU по TGID, профиль подтягивается из Telegram (`bot.get_chat`), пароль автогенерируется и показывается SU один раз, юзер сам меняет пароль через /dashboard
-**v4.4.3 модераторы**: SU может добавлять/удалять модераторов чатов через `/admin/moderators` (SU-only). Команды `/addadmin`, `/deladmin` в боте остаются как fallback. Профиль модератора (имя, @username) подтягивается через `bot.get_chat` best-effort.
+**Веб-панель**: SU (env WEB_PASSWORD) + мульти-юзер (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи, **v4.5: личный профиль /me + аватарки + Settings (Cleanup/Backup/Vacuum/Bot info)**, **v4.5.1: rate-limit /login, POST /logout, auth на /avatar, валидация report_chat_id, WAL checkpoint перед backup**, **v4.5.2: версия в футере + новый блок настроек чата (CAS toggle, link filter toggle, night mode toggle + schedule, warn decay days, link filter action)**
+**v4.4 web-админы**: создаются SU по TGID, профиль подтягивается из Telegram (`bot.get_chat`), пароль автогенерируется и показывается SU один раз, юзер сам меняет пароль через /me (v4.5: было /dashboard)
+**v4.4.3 модераторы**: SU может добавлять/удалять модераторов чатов через `/admin/users` (SU-only). Команды `/addadmin`, `/deladmin` в боте остаются как fallback. Профиль модератора (имя, @username) подтягивается через `bot.get_chat` best-effort.
+
+---
+
+## ✅ Готово — v4.5.2 (новые фичи: CAS, фильтры, стикеры, ночной режим, warn decay, версия в футере)
+
+### v4.5.2.1 ✅ Feature #48 — Version display в футере веб-панели
+
+**Задача**: показывать версию приложения в веб-панели, кликабельную → модалка с changelog.
+
+**Реализация**:
+- `web_app.py`: добавлены константы `APP_VERSION = "v4.5.2"` и `APP_RELEASE_DATE = "2026-07-29"`.
+- `web_app.py`: `templates.env.globals["app_version"]` и `["app_release_date"]` — глобальные
+  переменные Jinja2, доступны во всех шаблонах без необходимости прокидывать через каждый render.
+- `templates/base.html`: внизу страницы — `<footer class="version-footer">` с pill-кнопкой
+  `v4.5.2 · build 2026-07-29`. Клик открывает модалку с changelog (полный список фич v4.5.2 + ссылка на v4.5.1).
+- Модалка закрывается кликом вне её или на ✕.
+
+### v4.5.2.2 ✅ Feature #2 — CAS integration (per-chat toggle)
+
+**Задача**: проверять новых участников чата по базе api.cas.chat. Если юзер в CAS-базе — автобан.
+
+**Реализация**:
+- `db.py`: `ChatSettings.cas_check_enabled` (Boolean, default=False) — per-chat toggle.
+- `bot_handlers.py`: `_cas_check_user(user_id)` — async запрос к `https://api.cas.chat/v1/status?user_id=<id>`
+  через aiohttp с 3-сек таймаутом. Возвращает `(is_banned: bool, reason: str | None)`. Fail-open:
+  при сетевой ошибке возвращает `(False, None)` — лучше пропустить спамера, чем заблокировать вход при сбое CAS.
+- `bot_handlers.py`: `handle_new_members` — новый router.message handler для `F.new_chat_members`.
+  Если cas_check_enabled=True — для каждого нового юзера (кроме ботов) делает CAS-проверку.
+  При is_banned=True — банит + сохраняет punishment (mod_id=0 = system) + шлёт report в репорт-чат.
+  В любом случае удаляет join-сообщение (чистота чата).
+- DM команда: `/cas <chat_id> on|off` — включает/выключает CAS-проверку для чата.
+- Web panel: кнопка `CAS ●/○` в карточке чата + поле в Settings.
+
+### v4.5.2.3 ✅ Feature #7 — Word filter (regex/substring, off by default, per-chat)
+
+**Задача**: список запрещённых слов/паттернов с настраиваемым действием (delete/warn/mute/ban).
+Off by default = нет паттернов = off (без отдельного toggle).
+
+**Реализация**:
+- `db.py`: новая таблица `WordFilter` (id, chat_id, pattern, is_regex, action, mute_duration,
+  created_by, created_at, is_active). chat_id=0 = global default.
+- `bot_handlers.py`: `_word_filter_match(session, chat_id, text)` — возвращает первый совпавший
+  WordFilter (per-chat приоритет над global через `order_by(case((chat_id==0, 1), else_=0))`).
+  is_regex=True → `re.search` (битый regex логируется и пропускается); is_regex=False → case-insensitive
+  substring. Возвращает `(filter, matched_word)`.
+- `bot_handlers.py`: `handle_content_filters` — router.message handler для group/supergroup.
+  Проверяет text и caption. Если word filter match — применяет его action.
+- DM команды: `/addword <chat_id> <pattern> [action] [is_regex]`, `/delword <chat_id> <pattern>`,
+  `/listwords [chat_id]`. Валидация regex при is_regex=True (битый regex → отказ).
+
+### v4.5.2.4 ✅ Feature #8 — Link filter (global + per-chat allowlist, per-chat toggle)
+
+**Задача**: блокировка ссылок кроме allowlist. Off по умолчанию.
+
+**Реализация**:
+- `db.py`: `ChatSettings.link_filter_enabled` (Boolean, default=False),
+  `ChatSettings.link_filter_action` (String, default="delete"). Новая таблица `LinkAllowlist`
+  (id, chat_id, domain, created_by, created_at). chat_id=0 = global allowlist.
+- `db.py`: при `init_db` сидируется глобальный allowlist: `t.me`, `telegram.me`, `github.com`,
+  `youtu.be`, `youtube.com` (если пусто).
+- `bot_handlers.py`: `_extract_urls(text)` — regex для извлечения доменов (http(s)://, www., bare domain).
+  `_link_filter_check(session, chat_id, text)` — возвращает `(has_blocked, blocked_domains)`.
+  Сравнение по подстроке: `t.me` разрешит и `t.me`, и `blog.t.me`.
+- `bot_handlers.py`: `handle_content_filters` проверяет link filter если word filter не сработал.
+- DM команды: `/linkfilter <chat_id> on|off`, `/linkallow <chat_id|global> <domain>`,
+  `/linkallowlist [chat_id|global]`. Нормализация домена (убирает scheme и path).
+
+### v4.5.2.5 ✅ Feature #15 — Banned sticker packs (auto-add on !ban, manual /bansticker, punishment choice)
+
+**Задача**: запрет конкретных стикерпаков по ID. Автодобавление при !ban за стикер + ручное через
+команду в DM. Выбор наказания: delete/warn/mute/ban.
+
+**Реализация**:
+- `db.py`: новая таблица `BannedStickerPack` (id, chat_id, pack_name, punishment, mute_duration,
+  reason, added_by_mod_id, added_via, created_at, is_active). chat_id=0 = global.
+- `bot_handlers.py`: `_check_banned_sticker(session, chat_id, pack_name)` — возвращает активный
+  BannedStickerPack (per-chat приоритет над global через `order_by(case((chat_id==0, 1), else_=0))`).
+  `_add_banned_sticker_pack` — upsert: если пак уже активен — обновляет punishment, иначе создаёт.
+  `_parse_sticker_pack_link` — парсит `https://t.me/addstickers/<name>` и bare pack_name.
+- `bot_handlers.py`: `handle_sticker_message` — router.message handler для `F.sticker`. Если
+  у стикера есть `set_name` и пак в бан-листе — удаляет сообщение + применяет punishment.
+  Анонимные стикеры (без set_name) не проверяются.
+- `bot_handlers.py`: при `!ban` reply-сообщения со стикером — автоматически добавляет пак в
+  BannedStickerPack с punishment="ban" (added_via="auto_ban"). Модератор получает ephemeral
+  уведомление об автодобавлении.
+- DM команды: `/bansticker <pack_or_link> [delete|warn|mute|ban] [dur]`,
+  `/liststickers [chat_id]`, `/delsticker <pack_name> [chat_id]`.
+
+### v4.5.2.6 ✅ Auto night mode (user-requested, was #29-33)
+
+**Задача**: автоматическое включение ограничительных прав в заданное время (per-chat schedule,
+настройки прав/времени через веб-панель).
+
+**Реализация**:
+- `db.py`: `ChatSettings.night_mode_enabled` (Boolean, default=False), `night_mode_start` (HH:MM,
+  default="23:00"), `night_mode_end` (HH:MM, default="07:00"), `night_mode_permissions` (JSON
+  ChatPermissions), `night_mode_saved_permissions` (JSON snapshot ДО ночного режима),
+  `night_mode_currently_active` (Boolean, для логирования и веб-панели).
+- `bot_handlers.py`: `_night_mode_permissions_preset(preset)` — возвращает ChatPermissions для
+  `strict` (полный мьют), `text_only` (только текст, без медиа/стикеров — дефолт), `none` (без
+  ограничений), `custom` (неизвестный → text_only как safe default).
+  `_time_str_in_range(now, start, end)` — проверяет, находится ли МСК-время в диапазоне. Если
+  end <= start — диапазон пересекает полночь (23:00 → 07:00 = с 23:00 до 07:00 следующего дня).
+- `bot.py`: `_night_mode_loop` — background task, запускается в lifespan, раз в минуту вызывает
+  `_night_mode_tick`. Тик загружает все чаты с night_mode_enabled=True, для каждого проверяет
+  `_time_str_in_range`. Вход в окно → `_enter_night_mode` (snapshot текущих прав + applies night
+  perms + night_mode_currently_active=True). Выход из окна → `_exit_night_mode` (restores snapshot
+  + night_mode_currently_active=False).
+- DM команда: `/nightmode <chat_id> <start> <end> [strict|text_only|none]` или `/nightmode <chat_id> off`.
+- Web panel: кнопка `NIGHT ●/○` в карточке чата + поля start/end/preset в Settings.
+
+### v4.5.2.7 ✅ Feature #45 — Warn decay (per-chat warn_decay_days)
+
+**Задача**: варн автоматически «гаснет» через N дней. Без этого варны копятся вечно и ломают логику порогов.
+
+**Реализация**:
+- `db.py`: `ChatSettings.warn_decay_days` (Integer, default=0 = отключено).
+- `bot_handlers.py`: `_count_warns` — если `warn_decay_days > 0`, добавляет фильтр
+  `Punishment.created_at >= now - decay_days`. Сама запись в БД сохраняется для истории/веб-панели,
+  но не влияет на пороги. 0 = отключено (все варны учитываются).
+- DM команда: `/warndecay <chat_id> <days>` (0 = отключить).
+- Web panel: поле `Warn decay (days, 0=off)` в Settings чата.
+
+### v4.5.2.8 ✅ Auto-delete command messages (per-chat toggle)
+
+**Реализация**:
+- `db.py`: `ChatSettings.auto_delete_commands` (Boolean, default=True).
+- `bot_handlers.py`: в `handle_group_command` — проверяет `auto_delete_commands` перед удалением
+  сообщения модератора с командой. Если False — команда остаётся видимой (прозрачность модерации).
+
+### v4.5.2.9 ✅ Web panel extensions
+
+- `templates/admin_chats.html`: новые бейджи в карточке чата (CAS, LINK-FILTER, NIGHT start-end
+  с точкой если активен, DECAY N d). Новые кнопки toggle: CAS ●/○, LINK-FILTER ●/○, NIGHT ●/○.
+  Новые поля в Settings: warn_decay_days, link_filter_action (select), night_mode_start/end (HH:MM),
+  night_mode_preset (select).
+- `web_app.py`: `admin_chats_update` принимает новые поля (warn_decay_days, link_filter_action,
+  night_mode_start, night_mode_end, night_mode_preset) с валидацией (link_filter_action in
+  delete/warn/mute/ban, preset in text_only/strict/none, HH:MM regex). Строит JSON-снапшот
+  permissions по preset.
+- `web_app.py`: `admin_chats_toggle` принимает новые fields: `cas`, `link_filter`, `night_mode`.
+- `web_app.py`: новый Jinja2 filter `night_mode_preset_name` — распознаёт preset (strict/text_only/none/custom)
+  по JSON-снапшоту permissions (для отображения в select).
+
+### v4.5.2.10 ✅ Тесты — test_v452_features.py (96 checks)
+
+Новый файл `scripts/test_v452_features.py` покрывает:
+1. DB schema (новые таблицы + колонки + сид allowlist).
+2. CAS integration (success/clean/network-error fail-open).
+3. Word filter (substring/regex/per-chat priority/inactive/broken regex/empty).
+4. Link filter (extract URLs/allowlist/subdomain/per-chat allowlist).
+5. Banned sticker packs (per-chat priority/global fallback/inactive/upsert/parse link).
+6. Warn decay (no decay/with decay excludes old).
+7. Night mode helpers (presets/time_in_range simple/overnight).
+8. Version display (APP_VERSION=v4.5.2, _night_mode_preset_name filter).
+9. Paidunban removed (no _CMD_PAIDUNBAN, no is_paid column).
+10. Admin chats toggle (cas/link_filter/night_mode) + update (warn_decay/link_filter_action/night_mode).
+11. DM commands (cas/linkfilter/nightmode/warndecay/bansticker/liststickers/delsticker/addword/delword/
+    listwords/linkallow/linkallowlist).
+12. Group handlers (new_members CAS/sticker banned/content_filters word+link).
+
+Также обновлён `test_v451_audit_fixes.py`: TestAppVersion теперь проверяет v4.5.2 (было v4.5.1),
+TestAdminChatsUpdateReportChatId — добавлены новые обязательные поля формы (warn_decay_days, etc).
+
+**Итого**: 174 теста проходят (31 v4.5.1 + 47 v4.5 dashboard + 96 v4.5.2).
+
+---
+
+
+**Aiogram**: 3.30.0 (поддерживает Bot API 10.2: `send_rich_message`, `receiver_user_id`, `my_chat_member`, `get_user_profile_photos`)
+**Архитектура репорт-чата**: per-chat override → is_report_chat flag → default (chat_id=0) → disabled
+**Стелс-режим**: нарушитель НИКОГДА не получает уведомлений от бота; ephemeral видят только модераторы
+**Санкции**: !mute / !warn / !ban / !unmute / !unban / !unwarn [N] / !warns / !resetwarns
+**Веб-панель**: SU (env WEB_PASSWORD) + мульти-юзер (PBKDF2), автообновление каждые 15с, фильтры (action/revoked/sort), REVOKED-бейджи, **v4.5: личный профиль /me + аватарки + Settings (Cleanup/Backup/Vacuum/Bot info)**, **v4.5.1: rate-limit /login, POST /logout, auth на /avatar, валидация report_chat_id, WAL checkpoint перед backup**
+**v4.4 web-админы**: создаются SU по TGID, профиль подтягивается из Telegram (`bot.get_chat`), пароль автогенерируется и показывается SU один раз, юзер сам меняет пароль через /me (v4.5: было /dashboard)
+**v4.4.3 модераторы**: SU может добавлять/удалять модераторов чатов через `/admin/users` (SU-only). Команды `/addadmin`, `/deladmin` в боте остаются как fallback. Профиль модератора (имя, @username) подтягивается через `bot.get_chat` best-effort.
+
+---
+
+## ✅ Готово — v4.5.1 (генеральный аудит + фиксы логики и безопасности)
+
+### 1 ✅ Фикс логики банов/мутов: варны «гасятся» после авто-действия
+
+**Баг v4.4.10**: при `warns_to_mute=3` и `warns_to_ban=999999` (т.е. бан фактически недостижим),
+после первого автомьюта на 3-м варне каждый следующий !warn снова триггерил мьют. Повторный
+мьют делал `restrict_chat_member` с новым `until_date` (продлевал), а в репорт-чат шёл спам
+«Автомьют: 4 варнов», «Автомьют: 5 варнов» и т.д. до бесконечности. Аналогично с авто-баном,
+но там второй бан — no-op, поэтому незаметно.
+
+**Решение**: добавлена колонка `Punishment.consumed_by_action` (`String(20)`, nullable).
+Когда `_check_warn_threshold` триггерит автомьют или автобан, все активные варны юзера
+помечаются `consumed_by_action = 'auto_mute'` (или `'auto_ban'`). При этом `is_revoked`
+остаётся False — варн виден в логе веб-панели как активный, но `_count_warns` его больше
+не считает (`WHERE consumed_by_action IS NULL`). Следующий !warn начинает счёт с 0,
+и порог снова надо достичь честно.
+
+**Файлы**: `db.py` (модель + миграция), `bot_handlers.py` (`_count_warns`, `_revoke_last_warns`,
+новая `_mark_warns_consumed`, `_check_warn_threshold`).
+
+**Документация**: `warns_to_mute=0` отключает автомьют (варны идут сразу к бану);
+`warns_to_ban=0` отключает автобан (только мьют, без эскалации).
+
+### 2 ✅ B1: деактивированный модератор больше не сохраняет доступ через fallback
+
+**Баг v4.4.7**: при `is_active=False` в `_is_admin` блок `if wu and wu.is_active:` пропускался,
+срабатывал fallback `# 4. TG-only модератор`, и если в `chat_admins` осталась запись
+(при toggle её не чистим) — возвращалось True. Кнопка «Disable» в `/admin/users` была
+бесполезной: деактивированный модератор продолжал `!mute`/`!warn`/`!ban`.
+
+**Решение**: если `wu` существует, но `is_active=False` — `return False` сразу, не падая
+в fallback. Fallback теперь срабатывает ТОЛЬКО если `WebUser` не найден вовсе
+(настоящий TG-only модератор через `/addadmin` без веб-профиля).
+
+Дополнительно: `admin_users_delete` теперь чистит `chat_admins` для `tg_user_id`
+удаляемого юзера — иначе удалённый аккаунт сохранял права через fallback.
+
+### 3 ✅ B3: webhook защищён secret_token
+
+**Баг v4.4**: эндпоинт `/webhook` не проверял источник запроса. Любой, кто знает URL
+(`https://degraban.bothost.tech/webhook`), мог POST-нуть фейковый Update — бот выполнил
+бы команды от имени «админа».
+
+**Решение**: при `bot.set_webhook(...)` передаём `secret_token=WEBHOOK_SECRET`.
+Env `WEBHOOK_SECRET` (если не задан — генерируется случайно при старте). В эндпоинте
+`/webhook` проверяем заголовок `X-Telegram-Bot-Api-Secret-Token`; не совпадает — отбрасываем.
+
+### 4 ✅ B6: /avatar/{tg_user_id} требует auth
+
+**Баг v4.5**: эндпоинт был публичным — любой мог перебирать `tg_user_id` и тащить аватарки.
+
+**Решение**: добавлен `Depends(require_auth)`. Шаблоны используют тот же домен, так что
+браузер автоматически шлёт cookie с сессией — `<img src="/avatar/...">` продолжает работать.
+
+### 5 ✅ L1+L2: !resetwarns переписан + audit в репорт-чат
+
+**Баг v4.4**: `!resetwarns` занулял `duration_seconds` для всех warn-записей. Это ломало
+фильтр active/revoked в веб-панели (записи оставались «активными» с 0 поинтов),
+не писало audit (кто снял), не закрывало варны корректно для `!unwarn`.
+
+**Решение**: `!resetwarns` теперь помечает все активные warn-записи `is_revoked=True`
+с `revoked_by_mod_id` и `revoked_at`, шлёт audit в репорт-чат
+(`"↩️ Снятие санкции: N варн(а/ов) — полный сброс, команда !resetwarns, с @target, кем @moderator"`).
+Сохраняется запись типа `unwarn` с reason `"Полный сброс варнов (N шт.)"`.
+
+### 6 ✅ L3: защита от самонаказания и friendly-fire
+
+**Баг v4.4**: `handle_group_command` не проверял, что `target.id != mod.id` и что
+`target` не является модератором/админом в этом же чате. Модератор мог выдать себе
+`!warn` (автор это сделал случайно при первом назначении), мог warn-ить коллегу
+(с риском автобана). Для `!mute`/`!ban` Telegram отклонит, если target — TG-админ
+чата, но модератор-без-TG-админки будет успешно забанен.
+
+**Решение**: для наказательных команд (`!mute`/`!warn`/`!ban`) добавлены две проверки
+после парсинга target:
+  1. `target.id == mod.id` → ephemeral «❌ Нельзя применить наказание к самому себе.»
+  2. `_is_admin(session, chat_id, target.id)` → ephemeral «❌ Нельзя наказать …:
+     это модератор/админ в этом чате.»
+Для снятия (`!unmute`/`!unban`/`!unwarn`/`!resetwarns`) и просмотра (`!warns`)
+ограничения НЕ действуют — там нет вреда, только восстановление.
+
+### 7 ✅ L4: cap на !unwarn = текущее количество варнов
+
+**Раньше**: docstring обещал «макс. 100», в коде cap был хардкод 100. `_revoke_last_warns`
+и так клампил к фактическому кол-ву, но ошибка docstring вводила в заблуждение.
+
+**Решение**: cap = `current_warns` (через `_count_warns`). `!unwarn 999` у юзера с 3 варнами
+снимет 3, без ошибки. Help-текст обновлён: «cap = текущее кол-во» (вместо «макс. 100»).
+
+### 8 ✅ L5: !resetwarns только для SU/admin
+
+**Раньше**: любой модератор мог обнулить чужие варны (включая свои — заметать следы).
+Audit не писался.
+
+**Решение**: добавлена проверка через `_get_web_user_role(session, mod.id)`.
+Если `mod.id not in ADMIN_IDS` и роль не `su`/`admin` → ephemeral отказ:
+«❌ !resetwarns доступен только SU/Admin. Используйте !unwarn N для снятия отдельных варнов.»
+
+### 9 ✅ L7: валидация report_chat_id в /admin/chats
+
+**Баг v4.4**: `admin_chats_update` принимал любой int для `report_chat_id`. При опечатке
+(SU ввёл неправильный chat_id) отчёты тихо переставали приходить.
+
+**Решение**: при сохранении проверяем, что `report_chat_id` (если не None) указывает
+на чат с `is_report_chat=True`. Иначе — редирект с flash-сообщением:
+«Report chat N is not marked as report chat. Use the ☆ Make report button on that chat first.»
+Шаблон `admin_chats.html` заменён с `<input type="text">` на `<select>` с вариантами
+из `report_chat_options` (чаты с `is_report_chat=True`). Под полем — подсказка:
+«Only chats marked with ☆ Make report appear here.»
+
+### 10 ✅ Audit-сообщения в репорт-чат для всех снятий
+
+**Новая функция `_send_audit_to_report`**: отправляет краткое сообщение в репорт-чат
+о ручном снятии санкции. Формат:
+```
+↩️ Снятие санкции
+Действие: N варн(а/ов) (команда !unwarn)
+С кого: @target
+Кем: @moderator (вручную)
+```
+Вызывается из обработчиков `!unmute`, `!unban`, `!unwarn`, `!resetwarns`.
+
+### 11 ✅ B5: /logout — POST only
+
+**Баг v4.5**: `/logout` через GET позволял CSRF-logout через `<img src=".../logout">`
+на любом сайте. Не критично, но неприятно.
+
+**Решение**: добавлен `@app.post("/logout")` для реального logout. Старый `GET /logout`
+оставлен как редирект на `/login` (чтобы старые закладки не теряли сессию без действия).
+В `base.html` ссылка Logout теперь триггерит скрытую POST-форму через onclick.
+
+### 12 ✅ B4: rate-limit на /login (5 попыток / 5 минут по IP)
+
+**Баг v4.4**: брутфорс паролей админов ничем не ограничен.
+
+**Решение**: in-memory dict `{ip: [timestamps]}`. При 5+ попытках за 5 минут —
+возврат 429 с сообщением «Too many login attempts. Try again in 5 minutes.»
+Не персистентная (сбрасывается при рестарте), для нашего сценария достаточно.
+Учитывает `X-Forwarded-For` (за прокси Bothost).
+
+### 13 ✅ O1: WAL checkpoint перед backup/cleanup
+
+**Баг v4.5**: `shutil.copy2(DB_PATH, ...)` в WAL-режиме копирует только основной файл;
+свежие записи (последние несколько секунд) остаются в `-wal` файле и в бэкап не попадают.
+
+**Решение**: новая функция `_wal_checkpoint()` — выполняет `PRAGMA wal_checkpoint(TRUNCATE)`
+перед копированием. Дешёвая операция, безопасна для параллельных запросов. Вызывается
+в `admin_settings_backup` и `admin_cleanup_apply` (перед `shutil.copy2`).
+
+### 14 ✅ Help-текст обновлён
+
+`!unwarn [N]` — help теперь говорит «cap = текущее кол-во» вместо «макс. 100».
+
+### 15 ✅ .env.example: WEBHOOK_SECRET
+
+Добавлена документация для env-переменной `WEBHOOK_SECRET`. Генерируется автоматически,
+но лучше задать фиксированный (чтобы не делать `set_webhook` при каждом рестарте).
+
+### Тесты
+
+`scripts/test_v451_audit_fixes.py` — покрывает:
+- `_count_warns` исключает consumed
+- `_mark_warns_consumed` помечает варны
+- `_is_admin` для деактивированного модератора → False
+- `_get_web_user_role` возвращает правильную роль
+- `!resetwarns` для рядового модератора → отказ
+- `!unwarn` cap = current count
+- Webhook с неправильным secret_token → 401
+- `/avatar` без auth → redirect на /login
+- Rate-limit на /login после 5 попыток
+- `admin_chats_update` с невалидным report_chat_id → redirect с flash
+- `_wal_checkpoint` не падает
+
+### Файлы изменены
+
+- `db.py` — модель Punishment.consumed_by_action + миграция
+- `bot_handlers.py` — `_is_admin` fix, `_count_warns`, `_revoke_last_warns`,
+  `_mark_warns_consumed`, `_get_web_user_role`, `_send_audit_to_report`,
+  `_check_warn_threshold`, `handle_group_command` (self/firendly-fire), `!unmute`,
+  `!unban`, `!unwarn`, `!resetwarns` (переписан), help-текст `!unwarn`
+- `bot.py` — `WEBHOOK_SECRET`, `set_webhook(secret_token=...)`, проверка заголовка
+  в `/webhook`, импорт `secrets` и `fastapi`
+- `web_app.py` — `_check_login_rate_limit`, `_client_ip`, `_wal_checkpoint`,
+  `/avatar` auth, `/login` rate-limit, `/logout` POST + legacy GET, `admin_chats_update`
+  валидация, `admin_settings_backup`/`admin_cleanup_apply` WAL checkpoint,
+  `admin_users_delete` чистит `chat_admins`, `admin_chats_page` отдаёт
+  `report_chat_options`, APP_VERSION → v4.5.1
+- `templates/admin_chats.html` — dropdown для `report_chat_id`, подсказка про 0=disabled
+- `templates/base.html` — Logout как POST-форма через onclick
+- `templates/login.html` — поддержка `error_msg` (для rate-limit сообщения)
+- `.env.example` — `WEBHOOK_SECRET`
+- `TODO.md` — эта запись
+
+### Архив
+
+`ded-vobzhak-4.5.1.zip` — собран со всеми изменениями.
+
+---
+
+## ✅ Готово — v4.5.0 (редизайн веб-панели: урезанный дашборд + Profile + Settings + аватарки)
+
+### 32 ✅ Дашборд сокращён
+
+**Проблема v4.4.10**: дашборд перегружен — топ нарушителей/модераторов дублировал инфо из страниц пользователей, chat-settings дублировал отдельную вкладку `/admin/chats`, смена пароля занимала много места внизу страницы, anchor-nav не нужен при небольшом количестве секций.
+
+**Что сделано в `web_app.py`**:
+- Маршрут `/dashboard` теперь отдаёт только: `total_stats`, `total_all`, `rows`, фильтры/пагинацию. Убраны: `top_offenders`, `top_moderators`, `chat_settings`, `default_report_chat_id`.
+- Action filter в UI сокращён до 4 кнопок: All / Mute / Warn / Ban. URL с `?action=unmute/unwarn/unban` по-прежнему работает (для прямых ссылок из логов), но кнопок в UI нет.
+- Параметр `pw_msg` сохранён как legacy для редиректов от старых ссылок (теперь редиректы идут на `/me`).
+
+**Что сделано в `templates/dashboard.html`**:
+- Удалена anchor-nav.
+- Удалены секции: `top offenders / 30d`, `top moderators / 30d`, `chat settings`, `change my password`.
+- Общая статистика: 4 карточки (Total/Mutes/Warns/Bans) вместо 7 (без Unmute/Unwarn/Unban).
+- Search и Recent sanctions с фильтрами — без изменений.
+
+### 33 ✅ Новый маршрут /me (Profile)
+
+**Что сделано**:
+- `GET /me` — страница личного профиля: аватарка 96×96 + Refresh-кнопка, инфа об аккаунте (логин, роль, TG ID, дата создания/логина), форма смены пароля.
+- `POST /me/password` — смена пароля (логика не изменилась, только редиректы теперь на `/me` вместо `/dashboard`).
+- `POST /me/avatar/refresh` — принудительно скачивает аватарку из TG и обновляет `tg_photo_updated_at`.
+- Для SU — форма смены пароля заменена на предупреждение про `WEB_PASSWORD` env.
+- Для moderator — дополнительно инструкция: «Forgot your password? Ask SU to reset via /admin/users».
+
+**Шаблон `templates/profile.html`** (новый): большая аватарка слева, profile-table справа, форма смены пароля внизу.
+
+### 34 ✅ Новый маршрут /admin/settings (SU-only)
+
+**Что сделано**:
+- `GET /admin/settings` — страница с 4 секциями: Bot info, Backup, Cleanup, VACUUM.
+- `POST /admin/settings/backup` — создаёт копию БД (`<DB_PATH>.backup-<ts>.db`).
+- `POST /admin/settings/vacuum` — запускает VACUUM на файле БД, возвращает размер до/после.
+- `GET /admin/cleanup` теперь делает редирект на `/admin/settings#cleanup` (обратная совместимость для закладок/тестов).
+- `POST /admin/cleanup` сохранён как alias к cleanup-логике (редиректит на `/admin/settings#cleanup`).
+- Удалён шаблон `templates/admin_cleanup.html` (cleanup встроен в `admin_settings.html`).
+
+**Bot info показывает**: версию приложения, uptime, путь к БД + размер, кол-во чатов (total/enabled/disabled), модераторов, веб-юзеров, наказаний.
+
+### 35 ✅ Аватарки из Telegram
+
+**Что сделано в `db.py`**:
+- Добавлена колонка `WebUser.tg_photo_updated_at` (DateTime, nullable) — timestamp последнего успешного обновления аватарки.
+- Миграция в `init_db()`: `ALTER TABLE web_users ADD COLUMN tg_photo_updated_at DATETIME NULL`.
+
+**Что сделано в `web_app.py`**:
+- Константа `AVATARS_DIR = <data_dir>/avatars` (персистентная папка рядом с БД).
+- Константа `APP_VERSION = "v4.5.0"`.
+- Хелпер `_avatar_path(tg_user_id)` — путь к локальному файлу.
+- Хелпер `_avatar_url(tg_user_id, photo_updated_at)` — URL для `<img src=...>` с cache-buster `?v=<ts>`. Возвращает `None` если файла нет.
+- Асинхронный хелпер `_fetch_and_save_avatar(bot, tg_user_id)`:
+  1. `bot.get_user_profile_photos(user_id, limit=1)` — получает последнее фото.
+  2. Берёт самый большой размер (`photos.photos[0][-1]`).
+  3. `bot.get_file(file_id)` → `bot.download(file=file_path, destination=None)` → bytes.
+  4. Сохраняет в `<AVATARS_DIR>/<tg_user_id>.jpg`.
+  5. Не бросает исключений (best-effort) — все ошибки логируются и возвращают `False`.
+- Endpoint `GET /avatar/{tg_user_id}` — отдаёт файл через `FileResponse` (media_type=image/jpeg). 404 если файла нет.
+- Папка `AVATARS_DIR` создаётся при старте приложения (`os.makedirs(exist_ok=True)`).
+- `AuthUser` расширен полями `tg_user_id` и `avatar_url` — `require_auth` их заполняет при каждом запросе (для навбара).
+- Скачивание аватарки встроено в:
+  - `admin_users_create` — после создания веб-юзера по TG ID.
+  - `admin_users_bind_tg` — после привязки TG ID к существующему юзеру.
+  - `me_avatar_refresh` — по кнопке Refresh на странице /me.
+- При успешном скачивании обновляется `tg_photo_updated_at = datetime.now(UTC)`.
+
+**У нарушителей (модель User) аватарки НЕ подтягиваются** — это сознательное решение для экономии памяти и API-вызовов.
+
+### 36 ✅ Навбар переработан
+
+**Что сделано в `templates/base.html`**:
+- Убрана ссылка «Cleanup» (заменена на «Settings» — SU-only).
+- Добавлена ссылка «Profile» (для всех авторизованных) — на `/me`.
+- User-chip (бывшая `<span>`) теперь `<a href="/me">` — кликабельный, ведёт на профиль.
+- Внутри chip: микро-аватарка 24×24 (если есть) или placeholder с первой буквой логина, логин, бейдж роли (SU/ADMIN/MOD).
+- Добавлены стили: `.navbar .user-chip .avatar` (24×24, border-radius:50%), `.avatar-placeholder` (кружок с буквой), `.user-chip.active` (зелёная рамка при нахождении на /me).
+
+### 37 ✅ Welcome-сообщение обновлено
+
+В `_send_admin_welcome` текст про смену пароля изменён:
+- Было: «раздел Dashboard → блок Change my password»
+- Стало: «раздел Profile (ссылка в правом верхнем углу) → блок Change my password»
+
+### Тесты
+
+- `scripts/test_v448_disable_delete.py` — 16/16 PASS (регрессия: chat delete, disable middleware, _is_moderation_command).
+- `scripts/test_v449_warn_notify.py` — 11/11 PASS (регрессия: warn notification).
+- `scripts/test_v4410_report_redesign.py` — 20/20 PASS (регрессия: rich report structure).
+- `scripts/test_v45_dashboard.py` — новый файл, тесты v4.5: профиль, смена пароля, аватарка, settings, dashboard-урезанный (см. ниже).
+
+### Файловая структура (актуальная v4.5.0)
+```
+shadow-logger/
+├── .dockerignore
+├── .env.example
+├── Dockerfile
+├── requirements.txt          # aiogram==3.30.0
+├── bot.py
+├── bot_handlers.py
+├── db.py                     # v4.5: +tg_photo_updated_at в WebUser + миграция
+├── web_app.py                # v4.5: +/me, +/admin/settings, +avatar helpers, +APP_VERSION
+├── scripts/
+│   ├── test_v4410_report_redesign.py    # 20 проверок (регрессия)
+│   ├── test_v448_disable_delete.py      # 16 проверок (регрессия)
+│   ├── test_v449_warn_notify.py         # 11 проверок (регрессия)
+│   └── test_v45_dashboard.py            # v4.5: профиль/settings/аватарка
+└── templates/
+    ├── base.html             # v4.5: навбар с Profile/Settings + микро-аватарка
+    ├── dashboard.html        # v4.5: урезанный (Search + 4 stat + Recent sanctions)
+    ├── profile.html          # v4.5: НОВЫЙ — страница /me
+    ├── admin_settings.html   # v4.5: НОВЫЙ — Settings (Bot info/Backup/Cleanup/VACUUM)
+    ├── admin_chats.html
+    ├── admin.html
+    ├── login.html
+    └── user.html
+```
 
 ---
 

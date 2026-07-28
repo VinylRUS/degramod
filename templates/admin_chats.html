@@ -25,6 +25,10 @@
     <strong style="color: var(--danger);">delete</strong> a chat (the bot leaves the chat and all related data — settings, moderators, punishment history — is removed; use for test chats),
     or mark one chat as the global report chat.
     Chat title is fetched from Telegram; if missing, the bot was probably added without admin rights.
+    <br><br>
+    <strong style="color: var(--accent);">v4.5.1:</strong> multiple chats can be marked as report targets (☆ button on each).
+    Then for each regular chat you pick which report chat to use (dropdown in Settings).
+    Setting <code>warns_to_mute=0</code> disables auto-mute entirely; <code>warns_to_ban=0</code> disables auto-ban.
 </div>
 
 {% if not chats or chats | length == 0 %}
@@ -50,6 +54,10 @@
             {% if not c.is_enabled %}<span class="badge badge-revoked">DISABLED</span>{% endif %}
             {% if c.is_private %}<span class="badge" style="background: rgba(204,153,51,.15); color: var(--warn); border: 1px solid var(--warn);">PRIVATE</span>{% endif %}
             {% if c.is_report_chat %}<span class="badge badge-active">REPORT</span>{% endif %}
+            {% if c.cas_check_enabled %}<span class="badge" style="background: rgba(51,153,204,.15); color: var(--info); border: 1px solid var(--info);">CAS</span>{% endif %}
+            {% if c.link_filter_enabled %}<span class="badge" style="background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">LINK-FILTER</span>{% endif %}
+            {% if c.night_mode_enabled %}<span class="badge" style="background: rgba(102,102,102,.15); color: var(--text-dim); border: 1px solid var(--text-dim);">NIGHT {{ c.night_mode_start }}-{{ c.night_mode_end }}{% if c.night_mode_currently_active %} ●{% endif %}</span>{% endif %}
+            {% if c.warn_decay_days and c.warn_decay_days > 0 %}<span class="badge" style="background: rgba(0,204,102,.08); color: var(--accent); border: 1px solid var(--accent);">DECAY {{ c.warn_decay_days }}d</span>{% endif %}
             {% if c.hashtag %}<span style="color: var(--accent); font-size: 11px; font-family: var(--font-mono);">{{ c.hashtag }}</span>{% endif %}
         </div>
     </div>
@@ -87,6 +95,30 @@
                 {% if c.is_report_chat %}★ Report chat{% else %}☆ Make report{% endif %}
             </button>
         </form>
+        {# ── v4.5.2: CAS toggle ── #}
+        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+            <input type="hidden" name="field" value="cas">
+            <button type="submit"
+                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.cas_check_enabled %}var(--info){% else %}var(--border){% endif %}; color: {% if c.cas_check_enabled %}var(--info){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                {% if c.cas_check_enabled %}CAS ●{% else %}CAS ○{% endif %}
+            </button>
+        </form>
+        {# ── v4.5.2: Link filter toggle ── #}
+        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+            <input type="hidden" name="field" value="link_filter">
+            <button type="submit"
+                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.link_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.link_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                {% if c.link_filter_enabled %}LINK-FILTER ●{% else %}LINK-FILTER ○{% endif %}
+            </button>
+        </form>
+        {# ── v4.5.2: Night mode toggle ── #}
+        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+            <input type="hidden" name="field" value="night_mode">
+            <button type="submit"
+                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--text-dim){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--text){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                {% if c.night_mode_enabled %}NIGHT ●{% else %}NIGHT ○{% endif %}
+            </button>
+        </form>
         <button type="button" onclick="var el = document.getElementById('edit-{{ c.chat_id }}'); el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';"
                 style="padding: 4px 10px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
             ✎ Settings
@@ -112,9 +144,23 @@
                        style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
             </div>
             <div>
-                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Report chat ID (override; empty = use report-chat flag)</label>
-                <input type="text" name="report_chat_id" value="{{ c.report_chat_id if c.report_chat_id is not none else '' }}" placeholder="-1001234567890"
-                       style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Report chat (where moderation logs go)</label>
+                <select name="report_chat_id"
+                        style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                    <option value="" {% if c.report_chat_id is none %}selected{% endif %}>(use global default)</option>
+                    {% for rc in report_chat_options %}
+                    <option value="{{ rc.chat_id }}"
+                        {% if c.report_chat_id is not none and c.report_chat_id == rc.chat_id %}selected{% endif %}>
+                        {{ rc.title }} ({{ rc.chat_id }}){{ ' ' + rc.hashtag if rc.hashtag else '' }}
+                    </option>
+                    {% endfor %}
+                </select>
+                <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
+                    Only chats marked with <span style="color: var(--accent);">☆ Make report</span> appear here.
+                    {% if not report_chat_options or report_chat_options | length == 0 %}
+                    <br><span style="color: var(--warn);">No report chats yet — mark one with ☆ button first.</span>
+                    {% endif %}
+                </div>
             </div>
             <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2);">
                 <div>
@@ -131,6 +177,46 @@
                     <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warns → ban</label>
                     <input type="text" name="warns_to_ban" value="{{ c.warns_to_ban }}" pattern="[0-9]+"
                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                </div>
+            </div>
+            {# ── v4.5.2: warn decay + link filter action ── #}
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warn decay (days, 0=off)</label>
+                    <input type="text" name="warn_decay_days" value="{{ c.warn_decay_days or 0 }}" pattern="[0-9]+"
+                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Link filter action</label>
+                    <select name="link_filter_action"
+                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                        {% for act in ['delete', 'warn', 'mute', 'ban'] %}
+                        <option value="{{ act }}" {% if c.link_filter_action == act %}selected{% endif %}>{{ act }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+            </div>
+            {# ── v4.5.2: night mode schedule + permissions preset ── #}
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night mode start (МСК)</label>
+                    <input type="text" name="night_mode_start" value="{{ c.night_mode_start or '23:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="23:00"
+                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night mode end (МСК)</label>
+                    <input type="text" name="night_mode_end" value="{{ c.night_mode_end or '07:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="07:00"
+                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night mode preset</label>
+                    <select name="night_mode_preset"
+                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                        {% set current_preset = c.night_mode_permissions | night_mode_preset_name if c.night_mode_permissions else 'text_only' %}
+                        {% for preset in ['text_only', 'strict', 'none'] %}
+                        <option value="{{ preset }}" {% if current_preset == preset %}selected{% endif %}>{{ preset }}</option>
+                        {% endfor %}
+                    </select>
                 </div>
             </div>
             <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
