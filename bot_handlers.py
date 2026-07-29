@@ -1320,182 +1320,6 @@ def format_sanitary_days_textarea(pairs: list[list[str]] | str | None) -> str:
     return "\n".join(lines)
 
 
-# ── v4.5.5: Проверка прав бота при добавлении в чат ─────────────────────────
-# Бот использует 3 критических права:
-#   • can_change_info      — нужен для set_chat_permissions (night mode, sanitary day).
-#   • can_delete_messages  — нужен для delete_message (warn, link/word/sticker filter).
-#   • can_restrict_members — нужен для restrict_chat_member (mute) и ban_chat_member (ban).
-# Если бота добавили без админки или с неполным набором прав — Moderation/night/sanitary
-# будут молча падать. v4.5.5: при my_chat_member проверяем набор прав, сохраняем в
-# ChatSettings.bot_rights_missing (JSON list), шлём DM всем SU+admin с привязанным
-# tg_user_id. Веб-панель показывает бейдж "⚠️ RIGHTS" с кнопкой Recheck.
-_REQUIRED_BOT_RIGHTS: tuple[str, ...] = (
-    "can_change_info",
-    "can_delete_messages",
-    "can_restrict_members",
-)
-
-# Человекочитаемые названия прав для DM и веб-панели.
-_BOT_RIGHT_LABELS: dict[str, str] = {
-    "can_change_info":      "Can change chat info (needed for night mode & sanitary day)",
-    "can_delete_messages":  "Can delete messages (needed for warn, link/word/sticker filters)",
-    "can_restrict_members": "Can restrict/ban members (needed for mute & ban)",
-    "__not_admin__":        "Bot is NOT an administrator in this chat",
-}
-
-
-def _compute_bot_rights_missing(new_chat_member) -> list[str]:
-    """v4.5.5: вычисляет список недостающих боту прав из ChatMemberUpdated.new_chat_member.
-
-    Принимает ChatMember* объект (Member / Administrator / Left / Kicked / Restricted / Owner).
-    Возвращает список строк — имён прав из _REQUIRED_BOT_RIGHTS, которых нет,
-    плюс спец-маркер '__not_admin__' если статус бота != 'administrator'.
-
-    Дляadministrator: проверяет каждое из _REQUIRED_BOT_RIGHTS — если хоть одно False,
-    добавляет в список. Для всех остальных статусов (member/left/kicked/...) —
-    возвращает ['__not_admin__'] (т.к. у бота просто нет админ-прав в чате).
-
-    Атрибуты admin-прав у aiogram 3.x ChatMemberAdministrator — на верхнем уровне
-    объекта (can_delete_messages, can_restrict_members, can_change_info — bool).
-    """
-    status = getattr(new_chat_member, "status", None)
-    if status != "administrator":
-        # Бот не админ — все операции провалятся.
-        return ["__not_admin__"]
-    missing: list[str] = []
-    for right in _REQUIRED_BOT_RIGHTS:
-        val = getattr(new_chat_member, right, False)
-        if not val:
-            missing.append(right)
-    return missing
-
-
-def parse_bot_rights_missing(json_str: str | None) -> list[str]:
-    """v4.5.5: парсит JSON-список bot_rights_missing в list[str].
-
-    Возвращает [] для None/пустой строки/битого JSON (fail-safe).
-    """
-    if not json_str:
-        return []
-    try:
-        data = json.loads(json_str)
-        if not isinstance(data, list):
-            return []
-        return [str(x) for x in data if isinstance(x, str)]
-    except (ValueError, TypeError):
-        return []
-
-
-def serialize_bot_rights_missing(missing: list[str]) -> str:
-    """v4.5.5: сериализует list[str] в JSON-строку для bot_rights_missing."""
-    return json.dumps(list(missing))
-
-
-async def _notify_admins_about_rights(
-    bot, chat_id: int, chat_title: str | None, missing_rights: list[str],
-) -> None:
-    """v4.5.5: отправляет DM всем SU+admin о нехватке прав бота в чате.
-
-    Находит всех WebUser с role IN ('su', 'admin'), is_active=True,
-    tg_user_id IS NOT NULL. Шлёт каждому сообщение с указанием chat_id,
-    названия и списка недостающих прав (с человекочитаемыми описаниями).
-
-    Best-effort: ошибки отправки отдельным юзерам логируем INFO и продолжаем.
-    """
-    if not missing_rights:
-        return
-    try:
-        async with async_session() as session:
-            admins = (await session.execute(
-                select(WebUser).where(
-                    WebUser.role.in_(["su", "admin"]),
-                    WebUser.is_active.is_(True),
-                    WebUser.tg_user_id.is_not(None),
-                )
-            )).scalars().all()
-        if not admins:
-            return
-
-        title_display = chat_title or "(без названия)"
-        # Описание недостающих прав — каждое с новой строки.
-        bullet_lines = "\n".join(
-            f"   • {_BOT_RIGHT_LABELS.get(r, r)}" for r in missing_rights
-        )
-        text = (
-            f"⚠️ Боту не хватает прав в чате:\n"
-            f"   <b>{html.escape(title_display, quote=False)}</b>\n"
-            f"   ID: <code>{chat_id}</code>\n\n"
-            f"Недостающие права:\n{bullet_lines}\n\n"
-            f"Без этих прав часть функций бота (warn/mute/ban, night mode, "
-            f"sanitary day, фильтры) будет молча пропускать нарушения.\n"
-            f"Выдайте боту недостающие права через admin-панель Telegram "
-            f"(Edit admin → отметьте нужные галочки)."
-        )
-        for adm in admins:
-            try:
-                await bot.send_message(
-                    chat_id=adm.tg_user_id, text=text, parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.info(
-                    "notify_admins_about_rights: failed for user=%s tg=%s: %s",
-                    adm.username, adm.tg_user_id, e,
-                )
-    except Exception as e:
-        logger.warning("notify_admins_about_rights: %s", e)
-
-
-async def _persist_bot_rights_check(
-    session, chat_id: int, missing_rights: list[str],
-) -> None:
-    """v4.5.5: сохраняет результат проверки прав в ChatSettings.
-
-    Caller уже открыл session. Ставит bot_rights_missing (JSON или None если
-    список пустой) и bot_rights_checked_at = now UTC. НЕ коммитит —
-    caller решает когда коммитить.
-    """
-    from datetime import datetime as _dt, timezone as _tz
-    stmt = select(ChatSettings).where(ChatSettings.chat_id == chat_id)
-    settings = (await session.execute(stmt)).scalar_one_or_none()
-    if settings is None:
-        # Chat settings ещё не создан — ничего не делаем (права проверим
-        # позже, когда _ensure_chat_settings создаст запись).
-        return
-    settings.bot_rights_missing = (
-        serialize_bot_rights_missing(missing_rights) if missing_rights else None
-    )
-    settings.bot_rights_checked_at = _dt.now(_tz.utc)
-
-
-async def _check_and_persist_bot_rights(
-    bot, chat_id: int, chat_title: str | None, new_chat_member,
-    *, notify: bool = True,
-) -> list[str]:
-    """v4.5.5: атомарная операция — вычислить missing + сохранить + уведомить.
-
-    Используется из on_my_chat_member (notify=True) и из recheck endpoint
-    в web_app (notify=False — там результат показывается во flash).
-
-    Возвращает список недостающих прав (для использования в тестах/web).
-    """
-    missing = _compute_bot_rights_missing(new_chat_member)
-    try:
-        async with async_session() as session:
-            await _persist_bot_rights_check(session, chat_id, missing)
-            await session.commit()
-    except Exception as e:
-        logger.warning(
-            "check_and_persist_bot_rights: failed to persist for chat %s: %s",
-            chat_id, e,
-        )
-    if notify and missing:
-        # Уведомление шлём в отдельной задаче, чтобы не блокировать обработчик.
-        asyncio.create_task(
-            _notify_admins_about_rights(bot, chat_id, chat_title, missing)
-        )
-    return missing
-
-
 # ── Отправка отчёта в чат (Rich Messages, Bot API 10.2) ─────────────────────
 
 # Карта типов медиа → фабрика inline-блока для Rich Message.
@@ -1922,6 +1746,7 @@ async def _send_ephemeral(
     chat_id: int,
     recipient: types.User,
     text: str,
+    delete_after: float = 30.0,
 ) -> None:
     """Отправляет ephemeral-сообщение модератору в группе (Bot API 10.2).
 
@@ -1935,9 +1760,16 @@ async def _send_ephemeral(
 
     Если отправка не удалась (модератор заблокировал бота или ограничил
     ephemeral-сообщения) — тихо логируем и продолжаем.
+
+    v4.5.6: ``delete_after`` (по умолчанию 30 секунд). Ephemeral-сообщения
+    в Telegram-клиентах не «испаряются» автоматически — они остаются в чате
+    как видимые только получателю сообщения и могут реотображаться при
+    перезапуске клиента / скроллинге. Поэтому бот сам удаляет их через
+    ``delete_after`` секунд фоновой таской. ``delete_after=0`` отключает
+    авто-удаление (полезно для тестов).
     """
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=chat_id,
             text=text,
             receiver_user_id=recipient.id,
@@ -1949,8 +1781,26 @@ async def _send_ephemeral(
             "(this is normal if user restricted ephemeral messages)",
             recipient.id, chat_id, e,
         )
+        return
     except Exception as e:
         logger.warning("Ephemeral message unexpected error: %s", e)
+        return
+
+    # ── v4.5.6: планируем авто-удаление ──────────────────────────────
+    if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
+        async def _del_ephemeral():
+            try:
+                await asyncio.sleep(delete_after)
+                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except TelegramBadRequest as e:
+                logger.info(
+                    "Ephemeral auto-delete in chat %s msg %s failed: %s "
+                    "(message may already be gone)",
+                    chat_id, sent.message_id, e,
+                )
+            except Exception as e:
+                logger.warning("Ephemeral auto-delete unexpected error: %s", e)
+        asyncio.create_task(_del_ephemeral())
 
 
 # ── v4.4.9: уведомление НАРУШИТЕЛЮ при !warn (видно только ему) ──────────
@@ -1973,6 +1823,7 @@ async def _send_user_warn_notification(
     reason: str,
     total_warns: int,
     settings: ChatSettings,
+    delete_after: float = 30.0,
 ) -> None:
     """Отправляет нарушителю ephemeral-сообщение о выданном варне.
 
@@ -1980,6 +1831,11 @@ async def _send_user_warn_notification(
     Остальные участники чата его не видят. Если отправка не удалась
     (юзер заблокировал бота или ограничил ephemeral-сообщения) —
     тихо логируем и продолжаем; варн в БД уже сохранён.
+
+    v4.5.6: ``delete_after`` (по умолчанию 30 секунд). Аналогично
+    ``_send_ephemeral`` — бот сам удаляет уведомление через заданное
+    время, чтобы оно не висело в чате и не реотображалось при
+    перезапуске клиента. ``delete_after=0`` отключает авто-удаление.
     """
     reason_safe = html.escape(reason, quote=False) if reason else "(не указана)"
 
@@ -2014,7 +1870,7 @@ async def _send_user_warn_notification(
     )
 
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=chat_id,
             text=text,
             receiver_user_id=target.id,
@@ -2026,8 +1882,26 @@ async def _send_user_warn_notification(
             "(this is normal if user restricted ephemeral messages)",
             target.id, chat_id, e,
         )
+        return
     except Exception as e:
         logger.warning("Warn notification to user unexpected error: %s", e)
+        return
+
+    # ── v4.5.6: планируем авто-удаление ──────────────────────────────
+    if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
+        async def _del_warn_msg():
+            try:
+                await asyncio.sleep(delete_after)
+                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except TelegramBadRequest as e:
+                logger.info(
+                    "Warn notification auto-delete in chat %s msg %s failed: %s "
+                    "(message may already be gone)",
+                    chat_id, sent.message_id, e,
+                )
+            except Exception as e:
+                logger.warning("Warn notification auto-delete unexpected error: %s", e)
+        asyncio.create_task(_del_warn_msg())
 
 
 # ── Авто-санкция при превышении порога варнов ──────────────────────────────
@@ -4633,15 +4507,8 @@ async def stealth_catchall_group(message: types.Message) -> None:
     chat_settings (если ещё нет) и уведомляем SU. Это надёжнее, чем
     my_chat_member, т.к. Telegram не всегда присылает my_chat_member
     при добавлении бота (зависит от прав).
-
-    v4.5.5: Если у чата ещё не проверялись права бота (bot_rights_checked_at
-    is None) — запускаем проверку через bot.get_chat_member(chat_id, bot.id).
-    Это фолббэк на случай если my_chat_member не пришёл (Telegram такое
-    позволяет когда бота добавили без прав). Throttling: не чаще раза в час
-    (чтобы не дёргать TG API на каждое сообщение).
     """
     # v4.4.7: создаём chat_settings для чата, если ещё нет
-    needs_rights_check = False
     try:
         async with async_session() as session:
             settings, created = await _ensure_chat_settings(
@@ -4661,60 +4528,12 @@ async def stealth_catchall_group(message: types.Message) -> None:
                     "Auto-detected new chat: id=%s title='%s' — notified SU",
                     _new_chat_id, _new_chat_title,
                 )
-                # v4.5.5: новый чат — обязательно проверить права бота.
-                needs_rights_check = True
-            else:
-                # Чат уже был — проверяем нужна ли перепроверка (не чаще раза в час).
-                from datetime import datetime as _dt, timezone as _tz
-                checked_at = getattr(settings, "bot_rights_checked_at", None)
-                if checked_at is None:
-                    needs_rights_check = True
-                else:
-                    # Если последний раз проверяли > 1 часа назад и до сих пор
-                    # есть missing права — перепроверяем (вдруг админ выдал).
-                    missing_now = parse_bot_rights_missing(
-                        getattr(settings, "bot_rights_missing", None)
-                    )
-                    if missing_now:
-                        # SQLite может вернуть naive datetime (без tzinfo) —
-                        # нормализуем к UTC для корректного вычитания.
-                        if checked_at.tzinfo is None:
-                            checked_at = checked_at.replace(tzinfo=_tz.utc)
-                        if (_dt.now(_tz.utc) - checked_at).total_seconds() > 3600:
-                            needs_rights_check = True
     except Exception as e:
         logger.warning("stealth_catchall_group: ensure_chat_settings failed: %s", e)
-
-    # v4.5.5: фолббэк-проверка прав бота. Запускаем в фоне, чтобы не
-    # блокировать catchall (сообщения в чатах не должны ждать TG API).
-    if needs_rights_check:
-        asyncio.create_task(_stealth_check_bot_rights_safe(
-            message.bot, message.chat.id, message.chat.title,
-        ))
-
-
-async def _stealth_check_bot_rights_safe(bot, chat_id: int, chat_title: str | None) -> None:
-    """v4.5.5: безопасная обёртка для фоновой проверки прав бота в stealth_catchall.
-
-    Получает ChatMember через bot.get_chat_member, передаёт в
-    _check_and_persist_bot_rights. Все ошибки логируем, но не пробрасываем
-    (background task — некому ловить).
-    """
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
-        await _check_and_persist_bot_rights(
-            bot, chat_id=chat_id, chat_title=chat_title,
-            new_chat_member=member, notify=True,
-        )
-    except Exception as e:
-        logger.info("stealth_check_bot_rights: chat %s: %s", chat_id, e)
     return
 
 
 # ── v4.4.7: my_chat_member — обработка добавления/удаления бота ──────────
-# v4.5.5: при добавлении/повышении проверяем права бота (can_change_info,
-# can_delete_messages, can_restrict_members). Если их нет или бот не админ —
-# сохраняем bot_rights_missing и шлём DM всем Admin/SU с привязанным tg_user_id.
 @router.my_chat_member()
 async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
     """Срабатывает, когда бота добавляют/удаляют из чата, повышают/понижают права.
@@ -4723,12 +4542,6 @@ async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
     создаём chat_settings и уведомляем SU. my_chat_member более надёжен,
     чем stealth_catchall_group, т.к. срабатывает сразу при добавлении,
     а не при первом сообщении.
-
-    v4.5.5: при любом изменении статуса (added/promoted/demoted/kicked) —
-    перепроверяем права бота. Если бот стал administrator с полным набором
-    прав — bot_rights_missing очищается (NULL). Если бот понижен до member
-    или кикнут — bot_rights_missing = ['__not_admin__']. При наличии missing
-    прав — DM всем Admin/SU.
     """
     new_status = event.new_chat_member.status if event.new_chat_member else None
     old_status = event.old_chat_member.status if event.old_chat_member else None
@@ -4753,30 +4566,3 @@ async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
                     )
         except Exception as e:
             logger.warning("on_my_chat_member: failed: %s", e)
-
-    # v4.5.5: проверяем права бота при любом изменении статуса.
-    # Срабатывает для: member→administrator (added+promoted), left→member,
-    # left→administrator, administrator→member (demoted), *→kicked, и т.д.
-    # Не срабатывает только если new_chat_member is None (не должно быть).
-    if event.new_chat_member is not None:
-        try:
-            missing = await _check_and_persist_bot_rights(
-                event.bot,
-                chat_id=event.chat.id,
-                chat_title=event.chat.title,
-                new_chat_member=event.new_chat_member,
-                notify=True,
-            )
-            if missing:
-                logger.warning(
-                    "my_chat_member: bot rights missing in chat %s: %s",
-                    event.chat.id, missing,
-                )
-            elif new_status == "administrator":
-                # Бот стал полноценным админом со всеми правами — логируем.
-                logger.info(
-                    "my_chat_member: bot has full admin rights in chat %s",
-                    event.chat.id,
-                )
-        except Exception as e:
-            logger.warning("on_my_chat_member: bot_rights_check failed: %s", e)

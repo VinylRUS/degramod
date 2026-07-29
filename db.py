@@ -219,22 +219,6 @@ class ChatSettings(Base):
     # Флаг: сейчас активен санитарный день (для логирования и веб-панели).
     sanitary_days_currently_active = Column(Boolean, default=False, nullable=False)
 
-    # ── v4.5.5: Проверка прав бота при добавлении в чат ──────────────────
-    # JSON-массив имён прав, которых НЕ хватает боту для полноценной работы.
-    # Возможные значения: 'can_change_info', 'can_delete_messages',
-    # 'can_restrict_members' + специальный маркер '__not_admin__'
-    # (если бот не админ в чате вообще). NULL или "[]" — всё ок, прав достаточно.
-    # Заполняется в on_my_chat_member (при добавлении/повышении) и в
-    # stealth_catchall_group (фоллбэк через bot.get_chat_member). Обновляется
-    # по кнопке "Recheck rights" в /admin/chats (POST .../recheck-bot-rights).
-    # Когда missing не пустой — Admin/SU получают DM, в веб-панели показывается
-    # бейдж "⚠️ RIGHTS" с указанием каких прав не хватает.
-    bot_rights_missing = Column(Text, nullable=True)
-    # Когда последний раз проверяли права (UTC timestamp).
-    # Для отображения в веб-панели и для принятия решения — перепроверять ли
-    # при следующем сообщении в stealth_catchall_group (не чаще раза в час).
-    bot_rights_checked_at = Column(DateTime, nullable=True)
-
 
 class WordFilter(Base):
     """v4.5.2: Word filter (#7) — список запрещённых слов/паттернов для чата.
@@ -533,23 +517,6 @@ async def init_db() -> None:
             ("sanitary_days_currently_active",   "BOOLEAN NOT NULL DEFAULT 0"),
         ]
         for col_name, col_type in v454_chat_settings_cols:
-            if col_name not in columns:
-                await conn.execute(text(
-                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
-                ))
-
-    # ── Миграция: расширение chat_settings (v4.5.5) ────────────────────
-    # Новые поля для проверки прав бота при добавлении в чат:
-    # bot_rights_missing (JSON list строк) + bot_rights_checked_at (UTC ts).
-    # Идемпотентно (PRAGMA check + ALTER TABLE).
-    async with engine.begin() as conn:
-        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
-        columns = [row[1] for row in result.fetchall()]
-        v455_chat_settings_cols = [
-            ("bot_rights_missing",     "TEXT NULL"),
-            ("bot_rights_checked_at",  "DATETIME NULL"),
-        ]
-        for col_name, col_type in v455_chat_settings_cols:
             if col_name not in columns:
                 await conn.execute(text(
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"

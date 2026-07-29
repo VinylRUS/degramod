@@ -58,9 +58,6 @@
             {% if c.link_filter_enabled %}<span class="badge" style="background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">LINK-FILTER</span>{% endif %}
             {% if c.night_mode_enabled %}<span class="badge" style="background: rgba(102,102,102,.15); color: var(--text-dim); border: 1px solid var(--text-dim);">NIGHT {{ c.night_mode_start }}-{{ c.night_mode_end }}{% if c.night_mode_tz and c.night_mode_tz != 'Europe/Moscow' %} {{ c.night_mode_tz }}{% endif %}{% if c.night_mode_notify %} 🔔{% endif %}{% if c.night_mode_currently_active %} ●{% endif %}</span>{% endif %}
             {% if c.sanitary_days %}<span class="badge" style="background: {% if c.sanitary_days_currently_active %}rgba(220,38,38,.18){% else %}rgba(102,102,102,.15){% endif %}; color: {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %}; border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %};">SAN{% if c.sanitary_days_currently_active %} ●{% endif %}</span>{% endif %}
-            {# v4.5.5: badge если боту не хватает прав в чате #}
-            {% set bot_rights = c.bot_rights_missing | parse_bot_rights %}
-            {% if bot_rights %}<span class="badge" style="background: rgba(204,51,51,.18); color: var(--danger); border: 1px solid var(--danger); cursor: help;" title="Боту не хватает прав для полноценной работы">⚠️ RIGHTS{% if '__not_admin__' in bot_rights %} · NOT ADMIN{% endif %}</span>{% endif %}
             {% if c.warn_decay_days and c.warn_decay_days > 0 %}<span class="badge" style="background: rgba(0,204,102,.08); color: var(--accent); border: 1px solid var(--accent);">DECAY {{ c.warn_decay_days }}d</span>{% endif %}
             {% if c.hashtag %}<span style="color: var(--accent); font-size: 11px; font-family: var(--font-mono);">{{ c.hashtag }}</span>{% endif %}
         </div>
@@ -136,48 +133,6 @@
                 ✕ Delete
             </button>
         </form>
-    </div>
-    {% endif %}
-
-    {# ── v4.5.5: Bot rights warning panel — показываем если есть missing права #}
-    {% set bot_rights = c.bot_rights_missing | parse_bot_rights %}
-    {% if bot_rights and c.chat_id != 0 %}
-    <div style="margin-bottom: var(--sp-3); padding: var(--sp-2) var(--sp-3); background: rgba(204,51,51,.06); border-left: 3px solid var(--danger); border-radius: var(--r-xs);">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: var(--sp-3); flex-wrap: wrap;">
-            <div style="flex: 1; min-width: 260px;">
-                <div style="font-size: 11px; color: var(--danger); font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px;">
-                    ⚠️ Боту нужны права в чате для полноценной работы
-                </div>
-                {% if '__not_admin__' in bot_rights %}
-                <div style="font-size: 11px; color: var(--text); line-height: 1.6;">
-                    Бот <strong>не является администратором</strong> в этом чате. Без админ-прав не работают:
-                    warn/mute/ban, удаление сообщений, night mode, sanitary day, фильтры ссылок/слов/стикеров.
-                    Promote бота через admin-панель Telegram (чат → Manage chat → Administrators → Add admin).
-                </div>
-                {% else %}
-                <div style="font-size: 11px; color: var(--text); line-height: 1.6;">
-                    Бот админ, но не хватает прав:
-                    <ul style="margin: 4px 0 0 18px; padding: 0;">
-                        {% for r in bot_rights %}
-                        {% if r == 'can_change_info' %}<li><code>can_change_info</code> — нужен для night mode и sanitary day (set_chat_permissions)</li>{% endif %}
-                        {% if r == 'can_delete_messages' %}<li><code>can_delete_messages</code> — нужен для удаления сообщений (warn, link/word/sticker filters)</li>{% endif %}
-                        {% if r == 'can_restrict_members' %}<li><code>can_restrict_members</code> — нужен для mute и ban</li>{% endif %}
-                        {% endfor %}
-                    </ul>
-                    Выдайте недостающие права через admin-панель Telegram: чат → Administrators → выбрать бота → отметить галочки.
-                </div>
-                {% endif %}
-                {% if c.bot_rights_checked_at %}
-                <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim);">Last checked: {{ c.bot_rights_checked_at | msk }}</div>
-                {% endif %}
-            </div>
-            <form method="post" action="/admin/chats/{{ c.chat_id }}/recheck-bot-rights" style="display: inline;">
-                <button type="submit"
-                        style="padding: 5px 12px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap;">
-                    ↻ Recheck rights
-                </button>
-            </form>
-        </div>
     </div>
     {% endif %}
 
