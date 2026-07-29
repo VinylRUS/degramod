@@ -401,37 +401,6 @@ python scripts/test_v451_audit_fixes.py
 ### v4.5.1
 - Audit fixes: consumed warns, webhook secret, login rate-limit, POST logout, report chat validation, multi-report-chat, WAL checkpoint, `!unwarn` cap, `!resetwarns` SU/admin-only, friendly-fire protection.
 
-<details>
-<summary><strong>Полный changelog (старые версии)</strong></summary>
-
-> См. `templates/base.html` → клик по плашке версии в футере веб-панели → modal с полной историей.
-
-</details>
-
----
-
-## 🗺️ Roadmap
-
-- [ ] **CAPTCHA-верификация** новых участников (как у Shieldy / Rose)
-- [ ] **Anti-flood** — rate-limiting по сообщениями в единицу времени
-- [ ] **Raid protection** — детекция массового входа + авто-локдаун
-- [ ] **Slow mode** — интеграция с нативным Telegram slow mode
-- [ ] **Multi-language** — локализация UI веб-панели
-
----
-
-## 🤝 Участие в разработке
-
-Pull requests приветствуются. Перед крупными изменениями откройте issue для обсуждения.
-
-Все тесты должны проходить:
-
-```bash
-for f in scripts/test_v4*.py; do python "$f" || exit 1; done
-```
-
----
-
 ## 📄 Лицензия
 
 MIT License. См. [LICENSE](LICENSE).
@@ -440,8 +409,6 @@ MIT License. См. [LICENSE](LICENSE).
 
 <div align="center">
 
-**DegraBan** — стелс-модерация для Telegram, которую не видно, но которая работает.
-
-Made with 🛡️ and Python
+Сделано вдохновляясь Rose и Combot с ❤️ и при помощи z.ai
 
 </div>
