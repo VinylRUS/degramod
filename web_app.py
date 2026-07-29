@@ -75,11 +75,17 @@ MSK = timezone(timedelta(hours=3))
 PAGE_SIZE = 50  # записей на страницу в дашборде
 
 # ── v4.5: Версия приложения ────────────────────────────────────────────────
+# v4.5.5 (29 июля 2026): Проверка прав бота при добавлении в чат —
+# my_chat_member извлекает admin privileges, сохраняет bot_rights_missing
+# (JSON list), шлёт DM всем Admin/SU если прав не хватает. Веб-панель
+# показывает бейдж "⚠️ RIGHTS" + кнопка Recheck. Fallback: stealth_catchall
+# при первом сообщении дёргает bot.get_chat_member если my_chat_member
+# не пришёл.
 # v4.5.4 (29 июля 2026): Санитарные дни — lockdown чата на заданные даты.
 # ChatPermissions → all False; модераторов не касается (Telegram admin rights
 # override'ят chat-level perms). Ночной режим пропускает чаты в sanitary day.
 # Управление: /sanitary CLI command + веб-панель /admin/chats (textarea).
-APP_VERSION = "v4.5.4"
+APP_VERSION = "v4.5.5"
 APP_RELEASE_DATE = "2026-07-29"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -602,6 +608,13 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         templates.env.filters["format_sanitary_days"] = _fmt_san
     except ImportError:
         templates.env.filters["format_sanitary_days"] = lambda s: ""
+    # v4.5.5: parse_bot_rights filter — парсит JSON bot_rights_missing в list[str].
+    # Возвращает [] для None/пустой/битой строки (fail-safe в шаблоне).
+    try:
+        from bot_handlers import parse_bot_rights_missing as _parse_bot_rights
+        templates.env.filters["parse_bot_rights"] = _parse_bot_rights
+    except ImportError:
+        templates.env.filters["parse_bot_rights"] = lambda s: []
     # v4.5.2: глобальные переменные для всех шаблонов (версия в футере)
     templates.env.globals["app_version"] = APP_VERSION
     templates.env.globals["app_release_date"] = APP_RELEASE_DATE
@@ -2088,6 +2101,67 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "admin_chats_delete: chat_id=%s title='%s' by=%s "
             "(punishments=%s, chat_admins=%s, leave=%s)",
             chat_id, chat_title, _auth.username, pun_count, ca_count, leave_msg,
+        )
+        return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /admin/chats/{chat_id}/recheck-bot-rights — v4.5.5
+    #
+    #  POST. SU/admin. Дёргает bot.get_chat_member(chat_id, bot.id),
+    #  вычисляет недостающие права, сохраняет в ChatSettings.bot_rights_missing
+    #  + bot_rights_checked_at. Если прав не хватает — шлёт DM всем Admin/SU.
+    #  Redirect обратно на /admin/chats с flash-сообщением о результате.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/chats/{chat_id_str}/recheck-bot-rights")
+    async def admin_chats_recheck_bot_rights(
+        chat_id_str: str,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        try:
+            chat_id = int(chat_id_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+chat_id", status_code=303,
+            )
+        if chat_id == 0:
+            return RedirectResponse(
+                url="/admin/chats?flash=Cannot+recheck+rights+for+default+settings+(chat_id=0)",
+                status_code=303,
+            )
+
+        # Получаем ChatMember из TG и вычисляем права.
+        try:
+            from bot_handlers import _check_and_persist_bot_rights, _BOT_RIGHT_LABELS
+            if bot is None:
+                return RedirectResponse(
+                    url="/admin/chats?flash=Bot+instance+not+available",
+                    status_code=303,
+                )
+            member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+            missing = await _check_and_persist_bot_rights(
+                bot, chat_id=chat_id, chat_title=None,
+                new_chat_member=member, notify=True,
+            )
+        except Exception as e:
+            _req_logger.warning(
+                "admin_chats_recheck_bot_rights: chat_id=%s by=%s error=%s",
+                chat_id, _auth.username, e,
+            )
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Recheck+failed:+{str(e).replace(' ', '+')[:120]}",
+                status_code=303,
+            )
+
+        if not missing:
+            msg = f"Chat+{chat_id}:+bot+has+full+admin+rights+(can_change_info,+can_delete_messages,+can_restrict_members)"
+        else:
+            # Человекочитаемый список недостающих прав.
+            labels = [_BOT_RIGHT_LABELS.get(r, r).split(" (")[0] for r in missing]
+            msg = f"Chat+{chat_id}:+bot+is+missing+rights:+{',+'.join(labels)}"
+
+        _req_logger.info(
+            "admin_chats_recheck_bot_rights: chat_id=%s by=%s missing=%s",
+            chat_id, _auth.username, missing,
         )
         return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
 

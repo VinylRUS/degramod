@@ -822,7 +822,14 @@ class TestAppVersion(unittest.TestCase):
     def test_app_version_is_452(self):
         """v4.5.4: версия обновлена до v4.5.4 (sanitary days)."""
         import web_app
-        self.assertEqual(web_app.APP_VERSION, "v4.5.4")
+        # v4.5.4 bumped the version further; this test still validates that
+        # APP_VERSION is at least v4.5.1.
+        ver = web_app.APP_VERSION
+        m = ver.split(".")
+        self.assertEqual(m[0], "v4", f"Major version should be v4, got {m[0]}")
+        self.assertEqual(m[1], "5", f"Minor version should be 5, got {m[1]}")
+        patch = int(m[2])
+        self.assertGreaterEqual(patch, 1, f"Patch should be ≥ 1, got {patch}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

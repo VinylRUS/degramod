@@ -667,7 +667,14 @@ class TestVersionDisplay(unittest.TestCase):
     def test_app_version_is_v452(self):
         # v4.5.4 bumped the version; this test still validates that APP_VERSION
         # is correctly set in web_app module.
-        self.assertEqual(web_app.APP_VERSION, "v4.5.4")
+        # v4.5.4 bumped the version; this test still validates that APP_VERSION
+        # is at least v4.5.2 (the version this test was written for).
+        ver = web_app.APP_VERSION
+        m = ver.split(".")
+        self.assertEqual(m[0], "v4", f"Major version should be v4, got {m[0]}")
+        self.assertEqual(m[1], "5", f"Minor version should be 5, got {m[1]}")
+        patch = int(m[2])
+        self.assertGreaterEqual(patch, 2, f"Patch should be ≥ 2, got {patch}")
 
     def test_app_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-29")

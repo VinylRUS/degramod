@@ -19,7 +19,7 @@ test_v454_sanitary_day.py — Тесты v4.5.4: Санитарные дни (ch
  11. _sanitary_day_tick enter/exit (через mock bot).
  12. _enter_sanitary_day: snapshot + lockdown + flag set.
  13. _exit_sanitary_day: restore from snapshot + flag clear.
- 14. APP_VERSION = "v4.5.4".
+ 14. APP_VERSION bumped (≥ v4.5.4).
  15. /help содержит раздел "Санитарные дни".
  16. base.html changelog modal содержит v4.5.4 заголовок.
  17. admin_chats.html содержит textarea sanitary_days_text + SAN badge.
@@ -834,7 +834,15 @@ class TestEnterSanitaryDayExitsNightFirst(unittest.IsolatedAsyncioTestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_app_version_is_v454(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.5.4")
+        # v4.5.5 bumped the version further; this test still validates that
+        # the version is at least v4.5.4 (sanitary day shipped).
+        ver = web_app.APP_VERSION
+        # Парсим "v4.5.X" — split на '.', берём patch-компонент.
+        m = ver.split(".")
+        self.assertEqual(m[0], "v4", f"Major version should be v4, got {m[0]}")
+        self.assertEqual(m[1], "5", f"Minor version should be 5, got {m[1]}")
+        patch = int(m[2])
+        self.assertGreaterEqual(patch, 4, f"Patch should be ≥ 4, got {patch}")
 
     def test_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-29")

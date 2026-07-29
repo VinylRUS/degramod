@@ -634,16 +634,17 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
-                <p><strong>v4.5.4</strong> — 29 июля 2026</p>
+                <p><strong>v4.5.5</strong> — 29 июля 2026</p>
                 <ul>
-                    <li><strong>Sanitary days</strong>: schedule full chat lockdown (ChatPermissions → all False) on specific dates. One API call per chat — efficient even for 19k-member chats.</li>
-                    <li><strong>Moderators unaffected</strong>: Telegram admin rights (set via promote_chat_member) override chat-level ChatPermissions, so mods can still post during lockdown.</li>
-                    <li><strong>Night mode integration</strong>: when sanitary day starts, night mode is skipped (snapshot already preserved); when sanitary day ends, night mode re-enters if window is still active.</li>
-                    <li><strong>/sanitary CLI</strong>: <code>add</code>, <code>remove</code>, <code>clear</code>, <code>toggle</code> (manual test), <code>list</code> subcommands. Date format: <code>YYYY-MM-DD</code> or <code>YYYY-MM-DD:YYYY-MM-DD</code>.</li>
-                    <li><strong>Web panel</strong>: textarea in /admin/chats (one date/range per line, <code>#</code> comments allowed). Live <code>SAN</code> badge in chat header turns red when lockdown is active.</li>
-                    <li><strong>Timezone-aware</strong>: sanitary date boundaries use chat's <code>night_mode_tz</code>.</li>
+                    <li><strong>Bot rights check on chat add</strong>: when the bot is added or promoted in a chat, <code>my_chat_member</code> handler extracts its admin privileges and checks for the 3 critical rights: <code>can_change_info</code> (needed for night mode + sanitary day), <code>can_delete_messages</code> (warn, link/word/sticker filters), <code>can_restrict_members</code> (mute & ban).</li>
+                    <li><strong>DM to Admins &amp; SU</strong>: if any rights are missing (or the bot is not an admin at all), all active users with role <code>su</code>/<code>admin</code> and a bound TG ID get a DM listing the missing rights and how to grant them via Telegram's admin panel.</li>
+                    <li><strong>Web panel indication</strong>: chat appears in <code>/admin/chats</code> as usual, but shows a red warning badge in the header and a detailed warning panel with the missing rights list + a "Recheck rights" button. The chat is NOT hidden — admins can still see it and decide what to do.</li>
+                    <li><strong>Recheck button</strong>: <code>POST /admin/chats/&lt;id&gt;/recheck-bot-rights</code> — calls <code>bot.get_chat_member</code>, recomputes missing rights, updates <code>bot_rights_missing</code> + <code>bot_rights_checked_at</code>, sends DM if still missing. Flash message reports the result.</li>
+                    <li><strong>Fallback path</strong>: if <code>my_chat_member</code> was not delivered by Telegram (happens when bot is added without admin rights), <code>stealth_catchall_group</code> performs a one-shot <code>bot.get_chat_member</code> check on the first message. Throttled to once per hour per chat if rights are still missing.</li>
+                    <li><strong>Auto-clear</strong>: when the bot is promoted to a full admin (all 3 rights present), <code>bot_rights_missing</code> is set to <code>NULL</code> — badge and warning panel disappear from the web panel.</li>
                 </ul>
-                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.5.3</strong> — /help cleanup, Night mode — per-chat timezone, Night mode — weekend schedule, Night mode — custom permissions, Night mode — enter/exit notifications, /nightmode subcommands.</p>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.5.4</strong> — Sanitary days: full chat lockdown on configured dates (ChatPermissions → all False), moderators unaffected (Telegram admin rights override chat-level perms), night mode skipped during sanitary day, /sanitary CLI + textarea in /admin/chats, timezone-aware date boundaries.</p>
+                <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.3</strong> — /help cleanup, Night mode — per-chat timezone, Night mode — weekend schedule, Night mode — custom permissions, Night mode — enter/exit notifications, /nightmode subcommands.</p>
                 <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.2</strong> — CAS integration, word/link/sticker filters, auto night mode, warn decay, version display.</p>
                 <p style="color:var(--text-dim);font-size:11px;">Previous: v4.5.1 (audit fixes — consumed warns, webhook secret, login rate-limit, POST logout, report chat validation, multi-report-chat, WAL checkpoint, !unwarn cap, !resetwarns SU/admin-only, friendly-fire protection).</p>
             </div>
