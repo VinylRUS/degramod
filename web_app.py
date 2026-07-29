@@ -61,6 +61,7 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
     async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
+    PermissionPreset,
     _hash_password, _verify_password, DB_PATH,
 )
 
@@ -75,21 +76,29 @@ MSK = timezone(timedelta(hours=3))
 PAGE_SIZE = 50  # записей на страницу в дашборде
 
 # ── v4.5: Версия приложения ────────────────────────────────────────────────
+# v4.6.0 (30 июля 2026): Гранулярные права + пользовательские пресеты +
+# monthly санитарные дни + dashboard warnings card.
+#   • Новая таблица permission_presets: именованные наборы ChatPermissions
+#     для day / night / sanitary. Системные пресеты «Full lockdown»,
+#     «Text only», «Day default» — неудаляемые, создаются при init_db.
+#     Пользовательские пресеты — через /admin/presets.
+#   • Новые поля в ChatSettings: day_permissions (явные дневные права,
+#     NULL = старое поведение через snapshot), sanitary_days_permissions
+#     (права на время сан. дня, NULL = all False), last_sanitary_month
+#     (для suppress предупреждений «нет дат на след. месяц»).
+#   • Sanitary days: формат изменён на monthly — JSON-объект вида
+#     {"2026-08": [["2026-08-02","2026-08-03"]], "2026-09": []}.
+#     При выходе из последнего сан. дня месяца — ключ этого месяца
+#     удаляется, ставится last_sanitary_month.
+#   • Dashboard warnings card: критические ошибки бота > нет дат на
+#     сан. дни > у бота нет прав > прочее. Сортировка по важности.
 # v4.5.6 (29 июля 2026): Ephemeral-сообщения (подтверждения модератору и
 # уведомления нарушителю о варне) теперь авто-удаляются через 30 секунд.
-# Раньше они оставались в чате как видимые только получателю сообщения и
-# могли реотображаться при перезапуске клиента / скроллинге — выглядело
-# как «повторное оповещение». Теперь _send_ephemeral и
-# _send_user_warn_notification принимают delete_after (по умолч. 30с)
-# и сами удаляют сообщение фоновой таской.
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-# ChatPermissions → all False; модераторов не касается (Telegram admin rights
-# override'ят chat-level perms). Ночной режим пропускает чаты в sanitary day.
-# Управление: /sanitary CLI command + веб-панель /admin/chats (textarea).
-APP_VERSION = "v4.5.6"
-APP_RELEASE_DATE = "2026-07-29"
+APP_VERSION = "v4.6.0"
+APP_RELEASE_DATE = "2026-07-30"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -813,6 +822,62 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 base.offset(offset).limit(PAGE_SIZE)
             )).all()
 
+            # ── v4.6.0: Warnings card ────────────────────────────────────
+            # Собираем предупреждения со всех чатов, сортируем по важности:
+            # 1. critical (нет chat_settings — неожиданное) — приоритет 0
+            # 2. no_sanitary_next_month — приоритет 10
+            # 3. no_bot_rights — приоритет 20
+            # 4. other (e.g. chat disabled) — приоритет 30
+            warnings = []
+            from datetime import datetime as _dt, timezone as _tz
+            from zoneinfo import ZoneInfo as _ZI
+            try:
+                now_msk = _dt.now(_ZI("Europe/Moscow"))
+            except Exception:
+                now_msk = _dt.now(_tz.utc)
+            current_month = now_msk.strftime("%Y-%m")
+            # Следующий месяц (для warning "нет дат на след. месяц").
+            if now_msk.month == 12:
+                next_month = f"{now_msk.year + 1}-01"
+            else:
+                next_month = f"{now_msk.year}-{now_msk.month + 1:02d}"
+            day_of_month = now_msk.day
+            # Получаем все чаты.
+            all_chats = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id != 0).order_by(ChatSettings.chat_id)
+            )).scalars().all()
+            for chat in all_chats:
+                chat_label = chat.title or f"chat {chat.chat_id}"
+                # 1. Sanitary days warning — после 20-го числа, если на след. месяц нет дат
+                # и в этом месяце ещё не было сан. дня (last_sanitary_month != current).
+                if day_of_month >= 20 and chat.last_sanitary_month != current_month:
+                    try:
+                        sd_data = json.loads(chat.sanitary_days) if chat.sanitary_days else {}
+                    except (ValueError, TypeError):
+                        sd_data = {}
+                    next_month_pairs = sd_data.get(next_month, []) if isinstance(sd_data, dict) else []
+                    if not next_month_pairs:
+                        warnings.append({
+                            "priority": 10,
+                            "level": "warn",
+                            "chat_id": chat.chat_id,
+                            "chat_label": chat_label,
+                            "title": "Нет санитарных дней на следующий месяц",
+                            "detail": f"Месяц {next_month} не имеет дат санитарных дней. Настройте в /admin/chats → Sanitary days.",
+                        })
+                # 2. Chat disabled — friendly warning.
+                if not chat.is_enabled:
+                    warnings.append({
+                        "priority": 30,
+                        "level": "info",
+                        "chat_id": chat.chat_id,
+                        "chat_label": chat_label,
+                        "title": "Чат отключён",
+                        "detail": "Бот игнорирует все команды в этом чате. Включите через /admin/chats → ⚙ → is_enabled.",
+                    })
+            # Сортировка по priority.
+            warnings.sort(key=lambda w: (w["priority"], w["chat_label"]))
+
         return templates.TemplateResponse("dashboard.html", {
             "request": request,
             "rows": rows,
@@ -827,6 +892,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "auth_user": _auth,
             "app_version": APP_VERSION,
             "pw_msg": pw_msg or None,
+            "warnings": warnings,
         })
 
     # ── GET /user/<user_id> ─────────────────────────────────────────────
@@ -1621,12 +1687,24 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 if r.is_report_chat and r.chat_id != 0
             ]
 
+            # v4.6.0: список всех пресетов для dropdown в admin_chats.html.
+            presets_rows = (await session.execute(
+                select(PermissionPreset).order_by(
+                    PermissionPreset.scope, PermissionPreset.name
+                )
+            )).scalars().all()
+            presets_by_scope = {"day": [], "night": [], "sanitary": []}
+            for p in presets_rows:
+                if p.scope in presets_by_scope:
+                    presets_by_scope[p.scope].append(p)
+
         return templates.TemplateResponse("admin_chats.html", {
             "request": request,
             "chats": rows,
             "stats": stats,
             "mod_counts": mod_counts,
             "report_chat_options": report_chat_options,
+            "presets_by_scope": presets_by_scope,
             "auth_user": _auth,
             "flash": flash or None,
         })
@@ -1667,6 +1745,46 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # v4.5.4: sanitary days textarea. Multiline-текст, одна запись на
         # строку ('YYYY-MM-DD' или 'YYYY-MM-DD - YYYY-MM-DD').
         sanitary_days_text: str = Form(""),
+        # v4.6.0: гранулярные права — пресеты из БД.
+        # Если preset_id задан и валиден → берём permissions из пресета
+        # и сохраняем в соответствующее поле ChatSettings.
+        # preset_id="custom" → берём из custom grid ниже.
+        # preset_id="" или "__none__" → NULL (старое поведение, через snapshot).
+        day_preset_id: str = Form(""),
+        night_preset_id: str = Form(""),
+        sanitary_preset_id: str = Form("__lockdown__"),
+        # v4.6.0: custom grids для day и sanitary (показываются при preset="custom").
+        # Night-mode custom grid уже есть выше (perm_can_send_*).
+        day_perm_can_send_messages: str = Form(""),
+        day_perm_can_send_audios: str = Form(""),
+        day_perm_can_send_documents: str = Form(""),
+        day_perm_can_send_photos: str = Form(""),
+        day_perm_can_send_videos: str = Form(""),
+        day_perm_can_send_video_notes: str = Form(""),
+        day_perm_can_send_voice_notes: str = Form(""),
+        day_perm_can_send_polls: str = Form(""),
+        day_perm_can_send_other_messages: str = Form(""),
+        day_perm_can_add_web_page_previews: str = Form(""),
+        day_perm_can_change_info: str = Form(""),
+        day_perm_can_invite_users: str = Form(""),
+        day_perm_can_pin_messages: str = Form(""),
+        sanitary_perm_can_send_messages: str = Form(""),
+        sanitary_perm_can_send_audios: str = Form(""),
+        sanitary_perm_can_send_documents: str = Form(""),
+        sanitary_perm_can_send_photos: str = Form(""),
+        sanitary_perm_can_send_videos: str = Form(""),
+        sanitary_perm_can_send_video_notes: str = Form(""),
+        sanitary_perm_can_send_voice_notes: str = Form(""),
+        sanitary_perm_can_send_polls: str = Form(""),
+        sanitary_perm_can_send_other_messages: str = Form(""),
+        sanitary_perm_can_add_web_page_previews: str = Form(""),
+        sanitary_perm_can_change_info: str = Form(""),
+        sanitary_perm_can_invite_users: str = Form(""),
+        sanitary_perm_can_pin_messages: str = Form(""),
+        # v4.6.0: monthly sanitary days. Если задан — заменяет sanitary_days_text.
+        # Формат: JSON-строка вида {"2026-08": [["2026-08-02","2026-08-03"]]}.
+        # UI присылает textarea для каждого месяца отдельно, мы их тут собираем.
+        monthly_sanitary_days_json: str = Form(""),
         _auth: AuthUser = Depends(require_admin),
     ):
         """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -1823,31 +1941,166 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 "can_pin_messages": False,
             })
 
-        # v4.5.4: парсим sanitary_days textarea. Поддерживаем:
-        #   'YYYY-MM-DD'              — однодневный санитарный день
-        #   'YYYY-MM-DD:YYYY-MM-DD'   — диапазон
-        #   'YYYY-MM-DD - YYYY-MM-DD' — диапазон с пробелами
-        # Строки с '#' в начале — комментарии. Пустые строки игнорируются.
-        # Невалидные строки → redirect с ошибкой (вместо тихого пропуска),
-        # чтобы SU видел что именно не так.
+        # v4.5.4 / v4.6.0: парсим sanitary_days.
+        # v4.6.0: приоритет — monthly_sanitary_days_json (новый формат).
+        # Если пусто — fallback на старый textarea (sanitary_days_text).
         try:
             from bot_handlers import (
                 parse_sanitary_days_textarea, serialize_sanitary_days,
+                parse_sanitary_days_monthly, serialize_sanitary_days_monthly,
             )
         except ImportError:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Server+error+(bot_handlers+import+failed)",
                 status_code=303,
             )
-        san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
-        if san_errors:
-            # Беру первую ошибку — для flash-сообщения.
-            first_err = san_errors[0].replace(" ", "+")
-            return RedirectResponse(
-                url=f"/admin/chats?flash=Sanitary+days:+{first_err}",
-                status_code=303,
-            )
-        sanitary_days_json = serialize_sanitary_days(san_pairs) if san_pairs else None
+
+        monthly_sanitary_days_json = (monthly_sanitary_days_json or "").strip()
+        if monthly_sanitary_days_json:
+            # Новый формат — JSON dict от UI (monthly).
+            try:
+                sd_data = json.loads(monthly_sanitary_days_json)
+                if not isinstance(sd_data, dict):
+                    raise ValueError("expected dict")
+                # Парсим и валидируем каждую пару.
+                validated_monthly = {}
+                for mk, pairs_list in sd_data.items():
+                    if not isinstance(pairs_list, list):
+                        continue
+                    validated_pairs = []
+                    for pair in pairs_list:
+                        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                            continue
+                        san_pairs_one, san_errors_one = parse_sanitary_days_textarea(
+                            f"{pair[0]} - {pair[1]}"
+                        )
+                        if san_errors_one:
+                            first_err = san_errors_one[0].replace(" ", "+")
+                            return RedirectResponse(
+                                url=f"/admin/chats?flash=Sanitary+days+({mk}):+{first_err}",
+                                status_code=303,
+                            )
+                        validated_pairs.extend(san_pairs_one)
+                    validated_monthly[mk] = validated_pairs
+                sanitary_days_json = serialize_sanitary_days_monthly(validated_monthly) if validated_monthly else None
+            except (ValueError, TypeError) as e:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Invalid+monthly_sanitary_days_json:+{str(e)[:100]}",
+                    status_code=303,
+                )
+        else:
+            # Старый формат — textarea.
+            san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
+            if san_errors:
+                first_err = san_errors[0].replace(" ", "+")
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Sanitary+days:+{first_err}",
+                    status_code=303,
+                )
+            if san_pairs:
+                # Группируем по месяцам автоматически (конвертация в новый формат).
+                grouped: dict[str, list[list[str]]] = {}
+                for s, e in san_pairs:
+                    mk = s[:7]  # YYYY-MM
+                    grouped.setdefault(mk, []).append([s, e])
+                sanitary_days_json = serialize_sanitary_days_monthly(grouped)
+            else:
+                sanitary_days_json = None
+
+        # v4.6.0: обработка гранулярных прав (presets / custom grids).
+        # Загружаем все пресеты одним запросом.
+        async with async_session() as _ps:
+            preset_records = (await _ps.execute(
+                select(PermissionPreset)
+            )).scalars().all()
+        preset_by_id = {p.id: p for p in preset_records}
+
+        def _resolve_perms(preset_id_field: str, scope: str, custom_perms: dict) -> str | None:
+            """v4.6.0: Возвращает JSON-строку permissions для поля ChatSettings.
+
+            Логика:
+              • preset_id_field == "__none__" или "" → NULL (старое поведение)
+              • preset_id_field == "__lockdown__" → all False (только для sanitary)
+              • preset_id_field == "custom" → берём из custom_perms dict
+              • preset_id_field == int (валидный ID) → берём из preset_by_id
+            """
+            pid = (preset_id_field or "").strip()
+            if pid in ("", "__none__"):
+                return None
+            if pid == "__lockdown__":
+                return json.dumps({k: False for k in (
+                    "can_send_messages", "can_send_audios", "can_send_documents",
+                    "can_send_photos", "can_send_videos", "can_send_video_notes",
+                    "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+                    "can_add_web_page_previews", "can_change_info", "can_invite_users",
+                    "can_pin_messages",
+                )})
+            if pid == "custom":
+                return json.dumps(custom_perms)
+            # Числовой ID пресета.
+            try:
+                pid_int = int(pid)
+            except (ValueError, TypeError):
+                return None
+            preset = preset_by_id.get(pid_int)
+            if preset is None or preset.scope != scope:
+                return None
+            return preset.permissions
+
+        day_custom = {
+            "can_send_messages":          day_perm_can_send_messages == "on",
+            "can_send_audios":            day_perm_can_send_audios == "on",
+            "can_send_documents":         day_perm_can_send_documents == "on",
+            "can_send_photos":            day_perm_can_send_photos == "on",
+            "can_send_videos":            day_perm_can_send_videos == "on",
+            "can_send_video_notes":       day_perm_can_send_video_notes == "on",
+            "can_send_voice_notes":       day_perm_can_send_voice_notes == "on",
+            "can_send_polls":             day_perm_can_send_polls == "on",
+            "can_send_other_messages":   day_perm_can_send_other_messages == "on",
+            "can_add_web_page_previews": day_perm_can_add_web_page_previews == "on",
+            "can_change_info":            day_perm_can_change_info == "on",
+            "can_invite_users":           day_perm_can_invite_users == "on",
+            "can_pin_messages":           day_perm_can_pin_messages == "on",
+        }
+        sanitary_custom = {
+            "can_send_messages":          sanitary_perm_can_send_messages == "on",
+            "can_send_audios":            sanitary_perm_can_send_audios == "on",
+            "can_send_documents":         sanitary_perm_can_send_documents == "on",
+            "can_send_photos":            sanitary_perm_can_send_photos == "on",
+            "can_send_videos":            sanitary_perm_can_send_videos == "on",
+            "can_send_video_notes":       sanitary_perm_can_send_video_notes == "on",
+            "can_send_voice_notes":       sanitary_perm_can_send_voice_notes == "on",
+            "can_send_polls":             sanitary_perm_can_send_polls == "on",
+            "can_send_other_messages":   sanitary_perm_can_send_other_messages == "on",
+            "can_add_web_page_previews": sanitary_perm_can_add_web_page_previews == "on",
+            "can_change_info":            sanitary_perm_can_change_info == "on",
+            "can_invite_users":           sanitary_perm_can_invite_users == "on",
+            "can_pin_messages":           sanitary_perm_can_pin_messages == "on",
+        }
+        day_perms_json = _resolve_perms(day_preset_id, "day", day_custom)
+        sanitary_perms_json = _resolve_perms(sanitary_preset_id, "sanitary", sanitary_custom)
+        # Night perms: если night_preset_id задан — он переписывает night_perms_json.
+        night_custom_grid = {
+            "can_send_messages":          perm_can_send_messages == "on",
+            "can_send_audios":            perm_can_send_audios == "on",
+            "can_send_documents":         perm_can_send_documents == "on",
+            "can_send_photos":            perm_can_send_photos == "on",
+            "can_send_videos":            perm_can_send_videos == "on",
+            "can_send_video_notes":       perm_can_send_video_notes == "on",
+            "can_send_voice_notes":       perm_can_send_voice_notes == "on",
+            "can_send_polls":             perm_can_send_polls == "on",
+            "can_send_other_messages":   perm_can_send_other_messages == "on",
+            "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
+            # 3 admin-права — всегда False в night (старое поведение custom grid).
+            "can_change_info":            False,
+            "can_invite_users":           False,
+            "can_pin_messages":           False,
+        }
+        if night_preset_id and night_preset_id not in ("", "__none__"):
+            # v4.6.0: night_preset_id имеет приоритет над старым night_mode_preset dropdown.
+            night_resolved = _resolve_perms(night_preset_id, "night", night_custom_grid)
+            if night_resolved is not None:
+                night_perms_json = night_resolved
 
         async with async_session() as session:
             cs = (await session.execute(
@@ -1889,15 +2142,15 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             cs.night_mode_weekend_start = nm_wknd_start or None
             cs.night_mode_weekend_end = nm_wknd_end or None
             cs.night_mode_notify = (night_mode_notify == "on")
-            # Пустая строка из формы → None (дефолтный шаблон).
             enter_msg = (night_mode_notify_enter_msg or "").strip()
             exit_msg = (night_mode_notify_exit_msg or "").strip()
             cs.night_mode_notify_enter_msg = enter_msg or None
             cs.night_mode_notify_exit_msg = exit_msg or None
-            # v4.5.4: sanitary days. Сохраняем JSON (или None если пусто).
-            # Не сбрасываем sanitary_days_currently_active/saved_permissions
-            # здесь — это делает _sanitary_day_tick при выходе из sanitary day.
+            # v4.5.4 / v4.6.0: sanitary days. Сохраняем monthly JSON (или None).
             cs.sanitary_days = sanitary_days_json
+            # v4.6.0: гранулярные права.
+            cs.day_permissions = day_perms_json
+            cs.sanitary_days_permissions = sanitary_perms_json
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
@@ -1905,12 +2158,14 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, "
             "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
             "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
-            "weekend=%s-%s, notify=%s, sanitary=%s)",
+            "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s)",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
             decay, link_filter_action, nm_start, nm_end, night_mode_preset,
             nm_tz, nm_wknd_start or "-", nm_wknd_end or "-",
             night_mode_notify == "on",
-            len(san_pairs) if san_pairs else 0,
+            sanitary_days_json or "(none)",
+            "yes" if day_perms_json else "no",
+            "yes" if sanitary_perms_json else "no",
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",
@@ -2595,5 +2850,175 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             url=f"/admin/settings?flash={flash_msg}#cleanup",
             status_code=303,
         )
+
+    # ── v4.6.0: Permission Presets ────────────────────────────────────
+    @app.get("/admin/presets", response_class=HTMLResponse)
+    async def admin_presets_page(
+        request: Request,
+        flash: str = "",
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.6.0: страница управления пресетами прав для day/night/sanitary.
+
+        Доступ: SU + admin (moderator не имеет доступа — ему нечего тут делать).
+        """
+        async with async_session() as session:
+            presets = (await session.execute(
+                select(PermissionPreset).order_by(
+                    PermissionPreset.scope, PermissionPreset.name
+                )
+            )).scalars().all()
+
+        # Группируем по scope для UI.
+        grouped = {"day": [], "night": [], "sanitary": []}
+        for p in presets:
+            if p.scope in grouped:
+                grouped[p.scope].append(p)
+
+        return templates.TemplateResponse(
+            "admin_presets.html",
+            {
+                "request": request,
+                "presets_by_scope": grouped,
+                "flash": flash,
+                "app_version": APP_VERSION,
+                "app_release_date": APP_RELEASE_DATE,
+                "auth": _auth,
+            },
+        )
+
+    @app.post("/admin/presets/create")
+    async def admin_presets_create(
+        name: str = Form(...),
+        scope: str = Form(...),
+        perm_can_send_messages: str = Form(""),
+        perm_can_send_audios: str = Form(""),
+        perm_can_send_documents: str = Form(""),
+        perm_can_send_photos: str = Form(""),
+        perm_can_send_videos: str = Form(""),
+        perm_can_send_video_notes: str = Form(""),
+        perm_can_send_voice_notes: str = Form(""),
+        perm_can_send_polls: str = Form(""),
+        perm_can_send_other_messages: str = Form(""),
+        perm_can_add_web_page_previews: str = Form(""),
+        perm_can_change_info: str = Form(""),
+        perm_can_invite_users: str = Form(""),
+        perm_can_pin_messages: str = Form(""),
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.6.0: создать новый пользовательский пресет."""
+        name = (name or "").strip()
+        if not name or len(name) > 64:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+preset+name+(1-64+chars)",
+                status_code=303,
+            )
+        if scope not in ("day", "night", "sanitary"):
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+scope",
+                status_code=303,
+            )
+
+        perms = {
+            "can_send_messages":          perm_can_send_messages == "on",
+            "can_send_audios":            perm_can_send_audios == "on",
+            "can_send_documents":         perm_can_send_documents == "on",
+            "can_send_photos":            perm_can_send_photos == "on",
+            "can_send_videos":            perm_can_send_videos == "on",
+            "can_send_video_notes":       perm_can_send_video_notes == "on",
+            "can_send_voice_notes":       perm_can_send_voice_notes == "on",
+            "can_send_polls":             perm_can_send_polls == "on",
+            "can_send_other_messages":   perm_can_send_other_messages == "on",
+            "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
+            "can_change_info":            perm_can_change_info == "on",
+            "can_invite_users":           perm_can_invite_users == "on",
+            "can_pin_messages":           perm_can_pin_messages == "on",
+        }
+
+        async with async_session() as session:
+            # Уникальность name.
+            existing = (await session.execute(
+                select(PermissionPreset).where(PermissionPreset.name == name)
+            )).scalar_one_or_none()
+            if existing is not None:
+                return RedirectResponse(
+                    url=f"/admin/presets?flash=Preset+name+already+exists:+{name.replace(' ', '+')}",
+                    status_code=303,
+                )
+            preset = PermissionPreset(
+                name=name, scope=scope,
+                permissions=json.dumps(perms),
+                is_system=False,
+            )
+            session.add(preset)
+            await session.commit()
+            _req_logger.info(
+                "presets_create: name=%r scope=%s by=%s",
+                name, scope, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+created",
+            status_code=303,
+        )
+
+    @app.post("/admin/presets/{preset_id:int}/delete")
+    async def admin_presets_delete(
+        preset_id: int,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.6.0: удалить пользовательский пресет. Системные неудаляемы."""
+        async with async_session() as session:
+            preset = (await session.execute(
+                select(PermissionPreset).where(PermissionPreset.id == preset_id)
+            )).scalar_one_or_none()
+            if preset is None:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Preset+not+found",
+                    status_code=303,
+                )
+            if preset.is_system:
+                return RedirectResponse(
+                    url="/admin/presets?flash=System+presets+cannot+be+deleted",
+                    status_code=303,
+                )
+            name = preset.name
+            await session.delete(preset)
+            await session.commit()
+            _req_logger.info(
+                "presets_delete: id=%d name=%r by=%s",
+                preset_id, name, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+deleted",
+            status_code=303,
+        )
+
+    @app.get("/api/presets")
+    async def api_presets_list(
+        scope: str = "",
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.6.0: JSON-API список пресетов (для динамической подгрузки в admin_chats)."""
+        async with async_session() as session:
+            q = select(PermissionPreset).order_by(
+                PermissionPreset.scope, PermissionPreset.name
+            )
+            if scope in ("day", "night", "sanitary"):
+                q = q.where(PermissionPreset.scope == scope)
+            presets = (await session.execute(q)).scalars().all()
+        return JSONResponse({
+            "presets": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "scope": p.scope,
+                    "permissions": json.loads(p.permissions) if p.permissions else {},
+                    "is_system": p.is_system,
+                }
+                for p in presets
+            ]
+        })
 
     return app

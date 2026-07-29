@@ -592,6 +592,7 @@
         {% endif %}
         {% if auth_user and auth_user.role == 'su' %}
         <a href="/admin/users" class="nav-link {% if request.url.path.startswith('/admin/users') %}active{% endif %}">Users</a>
+        <a href="/admin/presets" class="nav-link {% if request.url.path.startswith('/admin/presets') %}active{% endif %}">Presets</a>
         <a href="/admin/settings" class="nav-link {% if request.url.path.startswith('/admin/settings') %}active{% endif %}">Settings</a>
         {% endif %}
         <span class="spacer"></span>
@@ -634,14 +635,16 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
-                <p><strong>v4.5.6</strong> — 29 июля 2026</p>
+                <p><strong>v4.6.0</strong> — 30 июля 2026</p>
                 <ul>
-                    <li><strong>Ephemeral auto-delete</strong>: confirmation messages to moderators (<code>✅ Замьютил</code> / <code>Забанен</code> / <code>Варн выдан</code> / <code>Размьючен</code> / etc.) and warn notifications to violators are now auto-deleted by the bot after 30 seconds via a background asyncio task.</li>
-                    <li><strong>Why</strong>: Telegram clients do not auto-evaporate <code>receiver_user_id</code>-targeted messages — they remain in the chat as receiver-only-visible messages and can re-appear on client restart or scroll. This looked like "duplicate notifications" to moderators. The bot now removes them itself.</li>
-                    <li><strong>New parameter</strong>: <code>_send_ephemeral(delete_after=30.0)</code> and <code>_send_user_warn_notification(delete_after=30.0)</code>. Set <code>delete_after=0</code> to disable auto-deletion (useful in tests).</li>
-                    <li><strong>Fault-tolerant</strong>: if the message is already gone (moderator deleted it manually, chat was purged, etc.), the <code>delete_message</code> call logs a debug-level message and the task exits cleanly — no error bubbles up.</li>
+                    <li><strong>Гранулярные права</strong>: теперь можно явно задавать права чата для дневного, ночного и санитарного режимов через пресеты. Больше не нужно полагаться на snapshot текущих прав — задайте свой набор в <code>/admin/presets</code> и привяжите к чату.</li>
+                    <li><strong>Пользовательские пресеты</strong>: новая страница <code>/admin/presets</code> для создания именованных наборов прав (например «Ночь Бэбэй», «День Деградач»). 3 системных пресета неудаляемы: «Full lockdown», «Text only», «Day default».</li>
+                    <li><strong>Monthly санитарные дни</strong>: формат хранения изменён на <code>{"YYYY-MM": [[start,end], ...]}</code>. При выходе из последнего сан. дня месяца — ключ этого месяца авто-удаляется, ставится отметка <code>last_sanitary_month</code>.</li>
+                    <li><strong>Dashboard warnings card</strong>: на дашборде теперь карточка с предупреждениями, отсортированными по важности (критические ошибки бота &gt; нет дат на сан. дни &gt; у бота нет прав &gt; прочее). После 20-го числа — предупреждение «нет дат на след. месяц» если не настроено.</li>
+                    <li><strong>Sanitary day permissions</strong>: по умолчанию полный локдаун (все права False, реакции остаются), но можно задать свой пресет (например, оставить только текст).</li>
                 </ul>
-                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.5.5</strong> — Bot rights check on chat add + DM Admin/SU if rights insufficient, ⚠ RIGHTS badge in /admin/chats, Recheck button, stealth_catchall fallback.</p>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.5.6</strong> — Ephemeral auto-delete: confirmation messages to moderators and warn notifications to violators are now auto-deleted by the bot after 30 second delay via a background asyncio task.</p>
+                <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.5</strong> — Bot rights check on chat add + DM Admin/SU if rights insufficient, ⚠ RIGHTS badge in /admin/chats, Recheck button, stealth_catchall fallback.</p>
                 <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.4</strong> — Sanitary days: full chat lockdown on configured dates (ChatPermissions → all False), moderators unaffected (Telegram admin rights override chat-level perms), night mode skipped during sanitary day, /sanitary CLI + textarea in /admin/chats, timezone-aware date boundaries.</p>
                 <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.3</strong> — /help cleanup, Night mode — per-chat timezone, Night mode — weekend schedule, Night mode — custom permissions, Night mode — enter/exit notifications, /nightmode subcommands.</p>
                 <p style="color:var(--text-dim);font-size:11px;"><strong>v4.5.2</strong> — CAS integration, word/link/sticker filters, auto night mode, warn decay, version display.</p>

@@ -19,7 +19,7 @@ test_v454_sanitary_day.py — Тесты v4.5.4: Санитарные дни (ch
  11. _sanitary_day_tick enter/exit (через mock bot).
  12. _enter_sanitary_day: snapshot + lockdown + flag set.
  13. _exit_sanitary_day: restore from snapshot + flag clear.
- 14. APP_VERSION = "v4.5.4".
+ 14. APP_VERSION = "v4.6.0".
  15. /help содержит раздел "Санитарные дни".
  16. base.html changelog modal содержит v4.5.4 заголовок.
  17. admin_chats.html содержит textarea sanitary_days_text + SAN badge.
@@ -626,8 +626,14 @@ class TestAdminChatsUpdateSanitary(unittest.IsolatedAsyncioTestCase):
             cs = (await s.execute(
                 select(ChatSettings).where(ChatSettings.chat_id == -1001234567890)
             )).scalar_one()
-            pairs = json.loads(cs.sanitary_days)
-            self.assertEqual(pairs, [["2026-08-01", "2026-08-01"], ["2026-08-15", "2026-08-17"]])
+            sd_data = json.loads(cs.sanitary_days)
+            # v4.6.0: формат изменён на monthly — {"YYYY-MM": [[start,end], ...]}
+            self.assertIsInstance(sd_data, dict)
+            self.assertIn("2026-08", sd_data)
+            self.assertEqual(
+                sd_data["2026-08"],
+                [["2026-08-01", "2026-08-01"], ["2026-08-15", "2026-08-17"]],
+            )
 
     async def test_update_invalid_sanitary_date(self):
         from httpx import AsyncClient, ASGITransport
@@ -834,10 +840,10 @@ class TestEnterSanitaryDayExitsNightFirst(unittest.IsolatedAsyncioTestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_app_version_is_v454(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.5.4")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
 
     def test_release_date_set(self):
-        self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-29")
+        self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -873,7 +879,7 @@ class TestChangelogModalV454(unittest.TestCase):
     def test_changelog_contains_v454(self):
         with open("/home/z/my-project/v4.5/templates/base.html", encoding="utf-8") as f:
             html = f.read()
-        self.assertIn("v4.5.4", html)
+        self.assertIn("v4.6.0", html)
         self.assertIn("Sanitary days", html)
         self.assertIn("lockdown", html)
         # v4.5.3 still mentioned (compressed).

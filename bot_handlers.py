@@ -1173,11 +1173,16 @@ def _parse_sanitary_date(s: str) -> date | None:
 
 
 def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
-    """v4.5.4: парсит JSON sanitary_days в list пар [start_iso, end_iso].
+    """v4.5.4 + v4.6.0: парсит JSON sanitary_days в list пар [start_iso, end_iso].
+
+    v4.6.0: поддерживает 2 формата хранения:
+      1. Старый (плоский массив пар): [["2026-08-01","2026-08-01"], ...]
+      2. Новый (monthly): {"2026-08": [["2026-08-01","2026-08-01"]], "2026-09": []}
+
+    Если данные — dict (новый формат) — берём ВСЕ пары из всех месяцев.
+    Если данные — list (старый формат) — берём как есть (обратная совместимость).
 
     Невалидные записи пропускаются. Возвращает [] для пустого/битого JSON.
-    Каждая запись должна быть массивом из 2 строк 'YYYY-MM-DD'.
-    end < start трактуется как однодневный санитарный день на start.
     """
     if not json_str:
         return []
@@ -1185,6 +1190,29 @@ def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
         data = json.loads(json_str)
     except (ValueError, TypeError):
         return []
+
+    # v4.6.0: новый формат — dict по месяцам.
+    if isinstance(data, dict):
+        out: list[list[str]] = []
+        for month_key, entries in data.items():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    continue
+                s, e = entry[0], entry[1]
+                if not isinstance(s, str) or not isinstance(e, str):
+                    continue
+                ds = _parse_sanitary_date(s)
+                de = _parse_sanitary_date(e)
+                if ds is None or de is None:
+                    continue
+                if de < ds:
+                    de = ds
+                out.append([ds.isoformat(), de.isoformat()])
+        return out
+
+    # Старый формат — плоский list.
     if not isinstance(data, list):
         return []
     out: list[list[str]] = []
@@ -1205,8 +1233,81 @@ def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
     return out
 
 
+def parse_sanitary_days_monthly(
+    json_str: str | None,
+    month_key: str | None = None,
+) -> dict[str, list[list[str]]]:
+    """v4.6.0: парсит JSON sanitary_days в dict по месяцам.
+
+    Возвращает dict {"YYYY-MM": [[start_iso, end_iso], ...], ...}.
+
+    Если month_key задан — возвращает dict только с этим месяцем
+    (пустой список если месяца нет в данных).
+
+    Старый формат (плоский массив) автоматически конвертируется:
+    пары группируются по месяцу даты начала.
+    """
+    if not json_str:
+        return {} if month_key is None else {month_key: []}
+    try:
+        data = json.loads(json_str)
+    except (ValueError, TypeError):
+        return {} if month_key is None else {month_key: []}
+
+    if isinstance(data, dict):
+        # Новый формат — фильтруем и нормализуем.
+        result: dict[str, list[list[str]]] = {}
+        for mk, entries in data.items():
+            if not isinstance(entries, list):
+                continue
+            month_pairs: list[list[str]] = []
+            for entry in entries:
+                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                    continue
+                s, e = entry[0], entry[1]
+                if not isinstance(s, str) or not isinstance(e, str):
+                    continue
+                ds = _parse_sanitary_date(s)
+                de = _parse_sanitary_date(e)
+                if ds is None or de is None:
+                    continue
+                if de < ds:
+                    de = ds
+                month_pairs.append([ds.isoformat(), de.isoformat()])
+            result[mk] = month_pairs
+        if month_key is not None:
+            return {month_key: result.get(month_key, [])}
+        return result
+
+    if isinstance(data, list):
+        # Старый формат — группируем по месяцу start.
+        grouped: dict[str, list[list[str]]] = {}
+        for entry in data:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                continue
+            s, e = entry[0], entry[1]
+            if not isinstance(s, str) or not isinstance(e, str):
+                continue
+            ds = _parse_sanitary_date(s)
+            de = _parse_sanitary_date(e)
+            if ds is None or de is None:
+                continue
+            if de < ds:
+                de = ds
+            mk = ds.strftime("%Y-%m")
+            grouped.setdefault(mk, []).append([ds.isoformat(), de.isoformat()])
+        if month_key is not None:
+            return {month_key: grouped.get(month_key, [])}
+        return grouped
+
+    return {} if month_key is None else {month_key: []}
+
+
 def serialize_sanitary_days(pairs: list[list[str]]) -> str:
     """v4.5.4: сериализует list пар [start_iso, end_iso] в JSON-строку.
+
+    v4.6.0: эта функция сохранена для обратной совместимости, но новые записи
+    рекомендуется хранить через serialize_sanitary_days_monthly (dict по месяцам).
 
     Каждая пара должна быть [start, end] ISO-строками; имена валидируются
     через _parse_sanitary_date (невалидные пропускаются).
@@ -1225,6 +1326,37 @@ def serialize_sanitary_days(pairs: list[list[str]]) -> str:
     return json.dumps(norm)
 
 
+def serialize_sanitary_days_monthly(
+    monthly: dict[str, list[list[str]]],
+) -> str:
+    """v4.6.0: сериализует dict по месяцам в JSON-строку.
+
+    Каждая пара валидируется и нормализуется. Пустые значения и пустые dict
+    → пустая строка "[]" (не None, чтобы UI отличал «нет настроек» от «пусто»).
+
+    Формат: {"2026-08": [["2026-08-02","2026-08-03"]], "2026-09": []}
+    """
+    if not monthly:
+        return "[]"
+    out: dict[str, list[list[str]]] = {}
+    for mk, pairs in monthly.items():
+        if not isinstance(pairs, list):
+            continue
+        norm: list[list[str]] = []
+        for p in pairs:
+            if not isinstance(p, (list, tuple)) or len(p) != 2:
+                continue
+            ds = _parse_sanitary_date(str(p[0]))
+            de = _parse_sanitary_date(str(p[1]))
+            if ds is None or de is None:
+                continue
+            if de < ds:
+                de = ds
+            norm.append([ds.isoformat(), de.isoformat()])
+        out[mk] = norm
+    return json.dumps(out)
+
+
 def is_sanitary_day_today(
     pairs: list[list[str]] | str | None,
     today: date | None = None,
@@ -1232,7 +1364,8 @@ def is_sanitary_day_today(
     """v4.5.4: проверяет, попадает ли today (по умолчанию сегодня UTC) в одну
     из пар санитарных дней.
 
-    Принимает как уже распарсенный list пар, так и сырую JSON-строку.
+    Принимает как уже распарсенный list пар, так и сырую JSON-строку
+    (поддерживает оба формата — list и dict-monthly, через parse_sanitary_days_json).
     Диапазон inclusive по обеим датам: [start, end].
     """
     if today is None:
@@ -1302,7 +1435,10 @@ def parse_sanitary_days_textarea(
 
 
 def format_sanitary_days_textarea(pairs: list[list[str]] | str | None) -> str:
-    """v4.5.4: форматирование списка пар в textarea-строки (для UI).
+    """v4.5.4 + v4.6.0: форматирование списка пар в textarea-строки (для UI).
+
+    v4.6.0: поддерживает оба формата JSON (плоский list и dict-monthly) —
+    парсит через parse_sanitary_days_json (которая сама определяет формат).
 
     Однодневные пары (start == end) выводятся одной датой.
     Многодневные — через ' - '.

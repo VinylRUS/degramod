@@ -870,7 +870,7 @@ class TestNightModePresetNameCustom(unittest.TestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_version_bumped(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.5.6")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -224,12 +224,12 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
 class TestVersionBumped(unittest.TestCase):
 
     def test_app_version_is_v456(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.5.6")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
 
     def test_changelog_has_v456_entry(self):
         with open("templates/base.html", "r", encoding="utf-8") as f:
             html = f.read()
-        self.assertIn("v4.5.6", html)
+        self.assertIn("v4.6.0", html)
         # Must mention ephemeral auto-delete
         self.assertIn("Ephemeral auto-delete", html)
         # Must mention 30 seconds

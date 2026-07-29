@@ -322,6 +322,150 @@
                 </div>
             </div>
 
+            {# ── v4.6.0: Granular permissions — Day / Sanitary preset dropdowns ── #}
+            <details style="margin-top: var(--sp-3); padding: var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                <summary style="cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">
+                    v4.6.0: Granular permissions (Day / Sanitary presets)
+                </summary>
+                <div style="margin-top: var(--sp-3);">
+                    <div style="font-size: 10px; color: var(--text-dim); margin-bottom: var(--sp-3);">
+                        По умолчанию дневные права берутся из текущего состояния чата (snapshot), а санитарные = полный локдаун.
+                        Здесь можно явно задать пресет для каждого режима. Создать свой пресет — на странице <a href="/admin/presets" style="color: var(--accent);">/admin/presets</a>.
+                    </div>
+
+                    {# Day preset #}
+                    {% set day_perms = c.day_permissions | from_json if c.day_permissions else {} %}
+                    <div style="margin-bottom: var(--sp-3); padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
+                            ☀️ Day preset (default chat state)
+                        </div>
+                        <select name="day_preset_id" id="day_preset_{{ c.chat_id }}" onchange="toggleDayGrid_{{ c.chat_id }}()"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
+                            <option value="__none__" {% if not c.day_permissions %}selected{% endif %}>(snapshot — auto from chat)</option>
+                            {% for p in presets_by_scope.day %}
+                            <option value="{{ p.id }}" {% if c.day_permissions and p.permissions == c.day_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                            {% endfor %}
+                            <option value="custom" {% if c.day_permissions and not (c.day_permissions in (presets_by_scope.day | map(attribute='permissions') | list)) %}selected{% endif %}>— Custom —</option>
+                        </select>
+                        <div id="day_custom_grid_{{ c.chat_id }}" style="margin-top: 6px; {% if not c.day_permissions or c.day_permissions in (presets_by_scope.day | map(attribute='permissions') | list) %}display:none;{% endif %}">
+                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                                {% set day_grid = [
+                                    ('day_perm_can_send_messages', 'Text msgs', day_perms.get('can_send_messages', False)),
+                                    ('day_perm_can_send_audios', 'Audios', day_perms.get('can_send_audios', False)),
+                                    ('day_perm_can_send_documents', 'Documents', day_perms.get('can_send_documents', False)),
+                                    ('day_perm_can_send_photos', 'Photos', day_perms.get('can_send_photos', False)),
+                                    ('day_perm_can_send_videos', 'Videos', day_perms.get('can_send_videos', False)),
+                                    ('day_perm_can_send_video_notes', 'Video notes', day_perms.get('can_send_video_notes', False)),
+                                    ('day_perm_can_send_voice_notes', 'Voice notes', day_perms.get('can_send_voice_notes', False)),
+                                    ('day_perm_can_send_polls', 'Polls', day_perms.get('can_send_polls', False)),
+                                    ('day_perm_can_send_other_messages', 'Stickers/GIFs', day_perms.get('can_send_other_messages', False)),
+                                    ('day_perm_can_add_web_page_previews', 'Link previews', day_perms.get('can_add_web_page_previews', False)),
+                                    ('day_perm_can_change_info', 'Change info', day_perms.get('can_change_info', False)),
+                                    ('day_perm_can_invite_users', 'Invite users', day_perms.get('can_invite_users', False)),
+                                    ('day_perm_can_pin_messages', 'Pin msgs', day_perms.get('can_pin_messages', False)),
+                                ] %}
+                                {% for field_name, label, val in day_grid %}
+                                <label style="display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text); cursor: pointer;">
+                                    <input type="checkbox" name="{{ field_name }}" {% if val %}checked{% endif %}>
+                                    {{ label }}
+                                </label>
+                                {% endfor %}
+                            </div>
+                        </div>
+                    </div>
+
+                    {# Night preset (overrides old dropdown above) #}
+                    {% set nm_perms_v460 = c.night_mode_permissions | from_json if c.night_mode_permissions else {} %}
+                    <div style="margin-bottom: var(--sp-3); padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
+                            🌙 Night preset (overrides old dropdown)
+                        </div>
+                        <select name="night_preset_id" id="night_preset_{{ c.chat_id }}" onchange="toggleNightGrid_{{ c.chat_id }}()"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
+                            <option value="__none__" {% if not c.night_mode_permissions %}selected{% endif %}>(none — use old dropdown above)</option>
+                            {% for p in presets_by_scope.night %}
+                            <option value="{{ p.id }}" {% if c.night_mode_permissions and p.permissions == c.night_mode_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                            {% endfor %}
+                            <option value="custom" {% if c.night_mode_permissions and not (c.night_mode_permissions in (presets_by_scope.night | map(attribute='permissions') | list)) %}selected{% endif %}>— Custom (use old grid above) —</option>
+                        </select>
+                        <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim);">
+                            Если выбран пресет — он переписывает значение из dropdown выше. Если «none» — используется старый dropdown + custom grid выше.
+                        </div>
+                    </div>
+
+                    {# Sanitary preset #}
+                    {% set san_perms = c.sanitary_days_permissions | from_json if c.sanitary_days_permissions else {} %}
+                    <div style="padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
+                            🧹 Sanitary preset (lockdown by default)
+                        </div>
+                        <select name="sanitary_preset_id" id="sanitary_preset_{{ c.chat_id }}" onchange="toggleSanitaryGrid_{{ c.chat_id }}()"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
+                            <option value="__lockdown__" {% if not c.sanitary_days_permissions %}selected{% endif %}>Full lockdown (default — all False, reactions remain)</option>
+                            {% for p in presets_by_scope.sanitary %}
+                            <option value="{{ p.id }}" {% if c.sanitary_days_permissions and p.permissions == c.sanitary_days_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                            {% endfor %}
+                            <option value="custom" {% if c.sanitary_days_permissions and not (c.sanitary_days_permissions in (presets_by_scope.sanitary | map(attribute='permissions') | list)) and c.sanitary_days_permissions != '{"can_send_messages": false, "can_send_audios": false, "can_send_documents": false, "can_send_photos": false, "can_send_videos": false, "can_send_video_notes": false, "can_send_voice_notes": false, "can_send_polls": false, "can_send_other_messages": false, "can_add_web_page_previews": false, "can_change_info": false, "can_invite_users": false, "can_pin_messages": false}' %}selected{% endif %}>— Custom —</option>
+                        </select>
+                        <div id="sanitary_custom_grid_{{ c.chat_id }}" style="margin-top: 6px; {% if not c.sanitary_days_permissions or c.sanitary_days_permissions in (presets_by_scope.sanitary | map(attribute='permissions') | list) or c.sanitary_days_permissions == '{"can_send_messages": false, "can_send_audios": false, "can_send_documents": false, "can_send_photos": false, "can_send_videos": false, "can_send_video_notes": false, "can_send_voice_notes": false, "can_send_polls": false, "can_send_other_messages": false, "can_add_web_page_previews": false, "can_change_info": false, "can_invite_users": false, "can_pin_messages": false}' %}display:none;{% endif %}">
+                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+                                {% set san_grid = [
+                                    ('sanitary_perm_can_send_messages', 'Text msgs', san_perms.get('can_send_messages', False)),
+                                    ('sanitary_perm_can_send_audios', 'Audios', san_perms.get('can_send_audios', False)),
+                                    ('sanitary_perm_can_send_documents', 'Documents', san_perms.get('can_send_documents', False)),
+                                    ('sanitary_perm_can_send_photos', 'Photos', san_perms.get('can_send_photos', False)),
+                                    ('sanitary_perm_can_send_videos', 'Videos', san_perms.get('can_send_videos', False)),
+                                    ('sanitary_perm_can_send_video_notes', 'Video notes', san_perms.get('can_send_video_notes', False)),
+                                    ('sanitary_perm_can_send_voice_notes', 'Voice notes', san_perms.get('can_send_voice_notes', False)),
+                                    ('sanitary_perm_can_send_polls', 'Polls', san_perms.get('can_send_polls', False)),
+                                    ('sanitary_perm_can_send_other_messages', 'Stickers/GIFs', san_perms.get('can_send_other_messages', False)),
+                                    ('sanitary_perm_can_add_web_page_previews', 'Link previews', san_perms.get('can_add_web_page_previews', False)),
+                                    ('sanitary_perm_can_change_info', 'Change info', san_perms.get('can_change_info', False)),
+                                    ('sanitary_perm_can_invite_users', 'Invite users', san_perms.get('can_invite_users', False)),
+                                    ('sanitary_perm_can_pin_messages', 'Pin msgs', san_perms.get('can_pin_messages', False)),
+                                ] %}
+                                {% for field_name, label, val in san_grid %}
+                                <label style="display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text); cursor: pointer;">
+                                    <input type="checkbox" name="{{ field_name }}" {% if val %}checked{% endif %}>
+                                    {{ label }}
+                                </label>
+                                {% endfor %}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <script>
+                    function toggleDayGrid_{{ c.chat_id }}() {
+                        const sel = document.getElementById('day_preset_{{ c.chat_id }}');
+                        const grid = document.getElementById('day_custom_grid_{{ c.chat_id }}');
+                        if (sel && grid) {
+                            grid.style.display = (sel.value === 'custom') ? 'block' : 'none';
+                        }
+                    }
+                    function toggleNightGrid_{{ c.chat_id }}() {
+                        // Night grid is the old custom grid (perm_can_send_*) — show only if preset=custom.
+                        const sel = document.getElementById('night_preset_{{ c.chat_id }}');
+                        const oldGrid = document.getElementById('nm_custom_grid_{{ c.chat_id }}');
+                        const oldSel = document.getElementById('nm_preset_{{ c.chat_id }}');
+                        if (sel && oldGrid) {
+                            if (sel.value === 'custom') {
+                                oldGrid.style.display = 'block';
+                                if (oldSel) oldSel.value = 'custom';
+                            } else if (sel.value !== '__none__') {
+                                oldGrid.style.display = 'none';
+                            }
+                        }
+                    }
+                    function toggleSanitaryGrid_{{ c.chat_id }}() {
+                        const sel = document.getElementById('sanitary_preset_{{ c.chat_id }}');
+                        const grid = document.getElementById('sanitary_custom_grid_{{ c.chat_id }}');
+                        if (sel && grid) {
+                            grid.style.display = (sel.value === 'custom') ? 'block' : 'none';
+                        }
+                    }
+                </script>
+            </details>
+
             <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
                 <button type="submit"
                         style="padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">

@@ -667,10 +667,10 @@ class TestVersionDisplay(unittest.TestCase):
     def test_app_version_is_v452(self):
         # v4.5.6 bumped the version; this test still validates that APP_VERSION
         # is correctly set in web_app module.
-        self.assertEqual(web_app.APP_VERSION, "v4.5.6")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
 
     def test_app_release_date_set(self):
-        self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-29")
+        self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
 
     def test_night_mode_preset_name_filter_exists(self):
         """Фильтр _night_mode_preset_name зарегистрирован в templates.env.filters."""

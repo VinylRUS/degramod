@@ -203,14 +203,31 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
 
     v4.5.3: если night_mode_notify=True — отправляет уведомление в чат
     (с кастомным текстом если задан).
+    v4.6.0: если cs.day_permissions задан (granular) — snapshot берётся из него,
+    иначе как раньше — из текущих ChatPermissions чата.
     """
     try:
         chat_info = await bot.get_chat(chat_id=cs.chat_id)
         current_perms = chat_info.permissions
-        # Сохраняем snapshot — что восстанавливать при выходе
-        snapshot_data = {}
-        for field in _PERM_FIELDS:
-            snapshot_data[field] = bool(getattr(current_perms, field, True)) if current_perms else True
+        # Сохраняем snapshot — что восстанавливать при выходе.
+        # v4.6.0: если есть явное day_permissions — используем его как «истинные»
+        # дневные права (это то что должно быть после выхода из ночного).
+        # Иначе — берём текущие права чата (старое поведение).
+        if cs.day_permissions:
+            try:
+                snapshot_data = json.loads(cs.day_permissions)
+                # Гарантируем что все 13 полей присутствуют.
+                snapshot_data = {k: bool(snapshot_data.get(k, False)) for k in _PERM_FIELDS}
+            except (ValueError, TypeError):
+                snapshot_data = {
+                    field: bool(getattr(current_perms, field, True)) if current_perms else True
+                    for field in _PERM_FIELDS
+                }
+        else:
+            snapshot_data = {
+                field: bool(getattr(current_perms, field, True)) if current_perms else True
+                for field in _PERM_FIELDS
+            }
         snapshot_json = json.dumps(snapshot_data)
 
         # Применяем ночные права
@@ -258,28 +275,34 @@ async def _exit_night_mode(cs: ChatSettings) -> None:
     """Восстанавливает права чата из snapshot при выходе из ночного режима.
 
     v4.5.3: если night_mode_notify=True — отправляет уведомление о выходе.
+    v4.6.0: приоритет восстановления:
+      1. cs.day_permissions (granular, явно заданные дневные права) — лучший вариант
+      2. cs.night_mode_saved_permissions (snapshot с входа в ночной режим)
+      3. Fallback: «всё разрешено»
     """
-    snapshot_json = cs.night_mode_saved_permissions
-    if not snapshot_json:
-        # Нет snapshot — даём дефолтные "всё разрешено"
-        from aiogram import types as _tg_types
-        restore_perms = _tg_types.ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True,
-            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-            can_add_web_page_previews=True, can_change_info=True, can_invite_users=True,
-            can_pin_messages=True,
-        )
-    else:
+    # v4.6.0: предпочтение — granular day_permissions.
+    if cs.day_permissions:
         try:
-            data = json.loads(snapshot_json)
+            data = json.loads(cs.day_permissions)
             from aiogram import types as _tg_types
             restore_perms = _tg_types.ChatPermissions(
-                **{k: data.get(k, True) for k in _PERM_FIELDS}
+                **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
             )
         except (ValueError, TypeError):
-            from aiogram import types as _tg_types
-            restore_perms = _tg_types.ChatPermissions(can_send_messages=True)
+            restore_perms = _fallback_all_true_perms()
+    else:
+        snapshot_json = cs.night_mode_saved_permissions
+        if not snapshot_json:
+            restore_perms = _fallback_all_true_perms()
+        else:
+            try:
+                data = json.loads(snapshot_json)
+                from aiogram import types as _tg_types
+                restore_perms = _tg_types.ChatPermissions(
+                    **{k: bool(data.get(k, True)) for k in _PERM_FIELDS}
+                )
+            except (ValueError, TypeError):
+                restore_perms = _fallback_all_true_perms()
 
     try:
         await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
@@ -404,7 +427,8 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
        day-права, чистим night-флаги). Это гарантирует, что sanitary snapshot
        содержит настоящие day-права, а не ночные.
     2. Делаем snapshot текущих ChatPermissions.
-    3. Ставим все права в False (полный lockdown).
+    3. Ставим все права в False (полный lockdown) — ИЛИ используем granular
+       sanitary_days_permissions если задан (v4.6.0).
     4. Сохраняем snapshot и флаг.
     """
     try:
@@ -427,18 +451,47 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                     cs = fresh
 
         # 2. Snapshot текущих прав.
-        chat_info = await bot.get_chat(chat_id=cs.chat_id)
-        current_perms = chat_info.permissions
-        snapshot_data = {}
-        for field in _PERM_FIELDS:
-            snapshot_data[field] = bool(getattr(current_perms, field, True)) if current_perms else True
+        # v4.6.0: если есть явное day_permissions — используем его как snapshot.
+        if cs.day_permissions:
+            try:
+                snapshot_data = json.loads(cs.day_permissions)
+                snapshot_data = {k: bool(snapshot_data.get(k, False)) for k in _PERM_FIELDS}
+            except (ValueError, TypeError):
+                chat_info = await bot.get_chat(chat_id=cs.chat_id)
+                current_perms = chat_info.permissions
+                snapshot_data = {
+                    field: bool(getattr(current_perms, field, True)) if current_perms else True
+                    for field in _PERM_FIELDS
+                }
+        else:
+            chat_info = await bot.get_chat(chat_id=cs.chat_id)
+            current_perms = chat_info.permissions
+            snapshot_data = {
+                field: bool(getattr(current_perms, field, True)) if current_perms else True
+                for field in _PERM_FIELDS
+            }
         snapshot_json = json.dumps(snapshot_data)
 
-        # 3. Применяем полный lockdown — все права False.
-        from aiogram import types as _tg_types
-        lockdown_perms = _tg_types.ChatPermissions(
-            **{k: False for k in _PERM_FIELDS}
-        )
+        # 3. Применяем sanitary-права.
+        # v4.6.0: если cs.sanitary_days_permissions задан — используем granular,
+        # иначе — полный lockdown (all False, как раньше).
+        if cs.sanitary_days_permissions:
+            try:
+                data = json.loads(cs.sanitary_days_permissions)
+                from aiogram import types as _tg_types
+                lockdown_perms = _tg_types.ChatPermissions(
+                    **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
+                )
+            except (ValueError, TypeError):
+                from aiogram import types as _tg_types
+                lockdown_perms = _tg_types.ChatPermissions(
+                    **{k: False for k in _PERM_FIELDS}
+                )
+        else:
+            from aiogram import types as _tg_types
+            lockdown_perms = _tg_types.ChatPermissions(
+                **{k: False for k in _PERM_FIELDS}
+            )
         await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=lockdown_perms)
 
         # 4. Сохраняем snapshot и флаг.
@@ -464,31 +517,54 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
     После восстановления night mode tick (запускается сразу после sanitary
     tick в _night_mode_loop) сам решит, нужно ли входить в ночной режим —
     если окно ещё активно, он сделает свежий snapshot и применит ночные права.
+
+    v4.6.0: приоритет восстановления:
+      1. cs.day_permissions (granular, явно заданные дневные права) — лучший вариант
+      2. cs.sanitary_days_saved_permissions (snapshot с входа в sanitary)
+      3. Fallback: «всё разрешено»
+
+    v4.6.0: после выхода — проставляем last_sanitary_month=current month чтобы
+    suppress dashboard warning "нет дат на след. месяц" если санитарный день
+    уже прошёл в этом месяце.
     """
-    snapshot_json = cs.sanitary_days_saved_permissions
-    if not snapshot_json:
-        # Нет snapshot — даём дефолтные "всё разрешено".
-        from aiogram import types as _tg_types
-        restore_perms = _tg_types.ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True,
-            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-            can_add_web_page_previews=True, can_change_info=True, can_invite_users=True,
-            can_pin_messages=True,
-        )
-    else:
+    # v4.6.0: предпочтение — granular day_permissions.
+    if cs.day_permissions:
         try:
-            data = json.loads(snapshot_json)
+            data = json.loads(cs.day_permissions)
             from aiogram import types as _tg_types
             restore_perms = _tg_types.ChatPermissions(
-                **{k: data.get(k, True) for k in _PERM_FIELDS}
+                **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
             )
         except (ValueError, TypeError):
-            from aiogram import types as _tg_types
-            restore_perms = _tg_types.ChatPermissions(can_send_messages=True)
+            restore_perms = _fallback_all_true_perms()
+    else:
+        snapshot_json = cs.sanitary_days_saved_permissions
+        if not snapshot_json:
+            restore_perms = _fallback_all_true_perms()
+        else:
+            try:
+                data = json.loads(snapshot_json)
+                from aiogram import types as _tg_types
+                restore_perms = _tg_types.ChatPermissions(
+                    **{k: bool(data.get(k, True)) for k in _PERM_FIELDS}
+                )
+            except (ValueError, TypeError):
+                restore_perms = _fallback_all_true_perms()
 
     try:
         await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+
+        # v4.6.0: проставляем last_sanitary_month и чистим старые месяцы.
+        from datetime import datetime as _dt, timezone as _tz
+        # Часовой пояс чата (берём из night_mode_tz — общий для всего chat_settings).
+        tz_name = cs.night_mode_tz or "Europe/Moscow"
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except (ValueError, KeyError, ImportError):
+            tz = _tz.utc
+        current_month_str = _dt.now(tz).strftime("%Y-%m")
+
         async with async_session() as session:
             db_cs = (await session.execute(
                 select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
@@ -496,10 +572,36 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
             if db_cs:
                 db_cs.sanitary_days_currently_active = False
                 db_cs.sanitary_days_saved_permissions = None
+                # v4.6.0: monthly cleanup — удаляем ключ текущего месяца из sanitary_days
+                # JSON и проставляем last_sanitary_month чтобы suppress warnings.
+                db_cs.last_sanitary_month = current_month_str
+                if db_cs.sanitary_days:
+                    try:
+                        sd_data = json.loads(db_cs.sanitary_days)
+                        if isinstance(sd_data, dict):
+                            # Удаляем ключ текущего месяца (сан. день прошёл).
+                            sd_data.pop(current_month_str, None)
+                            db_cs.sanitary_days = json.dumps(sd_data) if sd_data else None
+                    except (ValueError, TypeError):
+                        pass
                 await session.commit()
         logger.info("Sanitary day OFF for chat %s (perms restored)", cs.chat_id)
     except TelegramBadRequest as e:
         logger.error("Sanitary day exit failed for chat %s: %s", cs.chat_id, e)
+
+
+def _fallback_all_true_perms():
+    """v4.6.0: ChatPermissions со всеми True — фоллбэк когда нет ни snapshot,
+    ни granular day_permissions. Используется в _exit_night_mode / _exit_sanitary_day.
+    """
+    from aiogram import types as _tg_types
+    return _tg_types.ChatPermissions(
+        can_send_messages=True, can_send_audios=True, can_send_documents=True,
+        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+        can_add_web_page_previews=True, can_change_info=True, can_invite_users=True,
+        can_pin_messages=True,
+    )
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────

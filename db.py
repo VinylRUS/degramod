@@ -209,15 +209,67 @@ class ChatSettings(Base):
     # снапшот (как будто night закончился), потом sanitary берёт управление.
     # Когда sanitary day заканчивается — восстанавливаем snapshot, и night
     # mode tick может снова войти в ночной режим если окно всё ещё активно.
-    # Формат: JSON-массив пар [["YYYY-MM-DD","YYYY-MM-DD"], ...].
-    # Однодневный санитарный день — пара с одинаковыми датами.
-    # NULL или "[]" — санитарных дней нет.
+    # v4.6.0: формат изменён на monthly — JSON-объект вида
+    #   {"2026-08": [["2026-08-02","2026-08-03"]],
+    #    "2026-09": []}
+    # При выходе из последнего санитарного дня месяца — ключ этого месяца
+    # удаляется, ставится отметка last_sanitary_month="2026-08" чтобы
+    # suppress dashboard warnings ("в этом месяце уже был санитарный день").
+    # Старый формат (плоский массив пар) поддерживается — конвертируется
+    # при первом чтении (parse_sanitary_days_json).
     sanitary_days = Column(Text, nullable=True)
     # JSON-снапшот прав чата ДО входа в санитарный день — восстанавливается
     # при выходе из него. Аналог night_mode_saved_permissions.
     sanitary_days_saved_permissions = Column(Text, nullable=True)
     # Флаг: сейчас активен санитарный день (для логирования и веб-панели).
     sanitary_days_currently_active = Column(Boolean, default=False, nullable=False)
+
+    # ── v4.6.0: Granular permissions ───────────────────────────────────
+    # day_permissions — права, применяемые в нормальном дневном состоянии.
+    # Если NULL — бот берёт текущие права чата через snapshot (старое поведение,
+    # обратная совместимость). Если задан (JSON) — используется явно.
+    # Заполняется при выборе preset'а в веб-панели (PermissionPreset.scope='day').
+    day_permissions = Column(Text, nullable=True)
+    # sanitary_days_permissions — права на время санитарного дня. По умолчанию
+    # NULL = all False (полный локдаун). Можно переопределить через preset
+    # scope='sanitary' (например, оставить только текст).
+    sanitary_days_permissions = Column(Text, nullable=True)
+    # last_sanitary_month — месяц (YYYY-MM) в котором последний раз проводился
+    # санитарный день. Защищает от ложных warnings "нет дат на след. месяц"
+    # если санитарный день уже прошёл в текущем месяце. NULL = никогда.
+    last_sanitary_month = Column(String(7), nullable=True)
+
+
+class PermissionPreset(Base):
+    """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
+
+    Хранит именованный набор ChatPermissions (13 bool полей) с указанием scope.
+    Один пресет можно привязать к нескольким чатам — но в каждом чате сохраняется
+    копия JSON (в ChatSettings.day_permissions / night_mode_permissions /
+    sanitary_days_permissions), чтобы изменение/удаление пресета не ломало
+    уже настроенные чаты.
+
+    Системный пресет «Full lockdown» (scope='sanitary', id=1, все 13 полей False)
+    создаётся автоматически при init_db и не может быть удалён.
+
+    scope:
+      • 'day'      — пресет для дневного режима (default chat state)
+      • 'night'    — пресет для ночного режима
+      • 'sanitary' — пресет для санитарных дней
+
+    permissions — JSON вида {"can_send_messages": true, "can_send_audios": false, ...}
+    со всеми 13 полями ChatPermissions.
+    """
+    __tablename__ = "permission_presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(64), nullable=False, unique=True, index=True)
+    scope = Column(String(16), nullable=False, index=True)  # 'day' | 'night' | 'sanitary'
+    permissions = Column(Text, nullable=False)              # JSON of 13 ChatPermissions fields
+    is_system = Column(Boolean, default=False, nullable=False)  # True = неудаляемый системный пресет
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
 
 
 class WordFilter(Base):
@@ -522,6 +574,41 @@ async def init_db() -> None:
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
 
+    # ── Миграция: расширение chat_settings (v4.6.0) ────────────────────
+    # Новые поля: day_permissions, sanitary_days_permissions, last_sanitary_month.
+    # Идемпотентно (PRAGMA check + ALTER TABLE).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v460_chat_settings_cols = [
+            ("day_permissions",            "TEXT NULL"),
+            ("sanitary_days_permissions",  "TEXT NULL"),
+            ("last_sanitary_month",        "VARCHAR(7) NULL"),
+        ]
+        for col_name, col_type in v460_chat_settings_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
+    # ── Миграция: новая таблица permission_presets (v4.6.0) ───────────
+    # create_all() выше создаст её для новой БД; для существующей — IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS permission_presets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name VARCHAR(64) NOT NULL UNIQUE,
+                scope VARCHAR(16) NOT NULL,
+                permissions TEXT NOT NULL,
+                is_system BOOLEAN NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_permission_presets_scope ON permission_presets (scope)"
+        ))
+
     # ── v4.5.2: новые таблицы (word_filters, link_allowlist, banned_sticker_packs)
     # create_all() выше уже создаст их для новой БД; для существующей БД
     # добавляем CREATE TABLE IF NOT EXISTS на случай если create_all пропустил.
@@ -611,6 +698,61 @@ async def init_db() -> None:
             if existing_su.role != "su":
                 existing_su.role = "su"
                 await session.commit()
+
+    # ── v4.6.0: Seed системных permission presets ──────────────────────
+    # Создаём 3 неудаляемых системных пресета — по одному на каждый scope.
+    # Если они уже есть (idempotent) — пропускаем.
+    import json as _json
+    _ALL_TRUE = {k: True for k in (
+        "can_send_messages", "can_send_audios", "can_send_documents",
+        "can_send_photos", "can_send_videos", "can_send_video_notes",
+        "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+        "can_add_web_page_previews", "can_change_info", "can_invite_users",
+        "can_pin_messages",
+    )}
+    _ALL_FALSE = {k: False for k in _ALL_TRUE}
+    _TEXT_ONLY = {**_ALL_FALSE, "can_send_messages": True}
+    _DAY_DEFAULT = {
+        # Per user spec for "Day default":
+        # Allowed: text, audios, photos, videos, stickers/GIFs (other_messages)
+        # Blocked: documents, vnotes, voices, polls, link_previews,
+        #          change_info, invite_users, pin_messages
+        "can_send_messages": True,
+        "can_send_audios": True,
+        "can_send_photos": True,
+        "can_send_videos": True,
+        "can_send_other_messages": True,  # stickers, GIFs, dice
+        "can_send_documents": False,
+        "can_send_video_notes": False,
+        "can_send_voice_notes": False,
+        "can_send_polls": False,
+        "can_add_web_page_previews": False,
+        "can_change_info": False,
+        "can_invite_users": False,
+        "can_pin_messages": False,
+    }
+    _SYSTEM_PRESETS = [
+        ("Full lockdown", "sanitary", _ALL_FALSE),
+        ("Text only",     "night",    _TEXT_ONLY),
+        ("Day default",   "day",      _DAY_DEFAULT),
+    ]
+    async with async_session() as session:
+        for name, scope, perms in _SYSTEM_PRESETS:
+            existing_p = (await session.execute(
+                select(PermissionPreset).where(PermissionPreset.name == name)
+            )).scalar_one_or_none()
+            if existing_p is None:
+                session.add(PermissionPreset(
+                    name=name, scope=scope,
+                    permissions=_json.dumps(perms),
+                    is_system=True,
+                ))
+            else:
+                # Гарантируем что is_system=True (на случай если пресет был создан
+                # вручную до того как стал системным — unlikely но безопасно).
+                if not existing_p.is_system:
+                    existing_p.is_system = True
+        await session.commit()
 
 
 async def get_session() -> AsyncSession:
