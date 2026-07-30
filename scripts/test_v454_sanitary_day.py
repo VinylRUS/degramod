@@ -19,7 +19,7 @@ test_v454_sanitary_day.py — Тесты v4.5.4: Санитарные дни (ch
  11. _sanitary_day_tick enter/exit (через mock bot).
  12. _enter_sanitary_day: snapshot + lockdown + flag set.
  13. _exit_sanitary_day: restore from snapshot + flag clear.
- 14. APP_VERSION = "v4.6.0".
+ 14. APP_VERSION = "v4.6.1".
  15. /help содержит раздел "Санитарные дни".
  16. base.html changelog modal содержит v4.5.4 заголовок.
  17. admin_chats.html содержит textarea sanitary_days_text + SAN badge.
@@ -840,7 +840,7 @@ class TestEnterSanitaryDayExitsNightFirst(unittest.IsolatedAsyncioTestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_app_version_is_v454(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
     def test_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
@@ -879,7 +879,7 @@ class TestChangelogModalV454(unittest.TestCase):
     def test_changelog_contains_v454(self):
         with open("/home/z/my-project/v4.5/templates/base.html", encoding="utf-8") as f:
             html = f.read()
-        self.assertIn("v4.6.0", html)
+        self.assertIn("v4.6.1", html)
         self.assertIn("Sanitary days", html)
         self.assertIn("lockdown", html)
         # v4.5.3 still mentioned (compressed).
@@ -895,8 +895,10 @@ class TestAdminChatsTemplateV454(unittest.TestCase):
         with open("/home/z/my-project/v4.5/templates/admin_chats.html", encoding="utf-8") as f:
             html = f.read()
         self.assertIn('name="sanitary_days_text"', html)
-        self.assertIn("Sanitary days", html)
-        self.assertIn("LOCKDOWN ACTIVE", html)
+        # v4.6.1: UI переведён на русский; проверяем русское название секции.
+        self.assertIn("Санитарные дни", html)
+        # Бейдж активного локдауна остался (текст в шаблоне есть).
+        self.assertIn("LOCKDOWN", html)
 
     def test_template_contains_san_badge(self):
         with open("/home/z/my-project/v4.5/templates/admin_chats.html", encoding="utf-8") as f:

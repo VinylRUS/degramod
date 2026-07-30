@@ -18,17 +18,11 @@
 <div id="list" class="section-title">All chats <a class="anchor" href="#list">#</a></div>
 
 <div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-4); max-width: 900px; line-height: 1.7;">
-    Chats are detected automatically when the bot is added to them. For each chat you can:
-    set a hashtag (for reports), assign a report chat (where moderation logs go),
-    configure warn thresholds, mark a chat as private (admins won't have access, only SU and explicitly-assigned moderators),
-    <strong style="color: var(--warn);">disable</strong> the bot in a chat (it will completely ignore <em>everything</em> in the chat — no commands, no logging, no auto-detection; as if the bot isn't there),
-    <strong style="color: var(--danger);">delete</strong> a chat (the bot leaves the chat and all related data — settings, moderators, punishment history — is removed; use for test chats),
-    or mark one chat as the global report chat.
-    Chat title is fetched from Telegram; if missing, the bot was probably added without admin rights.
+    Chats are detected automatically when the bot is added to them. Click <strong>Настроить</strong> to open
+    a per-chat accordion with 4 sections: <em>Общее</em>, <em>Наказания</em>, <em>Ночной режим</em>,
+    <em>Санитарные дни</em>. Permission presets are managed on a separate page <a href="/admin/presets" style="color: var(--accent);">/admin/presets</a> — here you only pick which preset to use for each mode.
     <br><br>
-    <strong style="color: var(--accent);">v4.5.1:</strong> multiple chats can be marked as report targets (☆ button on each).
-    Then for each regular chat you pick which report chat to use (dropdown in Settings).
-    Setting <code>warns_to_mute=0</code> disables auto-mute entirely; <code>warns_to_ban=0</code> disables auto-ban.
+    <strong style="color: var(--danger);">Delete</strong> makes the bot leave the chat and removes all related data — settings, moderators, punishment history. Use for test chats.
 </div>
 
 {% if not chats or chats | length == 0 %}
@@ -71,412 +65,294 @@
     </div>
     {% endif %}
 
-    {# ── Toggle buttons row ── #}
+    {# ── Action buttons: only Настроить + Удалить ── #}
     {% if c.chat_id != 0 %}
     <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: var(--sp-3);">
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
-            <input type="hidden" name="field" value="enabled">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
-            </button>
-        </form>
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
-            <input type="hidden" name="field" value="private">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.is_private %}🔒 Private{% else %}🔓 Public{% endif %}
-            </button>
-        </form>
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;"
-              {% if c.is_report_chat %}onsubmit="return true;"{% else %}onsubmit="return confirm('Make this chat the report chat? Other chats will be unmarked.');"{% endif %}>
-            <input type="hidden" name="field" value="report_chat">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.is_report_chat %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.is_report_chat %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.is_report_chat %}★ Report chat{% else %}☆ Make report{% endif %}
-            </button>
-        </form>
-        {# ── v4.5.2: CAS toggle ── #}
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
-            <input type="hidden" name="field" value="cas">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.cas_check_enabled %}var(--info){% else %}var(--border){% endif %}; color: {% if c.cas_check_enabled %}var(--info){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.cas_check_enabled %}CAS ●{% else %}CAS ○{% endif %}
-            </button>
-        </form>
-        {# ── v4.5.2: Link filter toggle ── #}
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
-            <input type="hidden" name="field" value="link_filter">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.link_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.link_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.link_filter_enabled %}LINK-FILTER ●{% else %}LINK-FILTER ○{% endif %}
-            </button>
-        </form>
-        {# ── v4.5.2: Night mode toggle ── #}
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
-            <input type="hidden" name="field" value="night_mode">
-            <button type="submit"
-                    style="padding: 4px 10px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--text-dim){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--text){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                {% if c.night_mode_enabled %}NIGHT ●{% else %}NIGHT ○{% endif %}
-            </button>
-        </form>
         <button type="button" onclick="var el = document.getElementById('edit-{{ c.chat_id }}'); el.style.display = (el.style.display === 'none' || !el.style.display) ? 'block' : 'none';"
-                style="padding: 4px 10px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-            ✎ Settings
+                style="padding: 4px 10px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">
+            ▼ Настроить
         </button>
-        {# ── v4.4.8: Delete chat — бот ливает + чистим БД. Не показываем для chat_id=0. ── #}
-        {# Confirmation dialog показывает сколько наказаний/админов будет удалено. #}
         <form method="post" action="/admin/chats/{{ c.chat_id }}/delete" style="display: inline;"
               onsubmit="return confirm('Delete chat {{ c.title or c.chat_id }}?\n\nBot will LEAVE the chat and ALL data will be deleted:\n  • {{ stats.get(c.chat_id, 0) }} punishments\n  • {{ mod_counts.get(c.chat_id, 0) }} moderators\n  • chat settings\n\nThis cannot be undone.');">
             <button type="submit"
                     style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                ✕ Delete
+                ✕ Удалить
             </button>
         </form>
     </div>
     {% endif %}
 
-    {# ── Inline edit form ── #}
+    {# ──────────────────────────────────────────────────────────────────── #}
+    {# ── Inline edit form: 4 accordion sections ── v4.6.1 ── #}
+    {# ──────────────────────────────────────────────────────────────────── #}
     <div id="edit-{{ c.chat_id }}" style="display: none; padding-top: var(--sp-3); border-top: 1px dashed var(--border);">
-        <form method="post" action="/admin/chats/{{ c.chat_id }}/update" style="display: flex; flex-direction: column; gap: var(--sp-2);">
-            <div>
-                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Hashtag</label>
-                <input type="text" name="hashtag" value="{{ c.hashtag or '' }}" placeholder="#Деградач"
-                       style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-            </div>
-            <div>
-                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Report chat (where moderation logs go)</label>
-                <select name="report_chat_id"
-                        style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                    <option value="" {% if c.report_chat_id is none %}selected{% endif %}>(use global default)</option>
-                    {% for rc in report_chat_options %}
-                    <option value="{{ rc.chat_id }}"
-                        {% if c.report_chat_id is not none and c.report_chat_id == rc.chat_id %}selected{% endif %}>
-                        {{ rc.title }} ({{ rc.chat_id }}){{ ' ' + rc.hashtag if rc.hashtag else '' }}
-                    </option>
-                    {% endfor %}
-                </select>
-                <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
-                    Only chats marked with <span style="color: var(--accent);">☆ Make report</span> appear here.
-                    {% if not report_chat_options or report_chat_options | length == 0 %}
-                    <br><span style="color: var(--warn);">No report chats yet — mark one with ☆ button first.</span>
-                    {% endif %}
-                </div>
-            </div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2);">
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warns → mute</label>
-                    <input type="text" name="warns_to_mute" value="{{ c.warns_to_mute }}" pattern="[0-9]+"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Mute duration (sec)</label>
-                    <input type="text" name="mute_duration_seconds" value="{{ c.mute_duration_seconds }}" pattern="[0-9]+"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warns → ban</label>
-                    <input type="text" name="warns_to_ban" value="{{ c.warns_to_ban }}" pattern="[0-9]+"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-            </div>
-            {# ── v4.5.2: warn decay + link filter action ── #}
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warn decay (days, 0=off)</label>
-                    <input type="text" name="warn_decay_days" value="{{ c.warn_decay_days or 0 }}" pattern="[0-9]+"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Link filter action</label>
-                    <select name="link_filter_action"
-                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                        {% for act in ['delete', 'warn', 'mute', 'ban'] %}
-                        <option value="{{ act }}" {% if c.link_filter_action == act %}selected{% endif %}>{{ act }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-            </div>
-            {# ── v4.5.2 + v4.5.3: night mode full configuration ── #}
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night start</label>
-                    <input type="text" name="night_mode_start" value="{{ c.night_mode_start or '23:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="23:00"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night end</label>
-                    <input type="text" name="night_mode_end" value="{{ c.night_mode_end or '07:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="07:00"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Preset</label>
-                    <select name="night_mode_preset" id="nm_preset_{{ c.chat_id }}" onchange="toggleCustomGrid_{{ c.chat_id }}()"
-                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                        {% set current_preset = c.night_mode_permissions | night_mode_preset_name if c.night_mode_permissions else 'text_only' %}
-                        {% for preset in ['text_only', 'strict', 'none', 'custom'] %}
-                        <option value="{{ preset }}" {% if current_preset == preset %}selected{% endif %}>{{ preset }}</option>
-                        {% endfor %}
-                    </select>
-                </div>
-            </div>
+    <form method="post" action="/admin/chats/{{ c.chat_id }}/update" style="display: flex; flex-direction: column; gap: var(--sp-2);">
 
-            {# v4.5.3: timezone + weekend schedule #}
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Timezone (IANA)</label>
-                    <select name="night_mode_tz"
-                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
-                        {% set current_tz = c.night_mode_tz or 'Europe/Moscow' %}
-                        {% for tz in ['Europe/Moscow', 'Europe/Kaliningrad', 'Europe/Samara', 'Asia/Yekaterinburg', 'Asia/Omsk', 'Asia/Novosibirsk', 'Asia/Krasnoyarsk', 'Asia/Irkutsk', 'Asia/Yakutsk', 'Asia/Vladivostok', 'Asia/Magadan', 'Asia/Kamchatka', 'Europe/Kiev', 'Europe/Minsk', 'Europe/Riga', 'Europe/Tallinn', 'Europe/Vilnius', 'Europe/Tbilisi', 'Asia/Almaty', 'Asia/Tashkent'] %}
-                        <option value="{{ tz }}" {% if current_tz == tz %}selected{% endif %}>{{ tz }}</option>
+        {# ════════════ 1. Общее (default open) ════════════ #}
+        <details open style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+            <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
+                <span>📋 Общее</span>
+                <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {{ c.hashtag or '—' }} · {% if c.cas_check_enabled %}CAS{% endif %}{% if c.link_filter_enabled %} · LINK-FILTER{% endif %}{% if c.is_private %} · PRIVATE{% endif %} · day={% if c.day_permissions %}preset{% else %}snapshot{% endif %}
+                </span>
+            </summary>
+            <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+
+                {# Quick toggles — instant POST, no save needed #}
+                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: var(--sp-3);">
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="enabled">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
+                        </button>
+                    </form>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="cas">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.cas_check_enabled %}var(--info){% else %}var(--border){% endif %}; color: {% if c.cas_check_enabled %}var(--info){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            CAS {% if c.cas_check_enabled %}●{% else %}○{% endif %}
+                        </button>
+                    </form>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="link_filter">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.link_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.link_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            LINK-FILT {% if c.link_filter_enabled %}●{% else %}○{% endif %}
+                        </button>
+                    </form>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="private">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_private %}var(--warn){% else %}var(--border){% endif %}; color: {% if c.is_private %}var(--warn){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            {% if c.is_private %}🔒 PRIVATE{% else %}🔓 PUBLIC{% endif %}
+                        </button>
+                    </form>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;"
+                          {% if c.is_report_chat %}{% else %}onsubmit="return confirm('Make this chat a report chat?');"{% endif %}>
+                        <input type="hidden" name="field" value="report_chat">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_report_chat %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.is_report_chat %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            {% if c.is_report_chat %}★ REPORT{% else %}☆ make report{% endif %}
+                        </button>
+                    </form>
+                </div>
+
+                {# Hashtag + report chat dropdown #}
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Hashtag</label>
+                        <input type="text" name="hashtag" value="{{ c.hashtag or '' }}" placeholder="#Деградач"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Report chat (where logs go)</label>
+                        <select name="report_chat_id"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                            <option value="" {% if c.report_chat_id is none %}selected{% endif %}>(use global default)</option>
+                            {% for rc in report_chat_options %}
+                            <option value="{{ rc.chat_id }}"
+                                {% if c.report_chat_id is not none and c.report_chat_id == rc.chat_id %}selected{% endif %}>
+                                {{ rc.title }} ({{ rc.chat_id }})
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                {# Day preset #}
+                <div style="margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">☀️ Day preset (default chat state)</label>
+                    <select name="day_preset_id"
+                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                        <option value="__none__" {% if not c.day_permissions %}selected{% endif %}>(snapshot — auto from chat)</option>
+                        {% for p in presets_by_scope.day %}
+                        <option value="{{ p.id }}" {% if c.day_permissions and p.permissions == c.day_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
                         {% endfor %}
                     </select>
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Weekend start (optional)</label>
-                    <input type="text" name="night_mode_weekend_start" value="{{ c.night_mode_weekend_start or '' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="02:00"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Weekend end (optional)</label>
-                    <input type="text" name="night_mode_weekend_end" value="{{ c.night_mode_weekend_end or '' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="10:00"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+                    <div style="font-size: 9px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
+                        Все доступные пресеты создаются на странице <a href="/admin/presets" style="color: var(--accent);">/admin/presets →</a>
+                    </div>
                 </div>
             </div>
+        </details>
 
-            {# v4.5.3: notifications #}
-            <div style="display: grid; grid-template-columns: auto 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2); align-items: center;">
-                <div>
+        {# ════════════ 2. Наказания ════════════ #}
+        <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+            <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
+                <span>⚖ Наказания</span>
+                <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {{ c.warns_to_mute }} / {{ c.mute_duration_seconds }} / {{ c.warns_to_ban }}{% if c.warn_decay_days %} · decay {{ c.warn_decay_days }}d{% endif %} · link={{ c.link_filter_action }}
+                </span>
+            </summary>
+            <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warns → mute</label>
+                        <input type="text" name="warns_to_mute" value="{{ c.warns_to_mute }}" pattern="[0-9]+"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Mute dur (sec)</label>
+                        <input type="text" name="mute_duration_seconds" value="{{ c.mute_duration_seconds }}" pattern="[0-9]+"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warns → ban</label>
+                        <input type="text" name="warns_to_ban" value="{{ c.warns_to_ban }}" pattern="[0-9]+"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warn decay (days, 0=off)</label>
+                        <input type="text" name="warn_decay_days" value="{{ c.warn_decay_days or 0 }}" pattern="[0-9]+"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Link filter action</label>
+                        <select name="link_filter_action"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                            {% for act in ['delete', 'warn', 'mute', 'ban'] %}
+                            <option value="{{ act }}" {% if c.link_filter_action == act %}selected{% endif %}>{{ act }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </details>
+
+        {# ════════════ 3. Ночной режим ════════════ #}
+        <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
+            <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
+                <span>🌙 Ночной режим</span>
+                <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {% if c.night_mode_enabled %}{{ c.night_mode_start }}–{{ c.night_mode_end }} {{ c.night_mode_tz or 'MSK' }}{% if c.night_mode_notify %} · notify 🔔{% endif %}{% else %}disabled{% endif %}
+                </span>
+            </summary>
+            <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+
+                {# Night enable toggle (instant POST) #}
+                <div style="margin-bottom: var(--sp-3);">
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="night_mode">
+                        <button type="submit"
+                                style="padding: 4px 12px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">
+                            🌙 Night mode {% if c.night_mode_enabled %}● ENABLED{% else %}○ disabled{% endif %}
+                        </button>
+                    </form>
+                    <span style="font-size: 9px; color: var(--text-dim); margin-left: 8px;">Включается мгновенно. Остальные поля — требуют «Сохранить».</span>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night start</label>
+                        <input type="text" name="night_mode_start" value="{{ c.night_mode_start or '23:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="23:00"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Night end</label>
+                        <input type="text" name="night_mode_end" value="{{ c.night_mode_end or '07:00' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="07:00"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Timezone</label>
+                        <select name="night_mode_tz"
+                                style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                            {% set current_tz = c.night_mode_tz or 'Europe/Moscow' %}
+                            {% for tz in ['Europe/Moscow', 'Europe/Kaliningrad', 'Europe/Samara', 'Asia/Yekaterinburg', 'Asia/Omsk', 'Asia/Novosibirsk', 'Asia/Krasnoyarsk', 'Asia/Irkutsk', 'Asia/Yakutsk', 'Asia/Vladivostok', 'Asia/Magadan', 'Asia/Kamchatka', 'Europe/Kiev', 'Europe/Minsk', 'Europe/Riga', 'Europe/Tallinn', 'Europe/Vilnius', 'Europe/Tbilisi', 'Asia/Almaty', 'Asia/Tashkent'] %}
+                            <option value="{{ tz }}" {% if current_tz == tz %}selected{% endif %}>{{ tz }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Weekend start (optional)</label>
+                        <input type="text" name="night_mode_weekend_start" value="{{ c.night_mode_weekend_start or '' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="02:00"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Weekend end (optional)</label>
+                        <input type="text" name="night_mode_weekend_end" value="{{ c.night_mode_weekend_end or '' }}" pattern="[0-2][0-9]:[0-5][0-9]" placeholder="10:00"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                </div>
+
+                <div style="display: grid; grid-template-columns: auto 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2); align-items: center;">
                     <label style="display: flex; align-items: center; gap: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); cursor: pointer;">
                         <input type="checkbox" name="night_mode_notify" {% if c.night_mode_notify %}checked{% endif %}>
                         Notify
                     </label>
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Enter msg (optional)</label>
                     <input type="text" name="night_mode_notify_enter_msg" value="{{ c.night_mode_notify_enter_msg or '' }}" placeholder="🌙 Ночной режим включён"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 11px;">
-                </div>
-                <div>
-                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Exit msg (optional)</label>
+                           style="padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                     <input type="text" name="night_mode_notify_exit_msg" value="{{ c.night_mode_notify_exit_msg or '' }}" placeholder="☀️ Ночной режим снят"
-                           style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 11px;">
+                           style="padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                 </div>
-            </div>
 
-            {# v4.5.3: custom permissions grid — shown only when preset = 'custom' #}
-            {% set current_preset = c.night_mode_permissions | night_mode_preset_name if c.night_mode_permissions else 'text_only' %}
-            {% set nm_perms = c.night_mode_permissions | from_json if c.night_mode_permissions else {} %}
-            <div id="nm_custom_grid_{{ c.chat_id }}" style="margin-top: var(--sp-2); padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); {% if current_preset != 'custom' %}display:none;{% endif %}">
-                <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">Custom permissions (allowed during night)</div>
-                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;">
-                    {% set custom_perms = [
-                        ('perm_can_send_messages', 'Text msgs', nm_perms.get('can_send_messages', False)),
-                        ('perm_can_send_audios', 'Audios', nm_perms.get('can_send_audios', False)),
-                        ('perm_can_send_documents', 'Documents', nm_perms.get('can_send_documents', False)),
-                        ('perm_can_send_photos', 'Photos', nm_perms.get('can_send_photos', False)),
-                        ('perm_can_send_videos', 'Videos', nm_perms.get('can_send_videos', False)),
-                        ('perm_can_send_video_notes', 'Video notes', nm_perms.get('can_send_video_notes', False)),
-                        ('perm_can_send_voice_notes', 'Voice notes', nm_perms.get('can_send_voice_notes', False)),
-                        ('perm_can_send_polls', 'Polls', nm_perms.get('can_send_polls', False)),
-                        ('perm_can_send_other_messages', 'Stickers/GIFs', nm_perms.get('can_send_other_messages', False)),
-                        ('perm_can_add_web_page_previews', 'Link previews', nm_perms.get('can_add_web_page_previews', False)),
-                    ] %}
-                    {% for field_name, label, val in custom_perms %}
-                    <label style="display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text); cursor: pointer;">
-                        <input type="checkbox" name="{{ field_name }}" {% if val %}checked{% endif %}>
-                        {{ label }}
-                    </label>
-                    {% endfor %}
-                </div>
-                <div style="margin-top: 6px; font-size: 9px; color: var(--text-dim);">
-                    Checked = allowed during night. Unchecked = blocked. Admin-level rights (change_info/invite/pin) are always False during night mode.
-                </div>
-            </div>
-            <script>
-                function toggleCustomGrid_{{ c.chat_id }}() {
-                    const sel = document.getElementById('nm_preset_{{ c.chat_id }}');
-                    const grid = document.getElementById('nm_custom_grid_{{ c.chat_id }}');
-                    if (sel && grid) {
-                        grid.style.display = (sel.value === 'custom') ? 'block' : 'none';
-                    }
-                }
-            </script>
-
-            {# v4.5.4: Sanitary days — полный lockdown чата на заданные даты #}
-            <div style="margin-top: var(--sp-2); padding: var(--sp-2); background: var(--bg); border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--border){% endif %}; border-radius: var(--r-sm);">
-                <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px;">
-                    <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim);">
-                        Sanitary days
-                        {% if c.sanitary_days_currently_active %}<span style="color: var(--danger); font-weight: 700; margin-left: 6px;">● LOCKDOWN ACTIVE</span>{% endif %}
+                {# Night preset — only choice, no custom grid #}
+                <div style="margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">🌙 Ночной пресет (права в ночное время)</label>
+                    <select name="night_preset_id"
+                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                        <option value="__none__" {% if not c.night_mode_permissions %}selected{% endif %}>(none — night mode не меняет права)</option>
+                        {% for p in presets_by_scope.night %}
+                        <option value="{{ p.id }}" {% if c.night_mode_permissions and p.permissions == c.night_mode_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                        {% endfor %}
+                    </select>
+                    <div style="font-size: 9px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
+                        Список берётся из пресетов со scope=<code>night</code> со страницы <a href="/admin/presets" style="color: var(--accent);">/admin/presets →</a>
                     </div>
-                    <div style="font-size: 9px; color: var(--text-dim);">One per line: YYYY-MM-DD or YYYY-MM-DD - YYYY-MM-DD</div>
                 </div>
+            </div>
+        </details>
+
+        {# ════════════ 4. Санитарные дни ════════════ #}
+        <details style="background: var(--bg2); border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--border){% endif %}; border-radius: var(--r-sm);">
+            <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
+                <span>🧹 Санитарные дни{% if c.sanitary_days_currently_active %} <span style="color: var(--danger);">● LOCKDOWN</span>{% endif %}</span>
+                <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {% if c.sanitary_days %}{{ c.sanitary_days | format_sanitary_days | trim | length }} chars configured · {% if c.sanitary_days_permissions %}custom{% else %}lockdown{% endif %}{% else %}no dates{% endif %}
+                </span>
+            </summary>
+            <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Даты (одна в строке: YYYY-MM-DD или диапазон YYYY-MM-DD - YYYY-MM-DD)</label>
                 <textarea name="sanitary_days_text" rows="4" placeholder="2026-08-01&#10;2026-08-15 - 2026-08-17&#10;# comments allowed"
-                          style="width: 100%; padding: 6px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; resize: vertical;">{{ c.sanitary_days | format_sanitary_days }}</textarea>
-                <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim);">
-                    On these dates the chat is fully locked down (ChatPermissions → all False).
-                    Moderators are unaffected — their Telegram admin rights override chat-level perms.
-                    Night mode is skipped while sanitary day is active.
+                          style="width: 100%; padding: 6px 10px; background: var(--surface, var(--bg)); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; resize: vertical; box-sizing: border-box;">{{ c.sanitary_days | format_sanitary_days }}</textarea>
+                <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim); line-height: 1.6;">
+                    Даты хранятся по месяцам. После окончания последнего дня месяца — даты автоматически стираются и ставится невидимая метка «sanitary был в этом месяце» (чтобы дашборд не ругался). Реакции остаются доступны всегда — Telegram управляет ими отдельно.
+                </div>
+
+                {# Sanitary preset — only choice, no custom grid #}
+                <div style="margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">🧹 Санитарный пресет (права в санитарные дни)</label>
+                    <select name="sanitary_preset_id"
+                            style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
+                        <option value="__lockdown__" {% if not c.sanitary_days_permissions %}selected{% endif %}>🧹 Full lockdown (default — все False, реакции остаются)</option>
+                        {% for p in presets_by_scope.sanitary %}
+                        <option value="{{ p.id }}" {% if c.sanitary_days_permissions and p.permissions == c.sanitary_days_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                        {% endfor %}
+                    </select>
+                    <div style="font-size: 9px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
+                        Список берётся из пресетов со scope=<code>sanitary</code> со страницы <a href="/admin/presets" style="color: var(--accent);">/admin/presets →</a>
+                    </div>
                 </div>
             </div>
+        </details>
 
-            {# ── v4.6.0: Granular permissions — Day / Sanitary preset dropdowns ── #}
-            <details style="margin-top: var(--sp-3); padding: var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                <summary style="cursor: pointer; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">
-                    v4.6.0: Granular permissions (Day / Sanitary presets)
-                </summary>
-                <div style="margin-top: var(--sp-3);">
-                    <div style="font-size: 10px; color: var(--text-dim); margin-bottom: var(--sp-3);">
-                        По умолчанию дневные права берутся из текущего состояния чата (snapshot), а санитарные = полный локдаун.
-                        Здесь можно явно задать пресет для каждого режима. Создать свой пресет — на странице <a href="/admin/presets" style="color: var(--accent);">/admin/presets</a>.
-                    </div>
-
-                    {# Day preset #}
-                    {% set day_perms = c.day_permissions | from_json if c.day_permissions else {} %}
-                    <div style="margin-bottom: var(--sp-3); padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
-                            ☀️ Day preset (default chat state)
-                        </div>
-                        <select name="day_preset_id" id="day_preset_{{ c.chat_id }}" onchange="toggleDayGrid_{{ c.chat_id }}()"
-                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
-                            <option value="__none__" {% if not c.day_permissions %}selected{% endif %}>(snapshot — auto from chat)</option>
-                            {% for p in presets_by_scope.day %}
-                            <option value="{{ p.id }}" {% if c.day_permissions and p.permissions == c.day_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
-                            {% endfor %}
-                            <option value="custom" {% if c.day_permissions and not (c.day_permissions in (presets_by_scope.day | map(attribute='permissions') | list)) %}selected{% endif %}>— Custom —</option>
-                        </select>
-                        <div id="day_custom_grid_{{ c.chat_id }}" style="margin-top: 6px; {% if not c.day_permissions or c.day_permissions in (presets_by_scope.day | map(attribute='permissions') | list) %}display:none;{% endif %}">
-                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                                {% set day_grid = [
-                                    ('day_perm_can_send_messages', 'Text msgs', day_perms.get('can_send_messages', False)),
-                                    ('day_perm_can_send_audios', 'Audios', day_perms.get('can_send_audios', False)),
-                                    ('day_perm_can_send_documents', 'Documents', day_perms.get('can_send_documents', False)),
-                                    ('day_perm_can_send_photos', 'Photos', day_perms.get('can_send_photos', False)),
-                                    ('day_perm_can_send_videos', 'Videos', day_perms.get('can_send_videos', False)),
-                                    ('day_perm_can_send_video_notes', 'Video notes', day_perms.get('can_send_video_notes', False)),
-                                    ('day_perm_can_send_voice_notes', 'Voice notes', day_perms.get('can_send_voice_notes', False)),
-                                    ('day_perm_can_send_polls', 'Polls', day_perms.get('can_send_polls', False)),
-                                    ('day_perm_can_send_other_messages', 'Stickers/GIFs', day_perms.get('can_send_other_messages', False)),
-                                    ('day_perm_can_add_web_page_previews', 'Link previews', day_perms.get('can_add_web_page_previews', False)),
-                                    ('day_perm_can_change_info', 'Change info', day_perms.get('can_change_info', False)),
-                                    ('day_perm_can_invite_users', 'Invite users', day_perms.get('can_invite_users', False)),
-                                    ('day_perm_can_pin_messages', 'Pin msgs', day_perms.get('can_pin_messages', False)),
-                                ] %}
-                                {% for field_name, label, val in day_grid %}
-                                <label style="display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text); cursor: pointer;">
-                                    <input type="checkbox" name="{{ field_name }}" {% if val %}checked{% endif %}>
-                                    {{ label }}
-                                </label>
-                                {% endfor %}
-                            </div>
-                        </div>
-                    </div>
-
-                    {# Night preset (overrides old dropdown above) #}
-                    {% set nm_perms_v460 = c.night_mode_permissions | from_json if c.night_mode_permissions else {} %}
-                    <div style="margin-bottom: var(--sp-3); padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
-                            🌙 Night preset (overrides old dropdown)
-                        </div>
-                        <select name="night_preset_id" id="night_preset_{{ c.chat_id }}" onchange="toggleNightGrid_{{ c.chat_id }}()"
-                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
-                            <option value="__none__" {% if not c.night_mode_permissions %}selected{% endif %}>(none — use old dropdown above)</option>
-                            {% for p in presets_by_scope.night %}
-                            <option value="{{ p.id }}" {% if c.night_mode_permissions and p.permissions == c.night_mode_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
-                            {% endfor %}
-                            <option value="custom" {% if c.night_mode_permissions and not (c.night_mode_permissions in (presets_by_scope.night | map(attribute='permissions') | list)) %}selected{% endif %}>— Custom (use old grid above) —</option>
-                        </select>
-                        <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim);">
-                            Если выбран пресет — он переписывает значение из dropdown выше. Если «none» — используется старый dropdown + custom grid выше.
-                        </div>
-                    </div>
-
-                    {# Sanitary preset #}
-                    {% set san_perms = c.sanitary_days_permissions | from_json if c.sanitary_days_permissions else {} %}
-                    <div style="padding: var(--sp-2); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">
-                            🧹 Sanitary preset (lockdown by default)
-                        </div>
-                        <select name="sanitary_preset_id" id="sanitary_preset_{{ c.chat_id }}" onchange="toggleSanitaryGrid_{{ c.chat_id }}()"
-                                style="width: 100%; padding: 6px 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px;">
-                            <option value="__lockdown__" {% if not c.sanitary_days_permissions %}selected{% endif %}>Full lockdown (default — all False, reactions remain)</option>
-                            {% for p in presets_by_scope.sanitary %}
-                            <option value="{{ p.id }}" {% if c.sanitary_days_permissions and p.permissions == c.sanitary_days_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
-                            {% endfor %}
-                            <option value="custom" {% if c.sanitary_days_permissions and not (c.sanitary_days_permissions in (presets_by_scope.sanitary | map(attribute='permissions') | list)) and c.sanitary_days_permissions != '{"can_send_messages": false, "can_send_audios": false, "can_send_documents": false, "can_send_photos": false, "can_send_videos": false, "can_send_video_notes": false, "can_send_voice_notes": false, "can_send_polls": false, "can_send_other_messages": false, "can_add_web_page_previews": false, "can_change_info": false, "can_invite_users": false, "can_pin_messages": false}' %}selected{% endif %}>— Custom —</option>
-                        </select>
-                        <div id="sanitary_custom_grid_{{ c.chat_id }}" style="margin-top: 6px; {% if not c.sanitary_days_permissions or c.sanitary_days_permissions in (presets_by_scope.sanitary | map(attribute='permissions') | list) or c.sanitary_days_permissions == '{"can_send_messages": false, "can_send_audios": false, "can_send_documents": false, "can_send_photos": false, "can_send_videos": false, "can_send_video_notes": false, "can_send_voice_notes": false, "can_send_polls": false, "can_send_other_messages": false, "can_add_web_page_previews": false, "can_change_info": false, "can_invite_users": false, "can_pin_messages": false}' %}display:none;{% endif %}">
-                            <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; padding: 6px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
-                                {% set san_grid = [
-                                    ('sanitary_perm_can_send_messages', 'Text msgs', san_perms.get('can_send_messages', False)),
-                                    ('sanitary_perm_can_send_audios', 'Audios', san_perms.get('can_send_audios', False)),
-                                    ('sanitary_perm_can_send_documents', 'Documents', san_perms.get('can_send_documents', False)),
-                                    ('sanitary_perm_can_send_photos', 'Photos', san_perms.get('can_send_photos', False)),
-                                    ('sanitary_perm_can_send_videos', 'Videos', san_perms.get('can_send_videos', False)),
-                                    ('sanitary_perm_can_send_video_notes', 'Video notes', san_perms.get('can_send_video_notes', False)),
-                                    ('sanitary_perm_can_send_voice_notes', 'Voice notes', san_perms.get('can_send_voice_notes', False)),
-                                    ('sanitary_perm_can_send_polls', 'Polls', san_perms.get('can_send_polls', False)),
-                                    ('sanitary_perm_can_send_other_messages', 'Stickers/GIFs', san_perms.get('can_send_other_messages', False)),
-                                    ('sanitary_perm_can_add_web_page_previews', 'Link previews', san_perms.get('can_add_web_page_previews', False)),
-                                    ('sanitary_perm_can_change_info', 'Change info', san_perms.get('can_change_info', False)),
-                                    ('sanitary_perm_can_invite_users', 'Invite users', san_perms.get('can_invite_users', False)),
-                                    ('sanitary_perm_can_pin_messages', 'Pin msgs', san_perms.get('can_pin_messages', False)),
-                                ] %}
-                                {% for field_name, label, val in san_grid %}
-                                <label style="display: flex; align-items: center; gap: 4px; font-size: 10px; color: var(--text); cursor: pointer;">
-                                    <input type="checkbox" name="{{ field_name }}" {% if val %}checked{% endif %}>
-                                    {{ label }}
-                                </label>
-                                {% endfor %}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <script>
-                    function toggleDayGrid_{{ c.chat_id }}() {
-                        const sel = document.getElementById('day_preset_{{ c.chat_id }}');
-                        const grid = document.getElementById('day_custom_grid_{{ c.chat_id }}');
-                        if (sel && grid) {
-                            grid.style.display = (sel.value === 'custom') ? 'block' : 'none';
-                        }
-                    }
-                    function toggleNightGrid_{{ c.chat_id }}() {
-                        // Night grid is the old custom grid (perm_can_send_*) — show only if preset=custom.
-                        const sel = document.getElementById('night_preset_{{ c.chat_id }}');
-                        const oldGrid = document.getElementById('nm_custom_grid_{{ c.chat_id }}');
-                        const oldSel = document.getElementById('nm_preset_{{ c.chat_id }}');
-                        if (sel && oldGrid) {
-                            if (sel.value === 'custom') {
-                                oldGrid.style.display = 'block';
-                                if (oldSel) oldSel.value = 'custom';
-                            } else if (sel.value !== '__none__') {
-                                oldGrid.style.display = 'none';
-                            }
-                        }
-                    }
-                    function toggleSanitaryGrid_{{ c.chat_id }}() {
-                        const sel = document.getElementById('sanitary_preset_{{ c.chat_id }}');
-                        const grid = document.getElementById('sanitary_custom_grid_{{ c.chat_id }}');
-                        if (sel && grid) {
-                            grid.style.display = (sel.value === 'custom') ? 'block' : 'none';
-                        }
-                    }
-                </script>
-            </details>
-
-            <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
-                <button type="submit"
-                        style="padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
-                    Save
-                </button>
-                <button type="button" onclick="this.parentElement.parentElement.parentElement.style.display='none';"
-                        style="padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; border-radius: var(--r-xs);">
-                    Cancel
-                </button>
-            </div>
-        </form>
+        {# ── Save / Cancel ── #}
+        <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
+            <button type="submit"
+                    style="padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                ▸ Сохранить
+            </button>
+            <button type="button" onclick="this.parentElement.parentElement.parentElement.style.display='none';"
+                    style="padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; border-radius: var(--r-xs);">
+                Отмена
+            </button>
+        </div>
+    </form>
     </div>
 
     {# ── Help for new chats (no settings configured) ── #}

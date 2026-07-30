@@ -822,7 +822,7 @@ class TestAppVersion(unittest.TestCase):
     def test_app_version_is_452(self):
         """v4.5.6: версия обновлена до v4.5.6 (ephemeral auto-delete)."""
         import web_app
-        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

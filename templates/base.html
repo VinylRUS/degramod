@@ -635,7 +635,14 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
-                <p><strong>v4.6.0</strong> — 30 июля 2026</p>
+                <p><strong>v4.6.1</strong> — 30 июля 2026</p>
+                <ul>
+                    <li><strong>Редизайн /admin/chats</strong>: вместо «стены» полей — 4 сворачиваемых секции-аккордеона: <em>Общее</em>, <em>Наказания</em>, <em>Ночной режим</em>, <em>Санитарные дни</em>. Каждая секция показывает краткую сводку в заголовке (например <code>23:00–07:00 MSK · notify 🔔</code>), не открывая её.</li>
+                    <li><strong>Только выбор пресета, без custom grid</strong>: настройки чата больше не содержат 13 чекбоксов прав для каждого режима. Свои наборы прав создаются централизованно на странице <code>/admin/presets</code> — здесь только выбирается готовый пресет из dropdown. Один источник истины, ноль дублирования.</li>
+                    <li><strong>Toggle-кнопки убраны с карточки</strong>: ENABLED, CAS, LINK-FILTER, PRIVATE, REPORT, NIGHT перемещены внутрь соответствующих секций. Карточка в списке содержит только 2 кнопки: <em>Настроить</em> и <em>Удалить</em>.</li>
+                    <li><strong>POST-хендлер упрощён</strong>: вместо парсинга 39 чекбоксов (3 custom grids × 13 полей) + старого dropdown <code>night_mode_preset</code> + <code>monthly_sanitary_days_json</code> — теперь только 3 поля <code>day_preset_id</code> / <code>night_preset_id</code> / <code>sanitary_preset_id</code> + стандартные поля чата.</li>
+                </ul>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.6.0</strong> — 30 июля 2026</p>
                 <ul>
                     <li><strong>Гранулярные права</strong>: теперь можно явно задавать права чата для дневного, ночного и санитарного режимов через пресеты. Больше не нужно полагаться на snapshot текущих прав — задайте свой набор в <code>/admin/presets</code> и привяжите к чату.</li>
                     <li><strong>Пользовательские пресеты</strong>: новая страница <code>/admin/presets</code> для создания именованных наборов прав (например «Ночь Бэбэй», «День Деградач»). 3 системных пресета неудаляемы: «Full lockdown», «Text only», «Day default».</li>

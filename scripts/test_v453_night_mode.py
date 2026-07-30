@@ -735,36 +735,6 @@ class TestAdminChatsUpdateV453(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             self.assertFalse(cs.night_mode_notify)
 
-    async def test_update_custom_preset_saves_individual_perms(self):
-        """preset=custom + 10 чекбоксов → JSON с правильными флагами."""
-        from httpx import AsyncClient, ASGITransport
-        app = web_app.create_app()
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            cookies = await self._login_as_su(client)
-            r = await self._post_update(
-                client, cookies,
-                night_mode_preset="custom",
-                perm_can_send_messages="on",
-                perm_can_send_photos="on",
-                # audios, docs, videos и т.д. НЕ отправляем (=unchecked=False).
-            )
-            self.assertEqual(r.status_code, 303)
-        async with async_session() as s:
-            cs = (await s.execute(
-                select(ChatSettings).where(ChatSettings.chat_id == -1001234567890)
-            )).scalar_one()
-            perms = json.loads(cs.night_mode_permissions)
-            self.assertTrue(perms["can_send_messages"])
-            self.assertTrue(perms["can_send_photos"])
-            self.assertFalse(perms["can_send_audios"])
-            self.assertFalse(perms["can_send_videos"])
-            self.assertFalse(perms["can_send_other_messages"])
-            # admin-level права всегда False.
-            self.assertFalse(perms["can_change_info"])
-            self.assertFalse(perms["can_invite_users"])
-            self.assertFalse(perms["can_pin_messages"])
-
     async def test_update_notify_enter_exit_msgs(self):
         """Кастомные тексты уведомлений сохраняются."""
         from httpx import AsyncClient, ASGITransport
@@ -870,7 +840,7 @@ class TestNightModePresetNameCustom(unittest.TestCase):
 class TestAppVersion(unittest.TestCase):
 
     def test_version_bumped(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -997,26 +967,6 @@ class TestTemplateUsesV453Fields(unittest.TestCase):
         self.assertIn('name="night_mode_notify"', content)
         self.assertIn('name="night_mode_notify_enter_msg"', content)
         self.assertIn('name="night_mode_notify_exit_msg"', content)
-
-    def test_admin_chats_template_has_custom_perms_grid(self):
-        with open("/home/z/my-project/v4.5/templates/admin_chats.html") as f:
-            content = f.read()
-        # Поля генерируются через Jinja2 loop — name="{{ field_name }}", где
-        # field_name берётся из tuple. Проверяем что tuple содержит все 10 полей.
-        self.assertIn("'perm_can_send_messages'", content)
-        self.assertIn("'perm_can_send_audios'", content)
-        self.assertIn("'perm_can_send_photos'", content)
-        self.assertIn("'perm_can_send_other_messages'", content)
-        self.assertIn("'perm_can_add_web_page_previews'", content)
-        # Custom grid div должен быть.
-        self.assertIn("nm_custom_grid_", content)
-
-    def test_admin_chats_template_preset_dropdown_has_custom(self):
-        with open("/home/z/my-project/v4.5/templates/admin_chats.html") as f:
-            content = f.read()
-        # Проверяем что в dropdown пресета теперь 4 опции включая custom.
-        # Ищем 'custom' в списке preset'ов.
-        self.assertIn("'text_only', 'strict', 'none', 'custom'", content)
 
     def test_admin_chats_template_tz_dropdown_has_ekb(self):
         with open("/home/z/my-project/v4.5/templates/admin_chats.html") as f:

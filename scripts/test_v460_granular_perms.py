@@ -30,7 +30,7 @@ test_v460_granular_perms.py — Тесты v4.6.0: гранулярные пра
       появляется после 20-го числа если last_sanitary_month != current month.
   14. Backward compat: чаты без day_permissions/sanitary_days_permissions
       (NULL) продолжают работать со старым snapshot-поведением.
-  15. APP_VERSION = "v4.6.0" + changelog modal в base.html содержит v4.6.0.
+  15. APP_VERSION = "v4.6.1" + changelog modal в base.html содержит v4.6.0.
 
 Запуск:
     cd /home/z/my-project/v4.5
@@ -694,36 +694,9 @@ class TestAdminChatsUpdateGranularPerms(unittest.IsolatedAsyncioTestCase):
             for k, v in perms.items():
                 self.assertFalse(v, f"{k} must be False in lockdown")
 
-    async def test_custom_day_perms_saved(self):
-        from httpx import AsyncClient, ASGITransport
-        app = web_app.create_app()
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            cookies = await self._login_as_su(client)
-            r = await self._post_update(
-                client, cookies,
-                day_preset_id="custom",
-                day_perm_can_send_messages="on",
-                day_perm_can_send_photos="on",
-                day_perm_can_change_info="on",
-                # all others unchecked
-            )
-            self.assertEqual(r.status_code, 303)
-
-        async with async_session() as s:
-            cs = (await s.execute(
-                select(ChatSettings).where(ChatSettings.chat_id == -1001234567890)
-            )).scalar_one()
-            perms = json.loads(cs.day_permissions)
-            self.assertTrue(perms["can_send_messages"])
-            self.assertTrue(perms["can_send_photos"])
-            self.assertTrue(perms["can_change_info"])
-            self.assertFalse(perms["can_send_audios"])
-            self.assertFalse(perms["can_pin_messages"])
-
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Тест 11: monthly_sanitary_days_json
+# Тест 11: monthly_sanitary_days_json — Удалён в v4.6.1 (custom grids убраны из UI)
 # ═══════════════════════════════════════════════════════════════════════════
 class TestMonthlySanitaryDays(unittest.IsolatedAsyncioTestCase):
 
@@ -740,16 +713,14 @@ class TestMonthlySanitaryDays(unittest.IsolatedAsyncioTestCase):
         }, follow_redirects=False)
         return r.cookies
 
-    async def test_monthly_json_saved_as_dict(self):
+    async def test_textarea_groups_by_month(self):
+        """v4.6.1: UI шлёт только textarea (sanitary_days_text). Парсер
+        автоматически группирует даты по месяцам в monthly-формат."""
         from httpx import AsyncClient, ASGITransport
         app = web_app.create_app()
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             cookies = await self._login_as_su(client)
-            monthly = json.dumps({
-                "2026-08": [["2026-08-02", "2026-08-03"]],
-                "2026-09": [["2026-09-05", "2026-09-07"]],
-            })
             r = await client.post(
                 "/admin/chats/-1001234567890/update",
                 data={
@@ -762,10 +733,8 @@ class TestMonthlySanitaryDays(unittest.IsolatedAsyncioTestCase):
                     "link_filter_action": "delete",
                     "night_mode_start": "23:00",
                     "night_mode_end": "07:00",
-                    "night_mode_preset": "text_only",
                     "night_mode_tz": "Europe/Moscow",
-                    "sanitary_days_text": "",
-                    "monthly_sanitary_days_json": monthly,
+                    "sanitary_days_text": "2026-08-02\n2026-08-15 - 2026-08-17\n2026-09-05 - 2026-09-07",
                     "sanitary_preset_id": "__lockdown__",
                     "day_preset_id": "__none__",
                     "night_preset_id": "__none__",
@@ -780,7 +749,12 @@ class TestMonthlySanitaryDays(unittest.IsolatedAsyncioTestCase):
             )).scalar_one()
             data = json.loads(cs.sanitary_days)
             self.assertIsInstance(data, dict)
-            self.assertEqual(data["2026-08"], [["2026-08-02", "2026-08-03"]])
+            self.assertIn("2026-08", data)
+            self.assertIn("2026-09", data)
+            # 2026-08 должно содержать 2 пары: single 02 + range 15-17
+            self.assertEqual(len(data["2026-08"]), 2)
+            self.assertEqual(data["2026-08"][0], ["2026-08-02", "2026-08-02"])
+            self.assertEqual(data["2026-08"][1], ["2026-08-15", "2026-08-17"])
             self.assertEqual(data["2026-09"], [["2026-09-05", "2026-09-07"]])
 
 
@@ -923,7 +897,7 @@ class TestBackwardCompatGranularPerms(unittest.IsolatedAsyncioTestCase):
 class TestVersionBumpedV460(unittest.TestCase):
 
     def test_app_version_is_v460(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
     def test_app_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
@@ -931,7 +905,7 @@ class TestVersionBumpedV460(unittest.TestCase):
     def test_changelog_has_v460_entry(self):
         with open("templates/base.html", "r", encoding="utf-8") as f:
             html = f.read()
-        self.assertIn("v4.6.0", html)
+        self.assertIn("v4.6.1", html)
         # Must mention granular permissions
         self.assertIn("Гранулярные права", html)
         # Must mention presets

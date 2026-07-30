@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.6.0"
+APP_VERSION = "v4.6.1"
 APP_RELEASE_DATE = "2026-07-30"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -1719,72 +1719,26 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         warns_to_ban: str = Form(""),
         warn_decay_days: str = Form(""),
         link_filter_action: str = Form("delete"),
+        # v4.5.3: расширенная настройка ночного режима.
         night_mode_start: str = Form("23:00"),
         night_mode_end: str = Form("07:00"),
-        night_mode_preset: str = Form("text_only"),
-        # v4.5.3: расширенная настройка ночного режима.
         night_mode_tz: str = Form("Europe/Moscow"),
         night_mode_weekend_start: str = Form(""),
         night_mode_weekend_end: str = Form(""),
         night_mode_notify: str = Form(""),
         night_mode_notify_enter_msg: str = Form(""),
         night_mode_notify_exit_msg: str = Form(""),
-        # Custom permissions grid (10 чекбоксов). В HTML unchecked чекбоксы
-        # НЕ отправляются — поэтому "" → False, "on" → True.
-        # Эти поля используются ТОЛЬКО когда night_mode_preset == "custom".
-        perm_can_send_messages: str = Form(""),
-        perm_can_send_audios: str = Form(""),
-        perm_can_send_documents: str = Form(""),
-        perm_can_send_photos: str = Form(""),
-        perm_can_send_videos: str = Form(""),
-        perm_can_send_video_notes: str = Form(""),
-        perm_can_send_voice_notes: str = Form(""),
-        perm_can_send_polls: str = Form(""),
-        perm_can_send_other_messages: str = Form(""),
-        perm_can_add_web_page_previews: str = Form(""),
         # v4.5.4: sanitary days textarea. Multiline-текст, одна запись на
         # строку ('YYYY-MM-DD' или 'YYYY-MM-DD - YYYY-MM-DD').
         sanitary_days_text: str = Form(""),
-        # v4.6.0: гранулярные права — пресеты из БД.
-        # Если preset_id задан и валиден → берём permissions из пресета
-        # и сохраняем в соответствующее поле ChatSettings.
-        # preset_id="custom" → берём из custom grid ниже.
+        # v4.6.1: пресеты прав — только выбор из dropdown. Custom grids убраны,
+        # свои наборы прав создаются на странице /admin/presets.
         # preset_id="" или "__none__" → NULL (старое поведение, через snapshot).
+        # preset_id="__lockdown__" → all False (только для sanitary, default).
+        # preset_id=<int> → берём permissions из пресета.
         day_preset_id: str = Form(""),
         night_preset_id: str = Form(""),
         sanitary_preset_id: str = Form("__lockdown__"),
-        # v4.6.0: custom grids для day и sanitary (показываются при preset="custom").
-        # Night-mode custom grid уже есть выше (perm_can_send_*).
-        day_perm_can_send_messages: str = Form(""),
-        day_perm_can_send_audios: str = Form(""),
-        day_perm_can_send_documents: str = Form(""),
-        day_perm_can_send_photos: str = Form(""),
-        day_perm_can_send_videos: str = Form(""),
-        day_perm_can_send_video_notes: str = Form(""),
-        day_perm_can_send_voice_notes: str = Form(""),
-        day_perm_can_send_polls: str = Form(""),
-        day_perm_can_send_other_messages: str = Form(""),
-        day_perm_can_add_web_page_previews: str = Form(""),
-        day_perm_can_change_info: str = Form(""),
-        day_perm_can_invite_users: str = Form(""),
-        day_perm_can_pin_messages: str = Form(""),
-        sanitary_perm_can_send_messages: str = Form(""),
-        sanitary_perm_can_send_audios: str = Form(""),
-        sanitary_perm_can_send_documents: str = Form(""),
-        sanitary_perm_can_send_photos: str = Form(""),
-        sanitary_perm_can_send_videos: str = Form(""),
-        sanitary_perm_can_send_video_notes: str = Form(""),
-        sanitary_perm_can_send_voice_notes: str = Form(""),
-        sanitary_perm_can_send_polls: str = Form(""),
-        sanitary_perm_can_send_other_messages: str = Form(""),
-        sanitary_perm_can_add_web_page_previews: str = Form(""),
-        sanitary_perm_can_change_info: str = Form(""),
-        sanitary_perm_can_invite_users: str = Form(""),
-        sanitary_perm_can_pin_messages: str = Form(""),
-        # v4.6.0: monthly sanitary days. Если задан — заменяет sanitary_days_text.
-        # Формат: JSON-строка вида {"2026-08": [["2026-08-02","2026-08-03"]]}.
-        # UI присылает textarea для каждого месяца отдельно, мы их тут собираем.
-        monthly_sanitary_days_json: str = Form(""),
         _auth: AuthUser = Depends(require_admin),
     ):
         """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -1820,15 +1774,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # v4.5.2: валидация link_filter_action и night mode preset
+        # v4.5.2: валидация link_filter_action.
+        # v4.6.1: night_mode_preset валидация убрана — presetId из БД валидируется ниже.
         if link_filter_action not in ("delete", "warn", "mute", "ban"):
             return RedirectResponse(
                 url="/admin/chats?flash=Invalid+link_filter_action",
-                status_code=303,
-            )
-        if night_mode_preset not in ("text_only", "strict", "none", "custom"):
-            return RedirectResponse(
-                url="/admin/chats?flash=Invalid+night_mode_preset",
                 status_code=303,
             )
 
@@ -1888,66 +1838,19 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        # v4.5.2: строим JSON-снапшот permissions по preset
-        # Импортируем хелпер из bot_handlers (не идеально — web_app зависит от bot_handlers,
-        # но это уже было раньше: web_app импортирует from db).
-        # Чтобы не тащить aiogram.types в web_app, делаем permissions dict inline.
-        _ALL_PERM_KEYS = (
-            "can_send_messages", "can_send_audios", "can_send_documents",
-            "can_send_photos", "can_send_videos", "can_send_video_notes",
-            "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-            "can_add_web_page_previews", "can_change_info", "can_invite_users",
-            "can_pin_messages",
-        )
-        if night_mode_preset == "strict":
-            night_perms_json = json.dumps({k: False for k in _ALL_PERM_KEYS})
-        elif night_mode_preset == "none":
-            night_perms_json = json.dumps({k: True for k in _ALL_PERM_KEYS})
-        elif night_mode_preset == "custom":
-            # v4.5.3: строим JSON из 10 чекбоксов. can_change_info/invite/pin
-            # не редактируются через UI (для простоты) — берём из текущего
-            # состояния чата, не трогаем. Ставим False если у чата нет preserve.
-            # UI показывает только 10 «отправляемых» прав; остальные 3
-            # (change_info/invite/pin) — копируем из ранее сохранённого JSON,
-            # иначе False.
-            # Это безопасно: ночной режим ограничивает отправку, не админ-права.
-            custom_flags = {
-                "can_send_messages":          perm_can_send_messages == "on",
-                "can_send_audios":            perm_can_send_audios == "on",
-                "can_send_documents":         perm_can_send_documents == "on",
-                "can_send_photos":            perm_can_send_photos == "on",
-                "can_send_videos":            perm_can_send_videos == "on",
-                "can_send_video_notes":       perm_can_send_video_notes == "on",
-                "can_send_voice_notes":       perm_can_send_voice_notes == "on",
-                "can_send_polls":             perm_can_send_polls == "on",
-                "can_send_other_messages":   perm_can_send_other_messages == "on",
-                "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
-                # Эти 3 не редактируются через UI — ставим False (ночной режим
-                # не должен давать обычным юзерам админ-права).
-                "can_change_info":            False,
-                "can_invite_users":           False,
-                "can_pin_messages":           False,
-            }
-            night_perms_json = json.dumps(custom_flags)
-        else:  # text_only (default)
-            night_perms_json = json.dumps({
-                "can_send_messages": True,
-                "can_send_audios": False, "can_send_documents": False,
-                "can_send_photos": False, "can_send_videos": False,
-                "can_send_video_notes": False, "can_send_voice_notes": False,
-                "can_send_polls": False, "can_send_other_messages": False,
-                "can_add_web_page_previews": False,
-                "can_change_info": False, "can_invite_users": False,
-                "can_pin_messages": False,
-            })
+        # v4.6.1: night_mode_permissions теперь берётся только из night_preset_id.
+        # Старый dropdown night_mode_preset (text_only/strict/none/custom) и custom grid
+        # (perm_can_send_*) убраны из UI — свои наборы прав создаются на /admin/presets.
+        # Изначально night_perms_json = None (NULL в БД = night mode не меняет права).
+        # Если night_preset_id указывает на валидный пресет — берём его permissions.
+        night_perms_json: str | None = None
 
         # v4.5.4 / v4.6.0: парсим sanitary_days.
-        # v4.6.0: приоритет — monthly_sanitary_days_json (новый формат).
-        # Если пусто — fallback на старый textarea (sanitary_days_text).
+        # v4.6.1: monthly_sanitary_days_json убран — UI шлёт только sanitary_days_text
+        # (textarea). Парсинг остаётся тем же.
         try:
             from bot_handlers import (
-                parse_sanitary_days_textarea, serialize_sanitary_days,
-                parse_sanitary_days_monthly, serialize_sanitary_days_monthly,
+                parse_sanitary_days_textarea, serialize_sanitary_days_monthly,
             )
         except ImportError:
             return RedirectResponse(
@@ -1955,89 +1858,54 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=303,
             )
 
-        monthly_sanitary_days_json = (monthly_sanitary_days_json or "").strip()
-        if monthly_sanitary_days_json:
-            # Новый формат — JSON dict от UI (monthly).
-            try:
-                sd_data = json.loads(monthly_sanitary_days_json)
-                if not isinstance(sd_data, dict):
-                    raise ValueError("expected dict")
-                # Парсим и валидируем каждую пару.
-                validated_monthly = {}
-                for mk, pairs_list in sd_data.items():
-                    if not isinstance(pairs_list, list):
-                        continue
-                    validated_pairs = []
-                    for pair in pairs_list:
-                        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                            continue
-                        san_pairs_one, san_errors_one = parse_sanitary_days_textarea(
-                            f"{pair[0]} - {pair[1]}"
-                        )
-                        if san_errors_one:
-                            first_err = san_errors_one[0].replace(" ", "+")
-                            return RedirectResponse(
-                                url=f"/admin/chats?flash=Sanitary+days+({mk}):+{first_err}",
-                                status_code=303,
-                            )
-                        validated_pairs.extend(san_pairs_one)
-                    validated_monthly[mk] = validated_pairs
-                sanitary_days_json = serialize_sanitary_days_monthly(validated_monthly) if validated_monthly else None
-            except (ValueError, TypeError) as e:
-                return RedirectResponse(
-                    url=f"/admin/chats?flash=Invalid+monthly_sanitary_days_json:+{str(e)[:100]}",
-                    status_code=303,
-                )
+        # v4.6.1: UI присылает только textarea (sanitary_days_text).
+        # Парсим и группируем по месяцам автоматически.
+        san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
+        if san_errors:
+            first_err = san_errors[0].replace(" ", "+")
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Sanitary+days:+{first_err}",
+                status_code=303,
+            )
+        if san_pairs:
+            grouped: dict[str, list[list[str]]] = {}
+            for s, e in san_pairs:
+                mk = s[:7]  # YYYY-MM
+                grouped.setdefault(mk, []).append([s, e])
+            sanitary_days_json = serialize_sanitary_days_monthly(grouped)
         else:
-            # Старый формат — textarea.
-            san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
-            if san_errors:
-                first_err = san_errors[0].replace(" ", "+")
-                return RedirectResponse(
-                    url=f"/admin/chats?flash=Sanitary+days:+{first_err}",
-                    status_code=303,
-                )
-            if san_pairs:
-                # Группируем по месяцам автоматически (конвертация в новый формат).
-                grouped: dict[str, list[list[str]]] = {}
-                for s, e in san_pairs:
-                    mk = s[:7]  # YYYY-MM
-                    grouped.setdefault(mk, []).append([s, e])
-                sanitary_days_json = serialize_sanitary_days_monthly(grouped)
-            else:
-                sanitary_days_json = None
+            sanitary_days_json = None
 
-        # v4.6.0: обработка гранулярных прав (presets / custom grids).
-        # Загружаем все пресеты одним запросом.
+        # v4.6.1: пресеты прав — только выбор из dropdown, без custom grids.
+        # Загружаем все пресеты одним запросом для валидации.
         async with async_session() as _ps:
             preset_records = (await _ps.execute(
                 select(PermissionPreset)
             )).scalars().all()
         preset_by_id = {p.id: p for p in preset_records}
 
-        def _resolve_perms(preset_id_field: str, scope: str, custom_perms: dict) -> str | None:
-            """v4.6.0: Возвращает JSON-строку permissions для поля ChatSettings.
+        _ALL_PERM_KEYS = (
+            "can_send_messages", "can_send_audios", "can_send_documents",
+            "can_send_photos", "can_send_videos", "can_send_video_notes",
+            "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
+            "can_add_web_page_previews", "can_change_info", "can_invite_users",
+            "can_pin_messages",
+        )
 
-            Логика:
-              • preset_id_field == "__none__" или "" → NULL (старое поведение)
-              • preset_id_field == "__lockdown__" → all False (только для sanitary)
-              • preset_id_field == "custom" → берём из custom_perms dict
-              • preset_id_field == int (валидный ID) → берём из preset_by_id
+        def _resolve_perms(preset_id_field: str, scope: str) -> str | None:
+            """v4.6.1: Возвращает JSON-строку permissions для поля ChatSettings.
+
+            Логика (custom grids убраны — только выбор пресета):
+              • preset_id_field == "__none__" или "" → NULL (старое поведение / snapshot)
+              • preset_id_field == "__lockdown__" → all False (default для sanitary)
+              • preset_id_field == int (валидный ID) → берём из preset_by_id (с проверкой scope)
+              • невалидный ID или несоответствие scope → NULL (безопасный fallback)
             """
             pid = (preset_id_field or "").strip()
             if pid in ("", "__none__"):
                 return None
             if pid == "__lockdown__":
-                return json.dumps({k: False for k in (
-                    "can_send_messages", "can_send_audios", "can_send_documents",
-                    "can_send_photos", "can_send_videos", "can_send_video_notes",
-                    "can_send_voice_notes", "can_send_polls", "can_send_other_messages",
-                    "can_add_web_page_previews", "can_change_info", "can_invite_users",
-                    "can_pin_messages",
-                )})
-            if pid == "custom":
-                return json.dumps(custom_perms)
-            # Числовой ID пресета.
+                return json.dumps({k: False for k in _ALL_PERM_KEYS})
             try:
                 pid_int = int(pid)
             except (ValueError, TypeError):
@@ -2047,58 +1915,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 return None
             return preset.permissions
 
-        day_custom = {
-            "can_send_messages":          day_perm_can_send_messages == "on",
-            "can_send_audios":            day_perm_can_send_audios == "on",
-            "can_send_documents":         day_perm_can_send_documents == "on",
-            "can_send_photos":            day_perm_can_send_photos == "on",
-            "can_send_videos":            day_perm_can_send_videos == "on",
-            "can_send_video_notes":       day_perm_can_send_video_notes == "on",
-            "can_send_voice_notes":       day_perm_can_send_voice_notes == "on",
-            "can_send_polls":             day_perm_can_send_polls == "on",
-            "can_send_other_messages":   day_perm_can_send_other_messages == "on",
-            "can_add_web_page_previews": day_perm_can_add_web_page_previews == "on",
-            "can_change_info":            day_perm_can_change_info == "on",
-            "can_invite_users":           day_perm_can_invite_users == "on",
-            "can_pin_messages":           day_perm_can_pin_messages == "on",
-        }
-        sanitary_custom = {
-            "can_send_messages":          sanitary_perm_can_send_messages == "on",
-            "can_send_audios":            sanitary_perm_can_send_audios == "on",
-            "can_send_documents":         sanitary_perm_can_send_documents == "on",
-            "can_send_photos":            sanitary_perm_can_send_photos == "on",
-            "can_send_videos":            sanitary_perm_can_send_videos == "on",
-            "can_send_video_notes":       sanitary_perm_can_send_video_notes == "on",
-            "can_send_voice_notes":       sanitary_perm_can_send_voice_notes == "on",
-            "can_send_polls":             sanitary_perm_can_send_polls == "on",
-            "can_send_other_messages":   sanitary_perm_can_send_other_messages == "on",
-            "can_add_web_page_previews": sanitary_perm_can_add_web_page_previews == "on",
-            "can_change_info":            sanitary_perm_can_change_info == "on",
-            "can_invite_users":           sanitary_perm_can_invite_users == "on",
-            "can_pin_messages":           sanitary_perm_can_pin_messages == "on",
-        }
-        day_perms_json = _resolve_perms(day_preset_id, "day", day_custom)
-        sanitary_perms_json = _resolve_perms(sanitary_preset_id, "sanitary", sanitary_custom)
-        # Night perms: если night_preset_id задан — он переписывает night_perms_json.
-        night_custom_grid = {
-            "can_send_messages":          perm_can_send_messages == "on",
-            "can_send_audios":            perm_can_send_audios == "on",
-            "can_send_documents":         perm_can_send_documents == "on",
-            "can_send_photos":            perm_can_send_photos == "on",
-            "can_send_videos":            perm_can_send_videos == "on",
-            "can_send_video_notes":       perm_can_send_video_notes == "on",
-            "can_send_voice_notes":       perm_can_send_voice_notes == "on",
-            "can_send_polls":             perm_can_send_polls == "on",
-            "can_send_other_messages":   perm_can_send_other_messages == "on",
-            "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
-            # 3 admin-права — всегда False в night (старое поведение custom grid).
-            "can_change_info":            False,
-            "can_invite_users":           False,
-            "can_pin_messages":           False,
-        }
+        day_perms_json = _resolve_perms(day_preset_id, "day")
+        sanitary_perms_json = _resolve_perms(sanitary_preset_id, "sanitary")
+        # v4.6.1: night_perms_json — только из night_preset_id.
         if night_preset_id and night_preset_id not in ("", "__none__"):
-            # v4.6.0: night_preset_id имеет приоритет над старым night_mode_preset dropdown.
-            night_resolved = _resolve_perms(night_preset_id, "night", night_custom_grid)
+            night_resolved = _resolve_perms(night_preset_id, "night")
             if night_resolved is not None:
                 night_perms_json = night_resolved
 
@@ -2158,14 +1979,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, "
             "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
             "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
-            "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s)",
+            "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s, "
+            "night_preset_id=%s)",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
-            decay, link_filter_action, nm_start, nm_end, night_mode_preset,
+            decay, link_filter_action, nm_start, nm_end,
+            night_preset_id or "(none)",
             nm_tz, nm_wknd_start or "-", nm_wknd_end or "-",
             night_mode_notify == "on",
             sanitary_days_json or "(none)",
             "yes" if day_perms_json else "no",
             "yes" if sanitary_perms_json else "no",
+            night_preset_id or "(none)",
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",

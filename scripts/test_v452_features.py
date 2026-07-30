@@ -65,7 +65,7 @@ from sqlalchemy import select, delete, inspect as sqlinspect, text  # noqa: E402
 
 from db import (  # noqa: E402
     async_session, init_db, WebUser, ChatSettings, Punishment, User, Moderator,
-    ChatAdmin, WordFilter, LinkAllowlist, BannedStickerPack,
+    ChatAdmin, WordFilter, LinkAllowlist, BannedStickerPack, PermissionPreset,
 )
 
 import web_app  # noqa: E402
@@ -667,7 +667,7 @@ class TestVersionDisplay(unittest.TestCase):
     def test_app_version_is_v452(self):
         # v4.5.6 bumped the version; this test still validates that APP_VERSION
         # is correctly set in web_app module.
-        self.assertEqual(web_app.APP_VERSION, "v4.6.0")
+        self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
     def test_app_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
@@ -802,8 +802,21 @@ class TestAdminChatsToggleV452(unittest.IsolatedAsyncioTestCase):
 
     async def test_admin_chats_update_saves_v452_fields(self):
         """POST /admin/chats/<id>/update сохраняет warn_decay_days, link_filter_action,
-        night_mode_start/end/preset."""
+        night_mode_start/end. v4.6.1: night_mode_permissions берётся из night_preset_id."""
         from httpx import AsyncClient, ASGITransport
+        # v4.6.1: находим системный night-пресет "Text only" чтобы проверить
+        # что night_preset_id копирует permissions в ChatSettings.night_mode_permissions.
+        async with async_session() as s:
+            night_preset = (await s.execute(
+                select(PermissionPreset).where(
+                    PermissionPreset.scope == "night",
+                    PermissionPreset.is_system == True,  # noqa: E712
+                )
+            )).scalar_one_or_none()
+            self.assertIsNotNone(night_preset, "System night preset must be seeded")
+            night_preset_id = str(night_preset.id)
+            night_preset_perms = night_preset.permissions
+
         app = web_app.create_app()
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -820,7 +833,11 @@ class TestAdminChatsToggleV452(unittest.IsolatedAsyncioTestCase):
                     "link_filter_action": "mute",
                     "night_mode_start": "22:00",
                     "night_mode_end": "06:00",
-                    "night_mode_preset": "strict",
+                    "night_mode_tz": "Europe/Moscow",
+                    "night_preset_id": night_preset_id,
+                    "sanitary_preset_id": "__lockdown__",
+                    "day_preset_id": "__none__",
+                    "sanitary_days_text": "",
                 },
                 cookies=cookies,
                 follow_redirects=False,
@@ -835,8 +852,12 @@ class TestAdminChatsToggleV452(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(cs.night_mode_start, "22:00")
             self.assertEqual(cs.night_mode_end, "06:00")
             self.assertIsNotNone(cs.night_mode_permissions)
+            self.assertEqual(cs.night_mode_permissions, night_preset_perms,
+                             "night_mode_permissions should match the chosen preset")
             perms = json.loads(cs.night_mode_permissions)
-            self.assertFalse(perms["can_send_messages"])  # strict preset
+            # "Text only" system preset: can_send_messages=True, all others False.
+            self.assertTrue(perms["can_send_messages"])
+            self.assertFalse(perms["can_send_audios"])
 
     async def test_admin_chats_update_rejects_invalid_night_mode_time(self):
         from httpx import AsyncClient, ASGITransport
