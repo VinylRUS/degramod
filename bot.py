@@ -88,7 +88,8 @@ dp.include_router(mod_router)
 
 # Флаги режима
 _webhook_set = False
-_polling_task = None
+# v4.7.3: _polling_task убран — polling теперь живёт в едином TaskGroup
+# внутри lifespan (см. lifespan()). Глобальная переменная больше не нужна.
 
 
 async def _start_polling():
@@ -606,14 +607,78 @@ def _fallback_all_true_perms():
     )
 
 
+# ── v4.7.3: константа hard shutdown timeout ────────────────────────────────
+# На SIGTERM даём фоновым задачам максимум 5 секунд на graceful cancel.
+# Если за это время они не завершились — логируем и выходим принудительно
+# (event loop всё равно закроется, задачи умрут с PendingCancellation).
+_SHUTDOWN_TIMEOUT_SECONDS: float = 5.0
+
+
+# ── v4.7.3: Startup recovery ──────────────────────────────────────────────
+# При жёстком SIGTERM в предыдущем запуске чат мог остаться с
+# night_mode_currently_active=True или sanitary_days_currently_active=True,
+# но права не были восстановлены (тик оборвался на середине). Snapshot лежит
+# в БД (night_mode_saved_permissions), так что recovery возможен — нужно
+# просто прогнать один tick сразу после старта.
+async def _startup_recovery() -> None:
+    """v4.7.3: проверяет чаты с зависшими active-флагами и прогоняет tick.
+
+    Если чат имеет night_mode_currently_active=True, но сейчас не в окне
+    night mode — _night_mode_tick() восстановит права из snapshot и снимет
+    флаг. Если до сих пор в окне — ничего не произойдёт (already active).
+    Аналогично для sanitary_days_currently_active.
+    """
+    try:
+        async with async_session() as session:
+            from sqlalchemy import or_
+            stmt = select(ChatSettings).where(
+                or_(
+                    ChatSettings.night_mode_currently_active.is_(True),
+                    ChatSettings.sanitary_days_currently_active.is_(True),
+                ),
+                ChatSettings.chat_id != 0,  # пропускаем global default
+            )
+            stuck = (await session.execute(stmt)).scalars().all()
+        if not stuck:
+            return
+        logger.warning(
+            "Startup recovery: %d chats have stuck active flags — "
+            "running immediate tick to reconcile:",
+            len(stuck),
+        )
+        for cs in stuck:
+            logger.warning(
+                "  chat %s: night_active=%s sanitary_active=%s",
+                cs.chat_id,
+                bool(cs.night_mode_currently_active),
+                bool(cs.sanitary_days_currently_active),
+            )
+        # Прогоняем tick — sanitary ПЕРВЫМ (он имеет приоритет над night).
+        # Tick сам разберётся: снимет active-флаг если окно вышло,
+        # оставит если всё ещё в окне.
+        try:
+            await _sanitary_day_tick()
+            await _night_mode_tick()
+            logger.info("Startup recovery: tick completed, state reconciled")
+        except Exception as e:
+            logger.error("Startup recovery: tick failed: %s", e)
+    except Exception as e:
+        logger.warning("Startup recovery: check failed: %s", e)
+
+
 # ── Lifespan ────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app):
-    global _webhook_set, _polling_task
+    global _webhook_set
 
     # ── Startup ─────────────────────────────────────────────────
     await init_db()
     logger.info("DB initialized (WAL mode)")
+
+    # v4.7.3: recovery для чатов с зависшими active-флагами после жёсткого
+    # SIGTERM в предыдущем запуске. Должен идти ДО запуска background loop,
+    # чтобы loop не подхватил полузавершённое состояние.
+    await _startup_recovery()
 
     # Убираем команды из меню (стелс)
     try:
@@ -621,9 +686,6 @@ async def lifespan(app):
         logger.info("Bot commands cleared (stealth mode)")
     except Exception as e:
         logger.warning("delete_my_commands failed: %s", e)
-
-    # v4.5.2: запускаем night mode background task
-    night_mode_task = asyncio.create_task(_night_mode_loop())
 
     # ── Проверяем глобальный default репорт-чат из DB (chat_id=0) ──
     try:
@@ -670,7 +732,8 @@ async def lifespan(app):
             _webhook_set = False
 
     # Если вебхук не установлен — Long Polling
-    if not _webhook_set:
+    use_polling = not _webhook_set
+    if use_polling:
         if WEBHOOK_URL:
             logger.info("Webhook not confirmed — deleting webhook and starting Long Polling")
             try:
@@ -679,23 +742,69 @@ async def lifespan(app):
                 pass
         else:
             logger.info("WEBHOOK_URL not set — using Long Polling mode")
-        _polling_task = asyncio.create_task(_start_polling())
 
-    yield
-
-    # ── Shutdown ────────────────────────────────────────────────
-    if _polling_task:
-        _polling_task.cancel()
-        try:
-            await _polling_task
-        except asyncio.CancelledError:
-            pass
-    # v4.5.2: отменяем night mode background task
-    night_mode_task.cancel()
+    # v4.7.3: единый asyncio.TaskGroup для ВСЕХ background loops.
+    # Раньше задачи создавались через asyncio.create_task и «забывались» —
+    # при SIGTERM процесс обрывался, не дожидаясь завершения тика night mode,
+    # что могло оставить чат в состоянии «night mode active» с зависшим флагом.
+    # Теперь все loops живут в одном TaskGroup, shutdown отменяет их и ждёт
+    # завершения с hard timeout = _SHUTDOWN_TIMEOUT_SECONDS (5s).
+    polling_task: asyncio.Task | None = None
     try:
-        await night_mode_task
-    except asyncio.CancelledError:
+        async with asyncio.TaskGroup() as tg:
+            # Night mode loop — всегда запускается (даже если все чаты disabled,
+            # loop просто ничего не делает; дешевле чем проверять перед запуском).
+            night_task = tg.create_task(
+                _night_mode_loop(), name="night_mode_loop",
+            )
+            # Long polling — только если вебхук не установлен.
+            if use_polling:
+                polling_task = tg.create_task(
+                    _start_polling(), name="long_polling",
+                )
+
+            yield  # ← uvicorn обслуживает запросы здесь
+
+            # ── Shutdown ────────────────────────────────────────────────
+            # На выходе из yield (получен SIGTERM/uvicorn shutdown) — отменяем
+            # все фоновые задачи. TaskGroup на выходе из async with дождётся
+            # их завершения; мы добавляем сверху asyncio.wait_for с hard cap,
+            # чтобы зависшая задача не подвесила весь shutdown.
+            logger.info("Shutdown: cancelling background tasks...")
+            bg_tasks = [night_task]
+            if polling_task is not None:
+                bg_tasks.append(polling_task)
+            for t in bg_tasks:
+                if not t.done():
+                    t.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*bg_tasks, return_exceptions=True),
+                    timeout=_SHUTDOWN_TIMEOUT_SECONDS,
+                )
+                logger.info(
+                    "Shutdown: all background tasks cancelled cleanly within %.1fs",
+                    _SHUTDOWN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                still_running = [t.get_name() for t in bg_tasks if not t.done()]
+                logger.error(
+                    "Shutdown: %.1fs timeout reached — %d tasks still running: %s. "
+                    "Force-exiting (event loop will close, tasks will be killed).",
+                    _SHUTDOWN_TIMEOUT_SECONDS,
+                    len(still_running),
+                    still_running,
+                )
+                # Last-resort: повторный cancel. TaskGroup попытается дождаться
+                # на выходе, но event loop уже закрывается —Tasks умрут.
+                for t in bg_tasks:
+                    if not t.done():
+                        t.cancel()
+    except* asyncio.CancelledError:
+        # Ожидаемо при shutdown — uvicorn может кинуть CancelledError в lifespan.
         pass
+
+    # ── Webhook cleanup ────────────────────────────────────────────
     try:
         await bot.delete_webhook()
     except Exception:

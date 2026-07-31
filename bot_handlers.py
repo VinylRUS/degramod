@@ -126,6 +126,16 @@ logger = logging.getLogger("shadow_logger.bot_handlers")
 
 router = Router()
 
+# ── v4.7.3: Semaphore для ephemeral auto-delete ──────────────────────────
+# Каждое ephemeral-сообщение (varn-уведомление нарушителю, подтверждение
+# модератору) порождает fire-and-forget корутину `sleep(N) → delete_message`.
+# Раньше таких корутин создавалось без ограничений — поток из 1000 варнов
+# за минуту породил бы 1000 спящих задач. Semaphore(100) ограничивает
+# количество ОДНОВРЕМЕННО ожидающих auto-delete-задач: 101-я ждёт освобождения
+# слота. В Python 3.10+ Semaphore лениво привязывается к event loop при
+# первом acquire(), так что module-level объявление безопасно.
+_EPHEMERAL_DELETE_SEM = asyncio.Semaphore(100)
+
 # ── Конфигурация из окружения ──────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS: set[int] = {int(x.strip()) for x in _raw_admins.split(",") if x.strip()}
@@ -1927,11 +1937,24 @@ async def _send_ephemeral(
         return
 
     # ── v4.5.6: планируем авто-удаление ──────────────────────────────
+    # v4.7.3: Semaphore(100) ограничивает кол-во ОДНОВРЕМЕННО ожидающих
+    # auto-delete-задач. acquire() берётся ДО sleep — пока задача ждёт слот,
+    # она не считается «спящей» (не потребляет память под sleep-timer).
+    # На shutdown sem корректно освобождается через async with __aexit__.
     if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
         async def _del_ephemeral():
             try:
-                await asyncio.sleep(delete_after)
-                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+                async with _EPHEMERAL_DELETE_SEM:
+                    await asyncio.sleep(delete_after)
+                    await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except asyncio.CancelledError:
+                # Shutdown в процессе — сообщение останется (acceptable для
+                # ephemeral, оно видно только одному юзеру). Sem уже освобождён.
+                logger.debug(
+                    "Ephemeral auto-delete cancelled (shutdown?) chat=%s msg=%s",
+                    chat_id, sent.message_id,
+                )
+                raise  # propagate cancellation корректно
             except TelegramBadRequest as e:
                 logger.info(
                     "Ephemeral auto-delete in chat %s msg %s failed: %s "
@@ -2028,11 +2051,19 @@ async def _send_user_warn_notification(
         return
 
     # ── v4.5.6: планируем авто-удаление ──────────────────────────────
+    # v4.7.3: Semaphore(100) — см. _send_ephemeral.
     if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
         async def _del_warn_msg():
             try:
-                await asyncio.sleep(delete_after)
-                await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+                async with _EPHEMERAL_DELETE_SEM:
+                    await asyncio.sleep(delete_after)
+                    await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+            except asyncio.CancelledError:
+                logger.debug(
+                    "Warn notification auto-delete cancelled (shutdown?) chat=%s msg=%s",
+                    chat_id, sent.message_id,
+                )
+                raise
             except TelegramBadRequest as e:
                 logger.info(
                     "Warn notification auto-delete in chat %s msg %s failed: %s "
@@ -2719,12 +2750,20 @@ async def handle_group_command(message: types.Message) -> None:
                 text=f"⚠️ {target.first_name or target.id}: {total_warns} варнов",
             )
             # Удаляем ответ через 30 секунд
+            # v4.7.3: Semaphore(100) — тот же лимит что и для ephemeral,
+            # т.к. это тоже auto-delete фоновой задачей.
             async def _del_msg():
-                await asyncio.sleep(30)
                 try:
-                    await message.bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
-                except TelegramBadRequest:
-                    pass
+                    async with _EPHEMERAL_DELETE_SEM:
+                        await asyncio.sleep(30)
+                        try:
+                            await message.bot.delete_message(
+                                chat_id=chat_id, message_id=sent.message_id,
+                            )
+                        except TelegramBadRequest:
+                            pass
+                except asyncio.CancelledError:
+                    raise
             asyncio.create_task(_del_msg())
         try:
             await message.delete()
