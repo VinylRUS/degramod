@@ -381,6 +381,7 @@ def _today_in_tz(tz_name: str | None) -> date:
 
 async def _sanitary_day_tick():
     """v4.5.4: один проход sanitary day для всех чатов с configured sanitary days.
+    v4.7.2: только для чатов с sanitary_days_enabled=True.
 
     Для каждого чата:
       • parse sanitary_days JSON;
@@ -393,6 +394,7 @@ async def _sanitary_day_tick():
     try:
         async with async_session() as session:
             stmt = select(ChatSettings).where(
+                ChatSettings.sanitary_days_enabled.is_(True),  # v4.7.2
                 ChatSettings.sanitary_days.isnot(None),
                 ChatSettings.sanitary_days != "[]",
                 ChatSettings.sanitary_days != "",

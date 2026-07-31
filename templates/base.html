@@ -635,6 +635,14 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.7.2</strong> — 1 августа 2026</p>
+                <ul>
+                    <li><strong>Явный toggle для ночного режима и санитарных дней</strong>: раньше ночной режим включался автоматически при задании start/end, санитарные дни — при добавлении дат. Теперь оба требуют явного включения через кнопку <em>🌙 Night mode ● ENABLED</em> / <em>🧹 Sanitary days ● ENABLED</em> в соответствующей секции <code>/admin/chats</code>. Настройки сохраняются при выключении, но бот не применяет ограничения пока toggle off.</li>
+                    <li><strong>Подавление варнингов</strong>: для чатов с выключенным ночным режимом / санитарными днями бот больше не генерирует логи <code>logger.warning</code> и не показывает UI-бейджи. Команды <code>/nightmode</code> и <code>/sanitary</code> отвечают «функция выключена, сначала включите» при попытке <code>add</code>/<code>toggle</code>/<code>notify</code> на выключенном режиме.</li>
+                    <li><strong>Новые подкоманды <code>on</code>/<code>off</code></strong>: <code>/nightmode chat_id on</code>, <code>/sanitary chat_id on</code>, <code>/sanitary chat_id off</code> — явный toggle через CLI. Команда <code>off</code> корректно выходит из активного состояния (восстанавливает права из snapshot), не оставляя чат в night/sanitary-правах.</li>
+                    <li><strong>Миграция</strong>: при первом запуске v4.7.2 все существующие <code>night_mode_enabled</code> и <code>sanitary_days_currently_active</code> сбрасываются в <code>False</code>. После обновления SU должен явно включить функции в нужных чатах через <code>/admin/chats</code>. Это сознательное решение — пользователь предпочёл чистый старт для toggles.</li>
+                    <li><strong>Скрытие бейджа SAN</strong>: в карточке чата бейдж <em>SAN</em> показывается только если <code>sanitary_days_enabled=True</code> И есть даты. Раньше показывался при наличии дат даже если функция по факту не активна.</li>
+                </ul>
                 <p><strong>v4.7.1</strong> — 1 августа 2026</p>
                 <ul>
                     <li><strong>Хотфикс Jinja2-парсера</strong>: в changelog v4.6.2 внутри тега <code>&lt;code&gt;</code> лежал literal-фрагмент <code>{% raw %}{% if auth_user and ... %}{% endraw %}</code> — Jinja2 пытался его исполнить как код и ронял рендеринг любого шаблона, расширяющего <code>base.html</code>. Обёрнуто в <code>{% raw %}…{% endraw %}</code>. Симптом: белый экран / HTTP 500 на всех страницах после релиза v4.7.0.</li>

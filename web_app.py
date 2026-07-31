@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.1"
+APP_VERSION = "v4.7.2"
 APP_RELEASE_DATE = "2026-08-01"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -2004,8 +2004,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     ):
         """v4.4.7: переключает is_enabled / is_private / is_report_chat для чата.
         v4.5.2: добавлены toggle для cas, link_filter, night_mode.
+        v4.7.2: добавлен toggle для sanitary_days.
 
-        Поле form: field=enabled|private|report_chat|cas|link_filter|night_mode — что переключать.
+        Поле form: field=enabled|private|report_chat|cas|link_filter|night_mode|sanitary_days — что переключать.
         """
         try:
             chat_id = int(chat_id_str)
@@ -2016,7 +2017,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         form = await request.form()
         field = (form.get("field") or "").strip().lower()
-        valid_fields = {"enabled", "private", "report_chat", "cas", "link_filter", "night_mode"}
+        valid_fields = {"enabled", "private", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days"}
         if field not in valid_fields:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Invalid+toggle+field",
@@ -2047,8 +2048,50 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             elif field == "night_mode":
                 cs.night_mode_enabled = not cs.night_mode_enabled
                 if not cs.night_mode_enabled:
-                    cs.night_mode_currently_active = False
+                    # v4.7.2: при выключении — снимаем active, но НЕ выходим
+                    # через _exit_night_mode (это требует bot instance и может
+                    # затормозить). Tick сам увидит enabled=False и не тронет.
+                    # Если режим сейчас активен, восстановление прав произойдёт
+                    # через _exit_night_mode при следующем tick (он проверяет
+                    # enabled и пропустит, оставив active=True). Поэтому тут
+                    # явно сбрасываем active=False чтобы UI был консистентен,
+                    # но права в TG останутся night до вмешательства SU.
+                    # Лучше: дёрнуть _exit_night_mode если бот доступен.
+                    if cs.night_mode_currently_active and bot is not None:
+                        try:
+                            # Импортируем тут чтобы избежать circular import.
+                            from bot import _exit_night_mode
+                            await _exit_night_mode(cs)
+                            # Re-fetch т.к. _exit_night_mode коммитил.
+                            await session.refresh(cs)
+                        except Exception as e:
+                            _req_logger.warning(
+                                "toggle night_mode off: exit failed for chat %s: %s",
+                                chat_id, e,
+                            )
+                            cs.night_mode_currently_active = False
+                    else:
+                        cs.night_mode_currently_active = False
                 msg = f"Chat+{chat_id}+Night+mode+{'enabled' if cs.night_mode_enabled else 'disabled'}"
+            elif field == "sanitary_days":
+                # v4.7.2: явный toggle для санитарных дней.
+                cs.sanitary_days_enabled = not cs.sanitary_days_enabled
+                if not cs.sanitary_days_enabled and cs.sanitary_days_currently_active:
+                    # Выходим из sanitary day если он сейчас активен.
+                    if bot is not None:
+                        try:
+                            from bot import _exit_sanitary_day
+                            await _exit_sanitary_day(cs)
+                            await session.refresh(cs)
+                        except Exception as e:
+                            _req_logger.warning(
+                                "toggle sanitary off: exit failed for chat %s: %s",
+                                chat_id, e,
+                            )
+                            cs.sanitary_days_currently_active = False
+                    else:
+                        cs.sanitary_days_currently_active = False
+                msg = f"Chat+{chat_id}+Sanitary+days+{'enabled' if cs.sanitary_days_enabled else 'disabled'}"
             else:  # report_chat
                 if cs.is_report_chat:
                     cs.is_report_chat = False

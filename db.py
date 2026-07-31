@@ -223,6 +223,12 @@ class ChatSettings(Base):
     sanitary_days_saved_permissions = Column(Text, nullable=True)
     # Флаг: сейчас активен санитарный день (для логирования и веб-панели).
     sanitary_days_currently_active = Column(Boolean, default=False, nullable=False)
+    # ── v4.7.2: явный toggle для санитарных дней ───────────────────────
+    # Раньше sanitary day включался автоматически если sanitary_days не пустой.
+    # Теперь — явный toggle: если sanitary_days_enabled=False, _sanitary_day_tick
+    # пропускает чат, даже если даты заданы. Настройки (даты, perms) сохраняются,
+    # но не активны. Аналогично night_mode_enabled для ночного режима.
+    sanitary_days_enabled = Column(Boolean, default=False, nullable=False)
 
     # ── v4.6.0: Granular permissions ───────────────────────────────────
     # day_permissions — права, применяемые в нормальном дневном состоянии.
@@ -614,6 +620,42 @@ async def init_db() -> None:
                 await conn.execute(text(
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
+
+    # ── Миграция: sanitary_days_enabled + сброс night_mode_enabled (v4.7.2)
+    # v4.7.2: явные toggle для night mode и sanitary days.
+    #   - Добавляем колонку sanitary_days_enabled (Boolean, default 0).
+    #   - Сбрасываем night_mode_enabled=0 для всех чатов (пользователь решил
+    #     что при обновлении все функции должны быть выключены — нужно явно
+    #     включать через /admin/chats после обновления).
+    #   - Сбрасываем night_mode_currently_active=0 (на случай если чат был
+    #     в ночном режиме во время обновления — иначе при выключенном
+    #     night_mode_enabledtick не снимет активное состояние).
+    #   - Сбрасываем sanitary_days_currently_active=0 по той же причине.
+    # Идемпотентно: если колонка уже есть — пропускаем ALTER.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "sanitary_days_enabled" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN sanitary_days_enabled "
+                "BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        # Сброс toggles для всех существующих чатов (кроме default chat_id=0).
+        # Делаем это всегда при запуске — но update атомарный, не вредит.
+        # ВНИМАНИЕ: только в первый апгрейд до v4.7.2. Если уже сброшено —
+        # UPDATE просто перепишет 0 на 0 (no-op).
+        # Используем маркер: проверяем есть ли в БД хоть одна запись с
+        # night_mode_enabled=1 — если да, это первый запуск после апгрейда.
+        rows = (await conn.execute(text(
+            "SELECT COUNT(*) FROM chat_settings WHERE night_mode_enabled=1 "
+            "OR sanitary_days_currently_active=1"
+        ))).scalar()
+        if rows and rows > 0:
+            await conn.execute(text(
+                "UPDATE chat_settings SET night_mode_enabled=0, "
+                "night_mode_currently_active=0, sanitary_days_currently_active=0 "
+                "WHERE chat_id != 0"
+            ))
 
     # ── Миграция: новая таблица permission_presets (v4.6.0) ───────────
     # create_all() выше создаст её для новой БД; для существующей — IF NOT EXISTS.

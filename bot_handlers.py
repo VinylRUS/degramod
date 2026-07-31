@@ -3695,7 +3695,17 @@ async def cmd_nightmode(message: types.Message) -> None:
         async with async_session() as session:
             settings = await _get_chat_settings(session, chat_id)
             settings.night_mode_enabled = False
-            settings.night_mode_currently_active = False
+            # v4.7.2: если сейчас активен — выходим из ночного режима,
+            # восстанавливаем права из snapshot. Иначе чат зависнет в night-правах.
+            if settings.night_mode_currently_active:
+                try:
+                    from bot import _exit_night_mode
+                    # Re-fetch из сессии чтобы _exit_night_mode работал
+                    await _exit_night_mode(settings)
+                    await session.refresh(settings)
+                except Exception as e:
+                    logger.warning("nightmode off: exit failed for chat %s: %s", chat_id, e)
+                    settings.night_mode_currently_active = False
             await session.commit()
         await message.reply(
             f"✅ Ночной режим в чате {chat_id}: <b>выключен</b>",
@@ -3703,7 +3713,31 @@ async def cmd_nightmode(message: types.Message) -> None:
         )
         return
 
+    # ── SUBCOMMAND: on (v4.7.2) ─────────────────────────────────────
+    # Включает функцию night_mode_enabled=True, не меняя настроек.
+    # Полезно после миграции v4.7.2 (где все toggles сбрасываются в off).
+    if arg2 == "on":
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            settings.night_mode_enabled = True
+            await session.commit()
+            start = settings.night_mode_start or "23:00"
+            end = settings.night_mode_end or "07:00"
+            tz = settings.night_mode_tz or "Europe/Moscow"
+        await message.reply(
+            f"✅ Ночной режим в чате {chat_id}: <b>функция включена</b>\n"
+            f"⏰ {start} → {end} ({tz})\n"
+            "Бот будет автоматически применять ночные ограничения в заданное время.",
+            parse_mode="HTML",
+        )
+        return
+
     # ── SUBCOMMAND: tz ───────────────────────────────────────────────
+    # v4.7.2: tz/weekend/notify/preset/status — это настройки режима.
+    # Если night_mode_enabled=False, всё равно можно их менять (настройки
+    # сохраняются, но не активны). Это упрощает миграцию и не требует
+    # включать режим чтобы настроить. Однако tick не будет применять
+    # ничего пока enabled=False.
     if arg2 == "tz":
         if len(parts) < 4:
             async with async_session() as session:
@@ -4061,8 +4095,15 @@ async def cmd_sanitary(message: types.Message) -> None:
     (выданные через promote_chat_member) override'ят chat-level perms.
     Ночной режим в санитарный день пропускается (не дёргает права).
 
+    v4.7.2: добавлены подкоманды on/off — явный toggle функции.
+    Если sanitary_days_enabled=False, бот не обрабатывает add/toggle/
+    remove (только on/off/list/clear). Это убирает лишние варнинги в
+    чатах где функция выключена.
+
     Поддерживаемые формы:
       /sanitary chat_id                                  — показать список
+      /sanitary chat_id on                               — включить функцию
+      /sanitary chat_id off                              — выключить функцию
       /sanitary chat_id add <YYYY-MM-DD>                 — добавить один день
       /sanitary chat_id add <YYYY-MM-DD>:<YYYY-MM-DD>    — добавить диапазон
       /sanitary chat_id remove <YYYY-MM-DD>              — удалить день/диапазон,
@@ -4079,6 +4120,8 @@ async def cmd_sanitary(message: types.Message) -> None:
         await message.reply(
             "📋 Формат:\n"
             "  /sanitary chat_id\n"
+            "  /sanitary chat_id on\n"
+            "  /sanitary chat_id off\n"
             "  /sanitary chat_id add <YYYY-MM-DD>\n"
             "  /sanitary chat_id add <YYYY-MM-DD>:<YYYY-MM-DD>\n"
             "  /sanitary chat_id remove <YYYY-MM-DD>\n"
@@ -4103,8 +4146,10 @@ async def cmd_sanitary(message: types.Message) -> None:
         if not sub:
             pairs = parse_sanitary_days_json(settings.sanitary_days)
             if not pairs:
+                state = "включена" if settings.sanitary_days_enabled else "выключена"
                 await message.reply(
-                    f"📋 Санитарные дни чата {chat_id}: <b>пусто</b>",
+                    f"📋 Санитарные дни чата {chat_id}: <b>пусто</b>\n"
+                    f"Функция: <b>{state}</b>",
                     parse_mode="HTML",
                 )
                 return
@@ -4115,9 +4160,47 @@ async def cmd_sanitary(message: types.Message) -> None:
                 else:
                     lines.append(f"  {i}. {s} → {e}")
             status = " ● АКТИВЕН" if settings.sanitary_days_currently_active else ""
+            state = "включена" if settings.sanitary_days_enabled else "ВЫКЛЮЧЕНА (даты сохранены, не активны)"
             lines.append(f"Статус: {'🔒 lockdown' if settings.sanitary_days_currently_active else '⚪ не активен'}{status}")
+            lines.append(f"Функция: {state}")
             await message.reply(
                 "\n".join(lines),
+                parse_mode="HTML",
+            )
+            return
+
+        # ── v4.7.2: ON / OFF (явный toggle) ───────────────────────────
+        if sub == "on":
+            settings.sanitary_days_enabled = True
+            await session.commit()
+            await message.reply(
+                f"✅ Санитарные дни чата {chat_id}: <b>функция включена</b>\n"
+                "Бот будет автоматически входить в lockdown в заданные даты.",
+                parse_mode="HTML",
+            )
+            return
+        if sub == "off":
+            settings.sanitary_days_enabled = False
+            # Если сейчас активен — выходим из sanitary day.
+            if settings.sanitary_days_currently_active:
+                try:
+                    from bot import _exit_sanitary_day
+                    await _exit_sanitary_day(settings)
+                except Exception as e:
+                    logger.warning("sanitary off: exit failed for chat %s: %s", chat_id, e)
+            await session.commit()
+            await message.reply(
+                f"✅ Санитарные дни чата {chat_id}: <b>функция выключена</b>\n"
+                "Даты сохранены, но бот не будет применять lockdown.",
+                parse_mode="HTML",
+            )
+            return
+
+        # ── v4.7.2: gate на enabled для add/remove/toggle ─────────────
+        if sub in ("add", "remove", "toggle") and not settings.sanitary_days_enabled:
+            await message.reply(
+                f"⚠️ Функция санитарных дней выключена для чата {chat_id}.\n"
+                f"Сначала включите: <code>/sanitary {chat_id} on</code>",
                 parse_mode="HTML",
             )
             return

@@ -51,7 +51,7 @@
             {% if c.cas_check_enabled %}<span class="badge" style="background: rgba(51,153,204,.15); color: var(--info); border: 1px solid var(--info);">CAS</span>{% endif %}
             {% if c.link_filter_enabled %}<span class="badge" style="background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">LINK-FILTER</span>{% endif %}
             {% if c.night_mode_enabled %}<span class="badge" style="background: rgba(102,102,102,.15); color: var(--text-dim); border: 1px solid var(--text-dim);">NIGHT {{ c.night_mode_start }}-{{ c.night_mode_end }}{% if c.night_mode_tz and c.night_mode_tz != 'Europe/Moscow' %} {{ c.night_mode_tz }}{% endif %}{% if c.night_mode_notify %} 🔔{% endif %}{% if c.night_mode_currently_active %} ●{% endif %}</span>{% endif %}
-            {% if c.sanitary_days %}<span class="badge" style="background: {% if c.sanitary_days_currently_active %}rgba(220,38,38,.18){% else %}rgba(102,102,102,.15){% endif %}; color: {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %}; border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %};">SAN{% if c.sanitary_days_currently_active %} ●{% endif %}</span>{% endif %}
+            {% if c.sanitary_days_enabled and c.sanitary_days %}<span class="badge" style="background: {% if c.sanitary_days_currently_active %}rgba(220,38,38,.18){% else %}rgba(102,102,102,.15){% endif %}; color: {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %}; border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %};">SAN{% if c.sanitary_days_currently_active %} ●{% endif %}</span>{% endif %}
             {% if c.warn_decay_days and c.warn_decay_days > 0 %}<span class="badge" style="background: rgba(0,204,102,.08); color: var(--accent); border: 1px solid var(--accent);">DECAY {{ c.warn_decay_days }}d</span>{% endif %}
             {% if c.hashtag %}<span style="color: var(--accent); font-size: 11px; font-family: var(--font-mono);">{{ c.hashtag }}</span>{% endif %}
         </div>
@@ -356,15 +356,29 @@
             <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
                 <span>🧹 Санитарные дни{% if c.sanitary_days_currently_active %} <span style="color: var(--danger);">● LOCKDOWN</span>{% endif %}</span>
                 <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    {% if c.sanitary_days %}{{ c.sanitary_days | format_sanitary_days | trim | length }} chars configured · {% if c.sanitary_days_permissions %}custom{% else %}lockdown{% endif %}{% else %}no dates{% endif %}
+                    {% if not c.sanitary_days_enabled %}disabled{% elif c.sanitary_days %}{{ c.sanitary_days | format_sanitary_days | trim | length }} chars · {% if c.sanitary_days_permissions %}custom{% else %}lockdown{% endif %}{% else %}enabled, no dates{% endif %}
                 </span>
             </summary>
             <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+
+                {# v4.7.2: Sanitary enable toggle (instant POST) #}
+                <div style="margin-bottom: var(--sp-3);">
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="sanitary_days">
+                        <button type="submit"
+                                style="padding: 4px 12px; background: transparent; border: 1px solid {% if c.sanitary_days_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.sanitary_days_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">
+                            🧹 Sanitary days {% if c.sanitary_days_enabled %}● ENABLED{% else %}○ disabled{% endif %}
+                        </button>
+                    </form>
+                    <span style="font-size: 9px; color: var(--text-dim); margin-left: 8px;">Включается мгновенно. Даты и пресет — требуют «Сохранить».</span>
+                </div>
+
                 <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Даты (одна в строке: YYYY-MM-DD или диапазон YYYY-MM-DD - YYYY-MM-DD)</label>
                 <textarea name="sanitary_days_text" rows="4" placeholder="2026-08-01&#10;2026-08-15 - 2026-08-17&#10;# comments allowed"
                           style="width: 100%; padding: 6px 10px; background: var(--surface, var(--bg)); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; resize: vertical; box-sizing: border-box;">{{ c.sanitary_days | format_sanitary_days }}</textarea>
                 <div style="margin-top: 4px; font-size: 9px; color: var(--text-dim); line-height: 1.6;">
                     Даты хранятся по месяцам. После окончания последнего дня месяца — даты автоматически стираются и ставится невидимая метка «sanitary был в этом месяце» (чтобы дашборд не ругался). Реакции остаются доступны всегда — Telegram управляет ими отдельно.
+                    {% if not c.sanitary_days_enabled %}<br><strong style="color: var(--warn);">⚠ Функция выключена — даты сохранятся, но бот не будет применять lockdown.</strong>{% endif %}
                 </div>
 
                 {# Sanitary preset — only choice, no custom grid #}
