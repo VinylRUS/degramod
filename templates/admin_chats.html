@@ -99,6 +99,28 @@
             <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
 
                 {# Quick toggles — instant POST, no save needed #}
+                {# v4.7.0: для report-чата оставляем ТОЛЬКО enabled + make-report #}
+                {% if c.is_report_chat %}
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: var(--sp-3);">
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="enabled">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
+                        </button>
+                    </form>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
+                        <input type="hidden" name="field" value="report_chat">
+                        <button type="submit"
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            ★ REPORT
+                        </button>
+                    </form>
+                </div>
+                <div style="font-size: 10px; color: var(--text-dim); padding: var(--sp-2); background: var(--bg); border-radius: var(--r-sm); line-height: 1.6;">
+                    📌 Это <strong>чат для отчётов</strong> — сюда бот складывает репорты из других чатов. Настройки модерации (CAS, link-filter, night mode, санитарные дни, наказания) недоступны — репорт-чат не модерируется. Sync admins тоже недоступен.
+                </div>
+                {% else %}
                 <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: var(--sp-3);">
                     <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;">
                         <input type="hidden" name="field" value="enabled">
@@ -129,15 +151,17 @@
                         </button>
                     </form>
                     <form method="post" action="/admin/chats/{{ c.chat_id }}/toggle" style="display: inline;"
-                          {% if c.is_report_chat %}{% else %}onsubmit="return confirm('Make this chat a report chat?');"{% endif %}>
+                          onsubmit="return confirm('Make this chat a report chat? \n\nOther settings (CAS, link-filter, night mode, sanitary days, punishments) will be HIDDEN — report chat is not moderated.');">
                         <input type="hidden" name="field" value="report_chat">
                         <button type="submit"
-                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_report_chat %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.is_report_chat %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
-                            {% if c.is_report_chat %}★ REPORT{% else %}☆ make report{% endif %}
+                                style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                            ☆ make report
                         </button>
                     </form>
                 </div>
+                {% endif %}
 
+                {% if not c.is_report_chat %}
                 {# Hashtag + report chat dropdown #}
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2);">
                     <div>
@@ -174,9 +198,28 @@
                         Все доступные пресеты создаются на странице <a href="/admin/presets" style="color: var(--accent);">/admin/presets →</a>
                     </div>
                 </div>
+
+                {# v4.7.0: Sync admins button — только SU и только для не-report-чатов #}
+                {% if auth_user.role == 'su' %}
+                <div style="margin-top: var(--sp-3); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">👤 Moderators / Admins (v4.7.0)</label>
+                    <form method="post" action="/admin/chats/{{ c.chat_id }}/sync-admins" style="display: inline;"
+                          onsubmit="return confirm('Sync admins from Telegram?\n\n• New TG-admins → create pending WebUser (active after /start in DM).\n• Existing WebUser: role updated (can_promote → admin, else moderator).\n• Removed TG-admins → deactivated.\n\nThis is per-chat, manual sync.')">
+                        <button type="submit"
+                                style="padding: 6px 14px; background: transparent; border: 1px solid var(--info); color: var(--info); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">
+                            ↻ Sync admins from TG
+                        </button>
+                    </form>
+                    <div style="font-size: 9px; color: var(--text-dim); margin-top: 6px; line-height: 1.6;">
+                        Получает список админов чата из Telegram и создаёт для каждого pending-учётку (роль <code>admin</code> если у него есть <code>can_promote_members</code>, иначе <code>moderator</code>). Юзер активирует её командой <code>/start</code> в ЛС боту — получит логин+пароль в DM.
+                    </div>
+                </div>
+                {% endif %}
+                {% endif %}
             </div>
         </details>
 
+        {% if not c.is_report_chat %}
         {# ════════════ 2. Наказания ════════════ #}
         <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm);">
             <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
@@ -341,7 +384,10 @@
             </div>
         </details>
 
-        {# ── Save / Cancel ── #}
+        {% endif %}{# end if not c.is_report_chat — секции 2/3/4 скрыты для репорт-чата #}
+
+        {# ── Save / Cancel — для репорт-чата скрываем Save (там нечего сохранять) ── #}
+        {% if not c.is_report_chat %}
         <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
             <button type="submit"
                     style="padding: 6px 14px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
@@ -352,6 +398,14 @@
                 Отмена
             </button>
         </div>
+        {% else %}
+        <div style="display: flex; gap: var(--sp-2); margin-top: var(--sp-2);">
+            <button type="button" onclick="this.parentElement.parentElement.parentElement.style.display='none';"
+                    style="padding: 6px 14px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; cursor: pointer; border-radius: var(--r-xs);">
+                Закрыть
+            </button>
+        </div>
+        {% endif %}
     </form>
     </div>
 

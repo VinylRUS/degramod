@@ -376,6 +376,15 @@ class WebUser(Base):
     # <data_dir>/avatars/<tg_user_id>.jpg, чтобы не дёргать TG API на каждом
     # рендере и не хранить base64 в БД.
     tg_photo_updated_at = Column(DateTime, nullable=True)
+    # ── v4.7.0: авто-обнаружение TG-админов ────────────────────────────
+    # is_pending=True — WebUser создан sync-кнопкой, ждёт /start от юзера
+    # (is_active=False, без пароля). На /start → генерим пароль, is_active=True,
+    # is_pending=False, шлём DM с credentials.
+    is_pending = Column(Boolean, default=False, nullable=False)
+    # auto_discovered=True — маркер что учётка создана автоматически через sync,
+    # а не вручную SU. Полезно для статистики и для отличия исторических ручных
+    # учёток (v4.6.x и ранее) от новых авто.
+    auto_discovered = Column(Boolean, default=False, nullable=False)
 
 
 # ── Init / Shutdown ────────────────────────────────────────────────────────
@@ -485,6 +494,21 @@ async def init_db() -> None:
         if "tg_photo_updated_at" not in columns:
             await conn.execute(text(
                 "ALTER TABLE web_users ADD COLUMN tg_photo_updated_at DATETIME NULL"
+            ))
+
+    # ── Миграция: is_pending / auto_discovered в web_users (v4.7.0) ────
+    # is_pending=True — авто-созданная учётка, ждёт /start (is_active=False, без пароля).
+    # auto_discovered=True — маркер что создана через sync, а не вручную SU.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(web_users)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "is_pending" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN is_pending BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "auto_discovered" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE web_users ADD COLUMN auto_discovered BOOLEAN NOT NULL DEFAULT 0"
             ))
 
     # ── Миграция: расширение chat_settings (v4.4.7) ─────────────────────

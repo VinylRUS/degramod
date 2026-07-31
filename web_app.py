@@ -97,8 +97,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.6.1"
-APP_RELEASE_DATE = "2026-07-30"
+APP_VERSION = "v4.7.0"
+APP_RELEASE_DATE = "2026-08-01"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -2180,6 +2180,273 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         return RedirectResponse(url=f"/admin/chats?flash={msg}", status_code=303)
 
     # ──────────────────────────────────────────────────────────────────
+    #  /admin/chats/{chat_id}/sync-admins — v4.7.0: авто-обнаружение
+    #  TG-админов чата и создание/обновление WebUser.
+    #
+    #  Логика sync (per-chat, по кнопке SU):
+    #    1. Получаем TG-админов через bot.get_chat_administrators.
+    #    2. Пропускаем ботов и анонимных (если есть).
+    #    3. Для каждого TG-админа:
+    #       a. Если уже есть WebUser с этим tg_user_id:
+    #          - Если is_pending=True → оставляем как есть (ждёт /start).
+    #          - Если is_active=True → проверяем роль и chat_admins.
+    #            Обновляем role: can_promote_members → admin, иначе moderator.
+    #            (SU-override роль не трогаем — SU всегда SU.)
+    #          - Гарантируем наличие chat_admins записи (для moderator).
+    #       b. Если нет WebUser → создаём pending (is_active=False,
+    #          is_pending=True, без пароля, auto_discovered=True).
+    #          Логин: @username (если есть) или tg<TGID>.
+    #          Role: admin если can_promote_members, иначе moderator.
+    #    4. Для каждого существующего активного WebUser-moderator, привязанного
+    #       к этому чату через chat_admins, но НЕ найденного среди текущих
+    #       TG-админов → is_active=False (полная деактивация по решению SU).
+    #       Admin-роль не понижаем (он может быть админом в других чатах).
+    #
+    #  Ограничения:
+    #    • is_report_chat чаты игнорируются (репорт-чат не модерируется).
+    #    • Только SU (кнопка доступна только SU в UI).
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/chats/{chat_id_str}/sync-admins")
+    async def admin_chats_sync_admins(
+        chat_id_str: str,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.7.0: sync TG-admins of a chat → WebUser (pending or activate)."""
+        try:
+            chat_id = int(chat_id_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+chat_id",
+                status_code=303,
+            )
+        if chat_id == 0:
+            return RedirectResponse(
+                url="/admin/chats?flash=Cannot+sync+default+settings",
+                status_code=303,
+            )
+        if bot is None:
+            return RedirectResponse(
+                url="/admin/chats?flash=Bot+instance+not+available",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            )).scalar_one_or_none()
+            if cs is None:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
+                    status_code=303,
+                )
+            if cs.is_report_chat:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Report+chat+ignored+(no+admins+to+sync)",
+                    status_code=303,
+                )
+
+        # 1. Получаем TG-админов.
+        try:
+            tg_admins = await bot.get_chat_administrators(chat_id=chat_id)
+        except TelegramBadRequest as e:
+            _req_logger.warning(
+                "sync_admins: get_chat_administrators(%s) failed: %s",
+                chat_id, e,
+            )
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Telegram+error:+{str(e).replace(' ', '+')[:200]}",
+                status_code=303,
+            )
+        except Exception as e:
+            _req_logger.warning(
+                "sync_admins: get_chat_administrators(%s) unexpected: %s",
+                chat_id, e,
+            )
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Unexpected+error:+{str(e).replace(' ', '+')[:200]}",
+                status_code=303,
+            )
+
+        # Фильтруем ботов (is_bot=True) — у нас нет смысла создавать учётки для ботов.
+        tg_admins = [a for a in tg_admins if not getattr(a.user, "is_bot", False)]
+
+        # 2. Словарь tg_user_id → (can_promote, tg_user_obj) для удобства.
+        tg_admin_map: dict[int, tuple[bool, object]] = {}
+        for a in tg_admins:
+            uid = getattr(a.user, "id", None)
+            if uid is None:
+                continue
+            # can_promote_members есть и у creator, и у administrator с этим правом.
+            can_promote = bool(getattr(a, "can_promote_members", False)) or \
+                          getattr(a, "status", "") == "creator"
+            tg_admin_map[uid] = (can_promote, a.user)
+
+        # 3. Существующие WebUser по tg_user_id (одним запросом).
+        tg_ids = list(tg_admin_map.keys())
+        existing_wus: dict[int, WebUser] = {}
+        if tg_ids:
+            async with async_session() as session:
+                rows = (await session.execute(
+                    select(WebUser).where(WebUser.tg_user_id.in_(tg_ids))
+                )).scalars().all()
+                for wu in rows:
+                    existing_wus[wu.tg_user_id] = wu
+
+        # 4. Существующие chat_admins для этого чата (для деактивации отсутствующих).
+        async with async_session() as session:
+            existing_ca_rows = (await session.execute(
+                select(ChatAdmin).where(ChatAdmin.chat_id == chat_id)
+            )).scalars().all()
+        existing_ca_uids: set[int] = {ca.user_id for ca in existing_ca_rows}
+
+        # 5. Считаем что сделали — для флэша и лога.
+        created_pending = 0
+        created_admin = 0
+        created_moderator = 0
+        updated_role = 0
+        already_ok = 0
+        deactivated = 0
+
+        async with async_session() as session:
+            # 5a. Обработка найденных TG-админов.
+            for uid, (can_promote, tg_user) in tg_admin_map.items():
+                desired_role = "admin" if can_promote else "moderator"
+                wu = existing_wus.get(uid)
+                if wu is None:
+                    # Создаём pending.
+                    tg_username = getattr(tg_user, "username", None)
+                    if tg_username:
+                        login = tg_username.strip().lstrip("@").lower()
+                    else:
+                        login = f"tg{uid}"
+                    # Гарантируем уникальность логина (если вдруг занят).
+                    base_login = login
+                    suffix = 1
+                    while True:
+                        exists = (await session.execute(
+                            select(WebUser.id).where(WebUser.username == login)
+                        )).first()
+                        if not exists:
+                            break
+                        suffix += 1
+                        login = f"{base_login}{suffix}"
+                    new_wu = WebUser(
+                        username=login,
+                        password_hash=None,
+                        is_su=False,
+                        is_active=False,
+                        is_pending=True,
+                        auto_discovered=True,
+                        role=desired_role,
+                        tg_user_id=uid,
+                        tg_first_name=getattr(tg_user, "first_name", None),
+                        tg_last_name=getattr(tg_user, "last_name", None),
+                        tg_username=tg_username,
+                    )
+                    session.add(new_wu)
+                    if desired_role == "admin":
+                        created_admin += 1
+                    else:
+                        created_moderator += 1
+                    created_pending += 1
+                    # Гарантируем chat_admins для moderator.
+                    if desired_role == "moderator":
+                        ca = ChatAdmin(
+                            chat_id=chat_id,
+                            user_id=uid,
+                            added_by=None,
+                        )
+                        session.add(ca)
+                else:
+                    # WebUser уже есть.
+                    if wu.is_pending:
+                        # Ждёт /start — не трогаем.
+                        already_ok += 1
+                        # Но роль можем обновить (если изменилась).
+                        if not wu.is_su and wu.role != desired_role:
+                            wu.role = desired_role
+                            updated_role += 1
+                        # И chat_admins гарантия.
+                        if desired_role == "moderator" and uid not in existing_ca_uids:
+                            session.add(ChatAdmin(
+                                chat_id=chat_id, user_id=uid, added_by=None,
+                            ))
+                            existing_ca_uids.add(uid)
+                        continue
+                    if not wu.is_active:
+                        # Не pending и не active — деактивирован ранее. Пропускаем
+                        # (SU должен сам реактивировать через change-role/deactivate).
+                        already_ok += 1
+                        continue
+                    # Активный WebUser.
+                    if wu.is_su:
+                        # SU не трогаем.
+                        already_ok += 1
+                        continue
+                    # Обновляем роль если нужно.
+                    if wu.role != desired_role:
+                        wu.role = desired_role
+                        updated_role += 1
+                        # При повышении moderator→admin — чистим chat_admins
+                        # (админу они не нужны).
+                        if desired_role == "admin":
+                            for ca in (await session.execute(
+                                select(ChatAdmin).where(ChatAdmin.user_id == uid)
+                            )).scalars().all():
+                                await session.delete(ca)
+                            existing_ca_uids.discard(uid)
+                    # Гарантируем chat_admins для moderator.
+                    if desired_role == "moderator" and uid not in existing_ca_uids:
+                        session.add(ChatAdmin(
+                            chat_id=chat_id, user_id=uid, added_by=None,
+                        ))
+                        existing_ca_uids.add(uid)
+                    already_ok += 1
+
+            # 5b. Деактивация отсутствующих: для каждого uid в existing_ca_uids,
+            # которого нет среди текущих TG-админов → если есть WebUser с role=moderator
+            # → is_active=False (по решению SU "всегда deact").
+            for uid in list(existing_ca_uids):
+                if uid in tg_admin_map:
+                    continue  # всё ещё админ — не трогаем
+                wu = (await session.execute(
+                    select(WebUser).where(WebUser.tg_user_id == uid)
+                )).scalar_one_or_none()
+                if wu is None or wu.is_su:
+                    continue
+                if wu.role == "moderator" and wu.is_active:
+                    wu.is_active = False
+                    deactivated += 1
+                # Удаляем chat_admins запись для этого чата (он больше не админ тут).
+                for ca in (await session.execute(
+                    select(ChatAdmin).where(
+                        ChatAdmin.chat_id == chat_id,
+                        ChatAdmin.user_id == uid,
+                    )
+                )).scalars().all():
+                    await session.delete(ca)
+                existing_ca_uids.discard(uid)
+
+            await session.commit()
+
+        msg_parts = [
+            f"created={created_pending}",
+            f"(admin={created_admin},mod={created_moderator})",
+            f"updated_role={updated_role}",
+            f"deactivated={deactivated}",
+            f"already_ok={already_ok}",
+        ]
+        msg = "+".join(msg_parts)
+        _req_logger.info(
+            "sync_admins: chat_id=%s by=%s — %s",
+            chat_id, _auth.username, msg,
+        )
+        return RedirectResponse(
+            url=f"/admin/chats?flash=Sync+{chat_id_str}+done:+{msg.replace(' ', '+')}",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
     #  /admin/cleanup — безопасная очистка тестовых данных (v4.4.5)
     #
     #  SU-only. Позволяет одним кликом очистить тестовый мусор из БД:
@@ -2707,7 +2974,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 "flash": flash,
                 "app_version": APP_VERSION,
                 "app_release_date": APP_RELEASE_DATE,
-                "auth": _auth,
+                "auth_user": _auth,
             },
         )
 

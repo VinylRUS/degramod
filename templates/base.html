@@ -635,7 +635,21 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
-                <p><strong>v4.6.1</strong> — 30 июля 2026</p>
+                <p><strong>v4.7.0</strong> — 1 августа 2026</p>
+                <ul>
+                    <li><strong>Авто-обнаружение админов чата</strong>: ручное создание пользователей в /admin/users упразднено. Теперь SU жмёт кнопку «↻ Sync admins from TG» в карточке чата (страница <code>/admin/chats</code>) → бот получает список TG-админов через <code>get_chat_administrators</code> и создаёт для каждого pending-учётку (<code>is_active=False</code>, без пароля).</li>
+                    <li><strong>Активация через /start</strong>: юзер, которого SU синхронизировал, пишет боту <code>/start</code> в ЛС → бот генерирует пароль, активирует учётку (<code>is_active=True</code>, <code>is_pending=False</code>), скачивает аватарку и шлёт DM с логином/паролем под спойлером. Посторонним бот по-прежнему молчит (стелс).</li>
+                    <li><strong>Роль по TG-правам</strong>: если у админа есть <code>can_promote_members</code> (=owner) → роль <code>admin</code>, иначе <code>moderator</code> (привязан к своему чату через <code>chat_admins</code>). Логин: <code>@username</code> или <code>tg&lt;TGID&gt;</code> если @username нет.</li>
+                    <li><strong>Demote = deactivate</strong>: при следующем sync, если TG-owner снял админа в чате, его WebUser-moderator деактивируется (<code>is_active=False</code>). SU может реактивировать вручную.</li>
+                    <li><strong>Репорт-чат минимализм</strong>: при <code>is_report_chat=True</code> в карточке чата скрыты все настройки кроме <em>enabled</em> и <em>★ REPORT</em>. Репорт-чат не модерируется — нет смысла настраивать CAS/link-filter/night/sanitary. Sync admins для репорт-чатов тоже недоступен.</li>
+                    <li><strong>pending-бейдж в /admin/users</strong>: pending-юзеры (не написали /start) показываются с жёлтым бейджем <em>PENDING</em>. Авто-созданные учётки помечены серым <em>auto</em>. SU может: деактивировать, сменить роль, сбросить пароль, удалить, привязать другой TG ID.</li>
+                </ul>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.6.2</strong> — 31 июля 2026</p>
+                <ul>
+                    <li><strong>Отчёт в репорт-чате</strong>: сворачиваемый блок с текстом+медиа нарушителя переименован с «📎 Показать медиа» на «📎 Сообщение юзера» — название честно отражает содержимое (внутри не только фото/видео, но и текст сообщения нарушителя как цитата).</li>
+                    <li><strong>Фикс navbar на /admin/presets</strong>: маршрут передавал в шаблон ключ <code>auth</code> вместо <code>auth_user</code>, из-за чего условие в navbar’е <code>{% if auth_user and ... %}</code> не срабатывало — на странице пресетов были видны только <em>Dashboard</em> и <em>Logout</em>. Теперь на странице пресетов видны все доступные вкладки по ролевой модели (SU видит Users/Settings, admin видит Chats).</li>
+                </ul>
+                <p style="margin-top:10px;color:var(--text-dim);font-size:11px;"><strong>v4.6.1</strong> — 30 июля 2026</p>
                 <ul>
                     <li><strong>Редизайн /admin/chats</strong>: вместо «стены» полей — 4 сворачиваемых секции-аккордеона: <em>Общее</em>, <em>Наказания</em>, <em>Ночной режим</em>, <em>Санитарные дни</em>. Каждая секция показывает краткую сводку в заголовке (например <code>23:00–07:00 MSK · notify 🔔</code>), не открывая её.</li>
                     <li><strong>Только выбор пресета, без custom grid</strong>: настройки чата больше не содержат 13 чекбоксов прав для каждого режима. Свои наборы прав создаются централизованно на странице <code>/admin/presets</code> — здесь только выбирается готовый пресет из dropdown. Один источник истины, ноль дублирования.</li>

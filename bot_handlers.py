@@ -16,17 +16,17 @@ v4.4.9 ИСКЛЮЧЕНИЕ: при !warn нарушитель получает 
 
 v4.4.10 РЕДИЗАЙН ОТЧЁТА В РЕПОРТ-ЧАТЕ:
 • Структура: SectionHeading → Divider → List (нарушитель/причина/веб-профиль)
-  → Divider → Details «📎 Показать медиа» (медиа под спойлером, по умолчанию
-  свёрнуто) → Divider → Details «Доп. инфо» → Divider → Footer.
+  → Divider → Details «📎 Сообщение юзера» (текст+медиа под спойлером, по
+  умолчанию свёрнуто) → Divider → Details «Доп. инфо» → Divider → Footer.
 • Модератор перенесён в Footer (кликабельное имя, без приписки «Модератор:»)
   — раньше он был отдельным параграфом с эмодзи 👮, теперь компактнее.
 • Длинный URL веб-профиля спрятан под коротким текстом «Открыть профиль →»
   через RichTextUrl — больше URL не ломается посередине на мобиле.
 • ID нарушителя оформлен как inline-код (моноширинный) — выделяется визуально,
   легко копируется долгим тапом на мобильном.
-• Медиа обёрнуто в Details (сворачиваемый блок) — не торчит открыто, чтобы
-  модератор случайно не увидел шок-контент. По тапу на «📎 Показать медиа»
-  разворачивается.
+• Текст+медиа нарушителя обёрнуты в Details (сворачиваемый блок «📎 Сообщение
+  юзера») — не торчит открыто, чтобы модератор случайно не увидел шок-контент.
+  По тапу на «📎 Сообщение юзера» разворачивается.
 • Divider'ы (горизонтальные линии) визуально разделяют секции — на мобиле
   больше не «стена текста», а чёткие блоки. ★★★
 
@@ -81,6 +81,7 @@ import json
 import os
 import re
 import logging
+import secrets
 from datetime import datetime, timezone, timedelta, date
 from urllib.parse import urlparse
 
@@ -111,12 +112,14 @@ from aiogram.types import (
     RichTextUrl,
     RichTextBold,
     RichTextCode,
+    RichTextSpoiler,
 )
 from sqlalchemy import select, desc, func
 
 from db import (
     async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser,
     WordFilter, LinkAllowlist, BannedStickerPack,
+    _hash_password,
 )
 
 logger = logging.getLogger("shadow_logger.bot_handlers")
@@ -1600,10 +1603,10 @@ async def _send_report(
                           коротким текстом «Открыть профиль →» — больше не ломается.
                           ID нарушителя оформлен как inline-код (моноширинный).
       4. Divider        — разделитель
-      5. Details        — «📎 Показать медиа» (is_open=False): сворачиваемый блок с
-                          фото/видео/гиф из сообщения нарушителя. По умолчанию скрыт
-                          (защита от шок-контента), разворачивается по тапу.
-                          Если есть text_content — он идёт первым пунктом внутри Details.
+      5. Details        — «📎 Сообщение юзера» (is_open=False): сворачиваемый блок,
+                          куда входит текст сообщения нарушителя (как BlockQuotation)
+                          и фото/видео/гиф из него. По умолчанию скрыт (защита от
+                          шок-контента), разворачивается по тапу.
       6. Divider        — разделитель
       7. Details        — «Доп. инфо» (чат/длительность/варнов всего) — сворачиваемо
       8. Divider        — разделитель
@@ -1712,11 +1715,12 @@ async def _send_report(
 
     blocks.append(InputRichBlockList(items=list_items))
 
-    # ── Details: медиа под спойлером ───────────────────────────
-    # Все медиа (фото/видео/гиф) обёрнуты в сворачиваемый Details.
+    # ── Details: текст+медиа под спойлером ──────────────────────
+    # Текст сообщения нарушителя (как BlockQuotation) и все медиа (фото/видео/
+    # гиф) обёрнуты в сворачиваемый Details «📎 Сообщение юзера».
     # По умолчанию is_open=False — модератор не видит содержимое, пока не тапнет
-    # «📎 Показать медиа». Защита от шок-контента, который иначе сразу бросается
-    # в глаза при открытии репорт-чата.
+    # по заголовку. Защита от шок-контента, который иначе сразу бросается в
+    # глаза при открытии репорт-чата.
     if media_block is not None or text_content:
         media_details_blocks: list = []
         if text_content:
@@ -1730,7 +1734,7 @@ async def _send_report(
         blocks.append(InputRichBlockDivider())
         blocks.append(
             InputRichBlockDetails(
-                summary="📎 Показать медиа",
+                summary="📎 Сообщение юзера",
                 is_open=False,
                 blocks=media_details_blocks,
             )
@@ -4323,6 +4327,174 @@ async def cmd_help(message: types.Message) -> None:
 # Эти обработчики стоят ПОСЛЕ всех остальных, поэтому срабатывают
 # только если ни один специфичный хэндлер не подошёл.
 # ═══════════════════════════════════════════════════════════════════════════
+
+@router.message(F.chat.type == "private", Command("start"))
+async def private_start_handler(message: types.Message) -> None:
+    """v4.7.0: /start в ЛС боту — активирует pending WebUser.
+
+    Логика:
+      1. Ищем WebUser по tg_user_id = message.from_user.id.
+      2. Если найден и is_pending=True:
+         - Генерируем пароль (16 символов base64url).
+         - password_hash = _hash_password(password).
+         - is_active = True, is_pending = False.
+         - Скачиваем аватарку (best-effort).
+         - Шлём DM с credentials (login + password под спойлером).
+      3. Если найден и is_active=True (уже активирован):
+         - Шлём "ты уже активен, логин: X" (без пароля — он знает).
+      4. Если найден и is_active=False (деактивирован SU):
+         - Молчим (стелс — не выдаём существование бота).
+      5. Если не найден:
+         - Молчим (стелс — не даём посторонним знать что бот умеет /start).
+
+    Безопасность: бот НИКОГДА не отвечает посторонним. Только pending/active
+    WebUser получают ответ. Это сохраняет стелс-режим бота.
+    """
+    if not message.from_user:
+        return
+    tg_uid = message.from_user.id
+
+    async with async_session() as session:
+        wu = (await session.execute(
+            select(WebUser).where(WebUser.tg_user_id == tg_uid)
+        )).scalar_one_or_none()
+
+        if wu is None:
+            # Посторонний — молчим.
+            return
+
+        if wu.is_su:
+            # SU не должен активироваться через /start (его учётка создаётся
+            # из env при первом запуске). Молчим — он уже знает свой доступ.
+            return
+
+        if not wu.is_pending and not wu.is_active:
+            # Деактивирован SU — молчим.
+            return
+
+        if wu.is_active and not wu.is_pending:
+            # Уже активирован — напомним логин (без пароля).
+            login = wu.username
+            web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
+            web_root_url = web_url + "/"
+            greeting_name = ""
+            if wu.tg_first_name:
+                greeting_name = f", {wu.tg_first_name}"
+            try:
+                await message.bot.send_rich_message(
+                    chat_id=tg_uid,
+                    rich_message=InputRichMessage(blocks=[
+                        InputRichBlockSectionHeading(
+                            text=f"👋 Уже активны{greeting_name}", size=2,
+                        ),
+                        InputRichBlockParagraph(text=[
+                            "Ваша учётка уже активирована. ",
+                            "Веб-панель: ",
+                            RichTextUrl(text=web_root_url, url=web_root_url),
+                        ]),
+                        InputRichBlockParagraph(text=[
+                            "Логин: ", RichTextBold(text=login),
+                        ]),
+                        InputRichBlockParagraph(text=[
+                            "Если забыли пароль — используйте ",
+                            RichTextBold(text="«Сменить пароль»"),
+                            " в разделе Profile (если ещё помните текущий) ",
+                            "либо попросите SU сбросить пароль через /admin/users.",
+                        ]),
+                        InputRichBlockFooter(
+                            text=f"⏱ {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК"
+                        ),
+                    ]),
+                )
+            except TelegramBadRequest as e:
+                logger.warning(
+                    "private_start: send already-active DM failed for tg_uid=%s: %s",
+                    tg_uid, e,
+                )
+            return
+
+        # is_pending=True → активируем.
+        password = secrets.token_urlsafe(12)[:16]
+        wu.password_hash = _hash_password(password)
+        wu.is_active = True
+        wu.is_pending = False
+        wu.last_login_at = datetime.now(timezone.utc)
+        await session.commit()
+
+        login = wu.username
+        role = wu.role or "moderator"
+        first_name = wu.tg_first_name
+
+        # Скачиваем аватарку (best-effort). Импортируем тут, чтобы избежать
+        # циклического импорта с web_app на верхнем уровне.
+        try:
+            from web_app import _fetch_and_save_avatar
+            asyncio.create_task(_fetch_and_save_avatar(message.bot, tg_uid))
+        except ImportError:
+            pass
+
+        logger.info(
+            "private_start: activated pending WebUser tg_uid=%s login=%s role=%s",
+            tg_uid, login, role,
+        )
+
+    # Шлём DM с credentials (вне сессии БД).
+    web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
+    web_root_url = web_url + "/"
+    greeting_name = f", {first_name}" if first_name else ""
+
+    if role == "moderator":
+        heading = f"🔎 Доступ к веб-панели (модератор){greeting_name}"
+        rights_line = (
+            "Ваши права: только просмотр логов нарушителей (раздел Dashboard). "
+            "Управление админами, чатами и модераторами недоступно."
+        )
+    else:
+        heading = f"🎉 Доступ к веб-панели (админ){greeting_name}"
+        rights_line = (
+            "Ваши права: управление модераторами чатов и настройками чатов "
+            "(хэштег, пороги варнов), а также просмотр логов."
+        )
+
+    try:
+        await message.bot.send_rich_message(
+            chat_id=tg_uid,
+            rich_message=InputRichMessage(blocks=[
+                InputRichBlockSectionHeading(text=heading, size=2),
+                InputRichBlockParagraph(text=[
+                    "Вас добавили в систему «Дедушка Вобжак» (авто-обнаружение "
+                    "по админ-правам в чате). ",
+                    "Веб-панель: ",
+                    RichTextUrl(text=web_root_url, url=web_root_url),
+                ]),
+                InputRichBlockParagraph(text=rights_line),
+                InputRichBlockParagraph(text="Данные для входа (скрыты под спойлером):"),
+                InputRichBlockParagraph(
+                    text=RichTextSpoiler(
+                        text=[
+                            "Логин: ", RichTextBold(text=login), "\n",
+                            "Пароль: ", RichTextBold(text=password),
+                        ]
+                    )
+                ),
+                InputRichBlockParagraph(text=[
+                    "🔐 После первого входа смените пароль: раздел ",
+                    RichTextBold(text="Profile"),
+                    " → блок ",
+                    RichTextBold(text="Change my password"),
+                    ".",
+                ]),
+                InputRichBlockFooter(
+                    text=f"⏱ {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК"
+                ),
+            ]),
+        )
+    except TelegramBadRequest as e:
+        logger.warning(
+            "private_start: send credentials DM failed for tg_uid=%s: %s",
+            tg_uid, e,
+        )
+
 
 @router.message(F.chat.type == "private")
 async def stealth_catchall_private(message: types.Message) -> None:
