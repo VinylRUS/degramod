@@ -635,6 +635,18 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.7.9</strong> — 2 августа 2026</p>
+                <ul>
+                    <li><strong>Модераторы получили доступ к <code>/help</code></strong>: раньше команда <code>/help</code> в ЛС боту работала только для <code>ADMIN_IDS</code> (env) — модераторы, привязанные к чату через <code>chat_admins</code>, могли использовать <code>!mute</code>/<code>!warn</code> в группах, но не видели список доступных команд. Теперь <code>/help</code> проверяет роль через БД: <code>ADMIN_IDS</code> env, <code>WebUser.role='su'</code> или <code>'admin'</code> → полный help; <code>role='moderator'</code> с <code>is_active=True</code> → сокращённый help; все остальные — молчим (стелс сохраняется).</li>
+                    <li><strong>Сокращённый help для модераторов</strong>: отдельный текст с описанием только групповых команд (<code>!mute</code>, <code>!warn</code>, <code>!ban</code>, <code>!unmute</code>, <code>!unban</code>, <code>!unwarn</code>, <code>!warns</code>) с примерами и пояснениями. Без команд настройки чатов (<code>/sethashtag</code>, <code>/nightmode</code>, <code>/sanitary</code>, фильтров и т.д.) — они по-прежнему только для админов. В конце — ссылка на веб-панель и предупреждение, что <code>!resetwarns</code> доступен только админам.</li>
+                    <li><strong>Сохранён стелс-режим</strong>: посторонние (без WebUser или с <code>is_active=False</code>) по-прежнему не получают ответа на <code>/help</code> — бот молча игнорирует, не выдавая своего существования.</li>
+                </ul>
+                <p><strong>v4.7.8</strong> — 1 августа 2026</p>
+                <ul>
+                    <li><strong>Хотфикс 500-й ошибки при логине</strong>: на сервере <code>degraban.bothost.tech</code> SU-логин с правильным паролем падал с <code>500 Internal Server Error</code>. Причина — обновление <code>last_login_at</code> в БД вызывало исключение (вероятно, schema mismatch или DB lock). Логин с неверным паролем работал (return идёт раньше).</li>
+                    <li><strong>Решение</strong>: блок обновления <code>last_login_at</code> обёрнут в <code>try/except</code> и для SU, и для обычных админов. При ошибке — <code>_req_logger.exception()</code> пишет полный traceback в лог (для диагностики), но <code>return response</code> всё равно выполняется. Логин больше не блокируется метрикой аудита.</li>
+                    <li><strong>Важно для диагностики</strong>: если в логах uvicorn появится <code>login: failed to update su.last_login_at: ...</code> — это и есть корневая причина 500. После её устранения (миграция БД / cleanup / fix column type) try/except можно будет убрать в следующем релизе.</li>
+                </ul>
                 <p><strong>v4.7.7</strong> — 1 августа 2026</p>
                 <ul>
                     <li><strong>Хотфикс toggle-кнопок</strong>: при пустых полях даты в форме добавления sanitary-периода браузерная HTML5-валидация блокировала сабмит ВСЕХ toggle-кнопок (SAN / NIGHT / CAS / LINK / ENABLE / REPORT), потому что они жили в той же форме с <code>required</code>-полями и использовали <code>formaction</code>. Симптом: при нажатии SAN появлялось сообщение «Вы пропустили это поле» под Start date, переключение не происходило.</li>

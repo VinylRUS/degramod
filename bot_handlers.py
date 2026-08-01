@@ -4605,58 +4605,136 @@ async def cmd_sanitary(message: types.Message) -> None:
             return
 
 
+# ── v4.7.9: Тексты /help разделены по ролям ────────────────────────────────
+# Полный текст — для ADMIN_IDS env, WebUser с role='su' или role='admin'.
+# Сокращённый текст — для WebUser с role='moderator' и is_active=True:
+# только групповые модераторские команды + ссылка на веб-панель.
+# Все остальные (посторонние) — молчим (стелс сохраняется).
+
+_HELP_FULL_TEXT = (
+    "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
+    "<b>В группах (reply на сообщение):</b>\n"
+    "  !mute [длительность] [причина] — мьют (формат: 1d2h, 30м; без аргументов — перманент)\n"
+    "  !warn [причина] — варн (сообщение нарушителя удаляется)\n"
+    "  !ban [причина] — бан (если reply на стикер — пак автодобавляется в бан-лист)\n"
+    "  !unmute / !unban — снять ограничения\n"
+    "  !unwarn [N] — снять N последних варнов (по умолчанию 1)\n"
+    "  !warns / !resetwarns — показать / обнулить варны\n\n"
+    "<b>В личке (настройки чатов):</b>\n"
+    "  💡 Большинство настроек доступно в веб-панели: /admin/chats\n"
+    "  /settings chat_id — показать настройки\n"
+    "  /sethashtag chat_id #tag — хэштег чата\n"
+    "  /setreport chat_id [report_chat_id] — чат для отчётов (0 = сброс)\n"
+    "  /warns_mute chat_id N / /warns_ban chat_id N — пороги\n"
+    "  /mute_duration chat_id 1d2h — длительность мьюта\n"
+    "  /addadmin chat_id user_id / /deladmin chat_id user_id\n\n"
+    "<b>Фильтры (в личке):</b>\n"
+    "  /bansticker &lt;pack|link&gt; [delete|warn|mute|ban] [dur] — забанить стикерпак\n"
+    "  /liststickers [chat_id] / /delsticker &lt;pack&gt; [chat_id]\n"
+    "  /addword chat_id &lt;слово&gt; [action] [is_regex 0/1]\n"
+    "  /delword chat_id &lt;слово&gt; / /listwords [chat_id]\n"
+    "  /linkfilter chat_id on|off — фильтр ссылок\n"
+    "  /linkallow chat_id|global &lt;domain&gt; / /linkallowlist [chat_id]\n"
+    "  /cas chat_id on|off — CAS-проверка новых юзеров\n\n"
+    "<b>Ночной режим (в личке):</b>\n"
+    "  /nightmode chat_id &lt;start&gt; &lt;end&gt; [strict|text_only|none|custom]\n"
+    "  /nightmode chat_id off — выключить\n"
+    "  /nightmode chat_id tz &lt;Europe/Moscow&gt; — часовой пояс\n"
+    "  /nightmode chat_id weekend &lt;start&gt; &lt;end&gt; — расписание на сб/вс\n"
+    "  /nightmode chat_id weekend off — сбросить (использовать будничное)\n"
+    "  /nightmode chat_id notify on|off [custom_text] — уведомления входа/выхода\n"
+    "  /nightmode chat_id custom &lt;perm&gt;=0|1 ... — точечные права\n"
+    "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n\n"
+    "<b>Санитарные дни (в личке):</b>\n"
+    "  /sanitary chat_id — показать список\n"
+    "  /sanitary chat_id add &lt;YYYY-MM-DD&gt; — добавить день\n"
+    "  /sanitary chat_id add &lt;start&gt;:&lt;end&gt; — добавить диапазон\n"
+    "  /sanitary chat_id remove &lt;YYYY-MM-DD&gt; — удалить день/диапазон\n"
+    "  /sanitary chat_id clear — очистить список\n"
+    "  /sanitary chat_id toggle — вручную войти/выйти (для теста)\n"
+    "  💡 Lockdown чата (модераторы не страдают); ночной режим пропускается\n\n"
+    "<b>Прочее:</b>\n"
+    "  /warndecay chat_id &lt;days&gt; — срок действия варна (0 = отключено)\n"
+)
+
+_HELP_MODERATOR_TEXT = (
+    "📖 <b>Дедушка Вобжак — команды модератора</b>\n\n"
+    "<b>В группах (reply на сообщение нарушителя):</b>\n\n"
+    "  <code>!mute [длительность] [причина]</code>\n"
+    "    Мьют нарушителя. Длительность в формате <code>1d2h</code> (1 день 2 часа),\n"
+    "    <code>30м</code>, <code>2h</code>. Без аргументов — перманент.\n"
+    "    Пример: <code>!mute 1d спам</code> → мьют на 1 день за спам.\n\n"
+    "  <code>!warn [причина]</code>\n"
+    "    Вынести варн. Сообщение нарушителя удаляется.\n"
+    "    При достижении порога <code>warns_to_mute</code> — автомьют.\n"
+    "    Пример: <code>!warn мат</code>.\n\n"
+    "  <code>!ban [причина]</code>\n"
+    "    Бан нарушителя. Если reply на стикер — пак автодобавляется в бан-лист.\n"
+    "    Пример: <code>!ban реклама</code>.\n\n"
+    "  <code>!unmute</code> / <code>!unban</code>\n"
+    "    Снять мьют или бан с нарушителя (reply на его сообщение).\n\n"
+    "  <code>!unwarn [N]</code>\n"
+    "    Снять N последних варнов (по умолчанию 1).\n"
+    "    Пример: <code>!unwarn 2</code> → снимает 2 варна.\n\n"
+    "  <code>!warns</code>\n"
+    "    Показать количество активных варнов у нарушителя.\n"
+    "    Бот пришлёт статистику в личку, если сможет.\n\n"
+    "<b>Веб-панель:</b>\n"
+    "  🔗 <a href=\"https://degraban.bothost.tech\">degraban.bothost.tech</a>\n"
+    "  Логин и пароль выдаёт SU при создании аккаунта.\n"
+    "  Если забыли — напишите SU в Telegram.\n\n"
+    "<b>Важно:</b>\n"
+    "  • Наказания нельзя применять к себе и к другим модераторам этого чата.\n"
+    "  • <code>!resetwarns</code> доступен только администраторам.\n"
+    "  • Команды настройки чатов (<code>/sethashtag</code>, <code>/nightmode</code>,\n"
+    "    <code>/sanitary</code>, фильтры и т.д.) — только для админов.\n"
+    "    Запросите доступ у SU, если нужно менять настройки чата.\n"
+)
+
+
 @router.message(F.chat.type == "private", Command("help"))
 async def cmd_help(message: types.Message) -> None:
-    """Показывает список команд (только для ADMIN_IDS)."""
-    if message.from_user.id not in ADMIN_IDS:
-        return  # Стелс: молча игнорируем не-админов
+    """Показывает список команд.
 
-    text = (
-        "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
-        "<b>В группах (reply на сообщение):</b>\n"
-        "  !mute [длительность] [причина] — мьют (формат: 1d2h, 30м; без аргументов — перманент)\n"
-        "  !warn [причина] — варн (сообщение нарушителя удаляется)\n"
-        "  !ban [причина] — бан (если reply на стикер — пак автодобавляется в бан-лист)\n"
-        "  !unmute / !unban — снять ограничения\n"
-        "  !unwarn [N] — снять N последних варнов (по умолчанию 1)\n"
-        "  !warns / !resetwarns — показать / обнулить варны\n\n"
-        "<b>В личке (настройки чатов):</b>\n"
-        "  💡 Большинство настроек доступно в веб-панели: /admin/chats\n"
-        "  /settings chat_id — показать настройки\n"
-        "  /sethashtag chat_id #tag — хэштег чата\n"
-        "  /setreport chat_id [report_chat_id] — чат для отчётов (0 = сброс)\n"
-        "  /warns_mute chat_id N / /warns_ban chat_id N — пороги\n"
-        "  /mute_duration chat_id 1d2h — длительность мьюта\n"
-        "  /addadmin chat_id user_id / /deladmin chat_id user_id\n\n"
-        "<b>Фильтры (в личке):</b>\n"
-        "  /bansticker &lt;pack|link&gt; [delete|warn|mute|ban] [dur] — забанить стикерпак\n"
-        "  /liststickers [chat_id] / /delsticker &lt;pack&gt; [chat_id]\n"
-        "  /addword chat_id &lt;слово&gt; [action] [is_regex 0/1]\n"
-        "  /delword chat_id &lt;слово&gt; / /listwords [chat_id]\n"
-        "  /linkfilter chat_id on|off — фильтр ссылок\n"
-        "  /linkallow chat_id|global &lt;domain&gt; / /linkallowlist [chat_id]\n"
-        "  /cas chat_id on|off — CAS-проверка новых юзеров\n\n"
-        "<b>Ночной режим (в личке):</b>\n"
-        "  /nightmode chat_id &lt;start&gt; &lt;end&gt; [strict|text_only|none|custom]\n"
-        "  /nightmode chat_id off — выключить\n"
-        "  /nightmode chat_id tz &lt;Europe/Moscow&gt; — часовой пояс\n"
-        "  /nightmode chat_id weekend &lt;start&gt; &lt;end&gt; — расписание на сб/вс\n"
-        "  /nightmode chat_id weekend off — сбросить (использовать будничное)\n"
-        "  /nightmode chat_id notify on|off [custom_text] — уведомления входа/выхода\n"
-        "  /nightmode chat_id custom &lt;perm&gt;=0|1 ... — точечные права\n"
-        "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n\n"
-        "<b>Санитарные дни (в личке):</b>\n"
-        "  /sanitary chat_id — показать список\n"
-        "  /sanitary chat_id add &lt;YYYY-MM-DD&gt; — добавить день\n"
-        "  /sanitary chat_id add &lt;start&gt;:&lt;end&gt; — добавить диапазон\n"
-        "  /sanitary chat_id remove &lt;YYYY-MM-DD&gt; — удалить день/диапазон\n"
-        "  /sanitary chat_id clear — очистить список\n"
-        "  /sanitary chat_id toggle — вручную войти/выйти (для теста)\n"
-        "  💡 Lockdown чата (модераторы не страдают); ночной режим пропускается\n\n"
-        "<b>Прочее:</b>\n"
-        "  /warndecay chat_id &lt;days&gt; — срок действия варна (0 = отключено)\n"
-    )
-    await message.reply(text, parse_mode="HTML")
+    v4.7.9: раньше /help видели только ADMIN_IDS (env). Теперь:
+      • ADMIN_IDS env → полный help (как раньше)
+      • WebUser role='su' или 'admin', is_active=True → полный help
+      • WebUser role='moderator', is_active=True → сокращённый help
+        (только групповые модераторские команды + ссылка на веб-панель)
+      • Все остальные — молчим (стелс сохраняется).
+
+    Это закрывает проблему: модераторы, привязанные к чату через chat_admins,
+    могли использовать !mute/!warn в группах, но не видели /help — им было
+    неоткуда узнать синтаксис команд.
+    """
+    user_id = message.from_user.id
+
+    # 1. Глобальные супер-админы из env — всегда полный help
+    if user_id in ADMIN_IDS:
+        await message.reply(_HELP_FULL_TEXT, parse_mode="HTML")
+        return
+
+    # 2. Ищем веб-профиль по tg_user_id
+    async with async_session() as session:
+        wu = (await session.execute(
+            select(WebUser).where(WebUser.tg_user_id == user_id)
+        )).scalar_one_or_none()
+
+    # Посторонний или деактивированный — молчим (стелс)
+    if wu is None or not wu.is_active:
+        return
+
+    # 3. SU / admin → полный help
+    if wu.role in ("su", "admin"):
+        await message.reply(_HELP_FULL_TEXT, parse_mode="HTML")
+        return
+
+    # 4. Moderator → сокращённый help
+    if wu.role == "moderator":
+        await message.reply(_HELP_MODERATOR_TEXT, parse_mode="HTML")
+        return
+
+    # Неизвестная роль — safe default, молчим.
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.7"
+APP_VERSION = "v4.7.9"
 APP_RELEASE_DATE = "2026-08-01"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -705,14 +705,19 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 key=COOKIE_NAME, value=token, httponly=True,
                 secure=False, samesite="lax", max_age=86400 * 7,
             )
-            # Обновляем last_login_at
-            async with async_session() as session:
-                su_user = (await session.execute(
-                    select(WebUser).where(WebUser.username == "su")
-                )).scalar_one_or_none()
-                if su_user:
-                    su_user.last_login_at = datetime.now(timezone.utc)
-                    await session.commit()
+            # Обновляем last_login_at (v4.7.8: обёрнуто в try/except —
+            # обновление метрики не должно блокировать логин. Если БД
+            # повреждена или колонка отсутствует — логируем и идём дальше).
+            try:
+                async with async_session() as session:
+                    su_user = (await session.execute(
+                        select(WebUser).where(WebUser.username == "su")
+                    )).scalar_one_or_none()
+                    if su_user:
+                        su_user.last_login_at = datetime.now(timezone.utc)
+                        await session.commit()
+            except Exception as e:
+                _req_logger.exception("login: failed to update su.last_login_at: %s", e)
             return response
 
         # Обычный админ — проверяем по web_users
@@ -726,8 +731,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     or not wu.password_hash
                     or not _verify_password(password, wu.password_hash)):
                 return templates.TemplateResponse("login.html", {"request": request, "error": True})
-            wu.last_login_at = datetime.now(timezone.utc)
-            await session.commit()
+            # v4.7.8: last_login_at update — обёрнут в try/except аналогично SU.
+            try:
+                wu.last_login_at = datetime.now(timezone.utc)
+                await session.commit()
+            except Exception as e:
+                _req_logger.exception("login: failed to update %s.last_login_at: %s", username, e)
             token = _make_token(wu.username, is_su=wu.is_su, role=wu.role or "admin")
             response = RedirectResponse(url="/dashboard", status_code=303)
             response.set_cookie(
