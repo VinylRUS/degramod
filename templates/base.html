@@ -635,6 +635,12 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.7.7</strong> — 1 августа 2026</p>
+                <ul>
+                    <li><strong>Хотфикс toggle-кнопок</strong>: при пустых полях даты в форме добавления sanitary-периода браузерная HTML5-валидация блокировала сабмит ВСЕХ toggle-кнопок (SAN / NIGHT / CAS / LINK / ENABLE / REPORT), потому что они жили в той же форме с <code>required</code>-полями и использовали <code>formaction</code>. Симптом: при нажатии SAN появлялось сообщение «Вы пропустили это поле» под Start date, переключение не происходило.</li>
+                    <li><strong>Решение</strong>: ко всем toggle-кнопкам и кнопкам удаления sanitary-периодов добавлен атрибут <code>formnovalidate</code> — браузер пропускает HTML5-валидацию при сабмите через <code>formaction</code>. Серверная валидация в <code>add_sanitary_period</code> и <code>delete_sanitary_period</code> остаётся полной. Кнопка «Сохранить» валидирует форму как и раньше — все её поля валидны по построению.</li>
+                    <li><strong>Сохранена работоспособность</strong>: toggle-кнопки снова кликаются из любого состояния карточки (с пустыми или заполненными полями sanitary-формы). Кнопка «+ Add» по-прежнему требует заполнения start_date и end_date — но уже через серверную валидацию, а не через блокирующий browser tooltip.</li>
+                </ul>
                 <p><strong>v4.7.6</strong> — 1 августа 2026</p>
                 <ul>
                     <li><strong>UI санитарных дней в карточке чата</strong>: вместо textarea теперь удобный date/time picker. Четыре поля (start date / start time / end date / end time) + кнопка «+ Add» — добавляет период одним кликом. Время опционально — если оставить пустым, период full-day (старое поведение). Список назначенных периодов отображается ниже с кнопкой «✕» для удаления каждого. Старый textarea спрятан под <code>&lt;details&gt; Raw JSON (advanced)</code> — для совместимости с bot-командами и ручного редактирования.</li>

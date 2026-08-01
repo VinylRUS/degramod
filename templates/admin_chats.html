@@ -114,11 +114,11 @@
                 {# v4.7.0: для report-чата оставляем ТОЛЬКО enabled + make-report #}
                 {% if c.is_report_chat %}
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: var(--sp-3);">
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="enabled"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="enabled"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="report_chat"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="report_chat"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         ★ REPORT
                     </button>
@@ -131,27 +131,27 @@
                    NIGHT и SAN toggles перенесены сюда из <details> секций.
                    Лейблы сокращены: LINK-FILT → LINK, "make report" → REPORT. #}
                 <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: var(--sp-3);">
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="enabled"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="enabled"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="cas"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="cas"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.cas_check_enabled %}var(--info){% else %}var(--border){% endif %}; color: {% if c.cas_check_enabled %}var(--info){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         CAS {% if c.cas_check_enabled %}●{% else %}○{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="link_filter"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="link_filter"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.link_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.link_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         LINK {% if c.link_filter_enabled %}●{% else %}○{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="night_mode"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="night_mode"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         NIGHT {% if c.night_mode_enabled %}●{% else %}○{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="sanitary_days"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="sanitary_days"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.sanitary_days_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.sanitary_days_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         SAN {% if c.sanitary_days_enabled %}●{% else %}○{% endif %}
                     </button>
-                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" name="field" value="report_chat"
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="report_chat"
                             onclick="return confirm('Make this chat a report chat? \n\nOther settings (CAS, link-filter, night mode, sanitary days, punishments) will be HIDDEN — report chat is not moderated.');"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         ☆ REPORT
@@ -375,7 +375,7 @@
                             <input type="time" name="end_time" placeholder="09:00"
                                    style="width: 100%; padding: 4px 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-xs); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                         </div>
-                        <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/sanitary/add" formmethod="post"
+                        <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/sanitary/add" formmethod="post" formnovalidate
                                 style="padding: 5px 12px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 10px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 700;">
                             + Add
                         </button>
@@ -395,7 +395,7 @@
                         {% for entry in san_periods %}
                         <div style="display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-xs); font-family: var(--font-mono); font-size: 11px; color: var(--text);">
                             <span>{{ entry | format_sanitary_period }}</span>
-                            <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/sanitary/{{ loop.index0 }}/delete" formmethod="post"
+                            <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/sanitary/{{ loop.index0 }}/delete" formmethod="post" formnovalidate
                                     onclick="return confirm('Delete this sanitary period?')"
                                     style="padding: 2px 8px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                                 ✕
