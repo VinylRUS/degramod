@@ -423,8 +423,10 @@ async def _is_admin(session, chat_id: int, user_id: int) -> bool:
         if wu.role == "su":
             return True
         if wu.role == "admin":
-            # админ не лезет в приватные чаты
-            return not settings.is_private
+            # v4.7.6: упразднена система private/non-private чатов.
+            # Раньше: админ не лезет в приватные чаты (return not settings.is_private).
+            # Теперь: админ имеет доступ во все чаты (как и SU, но без права удалять чат).
+            return True
         if wu.role == "moderator":
             # модератор — только если явно привязан к этому чату
             ca = (await session.execute(
@@ -1170,6 +1172,7 @@ def _build_custom_night_permissions(
 # месяц 1-12) делаем в _parse_sanitary_date; regex ловит только формат.
 import re as _san_re
 _SAN_DATE_RE = _san_re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+_SAN_TIME_RE = _san_re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
 def _parse_sanitary_date(s: str) -> date | None:
@@ -1185,8 +1188,27 @@ def _parse_sanitary_date(s: str) -> date | None:
         return None
 
 
+def _parse_sanitary_time(s: str | None) -> str | None:
+    """v4.7.6: парсит 'HH:MM' (24-часовой формат) → нормализованная строка 'HH:MM'.
+
+    Возвращает None если невалидно или пусто. Нормализует '9:00' → '09:00'.
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    m = _SAN_TIME_RE.match(s)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    return f"{h:02d}:{mi:02d}"
+
+
 def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
-    """v4.5.4 + v4.6.0: парсит JSON sanitary_days в list пар [start_iso, end_iso].
+    """v4.5.4 + v4.6.0 + v4.7.6: парсит JSON sanitary_days в list периодов.
+
+    Каждый период = [start_iso, end_iso, start_hhmm?, end_hhmm?].
+    v4.7.6: добавлены опциональные поля start_time и end_time (HH:MM).
+    Если время не задано — период считается full-day (старое поведение).
 
     v4.6.0: поддерживает 2 формата хранения:
       1. Старый (плоский массив пар): [["2026-08-01","2026-08-01"], ...]
@@ -1211,18 +1233,9 @@ def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
             if not isinstance(entries, list):
                 continue
             for entry in entries:
-                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                    continue
-                s, e = entry[0], entry[1]
-                if not isinstance(s, str) or not isinstance(e, str):
-                    continue
-                ds = _parse_sanitary_date(s)
-                de = _parse_sanitary_date(e)
-                if ds is None or de is None:
-                    continue
-                if de < ds:
-                    de = ds
-                out.append([ds.isoformat(), de.isoformat()])
+                p = _normalize_sanitary_entry(entry)
+                if p is not None:
+                    out.append(p)
         return out
 
     # Старый формат — плоский list.
@@ -1230,19 +1243,48 @@ def parse_sanitary_days_json(json_str: str | None) -> list[list[str]]:
         return []
     out: list[list[str]] = []
     for entry in data:
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            continue
-        s, e = entry[0], entry[1]
-        if not isinstance(s, str) or not isinstance(e, str):
-            continue
-        ds = _parse_sanitary_date(s)
-        de = _parse_sanitary_date(e)
-        if ds is None or de is None:
-            continue
-        # Нормализуем: end < start → однодневный.
-        if de < ds:
-            de = ds
-        out.append([ds.isoformat(), de.isoformat()])
+        p = _normalize_sanitary_entry(entry)
+        if p is not None:
+            out.append(p)
+    return out
+
+
+def _normalize_sanitary_entry(entry) -> list[str] | None:
+    """v4.7.6: нормализует одну запись sanitary-периода.
+
+    Поддерживаемые форматы:
+      • [start, end]                  — full-day (старый)
+      • [start, end, start_time]      — start в HH:MM, end — full-day
+      • [start, end, start_time, end_time] — start_time .. end_time
+      • [start, end, null, null]      — null = full-day (нет времени)
+
+    Возвращает [start_iso, end_iso, start_hhmm?, end_hhmm?] или None.
+    Поле со значением None/пусто — опускается.
+    """
+    if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+        return None
+    s, e = entry[0], entry[1]
+    if not isinstance(s, str) or not isinstance(e, str):
+        return None
+    ds = _parse_sanitary_date(s)
+    de = _parse_sanitary_date(e)
+    if ds is None or de is None:
+        return None
+    if de < ds:
+        de = ds
+    out: list[str] = [ds.isoformat(), de.isoformat()]
+    # v4.7.6: опциональные поля времени.
+    if len(entry) >= 3:
+        st = _parse_sanitary_time(entry[2] if not isinstance(entry[2], (list, tuple)) else None) if entry[2] else None
+        if st:
+            out.append(st)
+    if len(entry) >= 4:
+        et = _parse_sanitary_time(entry[3] if not isinstance(entry[3], (list, tuple)) else None) if entry[3] else None
+        if et:
+            out.append(et)
+        elif len(out) == 3:
+            # start_time задан, end_time — нет. Оставляем как есть (3 поля).
+            pass
     return out
 
 
@@ -1250,9 +1292,11 @@ def parse_sanitary_days_monthly(
     json_str: str | None,
     month_key: str | None = None,
 ) -> dict[str, list[list[str]]]:
-    """v4.6.0: парсит JSON sanitary_days в dict по месяцам.
+    """v4.6.0 + v4.7.6: парсит JSON sanitary_days в dict по месяцам.
 
-    Возвращает dict {"YYYY-MM": [[start_iso, end_iso], ...], ...}.
+    Возвращает dict {"YYYY-MM": [[start_iso, end_iso, start_hhmm?, end_hhmm?], ...], ...}.
+
+    v4.7.6: каждое вложенное tuple может содержать опциональные start_time/end_time.
 
     Если month_key задан — возвращает dict только с этим месяцем
     (пустой список если месяца нет в данных).
@@ -1268,47 +1312,29 @@ def parse_sanitary_days_monthly(
         return {} if month_key is None else {month_key: []}
 
     if isinstance(data, dict):
-        # Новый формат — фильтруем и нормализуем.
         result: dict[str, list[list[str]]] = {}
         for mk, entries in data.items():
             if not isinstance(entries, list):
                 continue
             month_pairs: list[list[str]] = []
             for entry in entries:
-                if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                    continue
-                s, e = entry[0], entry[1]
-                if not isinstance(s, str) or not isinstance(e, str):
-                    continue
-                ds = _parse_sanitary_date(s)
-                de = _parse_sanitary_date(e)
-                if ds is None or de is None:
-                    continue
-                if de < ds:
-                    de = ds
-                month_pairs.append([ds.isoformat(), de.isoformat()])
+                p = _normalize_sanitary_entry(entry)
+                if p is not None:
+                    month_pairs.append(p)
             result[mk] = month_pairs
         if month_key is not None:
             return {month_key: result.get(month_key, [])}
         return result
 
     if isinstance(data, list):
-        # Старый формат — группируем по месяцу start.
         grouped: dict[str, list[list[str]]] = {}
         for entry in data:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            p = _normalize_sanitary_entry(entry)
+            if p is None:
                 continue
-            s, e = entry[0], entry[1]
-            if not isinstance(s, str) or not isinstance(e, str):
-                continue
-            ds = _parse_sanitary_date(s)
-            de = _parse_sanitary_date(e)
-            if ds is None or de is None:
-                continue
-            if de < ds:
-                de = ds
+            ds = _parse_sanitary_date(p[0])
             mk = ds.strftime("%Y-%m")
-            grouped.setdefault(mk, []).append([ds.isoformat(), de.isoformat()])
+            grouped.setdefault(mk, []).append(p)
         if month_key is not None:
             return {month_key: grouped.get(month_key, [])}
         return grouped
@@ -1342,12 +1368,15 @@ def serialize_sanitary_days(pairs: list[list[str]]) -> str:
 def serialize_sanitary_days_monthly(
     monthly: dict[str, list[list[str]]],
 ) -> str:
-    """v4.6.0: сериализует dict по месяцам в JSON-строку.
+    """v4.6.0 + v4.7.6: сериализует dict по месяцам в JSON-строку.
 
     Каждая пара валидируется и нормализуется. Пустые значения и пустые dict
-    → пустая строка "[]" (не None, чтобы UI отличал «нет настроек» от «пусто»).
+    → пустая строка "[]" (не None, чтобы UI отличил «нет настроек» от «пусто»).
 
-    Формат: {"2026-08": [["2026-08-02","2026-08-03"]], "2026-09": []}
+    v4.7.6: поддерживает опциональные поля времени (start_time, end_time).
+    Записи могут быть длиной 2 (без времени) или 3-4 (с временем).
+
+    Формат: {"2026-08": [["2026-08-02","2026-08-03","23:00","09:00"]], "2026-09": []}
     """
     if not monthly:
         return "[]"
@@ -1357,15 +1386,10 @@ def serialize_sanitary_days_monthly(
             continue
         norm: list[list[str]] = []
         for p in pairs:
-            if not isinstance(p, (list, tuple)) or len(p) != 2:
+            normalized = _normalize_sanitary_entry(p)
+            if normalized is None:
                 continue
-            ds = _parse_sanitary_date(str(p[0]))
-            de = _parse_sanitary_date(str(p[1]))
-            if ds is None or de is None:
-                continue
-            if de < ds:
-                de = ds
-            norm.append([ds.isoformat(), de.isoformat()])
+            norm.append(normalized)
         out[mk] = norm
     return json.dumps(out)
 
@@ -1373,13 +1397,15 @@ def serialize_sanitary_days_monthly(
 def is_sanitary_day_today(
     pairs: list[list[str]] | str | None,
     today: date | None = None,
+    now_dt: datetime | None = None,
 ) -> bool:
-    """v4.5.4: проверяет, попадает ли today (по умолчанию сегодня UTC) в одну
-    из пар санитарных дней.
+    """v4.5.4 + v4.7.6: проверяет, попадает ли today/now в один из диапазонов.
 
-    Принимает как уже распарсенный list пар, так и сырую JSON-строку
-    (поддерживает оба формата — list и dict-monthly, через parse_sanitary_days_json).
-    Диапазон inclusive по обеим датам: [start, end].
+    v4.7.6: если в периоде задано время — используется now_dt (datetime)
+    для datetime-сравнения. Если now_dt не передан — берётся текущий момент в UTC.
+    Если время НЕ задано — старая логика по date (inclusive [start, end]).
+
+    Принимает как уже распарсенный list периодов, так и сырую JSON-строку.
     """
     if today is None:
         today = datetime.now(timezone.utc).date()
@@ -1387,7 +1413,16 @@ def is_sanitary_day_today(
         pairs = parse_sanitary_days_json(pairs)
     if not pairs:
         return False
-    for s, e in pairs:
+    for entry in pairs:
+        if len(entry) >= 3:
+            # Период со временем — datetime-проверка.
+            if now_dt is None:
+                now_dt = datetime.now(timezone.utc)
+            if is_sanitary_active_now_at(entry, now_dt):
+                return True
+            continue
+        # Период без времени — date-проверка.
+        s, e = entry[0], entry[1]
         ds = _parse_sanitary_date(s)
         de = _parse_sanitary_date(e)
         if ds is None or de is None:
@@ -1395,6 +1430,50 @@ def is_sanitary_day_today(
         if ds <= today <= de:
             return True
     return False
+
+
+def is_sanitary_active_now_at(
+    entry: list[str],
+    now_dt: datetime,
+) -> bool:
+    """v4.7.6: проверяет, попадает ли datetime в один период со временем.
+
+    entry имеет формат [start_iso, end_iso, start_hhmm?, end_hhmm?].
+    Логика:
+      • start_dt = start_date + start_time (или 00:00 если start_time не задан).
+      • end_dt   = end_date + end_time (или 23:59:59 если end_time не задан).
+      • True если start_dt <= now_dt <= end_dt.
+
+    now_dt интерпретируется как локальное время в TZ чата (caller передаёт
+    правильное значение — обычно now в night_mode_tz).
+    """
+    if not entry or len(entry) < 2:
+        return False
+    ds = _parse_sanitary_date(entry[0])
+    de = _parse_sanitary_date(entry[1])
+    if ds is None or de is None:
+        return False
+    start_time = entry[2] if len(entry) >= 3 else None
+    end_time = entry[3] if len(entry) >= 4 else None
+
+    sh, sm = (0, 0)
+    if start_time:
+        parsed = _parse_sanitary_time(start_time)
+        if parsed:
+            sh, sm = int(parsed[:2]), int(parsed[3:5])
+    eh, em = (23, 59)
+    if end_time:
+        parsed = _parse_sanitary_time(end_time)
+        if parsed:
+            eh, em = int(parsed[:2]), int(parsed[3:5])
+
+    # now_dt может быть naive (считается уже в TZ чата) или aware (UTC).
+    # Нам нужна только date+time, без TZ-конвертации здесь.
+    nd = now_dt.replace(tzinfo=None) if now_dt.tzinfo else now_dt
+
+    start_dt = datetime(ds.year, ds.month, ds.day, sh, sm, 0)
+    end_dt = datetime(de.year, de.month, de.day, eh, em, 59)
+    return start_dt <= nd <= end_dt
 
 
 def parse_sanitary_days_textarea(
@@ -1448,25 +1527,161 @@ def parse_sanitary_days_textarea(
 
 
 def format_sanitary_days_textarea(pairs: list[list[str]] | str | None) -> str:
-    """v4.5.4 + v4.6.0: форматирование списка пар в textarea-строки (для UI).
+    """v4.5.4 + v4.6.0 + v4.7.6: форматирование списка пар в textarea-строки.
 
-    v4.6.0: поддерживает оба формата JSON (плоский list и dict-monthly) —
-    парсит через parse_sanitary_days_json (которая сама определяет формат).
-
-    Однодневные пары (start == end) выводятся одной датой.
+    v4.7.6: если в периоде есть время — оно добавляется к дате.
+    Однодневные пары (start == end) без времени выводятся одной датой.
     Многодневные — через ' - '.
+
+    Используется в <details> Raw JSON (advanced) для совместимости с bot-командами.
     """
     if isinstance(pairs, str):
         pairs = parse_sanitary_days_json(pairs)
     if not pairs:
         return ""
     lines: list[str] = []
-    for s, e in pairs:
-        if s == e:
-            lines.append(s)
+    for entry in pairs:
+        s = entry[0]
+        e = entry[1]
+        st = entry[2] if len(entry) >= 3 else None
+        et = entry[3] if len(entry) >= 4 else None
+        # С временем.
+        if st and et:
+            if s == e:
+                lines.append(f"{s} {st}-{et}")
+            else:
+                lines.append(f"{s} {st} - {e} {et}")
+        elif st:
+            if s == e:
+                lines.append(f"{s} {st}")
+            else:
+                lines.append(f"{s} {st} - {e}")
+        elif et:
+            if s == e:
+                lines.append(f"{s} - {et}")
+            else:
+                lines.append(f"{s} - {e} {et}")
         else:
-            lines.append(f"{s} - {e}")
+            # Без времени — старое поведение.
+            if s == e:
+                lines.append(s)
+            else:
+                lines.append(f"{s} - {e}")
     return "\n".join(lines)
+
+
+def format_sanitary_period_human(entry: list[str]) -> str:
+    """v4.7.6: форматирует один период для UI-списка назначенных периодов.
+
+    Возвращает строку вида:
+      • '31.07.2026 23:00 → 03.08.2026 09:00'  (с временем)
+      • '2026-08-01'                             (однодневный без времени)
+      • '2026-08-01 - 2026-08-03'                (диапазон без времени)
+    """
+    if not entry or len(entry) < 2:
+        return ""
+    s_iso = entry[0]
+    e_iso = entry[1]
+    start_time = entry[2] if len(entry) >= 3 else None
+    end_time = entry[3] if len(entry) >= 4 else None
+
+    def _fmt_date_ru(iso: str) -> str:
+        d = _parse_sanitary_date(iso)
+        if d is None:
+            return iso
+        return f"{d.day:02d}.{d.month:02d}.{d.year:04d}"
+
+    s_disp = _fmt_date_ru(s_iso)
+    e_disp = _fmt_date_ru(e_iso)
+
+    if start_time and end_time:
+        return f"{s_disp} {start_time} → {e_disp} {end_time}"
+    if start_time and not end_time:
+        return f"{s_disp} {start_time} → {e_disp}"
+    if not start_time and end_time:
+        return f"{s_disp} → {e_disp} {end_time}"
+    # Без времени.
+    if s_iso == e_iso:
+        return s_iso
+    return f"{s_iso} - {e_iso}"
+
+
+def add_sanitary_period(
+    json_str: str | None,
+    start_date: str,
+    end_date: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> tuple[str | None, str | None]:
+    """v4.7.6: добавляет период в sanitary_days JSON.
+
+    Парсит текущий JSON в monthly-формат, добавляет новую запись в нужный месяц
+    (по start_date), сериализует обратно.
+
+    Возвращает (new_json, error). При ошибке валидации — (None, 'сообщение').
+    """
+    ds = _parse_sanitary_date(start_date)
+    de = _parse_sanitary_date(end_date)
+    if ds is None:
+        return None, f"Invalid start date '{start_date}' (use YYYY-MM-DD)"
+    if de is None:
+        return None, f"Invalid end date '{end_date}' (use YYYY-MM-DD)"
+    if de < ds:
+        de = ds
+
+    st = _parse_sanitary_time(start_time) if start_time else None
+    et = _parse_sanitary_time(end_time) if end_time else None
+
+    monthly = parse_sanitary_days_monthly(json_str)
+    mk = ds.strftime("%Y-%m")
+    if mk not in monthly:
+        monthly[mk] = []
+    entry: list[str] = [ds.isoformat(), de.isoformat()]
+    if st:
+        entry.append(st)
+    if et:
+        entry.append(et)
+    monthly[mk].append(entry)
+    return serialize_sanitary_days_monthly(monthly), None
+
+
+def delete_sanitary_period(
+    json_str: str | None,
+    index: int,
+) -> tuple[str | None, str | None]:
+    """v4.7.6: удаляет период из sanitary_days JSON по глобальному индексу.
+
+    Глобальный индекс = позиция периода в плоском list от parse_sanitary_days_json
+    (который итерирует месяцы в порядке их появления в dict).
+
+    Возвращает (new_json, error). При ошибке — (None, 'сообщение').
+    """
+    pairs = parse_sanitary_days_json(json_str)
+    if index < 0 or index >= len(pairs):
+        return None, f"Invalid period index {index} (have {len(pairs)} periods)"
+    target = pairs[index]
+
+    # Парсим в monthly-формат и находим/удаляем target.
+    monthly = parse_sanitary_days_monthly(json_str)
+    for mk in list(monthly.keys()):
+        entries = monthly[mk]
+        for i, e in enumerate(entries):
+            if e == target:
+                del entries[i]
+                # Если месяц пустой — оставляем ключ (для UI: показываем что месяц был).
+                # Не удаляем ключ чтобы не сбросить last_sanitary_month маркер.
+                monthly[mk] = entries
+                return serialize_sanitary_days_monthly(monthly), None
+    return None, "Period not found in monthly structure"
+
+
+def get_sanitary_periods_flat(json_str: str | None) -> list[list[str]]:
+    """v4.7.6: возвращает плоский list периодов из JSON (для UI-списка).
+
+    Аналог parse_sanitary_days_json, но гарантированно возвращает
+    только валидные нормализованные периоды.
+    """
+    return parse_sanitary_days_json(json_str)
 
 
 # ── Отправка отчёта в чат (Rich Messages, Bot API 10.2) ─────────────────────

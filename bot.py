@@ -380,16 +380,39 @@ def _today_in_tz(tz_name: str | None) -> date:
     return datetime.now(timezone.utc).astimezone(tz).date()
 
 
+def _now_in_tz(tz_name: str | None) -> datetime:
+    """v4.7.6: возвращает текущий datetime в указанном часовом поясе.
+
+    Возвращает aware datetime с tzinfo соответствующей зоны.
+    Fallback на Europe/Moscow при невалидной зоне.
+    Используется для datetime-проверок sanitary periods со временем.
+    """
+    tz = None
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tz_name)
+        except (ValueError, KeyError, ImportError):
+            tz = None
+    if tz is None:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("Europe/Moscow")
+    return datetime.now(timezone.utc).astimezone(tz)
+
+
 async def _sanitary_day_tick():
     """v4.5.4: один проход sanitary day для всех чатов с configured sanitary days.
     v4.7.2: только для чатов с sanitary_days_enabled=True.
+    v4.7.6: поддержка datetime-периодов со временем (start_time/end_time).
 
     Для каждого чата:
       • parse sanitary_days JSON;
       • если список пустой и sanitary не активен — skip;
-      • вычислить today в часовом поясе чата (night_mode_tz);
-      • если today попадает в один из диапазонов и sanitary не активен → enter;
-      • если today НЕ попадает и sanitary активен → exit;
+      • вычислить today/now в часовом поясе чата (night_mode_tz);
+      • v4.7.6: если период имеет время — datetime-проверка через now;
+        иначе — date-проверка через today (старое поведение);
+      • если попадает и sanitary не активен → enter;
+      • если НЕ попадает и sanitary активен → exit;
       • иначе → ничего не делаем.
     """
     try:
@@ -413,7 +436,10 @@ async def _sanitary_day_tick():
             if not pairs:
                 continue
             today = _today_in_tz(cs.night_mode_tz)
-            is_today = is_sanitary_day_today(pairs, today=today)
+            now_dt = _now_in_tz(cs.night_mode_tz)
+            # v4.7.6: периоды со временем проверяются через now_dt (TZ-aware),
+            # без времени — через today (date). is_sanitary_day_today умеет оба.
+            is_today = is_sanitary_day_today(pairs, today=today, now_dt=now_dt)
 
             if is_today and not cs.sanitary_days_currently_active:
                 await _enter_sanitary_day(cs)

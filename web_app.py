@@ -61,7 +61,7 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
     async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
-    PermissionPreset,
+    PermissionPreset, WordFilter, LinkAllowlist,
     _hash_password, _verify_password, DB_PATH,
 )
 
@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.4"
+APP_VERSION = "v4.7.6"
 APP_RELEASE_DATE = "2026-08-01"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -620,6 +620,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         templates.env.filters["format_sanitary_days"] = _fmt_san
     except ImportError:
         templates.env.filters["format_sanitary_days"] = lambda s: ""
+    # v4.7.6: новые фильтры для UI sanitary days.
+    try:
+        from bot_handlers import (
+            format_sanitary_period_human as _fmt_san_period,
+            get_sanitary_periods_flat as _san_flat,
+        )
+        templates.env.filters["format_sanitary_period"] = _fmt_san_period
+        templates.env.filters["sanitary_periods_flat"] = _san_flat
+    except ImportError:
+        templates.env.filters["format_sanitary_period"] = lambda e: ""
+        templates.env.filters["sanitary_periods_flat"] = lambda s: []
     # v4.5.2: глобальные переменные для всех шаблонов (версия в футере)
     templates.env.globals["app_version"] = APP_VERSION
     templates.env.globals["app_release_date"] = APP_RELEASE_DATE
@@ -2002,11 +2013,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         request: Request,
         _auth: AuthUser = Depends(require_admin),
     ):
-        """v4.4.7: переключает is_enabled / is_private / is_report_chat для чата.
+        """v4.4.7: переключает is_enabled / is_report_chat для чата.
         v4.5.2: добавлены toggle для cas, link_filter, night_mode.
         v4.7.2: добавлен toggle для sanitary_days.
+        v4.7.6: упразднён toggle 'private' (система private/non-private удалена).
 
-        Поле form: field=enabled|private|report_chat|cas|link_filter|night_mode|sanitary_days — что переключать.
+        Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days — что переключать.
         """
         try:
             chat_id = int(chat_id_str)
@@ -2017,7 +2029,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         form = await request.form()
         field = (form.get("field") or "").strip().lower()
-        valid_fields = {"enabled", "private", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days"}
+        valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days"}
         if field not in valid_fields:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Invalid+toggle+field",
@@ -2036,9 +2048,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             if field == "enabled":
                 cs.is_enabled = not cs.is_enabled
                 msg = f"Chat+{chat_id}+{'enabled' if cs.is_enabled else 'disabled'}"
-            elif field == "private":
-                cs.is_private = not cs.is_private
-                msg = f"Chat+{chat_id}+{'now+private' if cs.is_private else 'now+public'}"
             elif field == "cas":
                 cs.cas_check_enabled = not cs.cas_check_enabled
                 msg = f"Chat+{chat_id}+CAS+{'enabled' if cs.cas_check_enabled else 'disabled'}"
@@ -2486,6 +2495,134 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Sync+{chat_id_str}+done:+{msg.replace(' ', '+')}",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /admin/chats/{chat_id}/sanitary/add — v4.7.6: добавить период
+    #  санитарных дней через UI (date+time picker).
+    #
+    #  Поля формы: start_date (YYYY-MM-DD), end_date (YYYY-MM-DD),
+    #  start_time (HH:MM, опционально), end_time (HH:MM, опционально).
+    #  Если время не задано — период full-day (старое поведение).
+    #
+    #  Доступ: require_admin (как и другие /admin/chats/*).
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/chats/{chat_id_str}/sanitary/add")
+    async def admin_chats_sanitary_add(
+        chat_id_str: str,
+        request: Request,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.6: добавить период санитарных дней."""
+        try:
+            chat_id = int(chat_id_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+chat_id",
+                status_code=303,
+            )
+        form = await request.form()
+        start_date = (form.get("start_date") or "").strip()
+        end_date = (form.get("end_date") or "").strip()
+        start_time = (form.get("start_time") or "").strip() or None
+        end_time = (form.get("end_time") or "").strip() or None
+
+        try:
+            from bot_handlers import add_sanitary_period
+        except ImportError:
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Server+error+(bot_handlers+import)",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            )).scalar_one_or_none()
+            if cs is None:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
+                    status_code=303,
+                )
+            new_json, err = add_sanitary_period(
+                cs.sanitary_days, start_date, end_date, start_time, end_time,
+            )
+            if err:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Sanitary+add+failed:+{err.replace(' ', '+')}",
+                    status_code=303,
+                )
+            cs.sanitary_days = new_json
+            cs.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+
+        _req_logger.info(
+            "sanitary_add: chat_id=%s by=%s start=%s%s end=%s%s",
+            chat_id, _auth.username,
+            start_date, f" {start_time}" if start_time else "",
+            end_date, f" {end_time}" if end_time else "",
+        )
+        return RedirectResponse(
+            url=f"/admin/chats?flash=Sanitary+period+added+for+chat+{chat_id}",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /admin/chats/{chat_id}/sanitary/{idx}/delete — v4.7.6: удалить период
+    #  санитарных дней по глобальному индексу.
+    #
+    #  idx = позиция в плоском list от parse_sanitary_days_json.
+    #  Доступ: require_admin.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/chats/{chat_id_str}/sanitary/{idx_str}/delete")
+    async def admin_chats_sanitary_delete(
+        chat_id_str: str,
+        idx_str: str,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.6: удалить период санитарных дней по индексу."""
+        try:
+            chat_id = int(chat_id_str)
+            idx = int(idx_str)
+        except (ValueError, TypeError):
+            return RedirectResponse(
+                url="/admin/chats?flash=Invalid+chat_id+or+index",
+                status_code=303,
+            )
+        try:
+            from bot_handlers import delete_sanitary_period
+        except ImportError:
+            return RedirectResponse(
+                url=f"/admin/chats?flash=Server+error+(bot_handlers+import)",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+            )).scalar_one_or_none()
+            if cs is None:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Chat+{chat_id}+not+found",
+                    status_code=303,
+                )
+            new_json, err = delete_sanitary_period(cs.sanitary_days, idx)
+            if err:
+                return RedirectResponse(
+                    url=f"/admin/chats?flash=Sanitary+delete+failed:+{err.replace(' ', '+')}",
+                    status_code=303,
+                )
+            cs.sanitary_days = new_json
+            cs.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+
+        _req_logger.info(
+            "sanitary_delete: chat_id=%s by=%s idx=%s",
+            chat_id, _auth.username, idx,
+        )
+        return RedirectResponse(
+            url=f"/admin/chats?flash=Sanitary+period+deleted+for+chat+{chat_id}",
             status_code=303,
         )
 
@@ -2994,6 +3131,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     ):
         """v4.6.0: страница управления пресетами прав для day/night/sanitary.
 
+        v4.7.5: добавлены секции Word filter (ban words) и Link allowlist.
+        Теперь страница — единое место для всех «глобальных списков» модерации.
+
         Доступ: SU + admin (moderator не имеет доступа — ему нечего тут делать).
         """
         async with async_session() as session:
@@ -3001,6 +3141,28 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 select(PermissionPreset).order_by(
                     PermissionPreset.scope, PermissionPreset.name
                 )
+            )).scalars().all()
+
+            # v4.7.5: Word filter — все активные паттерны, отсортированы
+            # по chat_id (global=0 первым), затем по created_at desc.
+            words = (await session.execute(
+                select(WordFilter)
+                .where(WordFilter.is_active.is_(True))
+                .order_by(WordFilter.chat_id.asc(), WordFilter.created_at.desc())
+            )).scalars().all()
+
+            # v4.7.5: Link allowlist — все домены, аналогичная сортировка.
+            links = (await session.execute(
+                select(LinkAllowlist)
+                .order_by(LinkAllowlist.chat_id.asc(), LinkAllowlist.created_at.asc())
+            )).scalars().all()
+
+            # v4.7.5: список чатов для dropdown в add-формах
+            # (chat_id=0 — global; реальные чаты для per-chat правил).
+            chats = (await session.execute(
+                select(ChatSettings)
+                .where(ChatSettings.chat_id != 0)
+                .order_by(ChatSettings.title.asc())
             )).scalars().all()
 
         # Группируем по scope для UI.
@@ -3014,6 +3176,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             {
                 "request": request,
                 "presets_by_scope": grouped,
+                "word_filters": words,
+                "link_allowlist": links,
+                "chats": chats,
                 "flash": flash,
                 "app_version": APP_VERSION,
                 "app_release_date": APP_RELEASE_DATE,
@@ -3126,6 +3291,242 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
         return RedirectResponse(
             url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+deleted",
+            status_code=303,
+        )
+
+    # ── v4.7.5: Word filter (ban words) CRUD ─────────────────────────
+    # Паритет с командами /addword, /delword, /listwords.
+    # chat_id=0 — глобальный паттерн (применяется ко всем чатам).
+    # is_regex=True — pattern интерпретируется как re.search, иначе — case-insensitive substring.
+    # action: delete|warn|mute|ban.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/presets/words/add")
+    async def admin_presets_words_add(
+        chat_id: str = Form("0"),
+        pattern: str = Form(...),
+        is_regex: str = Form(""),
+        action: str = Form("delete"),
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.5: добавить паттерн в word filter через веб-панель.
+
+        Валидация:
+          • pattern — непустой, 1-255 символов.
+          • is_regex=True → pattern должен компилироваться re.compile без ошибок.
+          • action ∈ {delete, warn, mute, ban}.
+          • chat_id — число (0 для global).
+          • Дубликат (chat_id + pattern + is_active=True) — обновляем action/is_regex.
+        """
+        # Парсим chat_id
+        chat_id = (chat_id or "0").strip()
+        try:
+            chat_id_int = int(chat_id)
+        except ValueError:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+chat_id+(must+be+number+or+0+for+global)",
+                status_code=303,
+            )
+
+        pattern = (pattern or "").strip()
+        if not pattern or len(pattern) > 255:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+pattern+(1-255+chars)",
+                status_code=303,
+            )
+
+        is_regex_bool = is_regex == "on"
+
+        if action not in ("delete", "warn", "mute", "ban"):
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+action",
+                status_code=303,
+            )
+
+        if is_regex_bool:
+            import re as _re
+            try:
+                _re.compile(pattern)
+            except _re.error as e:
+                return RedirectResponse(
+                    url=f"/admin/presets?flash=Invalid+regex:+{str(e).replace(' ', '+')[:80]}",
+                    status_code=303,
+                )
+
+        async with async_session() as session:
+            existing = (await session.execute(
+                select(WordFilter).where(
+                    WordFilter.chat_id == chat_id_int,
+                    WordFilter.pattern == pattern,
+                    WordFilter.is_active.is_(True),
+                )
+            )).scalar_one_or_none()
+            if existing:
+                existing.action = action
+                existing.is_regex = is_regex_bool
+                await session.commit()
+                _req_logger.info(
+                    "wordfilter_add (update existing): chat_id=%d pattern=%r by=%s",
+                    chat_id_int, pattern, _auth.username,
+                )
+                return RedirectResponse(
+                    url=f"/admin/presets?flash=Pattern+updated:+{pattern[:40].replace(' ', '+')}",
+                    status_code=303,
+                )
+            session.add(WordFilter(
+                chat_id=chat_id_int,
+                pattern=pattern,
+                is_regex=is_regex_bool,
+                action=action,
+                created_by=_auth.tg_user_id,
+            ))
+            await session.commit()
+            _req_logger.info(
+                "wordfilter_add: chat_id=%d pattern=%r action=%s regex=%s by=%s",
+                chat_id_int, pattern, action, is_regex_bool, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Pattern+added:+{pattern[:40].replace(' ', '+')}",
+            status_code=303,
+        )
+
+    @app.post("/admin/presets/words/{word_id:int}/delete")
+    async def admin_presets_words_delete(
+        word_id: int,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.5: удалить паттерн из word filter (soft-delete — is_active=False).
+
+        Soft-delete выбран для паритета с /delword (команда ботa тоже ставит
+        is_active=False). Это сохраняет историю добавлений для аудита.
+        """
+        async with async_session() as session:
+            wf = (await session.execute(
+                select(WordFilter).where(WordFilter.id == word_id)
+            )).scalar_one_or_none()
+            if wf is None:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Pattern+not+found",
+                    status_code=303,
+                )
+            if not wf.is_active:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Pattern+already+deleted",
+                    status_code=303,
+                )
+            wf.is_active = False
+            await session.commit()
+            _req_logger.info(
+                "wordfilter_delete: id=%d pattern=%r chat_id=%d by=%s",
+                word_id, wf.pattern, wf.chat_id, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Pattern+deleted:+{wf.pattern[:40].replace(' ', '+')}",
+            status_code=303,
+        )
+
+    # ── v4.7.5: Link allowlist CRUD ──────────────────────────────────
+    # Паритет с командами /linkallow, /linkallowlist.
+    # chat_id=0 — глобальный allowlist. Сравнение по подстроке домена.
+    # ──────────────────────────────────────────────────────────────────
+    @app.post("/admin/presets/links/add")
+    async def admin_presets_links_add(
+        chat_id: str = Form("0"),
+        domain: str = Form(...),
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.5: добавить домен в link allowlist через веб-панель.
+
+        Валидация (паритет с /linkallow):
+          • domain — непустой, после нормализации должен содержать точку.
+          • Убирается scheme и path если есть.
+          • Дубликат (chat_id + domain) — отказ с flash.
+        """
+        chat_id = (chat_id or "0").strip()
+        try:
+            chat_id_int = int(chat_id)
+        except ValueError:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+chat_id",
+                status_code=303,
+            )
+
+        domain = (domain or "").strip().lower()
+        # Нормализация: убираем scheme если есть
+        if "://" in domain:
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(domain)
+                domain = parsed.netloc.lower()
+            except ValueError:
+                pass
+        domain = domain.lstrip("@").strip("/")
+        if not domain or "." not in domain:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+domain+(must+contain+dot,+e.g.+t.me)",
+                status_code=303,
+            )
+
+        async with async_session() as session:
+            existing = (await session.execute(
+                select(LinkAllowlist).where(
+                    LinkAllowlist.chat_id == chat_id_int,
+                    LinkAllowlist.domain == domain,
+                )
+            )).scalar_one_or_none()
+            if existing:
+                return RedirectResponse(
+                    url=f"/admin/presets?flash=Domain+already+in+allowlist:+{domain}",
+                    status_code=303,
+                )
+            session.add(LinkAllowlist(
+                chat_id=chat_id_int,
+                domain=domain,
+                created_by=_auth.tg_user_id,
+            ))
+            await session.commit()
+            _req_logger.info(
+                "linkallowlist_add: chat_id=%d domain=%r by=%s",
+                chat_id_int, domain, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Domain+added:+{domain}",
+            status_code=303,
+        )
+
+    @app.post("/admin/presets/links/{link_id:int}/delete")
+    async def admin_presets_links_delete(
+        link_id: int,
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.5: удалить домен из link allowlist (hard delete).
+
+        Hard delete — потому что в таблице link_allowlist нет is_active флага
+        (в отличие от WordFilter). Это паритет с тем, как если бы строку
+        удалили через прямой SQL.
+        """
+        async with async_session() as session:
+            link = (await session.execute(
+                select(LinkAllowlist).where(LinkAllowlist.id == link_id)
+            )).scalar_one_or_none()
+            if link is None:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Domain+not+found",
+                    status_code=303,
+                )
+            domain = link.domain
+            chat_id = link.chat_id
+            await session.delete(link)
+            await session.commit()
+            _req_logger.info(
+                "linkallowlist_delete: id=%d domain=%r chat_id=%d by=%s",
+                link_id, domain, chat_id, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Domain+removed:+{domain}",
             status_code=303,
         )
 

@@ -5,6 +5,7 @@
 {% block content %}
 
 {# ── v4.6.0: Permission Presets (SU + admin) ──────────────────────── #}
+{# ── v4.7.5: + Word filter (ban words) + Link allowlist ───────────── #}
 
 {% if flash %}
 <div style="background: rgba(0,204,102,.08); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--text-dim); font-size: 12px;">
@@ -12,7 +13,15 @@
 </div>
 {% endif %}
 
-<div class="section-title">Permission Presets <a class="anchor" href="#">#</a></div>
+<div class="section-title">Presets &amp; Filters <a class="anchor" href="#">#</a></div>
+
+<div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--text-dim); font-size: 11px; line-height: 1.6;">
+    <strong style="color: var(--text);">Что здесь настраивается:</strong><br>
+    • <strong>Permission presets</strong> — именованные наборы из 13 прав <code>ChatPermissions</code> для day/night/sanitary режимов. Привязываются к чату на странице <code>/admin/chats</code>.<br>
+    • <strong>Ban words (word filter)</strong> — список запрещённых слов/regex-паттернов. <code>chat_id=0</code> — глобальные (для всех чатов); per-chat — только для конкретного чата. Применяется только если word filter включён в чате (через команду <code>/addword</code> или здесь).<br>
+    • <strong>Link allowlist</strong> — домены, разрешённые link-filter-ом. Все остальные домены блокируются. <code>chat_id=0</code> — глобальный allowlist.<br>
+    <strong style="color: var(--text);">Паритет с командами</strong>: изменения в UI эквивалентны командам <code>/addword</code>, <code>/delword</code>, <code>/linkallow</code> (и видны через <code>/listwords</code>, <code>/linkallowlist</code>).
+</div>
 
 <div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--text-dim); font-size: 11px; line-height: 1.6;">
     <strong style="color: var(--text);">Как это работает:</strong><br>
@@ -141,5 +150,198 @@
     {% endif %}
 </div>
 {% endfor %}
+
+{# ════════════════════════════════════════════════════════════════════ #}
+{# v4.7.5: Ban Words (Word Filter)                                      #}
+{# ════════════════════════════════════════════════════════════════════ #}
+
+<div style="margin-top: var(--sp-7); padding-top: var(--sp-5); border-top: 2px dashed var(--border);">
+    <div class="section-title" style="font-size: 14px;">🚫 Ban Words (Word Filter) <a class="anchor" href="#words">#</a></div>
+
+    <div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin: var(--sp-3) 0 var(--sp-5); color: var(--text-dim); font-size: 11px; line-height: 1.6;">
+        Список запрещённых слов/паттернов. Применяется ко всем сообщениям с текстом —
+        если в тексте найдено совпадение (substring или regex), применяется действие
+        (<code>delete</code> / <code>warn</code> / <code>mute</code> / <code>ban</code>).<br>
+        <strong style="color: var(--text);">Scope:</strong>
+        <code>chat_id=0</code> (Global) — применяется ко всем чатам; per-chat — только к указанному чату.
+        Per-chat имеет приоритет над global (если совпадают оба — сработает per-chat).<br>
+        <strong style="color: var(--text);">is_regex=on</strong> — pattern компилируется как Python regex через <code>re.search</code>.
+        Иначе — case-insensitive substring.<br>
+        <strong style="color: var(--text);">Паритет с командами</strong>: <code>/addword chat_id &lt;pattern&gt; [action] [is_regex]</code>,
+        <code>/delword chat_id &lt;pattern&gt;</code>, <code>/listwords [chat_id]</code>.
+    </div>
+
+    {# ── Add ban word form ── #}
+    <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
+        <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Add ban word</summary>
+        <form method="post" action="/admin/presets/words/add" style="margin-top: var(--sp-4);">
+            <div style="display: grid; grid-template-columns: 1.4fr 2fr 1fr 1fr; gap: var(--sp-3); align-items: end;">
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Scope (chat)</label>
+                    <select name="chat_id" required
+                            style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                        <option value="0">🌐 Global (all chats)</option>
+                        {% for c in chats %}
+                        <option value="{{ c.chat_id }}">{{ c.title or c.chat_id }} ({{ c.chat_id }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Pattern (1-255 chars)</label>
+                    <input type="text" name="pattern" required maxlength="255" placeholder="например: спам or regex: ^https?://\\S+"
+                           style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Action</label>
+                    <select name="action" required
+                            style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                        <option value="delete">delete — удалить</option>
+                        <option value="warn">warn — варн</option>
+                        <option value="mute">mute — мьют</option>
+                        <option value="ban">ban — бан</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Regex?</label>
+                    <label style="display: flex; align-items: center; gap: 6px; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 12px; cursor: pointer;">
+                        <input type="checkbox" name="is_regex">
+                        <span>is_regex</span>
+                    </label>
+                </div>
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); margin: var(--sp-3) 0;">
+                💡 Если pattern уже существует для выбранного scope — action и is_regex будут обновлены (upsert).
+            </div>
+            <button type="submit"
+                    style="padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                Add pattern
+            </button>
+        </form>
+    </details>
+
+    {# ── Existing ban words list ── #}
+    <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border);">
+        Active patterns
+        <span style="color: var(--text-dim); font-size: 10px; margin-left: 8px;">({{ word_filters|length }})</span>
+    </div>
+
+    {% if not word_filters %}
+    <div style="padding: var(--sp-3); background: var(--bg2); border: 1px dashed var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: 11px;">
+        Нет активных паттернов. Word filter пустой — никакие слова не блокируются.
+    </div>
+    {% else %}
+    <div style="display: grid; gap: var(--sp-2);">
+        {% for w in word_filters %}
+        <div style="display: grid; grid-template-columns: auto 1fr auto auto auto; gap: var(--sp-3); padding: var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); align-items: center;">
+            <span style="font-size: 9px; padding: 2px 6px; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-family: var(--font-mono);
+                {% if w.chat_id == 0 %}background: rgba(0,204,102,.15); color: var(--accent); border: 1px solid var(--accent);">GLOBAL{% else %}background: rgba(255,200,0,.1); color: var(--warn); border: 1px solid var(--warn);">{{ w.chat_id }}{% endif %}
+            </span>
+            <div>
+                <code style="color: var(--text); font-size: 13px; word-break: break-all;">{{ w.pattern }}</code>
+                {% if w.is_regex %}
+                <span style="font-size: 9px; padding: 1px 5px; margin-left: 6px; background: rgba(102,51,204,.15); color: #b388ff; border: 1px solid #b388ff; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">REGEX</span>
+                {% endif %}
+            </div>
+            <span style="font-size: 10px; padding: 2px 8px; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-family: var(--font-mono);
+                {% if w.action == 'delete' %}background: rgba(150,150,150,.15); color: var(--text-dim); border: 1px solid var(--border);">{{ w.action }}
+                {% elif w.action == 'warn' %}background: rgba(255,200,0,.1); color: var(--warn); border: 1px solid var(--warn);">{{ w.action }}
+                {% elif w.action == 'mute' %}background: rgba(255,140,0,.1); color: #ff8c00; border: 1px solid #ff8c00;">{{ w.action }}
+                {% elif w.action == 'ban' %}background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">{{ w.action }}{% endif %}
+            </span>
+            <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">#{{ w.id }}</span>
+            <form method="post" action="/admin/presets/words/{{ w.id }}/delete" style="display: inline;"
+                  onsubmit="return confirm('Delete pattern {{ w.pattern|e }}?\n\nThis will soft-delete it (is_active=False). Audit history is preserved.');">
+                <button type="submit"
+                        style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
+                    Delete
+                </button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+
+{# ════════════════════════════════════════════════════════════════════ #}
+{# v4.7.5: Link Allowlist                                              #}
+{# ════════════════════════════════════════════════════════════════════ #}
+
+<div style="margin-top: var(--sp-7); padding-top: var(--sp-5); border-top: 2px dashed var(--border);">
+    <div class="section-title" style="font-size: 14px;">🔗 Link Allowlist <a class="anchor" href="#links">#</a></div>
+
+    <div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin: var(--sp-3) 0 var(--sp-5); color: var(--text-dim); font-size: 11px; line-height: 1.6;">
+        Список доменов, разрешённых link-filter-ом. Если link-filter включён для чата
+        (через toggle на <code>/admin/chats</code> или <code>/linkfilter chat_id on</code>),
+        все ссылки на домены <strong>не из этого списка</strong> будут блокироваться действием
+        <code>link_filter_action</code> (настраивается в чате).<br>
+        <strong style="color: var(--text);">Scope:</strong>
+        <code>chat_id=0</code> (Global) — разрешён для всех чатов; per-chat — дополнение к глобальному списку.<br>
+        <strong style="color: var(--text);">Сравнение по подстроке</strong>: <code>t.me</code> разрешит <code>t.me</code>, <code>telegram.t.me</code> и любые поддомены.<br>
+        <strong style="color: var(--text);">Паритет с командами</strong>: <code>/linkallow chat_id|global &lt;domain&gt;</code>,
+        <code>/linkallowlist [chat_id]</code>.
+    </div>
+
+    {# ── Add allowlist domain form ── #}
+    <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
+        <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Add allowed domain</summary>
+        <form method="post" action="/admin/presets/links/add" style="margin-top: var(--sp-4);">
+            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: var(--sp-3); align-items: end;">
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Scope (chat)</label>
+                    <select name="chat_id" required
+                            style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                        <option value="0">🌐 Global (all chats)</option>
+                        {% for c in chats %}
+                        <option value="{{ c.chat_id }}">{{ c.title or c.chat_id }} ({{ c.chat_id }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Domain (без scheme и path)</label>
+                    <input type="text" name="domain" required maxlength="255" placeholder="t.me  или  github.com  или  my-site.ru"
+                           style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                </div>
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); margin: var(--sp-3) 0;">
+                💡 Scheme и path автоматически убираются (если введёшь <code>https://t.me/path</code> — сохранится <code>t.me</code>).
+            </div>
+            <button type="submit"
+                    style="padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                Add domain
+            </button>
+        </form>
+    </details>
+
+    {# ── Existing allowlist ── #}
+    <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border);">
+        Allowed domains
+        <span style="color: var(--text-dim); font-size: 10px; margin-left: 8px;">({{ link_allowlist|length }})</span>
+    </div>
+
+    {% if not link_allowlist %}
+    <div style="padding: var(--sp-3); background: var(--bg2); border: 1px dashed var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: 11px;">
+        Allowlist пуст. Если link-filter включён в чате — <strong>все</strong> ссылки будут блокироваться.
+        Добавь хотя бы <code>t.me</code> (чтобы пропускать Telegram-ссылки).
+    </div>
+    {% else %}
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--sp-2);">
+        {% for l in link_allowlist %}
+        <div style="display: grid; grid-template-columns: auto 1fr auto; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); align-items: center;">
+            <span style="font-size: 9px; padding: 2px 6px; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-family: var(--font-mono);
+                {% if l.chat_id == 0 %}background: rgba(0,204,102,.15); color: var(--accent); border: 1px solid var(--accent);">GLOBAL{% else %}background: rgba(255,200,0,.1); color: var(--warn); border: 1px solid var(--warn);">{{ l.chat_id }}{% endif %}
+            </span>
+            <code style="color: var(--text); font-size: 12px; word-break: break-all;">{{ l.domain }}</code>
+            <form method="post" action="/admin/presets/links/{{ l.id }}/delete" style="display: inline;"
+                  onsubmit="return confirm('Remove domain {{ l.domain|e }} from allowlist?\n\nLinks to this domain will be blocked by link-filter if enabled.');">
+                <button type="submit"
+                        style="padding: 2px 8px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
+                    ✕
+                </button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
 
 {% endblock %}
