@@ -351,13 +351,18 @@
 
                 {# v4.7.6: Add new period — date+time picker.
                    Форма с formaction на /sanitary/add (отдельный handler).
-                   Время опционально — если оставить пустым, период full-day. #}
+                   Время опционально — если оставить пустым, период full-day.
+                   v4.7.10: убран HTML5 required с date-полей. Они находились
+                   внутри главной /update формы, и браузер блокировал кнопку
+                   "Сохранить" сообщением "Вы пропустили это поле" при пустых
+                   датах. Серверная валидация в add_sanitary_period (bot_handlers.py)
+                   всё равно требует обе даты и вернёт понятную ошибку в flash. #}
                 <div style="background: var(--bg); padding: var(--sp-3); border-radius: var(--r-sm); margin-bottom: var(--sp-3);">
                     <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">+ Add sanitary period</div>
                     <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr auto; gap: 6px; align-items: end;">
                         <div>
                             <label style="display: block; font-size: 9px; color: var(--text-dim); margin-bottom: 2px;">Start date</label>
-                            <input type="date" name="start_date" required
+                            <input type="date" name="start_date"
                                    style="width: 100%; padding: 4px 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-xs); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                         </div>
                         <div>
@@ -367,7 +372,7 @@
                         </div>
                         <div>
                             <label style="display: block; font-size: 9px; color: var(--text-dim); margin-bottom: 2px;">End date</label>
-                            <input type="date" name="end_date" required
+                            <input type="date" name="end_date"
                                    style="width: 100%; padding: 4px 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-xs); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                         </div>
                         <div>

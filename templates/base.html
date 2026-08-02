@@ -635,6 +635,12 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.7.10</strong> — 2 августа 2026</p>
+                <ul>
+                    <li><strong>Хотфикс сохранения настроек чата</strong>: при нажатии «Сохранить» в карточке чата браузер показывал «Вы пропустили это поле» и блокировал сабмит. Причина — поля <code>start_date</code> и <code>end_date</code> в форме добавления санитарного периода имели HTML5-атрибут <code>required</code>, но сами находились внутри главной формы <code>/update</code>. Когда пользователь нажимал «Сохранить» (без добавления санитарного периода), браузер применял валидацию ко всем required-полям формы — и блокировал сабмит из-за пустых дат.</li>
+                    <li><strong>Решение</strong>: HTML5 <code>required</code> убран с полей <code>start_date</code>/<code>end_date</code>. Серверная валидация в <code>add_sanitary_period</code> (<code>bot_handlers.py</code>) уже существует и возвращает понятную ошибку через flash-сообщение, если попытаться добавить период без дат. Это повторение фикса v4.7.7 (тогда лечили toggle-кнопки через <code>formnovalidate</code>), но кнопка «Сохранить» была упущена.</li>
+                    <li><strong>Проверены все остальные шаблоны</strong>: <code>admin_presets.html</code>, <code>admin.html</code>, <code>admin_settings.html</code>, <code>profile.html</code>, <code>login.html</code> — у них required-поля живут в отдельных формах, конфликта с другими кнопками нет.</li>
+                </ul>
                 <p><strong>v4.7.9</strong> — 2 августа 2026</p>
                 <ul>
                     <li><strong>Модераторы получили доступ к <code>/help</code></strong>: раньше команда <code>/help</code> в ЛС боту работала только для <code>ADMIN_IDS</code> (env) — модераторы, привязанные к чату через <code>chat_admins</code>, могли использовать <code>!mute</code>/<code>!warn</code> в группах, но не видели список доступных команд. Теперь <code>/help</code> проверяет роль через БД: <code>ADMIN_IDS</code> env, <code>WebUser.role='su'</code> или <code>'admin'</code> → полный help; <code>role='moderator'</code> с <code>is_active=True</code> → сокращённый help; все остальные — молчим (стелс сохраняется).</li>

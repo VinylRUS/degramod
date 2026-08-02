@@ -31,6 +31,7 @@ ADMIN_IDS (env). Модераторы, привязанные к чату чер
 
 import os
 import sys
+import re
 import asyncio
 import unittest
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -139,7 +140,17 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
     # ──────────── 1. Version ────────────
 
     def test_01_app_version_is_v479(self):
-        self.assertEqual(web_app.APP_VERSION, "v4.7.9")
+        # v4.7.10+: APP_VERSION bumped beyond v4.7.9. This test now verifies
+        # that we're at least on v4.7.9 (when moderator /help fix shipped),
+        # so it doesn't break on every future version bump.
+        v = web_app.APP_VERSION
+        m = re.match(r"^v(\d+)\.(\d+)\.(\d+)$", v)
+        self.assertIsNotNone(m, f"APP_VERSION format unexpected: {v!r}")
+        major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        self.assertTrue(
+            (major, minor, patch) >= (4, 7, 9),
+            f"APP_VERSION {v} should be >= v4.7.9 (moderator /help fix)"
+        )
 
     # ──────────── 2. /help from ADMIN_IDS env → full text ────────────
 
