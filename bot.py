@@ -272,50 +272,166 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
         logger.error("Night mode enter failed for chat %s: %s", cs.chat_id, e)
 
 
-async def _exit_night_mode(cs: ChatSettings) -> None:
-    """Восстанавливает права чата из snapshot при выходе из ночного режима.
+# ── v4.7.12: Hardcoded Day default (совпадает с системным пресетом db.py:781-799)
+# Используется как последний эшелон фолбэка если ни day_permissions, ни snapshot,
+# ни системного пресета «Day default» в БД нет (например, БД пустая при первом запуске).
+# ВАЖНО: admin-права (can_change_info, can_invite_users, can_pin_messages) всегда False.
+_DAY_DEFAULT_HARDCODED = {
+    "can_send_messages": True,        # текст
+    "can_send_audios": True,          # музыка
+    "can_send_photos": True,          # фото
+    "can_send_videos": True,          # видео (НЕ video_notes!)
+    "can_send_other_messages": True,  # стикеры, GIFs, dice
+    "can_send_documents": False,
+    "can_send_video_notes": False,
+    "can_send_voice_notes": False,
+    "can_send_polls": False,
+    "can_add_web_page_previews": False,
+    "can_change_info": False,         # admin
+    "can_invite_users": False,        # admin
+    "can_pin_messages": False,        # admin
+}
 
-    v4.5.3: если night_mode_notify=True — отправляет уведомление о выходе.
-    v4.6.0: приоритет восстановления:
-      1. cs.day_permissions (granular, явно заданные дневные права) — лучший вариант
-      2. cs.night_mode_saved_permissions (snapshot с входа в ночной режим)
-      3. Fallback: «всё разрешено»
+
+async def _resolve_day_perms(cs: ChatSettings) -> tuple[object, str]:
+    """v4.7.12: возвращает дневные права чата (ChatPermissions) с приоритетом:
+
+      1. cs.day_permissions — явно привязанный к чату day preset (JSON-копия)
+      2. Системный пресет «Day default» (scope='day', is_system=True) из БД
+      3. Hardcoded _DAY_DEFAULT_HARDCODED (на случай пустой БД)
+
+    Returns: (ChatPermissions, source) где source = 'chat_preset' | 'system_default'
+             | 'hardcoded' — для логирования.
+    Никогда не возвращает all_true — admin-права всегда False.
     """
-    # v4.6.0: предпочтение — granular day_permissions.
+    from aiogram import types as _tg_types
+
+    # 1. Явно привязанный day preset.
     if cs.day_permissions:
         try:
             data = json.loads(cs.day_permissions)
-            from aiogram import types as _tg_types
-            restore_perms = _tg_types.ChatPermissions(
+            perms = _tg_types.ChatPermissions(
                 **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
             )
+            return perms, "chat_preset"
         except (ValueError, TypeError):
-            restore_perms = _fallback_all_true_perms()
-    else:
-        snapshot_json = cs.night_mode_saved_permissions
-        if not snapshot_json:
-            restore_perms = _fallback_all_true_perms()
-        else:
-            try:
-                data = json.loads(snapshot_json)
-                from aiogram import types as _tg_types
-                restore_perms = _tg_types.ChatPermissions(
-                    **{k: bool(data.get(k, True)) for k in _PERM_FIELDS}
-                )
-            except (ValueError, TypeError):
-                restore_perms = _fallback_all_true_perms()
+            logger.warning(
+                "Chat %s: day_permissions JSON corrupted (%.80r) — falling back",
+                cs.chat_id, cs.day_permissions,
+            )
 
+    # 2. Системный пресет «Day default».
     try:
-        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
         async with async_session() as session:
-            db_cs = (await session.execute(
-                select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+            from db import PermissionPreset
+            preset = (await session.execute(
+                select(PermissionPreset).where(
+                    PermissionPreset.name == "Day default",
+                    PermissionPreset.scope == "day",
+                )
             )).scalar_one_or_none()
-            if db_cs:
-                db_cs.night_mode_currently_active = False
-                db_cs.night_mode_saved_permissions = None
-                await session.commit()
-        logger.info("Night mode OFF for chat %s (perms restored)", cs.chat_id)
+            if preset and preset.permissions:
+                data = json.loads(preset.permissions)
+                perms = _tg_types.ChatPermissions(
+                    **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
+                )
+                return perms, "system_default"
+    except Exception as e:
+        logger.warning(
+            "Chat %s: failed to load system 'Day default' preset: %s — using hardcoded",
+            cs.chat_id, e,
+        )
+
+    # 3. Hardcoded fallback.
+    perms = _tg_types.ChatPermissions(
+        **{k: _DAY_DEFAULT_HARDCODED[k] for k in _PERM_FIELDS}
+    )
+    return perms, "hardcoded"
+
+
+def _night_window_active(cs: ChatSettings, now: datetime) -> bool:
+    """v4.7.12: проверяет находится ли текущее время в окне night mode для чата.
+
+    Обёртка над _night_mode_in_window с учётом per-chat tz + weekend schedule.
+    Если night_mode_enabled=False — всегда False (не в окне).
+    """
+    if not cs.night_mode_enabled:
+        return False
+    return _night_mode_in_window(
+        now=now,
+        weekday_start=cs.night_mode_start or "23:00",
+        weekday_end=cs.night_mode_end or "07:00",
+        weekend_start=cs.night_mode_weekend_start,
+        weekend_end=cs.night_mode_weekend_end,
+        tz_name=cs.night_mode_tz or "Europe/Moscow",
+    )
+
+
+async def _restore_day_state(cs: ChatSettings) -> str:
+    """v4.7.12: восстанавливает дневные права чата из day preset.
+
+    Применяет к чату права, полученные через _resolve_day_perms(cs).
+    Возвращает source ('chat_preset' | 'system_default' | 'hardcoded').
+    """
+    restore_perms, source = await _resolve_day_perms(cs)
+    await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+    logger.info(
+        "Day state restored for chat %s (source=%s)",
+        cs.chat_id, source,
+    )
+    return source
+
+
+async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> None:
+    """v4.7.12: выходит из ночного режима с учётом автопереключения.
+
+    Логика:
+      1. Снимает night-флаги (night_mode_currently_active=False, snapshot=None).
+      2. Если allow_auto_enter и night_mode_enabled и сейчас в окне —
+         сразу вызывает _enter_night_mode(cs) (свежий snapshot + night perms).
+         Это автопереход: не ждём следующий tick.
+      3. Иначе — восстанавливает дневные права через _restore_day_state(cs).
+
+    Args:
+      cs: ChatSettings чата (свежезагруженный из БД).
+      allow_auto_enter: если True (по умолчанию) — может сразу войти обратно
+        в night mode если включён и в окне. False — явно запрещает автопереход
+        (используется при _exit_sanitary_day если night не нужен).
+
+    v4.5.3: если night_mode_notify=True — отправляет уведомление о выходе
+    (только если действительно вышли в day, а не перешли в night).
+    """
+    # Сначала снимаем night-флаги (независимо от того, перейдём ли в night снова).
+    async with async_session() as session:
+        db_cs = (await session.execute(
+            select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+        )).scalar_one_or_none()
+        if db_cs:
+            db_cs.night_mode_currently_active = False
+            db_cs.night_mode_saved_permissions = None
+            await session.commit()
+            # Синхронизируем объект в памяти.
+            cs.night_mode_currently_active = False
+            cs.night_mode_saved_permissions = None
+
+    # Автопереход: если night mode включён и сейчас в окне — входим обратно.
+    if allow_auto_enter and cs.night_mode_enabled:
+        now = datetime.now(timezone.utc)
+        if _night_window_active(cs, now):
+            logger.info(
+                "Chat %s: auto-transition night→night (still in window) — re-entering",
+                cs.chat_id,
+            )
+            await _enter_night_mode(cs)
+            return
+
+    # Иначе — восстанавливаем дневные права.
+    try:
+        source = await _restore_day_state(cs)
+        logger.info(
+            "Night mode OFF for chat %s (day restored, source=%s)",
+            cs.chat_id, source,
+        )
 
         # v4.5.3: уведомление о выходе.
         if cs.night_mode_notify:
@@ -541,96 +657,85 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
 
 
 async def _exit_sanitary_day(cs: ChatSettings) -> None:
-    """v4.5.4: восстанавливает права чата из snapshot при выходе из sanitary day.
+    """v4.7.12: выходит из sanitary day с учётом автопереключения в night mode.
 
-    После восстановления night mode tick (запускается сразу после sanitary
-    tick в _night_mode_loop) сам решит, нужно ли входить в ночной режим —
-    если окно ещё активно, он сделает свежий snapshot и применит ночные права.
+    Логика:
+      1. Снимает sanitary-флаги (currently_active=False, snapshot=None).
+      2. Проставляет last_sanitary_month=current month (для suppress warnings).
+      3. Чистит ключ текущего месяца из sanitary_days JSON.
+      4. Если night_mode_enabled и сейчас в окне — сразу _enter_night_mode(cs).
+         Это автопереход: не ждём следующий night tick.
+      5. Иначе — _restore_day_state(cs) (day preset чата или системный Day default).
 
-    v4.6.0: приоритет восстановления:
-      1. cs.day_permissions (granular, явно заданные дневные права) — лучший вариант
-      2. cs.sanitary_days_saved_permissions (snapshot с входа в sanitary)
-      3. Fallback: «всё разрешено»
-
-    v4.6.0: после выхода — проставляем last_sanitary_month=current month чтобы
-    suppress dashboard warning "нет дат на след. месяц" если санитарный день
-    уже прошёл в этом месяце.
+    ВАЖНО: admin-права (can_change_info, can_invite_users, can_pin_messages)
+    никогда не выдаются вслепую. Если day preset не задан и системного «Day
+    default» нет — используется hardcoded-фолбэк с admin-правами OFF.
     """
-    # v4.6.0: предпочтение — granular day_permissions.
-    if cs.day_permissions:
-        try:
-            data = json.loads(cs.day_permissions)
-            from aiogram import types as _tg_types
-            restore_perms = _tg_types.ChatPermissions(
-                **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
-            )
-        except (ValueError, TypeError):
-            restore_perms = _fallback_all_true_perms()
-    else:
-        snapshot_json = cs.sanitary_days_saved_permissions
-        if not snapshot_json:
-            restore_perms = _fallback_all_true_perms()
-        else:
-            try:
-                data = json.loads(snapshot_json)
-                from aiogram import types as _tg_types
-                restore_perms = _tg_types.ChatPermissions(
-                    **{k: bool(data.get(k, True)) for k in _PERM_FIELDS}
-                )
-            except (ValueError, TypeError):
-                restore_perms = _fallback_all_true_perms()
-
+    # v4.6.0: проставляем last_sanitary_month и чистим старые месяцы.
+    from datetime import datetime as _dt, timezone as _tz
+    tz_name = cs.night_mode_tz or "Europe/Moscow"
     try:
-        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_name)
+    except (ValueError, KeyError, ImportError):
+        tz = _tz.utc
+    current_month_str = _dt.now(tz).strftime("%Y-%m")
 
-        # v4.6.0: проставляем last_sanitary_month и чистим старые месяцы.
-        from datetime import datetime as _dt, timezone as _tz
-        # Часовой пояс чата (берём из night_mode_tz — общий для всего chat_settings).
-        tz_name = cs.night_mode_tz or "Europe/Moscow"
-        try:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(tz_name)
-        except (ValueError, KeyError, ImportError):
-            tz = _tz.utc
-        current_month_str = _dt.now(tz).strftime("%Y-%m")
+    # 1. Снимаем sanitary-флаги + monthly cleanup.
+    async with async_session() as session:
+        db_cs = (await session.execute(
+            select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+        )).scalar_one_or_none()
+        if db_cs:
+            db_cs.sanitary_days_currently_active = False
+            db_cs.sanitary_days_saved_permissions = None
+            db_cs.last_sanitary_month = current_month_str
+            if db_cs.sanitary_days:
+                try:
+                    sd_data = json.loads(db_cs.sanitary_days)
+                    if isinstance(sd_data, dict):
+                        sd_data.pop(current_month_str, None)
+                        db_cs.sanitary_days = json.dumps(sd_data) if sd_data else None
+                except (ValueError, TypeError):
+                    pass
+            await session.commit()
+            # Синхронизируем объект в памяти.
+            cs.sanitary_days_currently_active = False
+            cs.sanitary_days_saved_permissions = None
 
-        async with async_session() as session:
-            db_cs = (await session.execute(
-                select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
-            )).scalar_one_or_none()
-            if db_cs:
-                db_cs.sanitary_days_currently_active = False
-                db_cs.sanitary_days_saved_permissions = None
-                # v4.6.0: monthly cleanup — удаляем ключ текущего месяца из sanitary_days
-                # JSON и проставляем last_sanitary_month чтобы suppress warnings.
-                db_cs.last_sanitary_month = current_month_str
-                if db_cs.sanitary_days:
-                    try:
-                        sd_data = json.loads(db_cs.sanitary_days)
-                        if isinstance(sd_data, dict):
-                            # Удаляем ключ текущего месяца (сан. день прошёл).
-                            sd_data.pop(current_month_str, None)
-                            db_cs.sanitary_days = json.dumps(sd_data) if sd_data else None
-                    except (ValueError, TypeError):
-                        pass
-                await session.commit()
-        logger.info("Sanitary day OFF for chat %s (perms restored)", cs.chat_id)
+    # 2. Автопереход в night mode если включён и в окне.
+    if cs.night_mode_enabled:
+        now = datetime.now(timezone.utc)
+        if _night_window_active(cs, now):
+            logger.info(
+                "Chat %s: auto-transition sanitary→night (in night window) — entering night",
+                cs.chat_id,
+            )
+            try:
+                await _enter_night_mode(cs)
+            except TelegramBadRequest as e:
+                logger.error(
+                    "Sanitary→night transition failed for chat %s: %s — falling back to day",
+                    cs.chat_id, e,
+                )
+                try:
+                    await _restore_day_state(cs)
+                except TelegramBadRequest as e2:
+                    logger.error(
+                        "Day restore fallback failed for chat %s: %s",
+                        cs.chat_id, e2,
+                    )
+            return
+
+    # 3. Иначе — восстанавливаем дневные права из preset.
+    try:
+        source = await _restore_day_state(cs)
+        logger.info(
+            "Sanitary day OFF for chat %s (day restored, source=%s)",
+            cs.chat_id, source,
+        )
     except TelegramBadRequest as e:
         logger.error("Sanitary day exit failed for chat %s: %s", cs.chat_id, e)
-
-
-def _fallback_all_true_perms():
-    """v4.6.0: ChatPermissions со всеми True — фоллбэк когда нет ни snapshot,
-    ни granular day_permissions. Используется в _exit_night_mode / _exit_sanitary_day.
-    """
-    from aiogram import types as _tg_types
-    return _tg_types.ChatPermissions(
-        can_send_messages=True, can_send_audios=True, can_send_documents=True,
-        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-        can_add_web_page_previews=True, can_change_info=True, can_invite_users=True,
-        can_pin_messages=True,
-    )
 
 
 # ── v4.7.3: константа hard shutdown timeout ────────────────────────────────

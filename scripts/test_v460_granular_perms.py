@@ -928,31 +928,34 @@ class TestVersionBumpedV460(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Тест 15: _fallback_all_true_perms (вспомогательная функция bot.py)
+# Тест 15: _DAY_DEFAULT_HARDCODED (v4.7.12 заменил _fallback_all_true_perms)
 # ═══════════════════════════════════════════════════════════════════════════
-class TestFallbackAllTruePerms(unittest.TestCase):
-    """v4.6.0: helper-функция в bot.py для fallback при отсутствии snapshot."""
+class TestDayDefaultHardcoded(unittest.TestCase):
+    """v4.7.12: hardcoded-фолбэк для случая когда нет ни day_permissions,
+    ни системного пресета «Day default» в БД. ВАЖНО: admin-права всегда OFF.
+    """
 
-    def test_returns_all_true_perms(self):
-        # Import lazily to avoid bot.py initializing with bad env.
-        import importlib
+    def test_hardcoded_day_default_perms(self):
         sys.path.insert(0, "/home/z/my-project/v4.5")
         import bot
-        perms = bot._fallback_all_true_perms()
-        # All 13 ChatPermissions fields must be True.
-        self.assertTrue(perms.can_send_messages)
-        self.assertTrue(perms.can_send_audios)
-        self.assertTrue(perms.can_send_documents)
-        self.assertTrue(perms.can_send_photos)
-        self.assertTrue(perms.can_send_videos)
-        self.assertTrue(perms.can_send_video_notes)
-        self.assertTrue(perms.can_send_voice_notes)
-        self.assertTrue(perms.can_send_polls)
-        self.assertTrue(perms.can_send_other_messages)
-        self.assertTrue(perms.can_add_web_page_previews)
-        self.assertTrue(perms.can_change_info)
-        self.assertTrue(perms.can_invite_users)
-        self.assertTrue(perms.can_pin_messages)
+        d = bot._DAY_DEFAULT_HARDCODED
+        # Allowed (по спеке пользователя): text, music, photos, videos,
+        # stickers/GIFs (other_messages).
+        self.assertTrue(d["can_send_messages"], "text must be allowed")
+        self.assertTrue(d["can_send_audios"], "music must be allowed")
+        self.assertTrue(d["can_send_photos"], "photos must be allowed")
+        self.assertTrue(d["can_send_videos"], "videos must be allowed")
+        self.assertTrue(d["can_send_other_messages"], "stickers/GIFs must be allowed")
+        # Explicitly blocked (video_notes — это видеосообщения, не видео!).
+        self.assertFalse(d["can_send_video_notes"], "video_notes must be blocked")
+        self.assertFalse(d["can_send_documents"], "documents must be blocked")
+        self.assertFalse(d["can_send_voice_notes"], "voice_notes must be blocked")
+        self.assertFalse(d["can_send_polls"], "polls must be blocked")
+        self.assertFalse(d["can_add_web_page_previews"], "link_previews must be blocked")
+        # Admin-права ВСЕГДА False — это главная защита v4.7.12.
+        self.assertFalse(d["can_change_info"], "can_change_info must NEVER be True in fallback")
+        self.assertFalse(d["can_invite_users"], "can_invite_users must NEVER be True in fallback")
+        self.assertFalse(d["can_pin_messages"], "can_pin_messages must NEVER be True in fallback")
 
 
 if __name__ == "__main__":
