@@ -1173,6 +1173,12 @@ def _build_custom_night_permissions(
 import re as _san_re
 _SAN_DATE_RE = _san_re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _SAN_TIME_RE = _san_re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+# v4.7.11: 'YYYY-MM-DD' или 'YYYY-MM-DD HH:MM' — одна часть диапазона с
+# опциональным временем. Используется parse_sanitary_days_textarea для
+# round-trip с format_sanitary_days_textarea.
+_SAN_DT_PART_RE = _san_re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})(?:\s+([01]?\d|2[0-3]):([0-5]\d))?$"
+)
 
 
 def _parse_sanitary_date(s: str) -> date | None:
@@ -1186,6 +1192,26 @@ def _parse_sanitary_date(s: str) -> date | None:
         return date(y, mo, d)
     except ValueError:
         return None
+
+
+def _parse_sanitary_dt_part(s: str) -> tuple[date | None, str | None]:
+    """v4.7.11: парсит часть диапазона — 'YYYY-MM-DD' или 'YYYY-MM-DD HH:MM'.
+
+    Возвращает (date, time_str|None). Если строка невалидна — (None, None).
+    Нормализует '9:00' → '09:00'.
+    """
+    s = (s or "").strip()
+    m = _SAN_DT_PART_RE.match(s)
+    if not m:
+        return None, None
+    try:
+        d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None, None
+    t = None
+    if m.group(4):
+        t = f"{int(m.group(4)):02d}:{int(m.group(5)):02d}"
+    return d, t
 
 
 def _parse_sanitary_time(s: str | None) -> str | None:
@@ -1479,15 +1505,26 @@ def is_sanitary_active_now_at(
 def parse_sanitary_days_textarea(
     text: str,
 ) -> tuple[list[list[str]], list[str]]:
-    """v4.5.4: парсит textarea (одна запись на строку) в list пар.
+    """v4.5.4 + v4.7.11: парсит textarea (одна запись на строку) в list пар.
 
-    Принимает строки вида:
-      'YYYY-MM-DD'              — однодневный санитарный день
-      'YYYY-MM-DD:YYYY-MM-DD'   — диапазон (включая обе даты)
-      'YYYY-MM-DD - YYYY-MM-DD' — диапазон с пробелами вокруг '-'
+    Принимает строки вида (v4.7.11 добавлена поддержка времени):
+      'YYYY-MM-DD'                              — однодневный сан. день
+      'YYYY-MM-DD HH:MM'                        — однодневный с start_time
+      'YYYY-MM-DD HH:MM-HH:MM'                  — однодневный с диапазоном времени
+      'YYYY-MM-DD:YYYY-MM-DD'                   — диапазон (включая обе даты)
+      'YYYY-MM-DD - YYYY-MM-DD'                 — диапазон с пробелами вокруг '-'
+      'YYYY-MM-DD HH:MM - YYYY-MM-DD HH:MM'     — диапазон со временем с обеих сторон
+      'YYYY-MM-DD HH:MM - YYYY-MM-DD'           — диапазон с start_time только
+      'YYYY-MM-DD - YYYY-MM-DD HH:MM'           — диапазон с end_time только
 
-    Возвращает (pairs, errors). errors — список строк с описанием проблем
-    (используется для feedback пользователю).
+    Это обратимо к format_sanitary_days_textarea — то, что мы записываем в
+    textarea при показе существующих данных, мы обязаны уметь читать обратно.
+
+    Возвращает (pairs, errors). Каждая пара — list[str] длиной 2/3/4:
+      [start_iso, end_iso]                       — без времени
+      [start_iso, end_iso, start_time]           — только start_time
+      [start_iso, end_iso, start_time, end_time] — оба времени
+    errors — список строк с описанием проблем (используется для feedback).
     """
     pairs: list[list[str]] = []
     errors: list[str] = []
@@ -1499,15 +1536,31 @@ def parse_sanitary_days_textarea(
         if not line or line.startswith("#"):
             continue
         # Поддерживаем разделители ':' и ' - ' и ' to '.
+        # v4.7.11: проверяем ' - ' ПЕРВЫМ, т.к. он встречается в формате
+        # 'YYYY-MM-DD HH:MM - YYYY-MM-DD HH:MM' и отделяет даты, а не время.
+        # Внутренний '-' между временем (HH:MM-HH:MM) не содержит пробелов
+        # вокруг, поэтому коллизии с ' - ' нет.
+        # v4.7.11: ':' как разделитель диапазона конфликтует с ':' внутри
+        # времени HH:MM (например '2026-07-31 23:00'). Используем ':' только
+        # если левая часть — это валидная дата YYYY-MM-DD без времени.
         sep = None
-        for cand in (" - ", " to ", " — ", " – ", ":"):
+        for cand in (" - ", " to ", " — ", " – "):
             if cand in line:
                 sep = cand
                 break
+        if sep is None and ":" in line:
+            # ':' может быть разделителем диапазона в старом формате
+            # 'YYYY-MM-DD:YYYY-MM-DD' — НО не в формате времени 'HH:MM'.
+            # Проверяем: берём подстроку до первого ':' — если она матчит
+            # как YYYY-MM-DD (без времени), то ':' — разделитель диапазона.
+            idx = line.find(":")
+            left_of_colon = line[:idx]
+            if _SAN_DATE_RE.match(left_of_colon):
+                sep = ":"
         if sep:
             parts = line.split(sep, 1)
-            ds = _parse_sanitary_date(parts[0].strip())
-            de = _parse_sanitary_date(parts[1].strip())
+            ds, st = _parse_sanitary_dt_part(parts[0].strip())
+            de, et = _parse_sanitary_dt_part(parts[1].strip())
             if ds is None:
                 errors.append(f"Строка {i}: невалидная дата начала '{parts[0].strip()}'")
                 continue
@@ -1516,8 +1569,50 @@ def parse_sanitary_days_textarea(
                 continue
             if de < ds:
                 de = ds
-            pairs.append([ds.isoformat(), de.isoformat()])
+            entry: list[str] = [ds.isoformat(), de.isoformat()]
+            if st and et:
+                entry.append(st)
+                entry.append(et)
+            elif st:
+                # Только start_time — без end_time (format_sanitary_days_textarea
+                # такое генерирует для случая 'elif st:' ветки).
+                entry.append(st)
+            elif et:
+                # Только end_time — генерируется 'elif et:' веткой. Чтобы
+                # не терять данные, сохраняем как [s, e, "00:00", et].
+                entry.append("00:00")
+                entry.append(et)
+            pairs.append(entry)
         else:
+            # Single-day: 'YYYY-MM-DD' / 'YYYY-MM-DD HH:MM' / 'YYYY-MM-DD HH:MM-HH:MM'.
+            # Сначала проверим формат с диапазоном времени 'HH:MM-HH:MM'.
+            m = _san_re.match(
+                r"^(\d{4}-\d{2}-\d{2})\s+([01]?\d|2[0-3]):([0-5]\d)-([01]?\d|2[0-3]):([0-5]\d)$",
+                line,
+            )
+            if m:
+                d = _parse_sanitary_date(m.group(1))
+                if d is None:
+                    errors.append(f"Строка {i}: невалидная дата '{line}' (нужен YYYY-MM-DD)")
+                    continue
+                st = f"{int(m.group(2)):02d}:{int(m.group(3)):02d}"
+                et = f"{int(m.group(4)):02d}:{int(m.group(5)):02d}"
+                pairs.append([d.isoformat(), d.isoformat(), st, et])
+                continue
+            # Теперь 'YYYY-MM-DD HH:MM' (только start_time).
+            m = _san_re.match(
+                r"^(\d{4}-\d{2}-\d{2})\s+([01]?\d|2[0-3]):([0-5]\d)$",
+                line,
+            )
+            if m:
+                d = _parse_sanitary_date(m.group(1))
+                if d is None:
+                    errors.append(f"Строка {i}: невалидная дата '{line}' (нужен YYYY-MM-DD)")
+                    continue
+                st = f"{int(m.group(2)):02d}:{int(m.group(3)):02d}"
+                pairs.append([d.isoformat(), d.isoformat(), st])
+                continue
+            # Только дата 'YYYY-MM-DD'.
             d = _parse_sanitary_date(line)
             if d is None:
                 errors.append(f"Строка {i}: невалидная дата '{line}' (нужен YYYY-MM-DD)")

@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.10"
+APP_VERSION = "v4.7.11"
 APP_RELEASE_DATE = "2026-08-01"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -1880,6 +1880,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
         # v4.6.1: UI присылает только textarea (sanitary_days_text).
         # Парсим и группируем по месяцам автоматически.
+        # v4.7.11: парсер теперь возвращает entries длиной 2/3/4 (с опциональным
+        # временем). Группировка должна сохранять время, иначе round-trip
+        # format→parse→serialize терял данные и валидация падала на строках
+        # вида '2026-07-31 23:00 - 2026-08-03 09:00'.
         san_pairs, san_errors = parse_sanitary_days_textarea(sanitary_days_text)
         if san_errors:
             first_err = san_errors[0].replace(" ", "+")
@@ -1889,9 +1893,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         if san_pairs:
             grouped: dict[str, list[list[str]]] = {}
-            for s, e in san_pairs:
-                mk = s[:7]  # YYYY-MM
-                grouped.setdefault(mk, []).append([s, e])
+            for entry in san_pairs:
+                # entry: [start_iso, end_iso] / [s, e, st] / [s, e, st, et]
+                mk = entry[0][:7]  # YYYY-MM
+                grouped.setdefault(mk, []).append(entry)
             sanitary_days_json = serialize_sanitary_days_monthly(grouped)
         else:
             sanitary_days_json = None
