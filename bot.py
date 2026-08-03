@@ -33,10 +33,37 @@ from bot_handlers import (
     _time_str_in_range, _parse_night_mode_permissions, _snapshot_permissions,
     _PERM_FIELDS, _night_mode_in_window,
     parse_sanitary_days_json, is_sanitary_day_today,
+    # v4.7.18: night mode / day mode notifications go to report chat, not
+    # to the public chat. Reuse the existing resolver — it honours per-chat
+    # override (ChatSettings.report_chat_id), is_report_chat flag, and the
+    # global default (chat_id=0).
+    _get_report_chat_id,
 )
 from datetime import datetime, timezone, timedelta, date
 import json
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods.base import TelegramMethod
+
+
+# v4.7.16: aiogram 3.30 не имеет обёртки для setChatSlowModeDelay (появилась
+# в более поздних версиях). Создаём минимальный TelegramMethod-класс — он
+# проходит через стандартный pipeline aiogram (session, retry, error handling).
+# Возвращает True (как и все set_chat_* методы Telegram).
+# После апгрейда aiogram — заменить на bot.set_chat_slow_mode_delay(...).
+class SetChatSlowModeDelay(TelegramMethod[bool]):
+    """Обёртка над Telegram Bot API method setChatSlowModeDelay.
+
+    Use this method to change the slow mode delay in a chat. The bot must
+    be an administrator in the chat for this to work and must have the
+    can_restrict_members administrator right. Returns True on success.
+
+    Source: https://core.telegram.org/bots/api#setchatslowmodedelay
+    """
+    __returning__ = bool
+    __api_method__ = "setChatSlowModeDelay"
+
+    chat_id: int | str
+    slow_mode_delay: int
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,18 +89,13 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") or secrets.token_hex(16)
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env variable is required")
 
-# ── Диагностика ─────────────────────────────────────────────────────────────
-logger.info("=== ENV DUMP ===")
-for key, val in sorted(os.environ.items()):
-    if key in ("BOT_TOKEN", "API_TOKEN", "BOT_API_TOKEN", "TELEGRAM_BOT_TOKEN",
-               "TOKEN", "WEB_PASSWORD", "SESSION_SECRET"):
-        val = val[:8] + "..." if val else "(empty)"
-    logger.info("  %s = %s", key, val)
-logger.info("=== END ENV ===")
-
+# v4.7.13: убран ENV DUMP — был полезен при отладке webhook/домена,
+# сейчас только мусорит в логах. Секреты (BOT_TOKEN, WEB_PASSWORD, etc.)
+# по-прежнему не логируем нигде. Запуск кода ниже — единственный источник
+# релевантной startup-инфо (webhook URL, port) в логах.
 _hostname = socket.gethostname()
 _host_ip = socket.gethostbyname(_hostname) if _hostname else "?"
-logger.info("Hostname: %s | IP: %s | Listening: 0.0.0.0:%d | Webhook: %s",
+logger.info("Startup: host=%s ip=%s port=%d webhook=%s",
             _hostname, _host_ip, PORT, WEBHOOK_URL or "(not set)")
 
 # ── Глобальные объекты бота ────────────────────────────────────────────────
@@ -206,10 +228,17 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
     (с кастомным текстом если задан).
     v4.6.0: если cs.day_permissions задан (granular) — snapshot берётся из него,
     иначе как раньше — из текущих ChatPermissions чата.
+    v4.7.16: если cs.night_mode_slow_mode_delay > 0 — дополнительно
+    применяет slow_mode (минимальный интервал между сообщениями).
+    Snapshot текущего slow_mode_delay сохраняется в
+    night_mode_saved_slow_mode_delay для восстановления при выходе.
     """
     try:
         chat_info = await bot.get_chat(chat_id=cs.chat_id)
         current_perms = chat_info.permissions
+        # v4.7.16: snapshot текущего slow_mode_delay (chat-level свойство,
+        # не входит в ChatPermissions). Берём ПЕРЕД любыми изменениями.
+        current_slow_mode = getattr(chat_info, "slow_mode_delay", 0) or 0
         # Сохраняем snapshot — что восстанавливать при выходе.
         # v4.6.0: если есть явное day_permissions — используем его как «истинные»
         # дневные права (это то что должно быть после выхода из ночного).
@@ -235,6 +264,25 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
         night_perms = _parse_night_mode_permissions(cs.night_mode_permissions)
         await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=night_perms)
 
+        # v4.7.16: применяем ночной slow_mode если задан (>0).
+        # 0 = не трогать slow_mode (backward compat, чат остаётся как есть).
+        # Диапазон Telegram: 0..36400 сек. Контроль на стороне записи настройки.
+        night_slow = int(cs.night_mode_slow_mode_delay or 0)
+        if night_slow > 0:
+            try:
+                await bot(SetChatSlowModeDelay(
+                    chat_id=cs.chat_id, slow_mode_delay=night_slow,
+                ))
+                logger.info(
+                    "Night mode: slow_mode set to %ds for chat %s",
+                    night_slow, cs.chat_id,
+                )
+            except TelegramBadRequest as e:
+                logger.warning(
+                    "Night mode: set_chat_slow_mode_delay(%ds) failed for chat %s: %s",
+                    night_slow, cs.chat_id, e,
+                )
+
         # Сохраняем snapshot и флаг
         async with async_session() as session:
             db_cs = (await session.execute(
@@ -243,13 +291,26 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
             if db_cs:
                 db_cs.night_mode_saved_permissions = snapshot_json
                 db_cs.night_mode_currently_active = True
+                # v4.7.16: snapshot slow_mode_delay для восстановления при выходе.
+                db_cs.night_mode_saved_slow_mode_delay = current_slow_mode
                 await session.commit()
         logger.info(
-            "Night mode ON for chat %s (perms applied, snapshot saved)",
-            cs.chat_id,
+            "Night mode ON for chat %s (perms applied, snapshot saved, "
+            "saved_slow_mode=%ds)",
+            cs.chat_id, current_slow_mode,
         )
 
         # v4.5.3: уведомление о входе.
+        # v4.7.18: уведомление идёт в репорт-чат, а НЕ в общий чат. Раньше
+        # бот писал «🌙 Ночной режим включён …» прямо в cs.chat_id — это
+        # засоряло чат модераторским шумом и было видно обычным юзерам.
+        # Теперь — через _get_report_chat_id(session, cs.chat_id):
+        #   1. Per-chat override (ChatSettings.report_chat_id для данного chat_id)
+        #   2. Любой чат с is_report_chat=True
+        #   3. Глобальный default (chat_id=0)
+        #   4. None — репорт-чата нет → лог warning, уведомление не отправляем.
+        # Это намеренный разрыв с прошлым поведением: если репорт-чат не
+        # настроен — уведомление пропускается, а не падает в общий чат.
         if cs.night_mode_notify:
             try:
                 text = _format_night_notification(
@@ -262,7 +323,24 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
                         "Сейчас действуют ночные ограничения."
                     ),
                 )
-                await bot.send_message(chat_id=cs.chat_id, text=text)
+                async with async_session() as notify_session:
+                    report_chat_id = await _get_report_chat_id(
+                        notify_session, cs.chat_id,
+                    )
+                if report_chat_id is None:
+                    logger.warning(
+                        "Night mode enter notify for chat %s: no report chat "
+                        "configured — skipping (set report_chat_id or "
+                        "is_report_chat=True to receive night mode notifications)",
+                        cs.chat_id,
+                    )
+                else:
+                    await bot.send_message(chat_id=report_chat_id, text=text)
+                    logger.info(
+                        "Night mode enter notify sent to report chat %s "
+                        "(source chat %s)",
+                        report_chat_id, cs.chat_id,
+                    )
             except TelegramBadRequest as e:
                 logger.warning(
                     "Night mode enter notify failed for chat %s: %s",
@@ -372,9 +450,47 @@ async def _restore_day_state(cs: ChatSettings) -> str:
 
     Применяет к чату права, полученные через _resolve_day_perms(cs).
     Возвращает source ('chat_preset' | 'system_default' | 'hardcoded').
+
+    v4.7.16: дополнительно восстанавливает slow_mode_delay:
+      • Если cs.day_slow_mode_delay > 0 — применяем его (preset-driven,
+        приоритет над snapshot'ом — как v4.7.12 для ChatPermissions).
+      • Иначе если cs.night_mode_saved_slow_mode_delay не None —
+        восстанавливаем snapshot.
+      • Иначе — не трогаем slow_mode (backward compat).
+    Это гарантирует, что при выходе из ночного режима slow_mode
+    возвращается к дневному значению (если задан preset) или к
+    сохранённому снимку (если preset не задан, но был snapshot).
     """
     restore_perms, source = await _resolve_day_perms(cs)
     await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+
+    # v4.7.16: восстанавливаем slow_mode.
+    day_slow = int(cs.day_slow_mode_delay or 0)
+    saved_slow = cs.night_mode_saved_slow_mode_delay
+    if day_slow > 0:
+        target_slow = day_slow
+        slow_source = "day_preset"
+    elif saved_slow is not None:
+        target_slow = int(saved_slow)
+        slow_source = "snapshot"
+    else:
+        target_slow = None
+        slow_source = "skip"
+    if target_slow is not None:
+        try:
+            await bot(SetChatSlowModeDelay(
+                chat_id=cs.chat_id, slow_mode_delay=target_slow,
+            ))
+            logger.info(
+                "Day state: slow_mode restored to %ds for chat %s (source=%s)",
+                target_slow, cs.chat_id, slow_source,
+            )
+        except TelegramBadRequest as e:
+            logger.warning(
+                "Day state: set_chat_slow_mode_delay(%ds) failed for chat %s: %s",
+                target_slow, cs.chat_id, e,
+            )
+
     logger.info(
         "Day state restored for chat %s (source=%s)",
         cs.chat_id, source,
@@ -386,11 +502,17 @@ async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> N
     """v4.7.12: выходит из ночного режима с учётом автопереключения.
 
     Логика:
-      1. Снимает night-флаги (night_mode_currently_active=False, snapshot=None).
+      1. Снимает night-флаги (night_mode_currently_active=False,
+         snapshot=None). v4.7.16: night_mode_saved_slow_mode_delay
+         НЕ очищаем здесь — он нужен _restore_day_state как fallback
+         для восстановления slow_mode. Очистим после restore.
       2. Если allow_auto_enter и night_mode_enabled и сейчас в окне —
          сразу вызывает _enter_night_mode(cs) (свежий snapshot + night perms).
          Это автопереход: не ждём следующий tick.
       3. Иначе — восстанавливает дневные права через _restore_day_state(cs).
+         _restore_day_state использует day_slow_mode_delay (если задан) или
+         night_mode_saved_slow_mode_delay (snapshot) для восстановления
+         slow_mode. После успешного restore — чистим snapshot slow_mode.
 
     Args:
       cs: ChatSettings чата (свежезагруженный из БД).
@@ -402,6 +524,8 @@ async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> N
     (только если действительно вышли в day, а не перешли в night).
     """
     # Сначала снимаем night-флаги (независимо от того, перейдём ли в night снова).
+    # v4.7.16: night_mode_saved_slow_mode_delay оставляем — он нужен
+    # _restore_day_state как fallback. Очистим после restore.
     async with async_session() as session:
         db_cs = (await session.execute(
             select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
@@ -433,7 +557,21 @@ async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> N
             cs.chat_id, source,
         )
 
+        # v4.7.16: чистим snapshot slow_mode ПОСЛЕ успешного restore.
+        # Если restore упал выше (бросил исключение) — snapshot остаётся,
+        # и следующий tick попытается снова. Это безопасно.
+        async with async_session() as session:
+            db_cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == cs.chat_id)
+            )).scalar_one_or_none()
+            if db_cs:
+                db_cs.night_mode_saved_slow_mode_delay = None
+                await session.commit()
+            cs.night_mode_saved_slow_mode_delay = None
+
         # v4.5.3: уведомление о выходе.
+        # v4.7.18: уведомление идёт в репорт-чат, а НЕ в общий чат
+        # (см. комментарий в _enter_night_mode — та же логика).
         if cs.night_mode_notify:
             try:
                 text = _format_night_notification(
@@ -446,7 +584,24 @@ async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> N
                         "Обычные права чата восстановлены."
                     ),
                 )
-                await bot.send_message(chat_id=cs.chat_id, text=text)
+                async with async_session() as notify_session:
+                    report_chat_id = await _get_report_chat_id(
+                        notify_session, cs.chat_id,
+                    )
+                if report_chat_id is None:
+                    logger.warning(
+                        "Night mode exit notify for chat %s: no report chat "
+                        "configured — skipping (set report_chat_id or "
+                        "is_report_chat=True to receive night mode notifications)",
+                        cs.chat_id,
+                    )
+                else:
+                    await bot.send_message(chat_id=report_chat_id, text=text)
+                    logger.info(
+                        "Night mode exit notify sent to report chat %s "
+                        "(source chat %s)",
+                        report_chat_id, cs.chat_id,
+                    )
             except TelegramBadRequest as e:
                 logger.warning(
                     "Night mode exit notify failed for chat %s: %s",

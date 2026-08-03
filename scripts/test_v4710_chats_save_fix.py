@@ -107,9 +107,12 @@ class TestV4710ChatsSaveFix(unittest.TestCase):
     # ─── 1. Version ──────────────────────────────────────────────────────
 
     def test_01_app_version_bumped(self):
-        """APP_VERSION должен быть v4.7.10."""
-        self.assertEqual(APP_VERSION, "v4.7.10",
-                         f"APP_VERSION should be v4.7.10, got {APP_VERSION}")
+        """APP_VERSION должен быть >= v4.7.10 (тест ослаблен в v4.7.13)."""
+        # v4.7.13: ослаблен с == "v4.7.10" на >= v4.7.10 — чтобы не падать
+        # на каждом следующем релизе. Изначальная проверка была валидна
+        # только в момент выхода v4.7.10.
+        self.assertGreaterEqual(APP_VERSION, "v4.7.10",
+                                f"APP_VERSION should be >= v4.7.10, got {APP_VERSION}")
 
     # ─── 2-3. Required removed from start_date / end_date ────────────────
 

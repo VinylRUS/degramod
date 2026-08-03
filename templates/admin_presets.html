@@ -81,6 +81,21 @@
             💡 Для «полный локдаун» — оставьте все чекбоксы пустыми. Для «только текст» — отметьте только «Text msgs».
         </div>
 
+        {# v4.7.16: Slow mode delay (chat-level, separate from ChatPermissions) #}
+        <div style="display: grid; grid-template-columns: 1fr 2fr; gap: var(--sp-3); margin-bottom: var(--sp-3); align-items: end;">
+            <div>
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">🐌 Slow mode (сек, опционально)</label>
+                <input type="number" name="slow_mode_delay" min="0" max="36400" step="1" placeholder="пусто = не менять"
+                       style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px;">
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); line-height: 1.6; padding-bottom: 4px;">
+                Минимальный интервал между сообщениями одного юзера.<br>
+                <strong>Пусто</strong> = не менять slow_mode при применении пресета (backward compat).<br>
+                <strong>0</strong> = выключить slow_mode. <strong>1..36400</strong> = N секунд.<br>
+                Типичные значения: day=10, night=30..60.
+            </div>
+        </div>
+
         <button type="submit"
                 style="padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
             Create preset
@@ -111,40 +126,124 @@
     {% else %}
     <div style="display: grid; gap: var(--sp-2);">
         {% for p in presets_by_scope[scope] %}
-        <div style="display: grid; grid-template-columns: 1fr auto; gap: var(--sp-3); padding: var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); align-items: center;">
-            <div>
-                <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px;">
-                    <strong style="color: var(--text); font-size: 13px;">{{ p.name }}</strong>
-                    {% if p.is_system %}
-                    <span style="font-size: 9px; padding: 2px 6px; background: rgba(0,204,102,.15); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">SYSTEM</span>
-                    {% endif %}
-                    <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">#{{ p.id }}</span>
+        {# v4.7.17: каждый пресет обёрнут в <details> — клик на "Edit ▾"
+           раскрывает inline-форму редактирования с pre-filled значениями.
+           Системные пресеты показывают "—" вместо кнопок. #}
+        {% set perms = p.permissions | from_json if p.permissions else {} %}
+        <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); {% if not p.is_system %}cursor: pointer;{% endif %}">
+            <summary style="display: grid; grid-template-columns: 1fr auto; gap: var(--sp-3); padding: var(--sp-3); align-items: center; {% if not p.is_system %}cursor: pointer;{% else %}cursor: default;{% endif %} list-style: none;">
+                <div>
+                    <div style="display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px;">
+                        <strong style="color: var(--text); font-size: 13px;">{{ p.name }}</strong>
+                        {% if p.is_system %}
+                        <span style="font-size: 9px; padding: 2px 6px; background: rgba(0,204,102,.15); color: var(--accent); border: 1px solid var(--accent); border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">SYSTEM</span>
+                        {% endif %}
+                        <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">#{{ p.id }}</span>
+                    </div>
+                    <div style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">
+                        {% set ns = namespace(count=0) %}
+                        {% for k, v in perms.items() %}{% if v %}{% set ns.count = ns.count + 1 %}{% endif %}{% endfor %}
+                        {% if ns.count == 13 %}<span style="color: var(--accent);">ALL ON (13)</span>
+                        {% elif ns.count == 0 %}<span style="color: var(--danger);">FULL LOCKDOWN (0)</span>
+                        {% elif ns.count == 1 and perms.get('can_send_messages') %}<span style="color: var(--warn);">TEXT ONLY (1)</span>
+                        {% else %}<span>{{ ns.count }} allowed: {% for k, v in perms.items() if v %}{{ k }}{% if not loop.last %}, {% endif %}{% endfor %}</span>
+                        {% endif %}
+                        {% if p.slow_mode_delay is not none %}
+                        <span style="color: #b388ff; margin-left: 6px;">🐌 slow_mode={{ p.slow_mode_delay }}с</span>
+                        {% endif %}
+                    </div>
                 </div>
-                <div style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">
-                    {% set perms = p.permissions | from_json if p.permissions else {} %}
-                    {% set ns = namespace(count=0) %}
-                    {% for k, v in perms.items() %}{% if v %}{% set ns.count = ns.count + 1 %}{% endif %}{% endfor %}
-                    {% if ns.count == 13 %}<span style="color: var(--accent);">ALL ON (13)</span>
-                    {% elif ns.count == 0 %}<span style="color: var(--danger);">FULL LOCKDOWN (0)</span>
-                    {% elif ns.count == 1 and perms.get('can_send_messages') %}<span style="color: var(--warn);">TEXT ONLY (1)</span>
-                    {% else %}<span>{{ ns.count }} allowed: {% for k, v in perms.items() if v %}{{ k }}{% if not loop.last %}, {% endif %}{% endfor %}</span>
+                <div onclick="event.stopPropagation();" style="display: flex; gap: 6px; align-items: center;">
+                    {% if not p.is_system %}
+                    <span style="padding: 4px 10px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-radius: var(--r-xs); user-select: none;">
+                        Edit ▾
+                    </span>
+                    <form method="post" action="/admin/presets/{{ p.id }}/delete" style="display: inline;"
+                          onsubmit="return confirm('Delete preset {{ p.name|e }}?\nExisting chats using it will keep their saved copy — not affected.');">
+                        <button type="submit"
+                                style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
+                            Delete
+                        </button>
+                    </form>
+                    {% else %}
+                    <span style="font-size: 10px; color: var(--text-dim); padding: 4px 10px;">—</span>
                     {% endif %}
                 </div>
-            </div>
-            <div>
-                {% if not p.is_system %}
-                <form method="post" action="/admin/presets/{{ p.id }}/delete" style="display: inline;"
-                      onsubmit="return confirm('Delete preset {{ p.name }}?\\nExisting chats using it will keep their saved copy — not affected.');">
+            </summary>
+            {% if not p.is_system %}
+            <form method="post" action="/admin/presets/{{ p.id }}/edit" style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+                <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); margin-bottom: var(--sp-3);">
+                    Edit preset #{{ p.id }} «{{ p.name }}»
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-bottom: var(--sp-3);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Name (1-64 chars, unique)</label>
+                        <input type="text" name="name" required maxlength="64" value="{{ p.name }}"
+                               style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Scope</label>
+                        <select name="scope" required
+                                style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                            <option value="day" {% if p.scope == 'day' %}selected{% endif %}>day — дневной режим</option>
+                            <option value="night" {% if p.scope == 'night' %}selected{% endif %}>night — ночной режим</option>
+                            <option value="sanitary" {% if p.scope == 'sanitary' %}selected{% endif %}>sanitary — санитарный день</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 6px;">Permissions (checked = allowed)</div>
+                <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); margin-bottom: var(--sp-3);">
+                    {% set perm_fields = [
+                        ('perm_can_send_messages', 'Text msgs', 'can_send_messages'),
+                        ('perm_can_send_audios', 'Audios', 'can_send_audios'),
+                        ('perm_can_send_documents', 'Documents', 'can_send_documents'),
+                        ('perm_can_send_photos', 'Photos', 'can_send_photos'),
+                        ('perm_can_send_videos', 'Videos', 'can_send_videos'),
+                        ('perm_can_send_video_notes', 'Video notes', 'can_send_video_notes'),
+                        ('perm_can_send_voice_notes', 'Voice notes', 'can_send_voice_notes'),
+                        ('perm_can_send_polls', 'Polls', 'can_send_polls'),
+                        ('perm_can_send_other_messages', 'Stickers/GIFs', 'can_send_other_messages'),
+                        ('perm_can_add_web_page_previews', 'Link previews', 'can_add_web_page_previews'),
+                        ('perm_can_change_info', 'Change info', 'can_change_info'),
+                        ('perm_can_invite_users', 'Invite users', 'can_invite_users'),
+                        ('perm_can_pin_messages', 'Pin msgs', 'can_pin_messages'),
+                    ] %}
+                    {% for field_name, label, json_key in perm_fields %}
+                    <label style="display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text); cursor: pointer; padding: 4px;">
+                        <input type="checkbox" name="{{ field_name }}" {% if perms.get(json_key) %}checked{% endif %}>
+                        {{ label }}
+                    </label>
+                    {% endfor %}
+                </div>
+
+                {# v4.7.16/17: Slow mode delay (chat-level) #}
+                <div style="display: grid; grid-template-columns: 1fr 2fr; gap: var(--sp-3); margin-bottom: var(--sp-3); align-items: end;">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">🐌 Slow mode (сек, опционально)</label>
+                        <input type="number" name="slow_mode_delay" min="0" max="36400" step="1" placeholder="пусто = не менять"
+                               {% if p.slow_mode_delay is not none %}value="{{ p.slow_mode_delay }}"{% endif %}
+                               style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 13px;">
+                    </div>
+                    <div style="font-size: 10px; color: var(--text-dim); line-height: 1.6; padding-bottom: 4px;">
+                        <strong>Пусто</strong> = slow_mode не меняется при применении пресета.<br>
+                        <strong>0</strong> = выключить slow_mode. <strong>1..36400</strong> = N секунд.
+                    </div>
+                </div>
+
+                <div style="display: flex; gap: var(--sp-3); align-items: center;">
                     <button type="submit"
-                            style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
-                        Delete
+                            style="padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                        Save changes
                     </button>
-                </form>
-                {% else %}
-                <span style="font-size: 10px; color: var(--text-dim); padding: 4px 10px;">—</span>
-                {% endif %}
-            </div>
-        </div>
+                    <span style="font-size: 10px; color: var(--text-dim);">
+                        💡 Чаты, привязанные к этому пресету, хранят копию прав — их это не затронет.
+                        Чтобы обновить права в конкретном чате, перенастройте его на <code>/admin/chats</code>.
+                    </span>
+                </div>
+            </form>
+            {% endif %}
+        </details>
         {% endfor %}
     </div>
     {% endif %}

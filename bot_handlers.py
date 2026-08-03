@@ -195,8 +195,18 @@ def _format_duration(seconds: int) -> str:
 # ── Full mute permissions — запретить ВСЕ виды отправки ──────────────────────
 def _mute_permissions() -> types.ChatPermissions:
     """ChatPermissions для полного мьюта: запрещает отправку всех типов контента.
+
     Telegram интерпретирует None в ChatPermissions как True (разрешено),
-    поэтому нужно явно ставить False на каждое поле.
+    поэтому нужно явно ставить False на каждое контентное поле.
+
+    v4.7.14: убраны 3 админских поля (can_change_info / can_invite_users /
+    can_pin_messages). Это права администратора — они выдаются через
+    promote_chat_member, а restrict_chat_member их не должен касаться.
+    Раньше их явная установка в False приводила к тому, что при unmute
+    (когда восстанавливаются права чата через chat_info.permissions) эти
+    поля затирали админские права, если они были у пользователя.
+    Хотя Telegram обычно игнорирует такие попытки для не-админов,
+    поведение было логически некорректным и потенциально опасным.
     """
     return types.ChatPermissions(
         can_send_messages=False,
@@ -209,9 +219,6 @@ def _mute_permissions() -> types.ChatPermissions:
         can_send_polls=False,
         can_send_other_messages=False,
         can_add_web_page_previews=False,
-        can_change_info=False,
-        can_invite_users=False,
-        can_pin_messages=False,
     )
 
 
@@ -2701,6 +2708,17 @@ async def handle_group_command(message: types.Message) -> None:
             ),
         )
 
+        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ отчёта. _send_report
+        # читает атрибуты из Python-объекта reply_to_message (text, photo,
+        # file_id, sticker) — они остаются в памяти после удаления. Но мы
+        # перестраховываемся: сначала отчёт уходит в репорт-чат (с текстом
+        # и медиа), и только потом оригинал удаляется из модерируемого чата.
+        try:
+            await message.reply_to_message.delete()
+        except TelegramBadRequest as e:
+            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                           target.id, chat_id, e)
+
         return
 
     # ── !warn ───────────────────────────────────────────────────────────
@@ -2721,13 +2739,6 @@ async def handle_group_command(message: types.Message) -> None:
             total_warns_now = await _count_warns(session, target.id, chat_id)
             # Подтягиваем настройки чата — нужны пороги для уведомления нарушителю
             chat_settings = await _get_chat_settings(session, chat_id)
-
-        # Удаляем сообщение нарушителя, за которое выдан варн
-        try:
-            await message.reply_to_message.delete()
-        except TelegramBadRequest as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
 
         # Теперь отчёт — в нём будет правильный счётчик варнов
         await _send_report(
@@ -2763,6 +2774,18 @@ async def handle_group_command(message: types.Message) -> None:
             bot=message.bot, chat_id=chat_id,
             target=target, mod=mod,
         )
+
+        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций с ним.
+        # Раньше удалялось ДО _send_report — это работало (потому что
+        # _send_report читает атрибуты из Python-объекта, который остаётся
+        # в памяти), но логически было хрупким. Теперь удаление — последняя
+        # операция, после того как отчёт ушел и пороги проверены.
+        try:
+            await message.reply_to_message.delete()
+        except TelegramBadRequest as e:
+            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                           target.id, chat_id, e)
+
         return
 
     # ── !ban ────────────────────────────────────────────────────────────
@@ -2812,6 +2835,9 @@ async def handle_group_command(message: types.Message) -> None:
         # модератора от необходимости отдельно выполнять !bansticker.
         # v4.5.3: используем getattr для безопасности (mock objects в тестах
         # могут не иметь атрибута 'sticker' — это нормально, просто пропустим).
+        # v4.7.15: читаем sticker ДО удаления сообщения — для надёжности
+        # (хотя Python-объект остаётся в памяти после delete, мы явно
+        # сохраняем ссылку заранее).
         sticker = getattr(message.reply_to_message, "sticker", None)
         if sticker and sticker.set_name:
             try:
@@ -2853,6 +2879,16 @@ async def handle_group_command(message: types.Message) -> None:
             ),
         )
 
+        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций.
+        # Сначала — отчёт в репорт-чат (с текстом и медиа), потом
+        # auto-add стикерпака (если бан за стикер), потом ephemeral
+        # модератору, и только в самом конце — удаление оригинала.
+        try:
+            await message.reply_to_message.delete()
+        except TelegramBadRequest as e:
+            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                           target.id, chat_id, e)
+
         return
 
     # ── !unmute ─────────────────────────────────────────────────────────
@@ -2866,6 +2902,26 @@ async def handle_group_command(message: types.Message) -> None:
             if chat_perms is None:
                 # Группа с супер-админом без дефолтных прав — даём всё
                 chat_perms = types.ChatPermissions(can_send_messages=True)
+            # v4.7.14: зануляем админские права — они НЕ должны
+            # восстанавливаться через restrict_chat_member. Если у чата
+            # в дефолтных правах вдруг есть can_change_info/can_invite_users/
+            # can_pin_messages (что бывает, если владелец открыл их для всех),
+            # то без этой очистки unmute мог бы "случайно" раздать админ-права
+            # размьюченному. Админ-права выдаются только через promote.
+            chat_perms = types.ChatPermissions(
+                can_send_messages=getattr(chat_perms, "can_send_messages", False),
+                can_send_audios=getattr(chat_perms, "can_send_audios", False),
+                can_send_documents=getattr(chat_perms, "can_send_documents", False),
+                can_send_photos=getattr(chat_perms, "can_send_photos", False),
+                can_send_videos=getattr(chat_perms, "can_send_videos", False),
+                can_send_video_notes=getattr(chat_perms, "can_send_video_notes", False),
+                can_send_voice_notes=getattr(chat_perms, "can_send_voice_notes", False),
+                can_send_polls=getattr(chat_perms, "can_send_polls", False),
+                can_send_other_messages=getattr(chat_perms, "can_send_other_messages", False),
+                can_add_web_page_previews=getattr(chat_perms, "can_add_web_page_previews", False),
+                # Админские права — НЕ передаются (Telegram проигнорирует,
+                # но мы явно не ставим их в True).
+            )
         except TelegramBadRequest as e:
             logger.error("get_chat for unmute failed: %s", e)
             try:
@@ -4026,7 +4082,9 @@ async def cmd_nightmode(message: types.Message) -> None:
             "  /nightmode chat_id notify on [custom_text] | off\n"
             "  /nightmode chat_id notify_text enter|exit <text>\n"
             "  /nightmode chat_id custom <perm>=0|1 ...\n"
-            "💡 perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links",
+            "  /nightmode chat_id slowmode [day_sec] [night_sec] | off\n"
+            "💡 perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n"
+            "💡 slowmode: 0..36400 сек; day — днём, night — ночью; 0=выкл",
             parse_mode=None,
         )
         return
@@ -4332,6 +4390,104 @@ async def cmd_nightmode(message: types.Message) -> None:
         await message.reply(
             f"✅ Точечные права для чата {chat_id} применены (base=<b>{base_preset}</b>):\n"
             f"<code>{html.escape(summary)}</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    # ── SUBCOMMAND: slowmode (v4.7.16) ──────────────────────────────
+    # /nightmode chat_id slowmode              — показать текущие настройки
+    # /nightmode chat_id slowmode <day> <night> — установить day/night slow_mode (сек)
+    # /nightmode chat_id slowmode off          — выключить slow_mode changes (0/0)
+    # Telegram: 0 <= slow_mode_delay <= 36400. 0 = выкл.
+    if arg2 == "slowmode":
+        # Перепарсим с большим maxsplit чтобы получить day/night аргументы.
+        sub = raw.split(maxsplit=5)
+        # sub = ['/nightmode', chat_id_str, 'slowmode', arg3?, arg4?]
+        if len(sub) < 4:
+            # Show current
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat_id)
+                day_s = int(settings.day_slow_mode_delay or 0)
+                night_s = int(settings.night_mode_slow_mode_delay or 0)
+                saved_s = settings.night_mode_saved_slow_mode_delay
+            await message.reply(
+                f"🐌 Slow mode для чата {chat_id}:\n"
+                f"  ☀️ Day:   <b>{day_s}</b> сек ({'выкл' if day_s == 0 else 'включён'})\n"
+                f"  🌙 Night: <b>{night_s}</b> сек ({'выкл' if night_s == 0 else 'включён'})\n"
+                + (f"  💾 Saved: {int(saved_s)} сек (snapshot для restore)"
+                   if saved_s is not None else ""),
+                parse_mode="HTML",
+            )
+            return
+        arg3 = sub[3].strip().lower()
+        if arg3 == "off":
+            # Disable both
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat_id)
+                settings.day_slow_mode_delay = 0
+                settings.night_mode_slow_mode_delay = 0
+                # НЕ трогаем night_mode_saved_slow_mode_delay — если night mode
+                # сейчас активен, при выходе restore вернёт snapshot. Иначе
+                # snapshot не нужен (его очистит _exit_night_mode при следующем
+                # цикле). Просто сбрасываем настройки.
+                await session.commit()
+            await message.reply(
+                f"✅ Slow mode changes для чата {chat_id}: <b>выключены</b>\n"
+                "Текущий slow_mode в чате не меняется. "
+                "При следующем входе/выходе из night mode бот не будет трогать slow_mode.",
+                parse_mode="HTML",
+            )
+            return
+        # Parse <day_sec> <night_sec>
+        if len(sub) < 5:
+            await message.reply(
+                "❌ Укажите оба значения: <day_sec> <night_sec>\n"
+                "💡 /nightmode chat_id slowmode 10 60\n"
+                "💡 0 = выкл для этой стороны (например '0 60' — днём не трогать, ночью 60с)\n"
+                "💡 /nightmode chat_id slowmode off — полностью выключить",
+                parse_mode=None,
+            )
+            return
+        try:
+            day_v = int(sub[3])
+            night_v = int(sub[4])
+        except ValueError:
+            await message.reply(
+                "❌ Значения должны быть целыми числами (секунды)\n"
+                "💡 /nightmode chat_id slowmode 10 60",
+                parse_mode=None,
+            )
+            return
+        # Telegram limit: 0..36400. 0 = disabled.
+        for label, v in (("day", day_v), ("night", night_v)):
+            if v < 0 or v > 36400:
+                await message.reply(
+                    f"❌ {label}_sec={v} вне диапазона (0..36400)\n"
+                    "💡 0 = выкл, типичные значения: day=10, night=30..60",
+                    parse_mode=None,
+                )
+                return
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            settings.day_slow_mode_delay = day_v
+            settings.night_mode_slow_mode_delay = night_v
+            await session.commit()
+        # Человекочитаемое описание
+        def _sm_desc(v: int) -> str:
+            if v == 0:
+                return "выкл (не меняется)"
+            if v < 60:
+                return f"{v}с"
+            m, s = divmod(v, 60)
+            if s == 0:
+                return f"{m}мин"
+            return f"{m}мин {s}с"
+        await message.reply(
+            f"✅ Slow mode для чата {chat_id} настроен:\n"
+            f"  ☀️ Day:   <b>{_sm_desc(day_v)}</b>\n"
+            f"  🌙 Night: <b>{_sm_desc(night_v)}</b>\n"
+            "Применится автоматически при следующем входе/выходе из night mode. "
+            "Если night mode сейчас активен — изменения вступят в силу при следующем тике.",
             parse_mode="HTML",
         )
         return
@@ -4739,7 +4895,9 @@ _HELP_FULL_TEXT = (
     "  /nightmode chat_id weekend off — сбросить (использовать будничное)\n"
     "  /nightmode chat_id notify on|off [custom_text] — уведомления входа/выхода\n"
     "  /nightmode chat_id custom &lt;perm&gt;=0|1 ... — точечные права\n"
-    "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n\n"
+    "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n"
+    "  /nightmode chat_id slowmode &lt;day_sec&gt; &lt;night_sec&gt; — slow mode (0=выкл, 0..36400)\n"
+    "  /nightmode chat_id slowmode off — выключить slow mode changes\n\n"
     "<b>Санитарные дни (в личке):</b>\n"
     "  /sanitary chat_id — показать список\n"
     "  /sanitary chat_id add &lt;YYYY-MM-DD&gt; — добавить день\n"

@@ -321,11 +321,14 @@
                             style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 11px; box-sizing: border-box;">
                         <option value="__none__" {% if not c.night_mode_permissions %}selected{% endif %}>(none — night mode не меняет права)</option>
                         {% for p in presets_by_scope.night %}
-                        <option value="{{ p.id }}" {% if c.night_mode_permissions and p.permissions == c.night_mode_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}</option>
+                        <option value="{{ p.id }}" {% if c.night_mode_permissions and p.permissions == c.night_mode_permissions %}selected{% endif %}>{{ p.name }}{% if p.is_system %} (system){% endif %}{% if p.slow_mode_delay is not none %} · 🐌 {{ p.slow_mode_delay }}с{% endif %}</option>
                         {% endfor %}
                     </select>
                     <div style="font-size: 9px; color: var(--text-dim); margin-top: 4px; line-height: 1.5;">
                         Список берётся из пресетов со scope=<code>night</code> со страницы <a href="/admin/presets" style="color: var(--accent);">/admin/presets →</a>
+                        {% if c.night_mode_slow_mode_delay is defined and c.night_mode_slow_mode_delay %}
+                            <br>🐌 Текущий night slow_mode: <b>{{ c.night_mode_slow_mode_delay }}</b> сек
+                        {% endif %}
                     </div>
                 </div>
             </div>

@@ -97,8 +97,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.12"
-APP_RELEASE_DATE = "2026-08-01"
+APP_VERSION = "v4.7.18"
+APP_RELEASE_DATE = "2026-08-04"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -1756,6 +1756,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # preset_id="" или "__none__" → NULL (старое поведение, через snapshot).
         # preset_id="__lockdown__" → all False (только для sanitary, default).
         # preset_id=<int> → берём permissions из пресета.
+        # v4.7.16: из пресета также копируется slow_mode_delay (если задан).
         day_preset_id: str = Form(""),
         night_preset_id: str = Form(""),
         sanitary_preset_id: str = Form("__lockdown__"),
@@ -1917,36 +1918,42 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "can_pin_messages",
         )
 
-        def _resolve_perms(preset_id_field: str, scope: str) -> str | None:
-            """v4.6.1: Возвращает JSON-строку permissions для поля ChatSettings.
+        def _resolve_perms(preset_id_field: str, scope: str) -> tuple[str | None, int | None]:
+            """v4.6.1: Возвращает (JSON-строка permissions, slow_mode_delay) для ChatSettings.
 
             Логика (custom grids убраны — только выбор пресета):
-              • preset_id_field == "__none__" или "" → NULL (старое поведение / snapshot)
-              • preset_id_field == "__lockdown__" → all False (default для sanitary)
-              • preset_id_field == int (валидный ID) → берём из preset_by_id (с проверкой scope)
-              • невалидный ID или несоответствие scope → NULL (безопасный fallback)
+              • preset_id_field == "__none__" или "" → (None, None) (старое поведение / snapshot)
+              • preset_id_field == "__lockdown__" → (all False, None) (default для sanitary)
+              • preset_id_field == int (валидный ID) → берём из preset_by_id
+                (с проверкой scope). v4.7.16: slow_mode_delay тоже из пресета.
+              • невалидный ID или несоответствие scope → (None, None) (safe fallback)
+
+            v4.7.16: slow_mode_delay — None = не менять, 0 = выкл, >0 = N сек.
+            Копируется в ChatSettings.day_slow_mode_delay / night_mode_slow_mode_delay.
             """
             pid = (preset_id_field or "").strip()
             if pid in ("", "__none__"):
-                return None
+                return None, None
             if pid == "__lockdown__":
-                return json.dumps({k: False for k in _ALL_PERM_KEYS})
+                return json.dumps({k: False for k in _ALL_PERM_KEYS}), None
             try:
                 pid_int = int(pid)
             except (ValueError, TypeError):
-                return None
+                return None, None
             preset = preset_by_id.get(pid_int)
             if preset is None or preset.scope != scope:
-                return None
-            return preset.permissions
+                return None, None
+            return preset.permissions, preset.slow_mode_delay
 
-        day_perms_json = _resolve_perms(day_preset_id, "day")
-        sanitary_perms_json = _resolve_perms(sanitary_preset_id, "sanitary")
+        day_perms_json, day_slow = _resolve_perms(day_preset_id, "day")
+        sanitary_perms_json, _sanitary_slow = _resolve_perms(sanitary_preset_id, "sanitary")
         # v4.6.1: night_perms_json — только из night_preset_id.
+        night_slow: int | None = None
         if night_preset_id and night_preset_id not in ("", "__none__"):
-            night_resolved = _resolve_perms(night_preset_id, "night")
+            night_resolved, night_slow_candidate = _resolve_perms(night_preset_id, "night")
             if night_resolved is not None:
                 night_perms_json = night_resolved
+                night_slow = night_slow_candidate
 
         async with async_session() as session:
             cs = (await session.execute(
@@ -1997,6 +2004,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             # v4.6.0: гранулярные права.
             cs.day_permissions = day_perms_json
             cs.sanitary_days_permissions = sanitary_perms_json
+            # v4.7.16: slow_mode копируется из пресета (как permissions).
+            # None = пресет не выбран → 0 (не менять slow_mode, backward compat).
+            # 0 = выкл. >0 = N сек. См. PermissionPreset.slow_mode_delay.
+            cs.day_slow_mode_delay = day_slow if day_slow is not None else 0
+            cs.night_mode_slow_mode_delay = night_slow if night_slow is not None else 0
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
@@ -2005,7 +2017,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
             "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
             "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s, "
-            "night_preset_id=%s)",
+            "night_preset_id=%s, day_slow=%s, night_slow=%s)",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
             decay, link_filter_action, nm_start, nm_end,
             night_preset_id or "(none)",
@@ -2015,6 +2027,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "yes" if day_perms_json else "no",
             "yes" if sanitary_perms_json else "no",
             night_preset_id or "(none)",
+            day_slow if day_slow is not None else "(unchanged)",
+            night_slow if night_slow is not None else "(unchanged)",
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",
@@ -3217,9 +3231,13 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         perm_can_change_info: str = Form(""),
         perm_can_invite_users: str = Form(""),
         perm_can_pin_messages: str = Form(""),
+        # v4.7.16: slow_mode_delay (chat-level, separate from ChatPermissions).
+        # Empty/blank = None (не менять slow_mode при применении пресета).
+        # 0 = выкл. >0 = N сек. Telegram limit: 0..36400.
+        slow_mode_delay: str = Form(""),
         _auth: AuthUser = Depends(require_admin),
     ):
-        """v4.6.0: создать новый пользовательский пресет."""
+        """v4.6.0: создать новый пользовательский пресет. v4.7.16: + slow_mode_delay."""
         name = (name or "").strip()
         if not name or len(name) > 64:
             return RedirectResponse(
@@ -3231,6 +3249,23 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 url="/admin/presets?flash=Invalid+scope",
                 status_code=303,
             )
+
+        # v4.7.16: парсим slow_mode_delay. Empty = None (не менять).
+        slow_mode_raw = (slow_mode_delay or "").strip()
+        slow_mode_value: int | None = None
+        if slow_mode_raw:
+            try:
+                slow_mode_value = int(slow_mode_raw)
+            except ValueError:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Invalid+slow_mode_delay+(must+be+integer)",
+                    status_code=303,
+                )
+            if slow_mode_value < 0 or slow_mode_value > 36400:
+                return RedirectResponse(
+                    url="/admin/presets?flash=slow_mode_delay+must+be+0..36400",
+                    status_code=303,
+                )
 
         perms = {
             "can_send_messages":          perm_can_send_messages == "on",
@@ -3261,17 +3296,151 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             preset = PermissionPreset(
                 name=name, scope=scope,
                 permissions=json.dumps(perms),
+                slow_mode_delay=slow_mode_value,
                 is_system=False,
             )
             session.add(preset)
             await session.commit()
             _req_logger.info(
-                "presets_create: name=%r scope=%s by=%s",
-                name, scope, _auth.username,
+                "presets_create: name=%r scope=%s slow_mode=%s by=%s",
+                name, scope, slow_mode_value, _auth.username,
             )
 
         return RedirectResponse(
             url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+created",
+            status_code=303,
+        )
+
+    # ── v4.7.17: редактирование пресетов ──────────────────────────────
+    # Раньше пресеты можно было только создать и удалить. Если опечатка в имени,
+    # лишний чекбокс или забыли slow_mode — единственный путь был удалить и
+    # пересоздать. Теперь — Edit: меняет name/scope/permissions/slow_mode in-place.
+    # Системные пресеты нельзя редактировать (как и удалять) — это гарантия того,
+    # что «Full lockdown» / «Text only» / «Day default» всегда остаются каноничными.
+    # Уникальность name проверяется с исключением текущего пресета (иначе нельзя
+    # сохранить пресет, не меняя имя).
+    # Замечание про chats: чаты, привязанные к пресету, хранят КОПИЮ JSON в
+    # ChatSettings (day_permissions / night_mode_permissions / ...). Поэтому
+    # редактирование пресета НЕ затрагивает уже настроенные чаты — это by design,
+    # как и для удаления. Чтобы обновить права в конкретном чате, нужно
+    # перенастроить его на странице /admin/chats (или дождаться следующего
+    # входа/выхода из night mode).
+    @app.post("/admin/presets/{preset_id:int}/edit")
+    async def admin_presets_edit(
+        preset_id: int,
+        name: str = Form(...),
+        scope: str = Form(...),
+        perm_can_send_messages: str = Form(""),
+        perm_can_send_audios: str = Form(""),
+        perm_can_send_documents: str = Form(""),
+        perm_can_send_photos: str = Form(""),
+        perm_can_send_videos: str = Form(""),
+        perm_can_send_video_notes: str = Form(""),
+        perm_can_send_voice_notes: str = Form(""),
+        perm_can_send_polls: str = Form(""),
+        perm_can_send_other_messages: str = Form(""),
+        perm_can_add_web_page_previews: str = Form(""),
+        perm_can_change_info: str = Form(""),
+        perm_can_invite_users: str = Form(""),
+        perm_can_pin_messages: str = Form(""),
+        slow_mode_delay: str = Form(""),
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.7.17: редактировать пресет (name/scope/permissions/slow_mode_delay).
+
+        Системные пресеты редактировать нельзя (как и удалять).
+        Уникальность name проверяется с исключением текущего preset_id.
+        Валидация полей — идентична admin_presets_create.
+        """
+        name = (name or "").strip()
+        if not name or len(name) > 64:
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+preset+name+(1-64+chars)",
+                status_code=303,
+            )
+        if scope not in ("day", "night", "sanitary"):
+            return RedirectResponse(
+                url="/admin/presets?flash=Invalid+scope",
+                status_code=303,
+            )
+
+        # v4.7.16: парсим slow_mode_delay. Empty = None (не менять).
+        slow_mode_raw = (slow_mode_delay or "").strip()
+        slow_mode_value: int | None = None
+        if slow_mode_raw:
+            try:
+                slow_mode_value = int(slow_mode_raw)
+            except ValueError:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Invalid+slow_mode_delay+(must+be+integer)",
+                    status_code=303,
+                )
+            if slow_mode_value < 0 or slow_mode_value > 36400:
+                return RedirectResponse(
+                    url="/admin/presets?flash=slow_mode_delay+must+be+0..36400",
+                    status_code=303,
+                )
+
+        perms = {
+            "can_send_messages":          perm_can_send_messages == "on",
+            "can_send_audios":            perm_can_send_audios == "on",
+            "can_send_documents":         perm_can_send_documents == "on",
+            "can_send_photos":            perm_can_send_photos == "on",
+            "can_send_videos":            perm_can_send_videos == "on",
+            "can_send_video_notes":       perm_can_send_video_notes == "on",
+            "can_send_voice_notes":       perm_can_send_voice_notes == "on",
+            "can_send_polls":             perm_can_send_polls == "on",
+            "can_send_other_messages":   perm_can_send_other_messages == "on",
+            "can_add_web_page_previews": perm_can_add_web_page_previews == "on",
+            "can_change_info":            perm_can_change_info == "on",
+            "can_invite_users":           perm_can_invite_users == "on",
+            "can_pin_messages":           perm_can_pin_messages == "on",
+        }
+
+        async with async_session() as session:
+            preset = (await session.execute(
+                select(PermissionPreset).where(PermissionPreset.id == preset_id)
+            )).scalar_one_or_none()
+            if preset is None:
+                return RedirectResponse(
+                    url="/admin/presets?flash=Preset+not+found",
+                    status_code=303,
+                )
+            if preset.is_system:
+                return RedirectResponse(
+                    url="/admin/presets?flash=System+presets+cannot+be+edited",
+                    status_code=303,
+                )
+
+            # Уникальность name — исключаем текущий preset_id.
+            existing = (await session.execute(
+                select(PermissionPreset).where(
+                    PermissionPreset.name == name,
+                    PermissionPreset.id != preset_id,
+                )
+            )).scalar_one_or_none()
+            if existing is not None:
+                return RedirectResponse(
+                    url=f"/admin/presets?flash=Preset+name+already+exists:+{name.replace(' ', '+')}",
+                    status_code=303,
+                )
+
+            old_name = preset.name
+            old_scope = preset.scope
+            preset.name = name
+            preset.scope = scope
+            preset.permissions = json.dumps(perms)
+            preset.slow_mode_delay = slow_mode_value
+            # updated_at апдейтится автоматически через onupdate=lambda.
+            await session.commit()
+            _req_logger.info(
+                "presets_edit: id=%d name=%r->%r scope=%s->%s slow_mode=%s by=%s",
+                preset_id, old_name, name, old_scope, scope,
+                slow_mode_value, _auth.username,
+            )
+
+        return RedirectResponse(
+            url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+updated",
             status_code=303,
         )
 

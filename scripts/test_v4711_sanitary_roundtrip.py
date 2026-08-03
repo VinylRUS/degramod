@@ -88,8 +88,11 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
     # ─── 1. Version ─────────────────────────────────────────────────────
 
     def test_01_app_version_bumped(self):
-        self.assertEqual(APP_VERSION, "v4.7.11",
-                         f"APP_VERSION should be v4.7.11, got {APP_VERSION}")
+        """APP_VERSION должен быть >= v4.7.11 (тест ослаблен в v4.7.13)."""
+        # v4.7.13: ослаблен с == "v4.7.11" на >= v4.7.11 — чтобы не падать
+        # на каждом следующем релизе.
+        self.assertGreaterEqual(APP_VERSION, "v4.7.11",
+                                f"APP_VERSION should be >= v4.7.11, got {APP_VERSION}")
 
     # ─── 2. Воспроизведение исходного бага ─────────────────────────────
 

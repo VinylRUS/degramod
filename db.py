@@ -198,6 +198,23 @@ class ChatSettings(Base):
     night_mode_notify_enter_msg = Column(Text, nullable=True)
     # Кастомный текст уведомления при выходе (NULL = дефолтный шаблон).
     night_mode_notify_exit_msg = Column(Text, nullable=True)
+    # ── v4.7.16: Slow mode (chat-level, separate from ChatPermissions) ────
+    # Telegram позволяет ставить slow_mode_delay (0-36400 сек) — минимальный
+    # интервал между сообщениями одного юзера. Не входит в ChatPermissions,
+    # это отдельное свойство чата (chat.slow_mode_delay).
+    # night_mode_slow_mode_delay — slow_mode (сек) во время ночного режима.
+    #   0 = не менять (поведение по умолчанию, backward compat).
+    #   Типичное значение: 30 или 60 — ночью интервал больше.
+    # day_slow_mode_delay — slow_mode (сек) в дневном режиме. Приоритет над
+    #   snapshot'ом при восстановлении (preset-driven, как v4.7.12 для прав).
+    #   0 = не менять (тогда восстанавливается snapshot если он есть).
+    #   Типичное значение: 10.
+    # night_mode_saved_slow_mode_delay — snapshot chat.slow_mode_delay на
+    #   момент входа в ночной режим. Используется как fallback для
+    #   восстановления при выходе, если day_slow_mode_delay=0.
+    night_mode_slow_mode_delay = Column(Integer, default=0, nullable=False)
+    day_slow_mode_delay = Column(Integer, default=0, nullable=False)
+    night_mode_saved_slow_mode_delay = Column(Integer, nullable=True)
 
     # ── v4.5.4: Санитарный день ─────────────────────────────────────────
     # Список дат/диапазонов, в которые чат переводится в полный lockdown
@@ -272,6 +289,14 @@ class PermissionPreset(Base):
     name = Column(String(64), nullable=False, unique=True, index=True)
     scope = Column(String(16), nullable=False, index=True)  # 'day' | 'night' | 'sanitary'
     permissions = Column(Text, nullable=False)              # JSON of 13 ChatPermissions fields
+    # v4.7.16: slow_mode_delay (chat-level, separate from ChatPermissions).
+    # None = не менять slow_mode при применении пресета (backward compat).
+    # 0 = выключить slow_mode (применить set_chat_slow_mode_delay(0)).
+    # >0 = установить slow_mode в N секунд (Telegram limit: 0..36400).
+    # Копируется в ChatSettings.day_slow_mode_delay / night_mode_slow_mode_delay
+    # при выборе пресета — для independence (изменение/удаление пресета не ломает
+    # уже настроенные чаты, как и для permissions).
+    slow_mode_delay = Column(Integer, nullable=True)
     is_system = Column(Boolean, default=False, nullable=False)  # True = неудаляемый системный пресет
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
@@ -657,6 +682,24 @@ async def init_db() -> None:
                 "WHERE chat_id != 0"
             ))
 
+    # ── Миграция: v4.7.16 slow_mode columns (chat-level, separate from
+    # ChatPermissions). Идемпотентно (PRAGMA check + ALTER TABLE).
+    # НЕ сбрасываем существующие значения slow_mode у чатов — это новая
+    # фича, по умолчанию выключена (0 = не менять).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v4716_chat_settings_cols = [
+            ("night_mode_slow_mode_delay",     "INTEGER NOT NULL DEFAULT 0"),
+            ("day_slow_mode_delay",            "INTEGER NOT NULL DEFAULT 0"),
+            ("night_mode_saved_slow_mode_delay", "INTEGER NULL"),
+        ]
+        for col_name, col_type in v4716_chat_settings_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
     # ── Миграция: новая таблица permission_presets (v4.6.0) ───────────
     # create_all() выше создаст её для новой БД; для существующей — IF NOT EXISTS.
     async with engine.begin() as conn:
@@ -674,6 +717,17 @@ async def init_db() -> None:
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_permission_presets_scope ON permission_presets (scope)"
         ))
+
+    # ── Миграция: v4.7.16 slow_mode_delay в permission_presets ────────
+    # Идемпотентно (PRAGMA check + ALTER TABLE). None = не менять slow_mode,
+    # 0 = выкл, >0 = установить N сек. См. PermissionPreset.slow_mode_delay.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(permission_presets)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "slow_mode_delay" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE permission_presets ADD COLUMN slow_mode_delay INTEGER NULL"
+            ))
 
     # ── v4.5.2: новые таблицы (word_filters, link_allowlist, banned_sticker_packs)
     # create_all() выше уже создаст их для новой БД; для существующей БД
