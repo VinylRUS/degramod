@@ -38,10 +38,29 @@ from bot_handlers import (
     # override (ChatSettings.report_chat_id), is_report_chat flag, and the
     # global default (chat_id=0).
     _get_report_chat_id,
+    # v4.7.20: !alarm integration — _deactivate_alarm используется в
+    # _night_mode_tick для (1) auto-off при истечении alarm_active_until,
+    # (2) auto-deactivate при входе в night mode (alarm избыточен когда
+    # night mode уже ограничивает права).
+    _deactivate_alarm,
+    # v4.7.20: env-chats cleanup при старте — если чат из CHAT_HASHTAGS
+    # не отвечает (бот кикнут / чат удалён), помечаем is_enabled=False.
+    # Раньше бот при каждом апдейте пересоздавал chat_settings для мёртвых
+    # чатов из env (CHAT_HASHTAGS=-1003972381175:Test), и SU не мог их
+    # удалить из веб-панели — они "воскресали" при следующем сообщении.
+    _CHAT_HASHTAGS,
 )
 from datetime import datetime, timezone, timedelta, date
 import json
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
+# v4.7.19: TelegramAPIError — базовый класс для ВСЕХ Telegram-ошибок
+# (TelegramNotFound, TelegramForbiddenError, TelegramConflictError, ...).
+# Раньше ловили только TelegramBadRequest, но TelegramNotFound ("Not Found"
+# при отправке в удалённый/несуществующий чат) и TelegramForbiddenError
+# ("bot was kicked from chat") — это ОТДЕЛЬНЫЕ классы, не наследники
+# TelegramBadRequest. Из-за этого исключение пробивалось наверх в
+# _night_mode_tick и засоряло лог ERROR'ами каждую минуту. Теперь ловим
+# базовый класс — любая ошибка Telegram логируется как warning и не валит tick.
 from aiogram.methods.base import TelegramMethod
 
 
@@ -181,6 +200,43 @@ async def _night_mode_tick():
             # дёргать права пока активен sanitary day.
             if cs.sanitary_days_currently_active:
                 continue
+
+            # v4.7.20: auto-off alarm если alarm_active_until истёк.
+            # Проверяем ПЕРЕД night mode логикой — чтобы alarm не конфликтовал
+            # с night. Если alarm_active_until is None — alarm до ручного off.
+            if (cs.alarm_currently_active
+                    and cs.alarm_active_until is not None
+                    and now >= cs.alarm_active_until):
+                logger.info(
+                    "Alarm auto-off: chat %s alarm_active_until=%s (now=%s)",
+                    cs.chat_id, cs.alarm_active_until.isoformat(), now.isoformat(),
+                )
+                try:
+                    async with async_session() as alarm_session:
+                        alarm_cs = (await alarm_session.execute(
+                            select(ChatSettings).where(
+                                ChatSettings.chat_id == cs.chat_id
+                            )
+                        )).scalar_one_or_none()
+                        if alarm_cs and alarm_cs.alarm_currently_active:
+                            # Используем _deactivate_alarm из bot_handlers.
+                            # Восстанавливает права из snapshot/preset.
+                            await _deactivate_alarm(
+                                alarm_session, alarm_cs, bot,
+                                cs.chat_id, reason="auto_off_timeout",
+                            )
+                            # Синхронизируем cs в памяти — чтобы后续 night mode
+                            # логика видела, что alarm снят.
+                            cs.alarm_currently_active = False
+                            cs.alarm_saved_permissions = None
+                            cs.alarm_saved_slow_mode_delay = None
+                            cs.alarm_active_until = None
+                except Exception as e:
+                    logger.error(
+                        "Alarm auto-off failed for chat %s: %s",
+                        cs.chat_id, e,
+                    )
+
             tz_name = cs.night_mode_tz or "Europe/Moscow"
             in_window = _night_mode_in_window(
                 now=now,
@@ -191,6 +247,42 @@ async def _night_mode_tick():
                 tz_name=tz_name,
             )
             if in_window and not cs.night_mode_currently_active:
+                # v4.7.20: перед входом в night mode — снять активный alarm.
+                # Night mode и так ограничивает права, alarm избыточен.
+                # Snapshot alarm'а будет утерян, но это OK: night mode сохранит
+                # свой snapshot прав (в _enter_night_mode), и при выходе из
+                # night mode права восстановятся из него.
+                if cs.alarm_currently_active:
+                    logger.info(
+                        "Alarm auto-deactivate on night mode enter: chat %s",
+                        cs.chat_id,
+                    )
+                    try:
+                        async with async_session() as alarm_session:
+                            alarm_cs = (await alarm_session.execute(
+                                select(ChatSettings).where(
+                                    ChatSettings.chat_id == cs.chat_id
+                                )
+                            )).scalar_one_or_none()
+                            if alarm_cs and alarm_cs.alarm_currently_active:
+                                # reason="night_mode_enter" — в логах будет видно
+                                # что alarm снят именно из-за входа в night, а не
+                                # из-за таймаута или ручного off.
+                                await _deactivate_alarm(
+                                    alarm_session, alarm_cs, bot,
+                                    cs.chat_id, reason="night_mode_enter",
+                                )
+                                cs.alarm_currently_active = False
+                                cs.alarm_saved_permissions = None
+                                cs.alarm_saved_slow_mode_delay = None
+                                cs.alarm_active_until = None
+                    except Exception as e:
+                        logger.error(
+                            "Alarm auto-deactivate on night mode enter failed "
+                            "for chat %s: %s (continuing — night mode will "
+                            "still apply its own perms)",
+                            cs.chat_id, e,
+                        )
                 # Вход в ночной режим
                 await _enter_night_mode(cs)
             elif not in_window and cs.night_mode_currently_active:
@@ -277,7 +369,7 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
                     "Night mode: slow_mode set to %ds for chat %s",
                     night_slow, cs.chat_id,
                 )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
                 logger.warning(
                     "Night mode: set_chat_slow_mode_delay(%ds) failed for chat %s: %s",
                     night_slow, cs.chat_id, e,
@@ -341,12 +433,23 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
                         "(source chat %s)",
                         report_chat_id, cs.chat_id,
                     )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
+                # v4.7.19: ловим базовый класс TelegramAPIError вместо
+                # TelegramBadRequest — TelegramNotFound ("Not Found" при
+                # отправке в удалённый чат) и TelegramForbiddenError ("bot
+                # was kicked") не наследуют TelegramBadRequest и раньше
+                # пробивались наверх в _night_mode_tick, засоряя лог ERROR'ами.
+                # Также логируем report_chat_id — сразу видно, какой ID кривой.
                 logger.warning(
-                    "Night mode enter notify failed for chat %s: %s",
-                    cs.chat_id, e,
+                    "Night mode enter notify failed: source_chat=%s, "
+                    "report_chat=%s, error=%s",
+                    cs.chat_id, report_chat_id, e,
                 )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.19: та же логика — ловим базовый класс. Если bot.get_chat /
+        # bot.set_chat_permissions падают с NotFound (чат удалён/бот кикнут) —
+        # логируем как error (это уже не notify, а сам night mode не сработал),
+        # но tick продолжается для остальных чатов.
         logger.error("Night mode enter failed for chat %s: %s", cs.chat_id, e)
 
 
@@ -371,11 +474,72 @@ _DAY_DEFAULT_HARDCODED = {
 }
 
 
+# v4.7.20: кеш системного пресета «Day default».
+# Раньше каждый вызов _resolve_day_perms делал SQL-запрос за пресетом — это
+# лишняя нагрузка на БД при каждом выходе из ночного режима. Теперь пресет
+# кешируется в module-level переменной при первом обращении.
+# Если SU меняет/удаляет «Day default» — кеш инвалидируется через
+# _invalidate_day_default_cache() (вызывается из web_app.py при редактировании
+# системного пресета).
+_DAY_DEFAULT_CACHE: dict | None = None
+_DAY_DEFAULT_CACHE_LOADED: bool = False  # True если кеш уже пробовали грузить (даже если None)
+
+
+def _invalidate_day_default_cache() -> None:
+    """v4.7.20: инвалидирует кеш «Day default» пресета.
+
+    Вызывается из web_app.py когда SU редактирует/удаляет системный пресет
+    «Day default» (scope='day', is_system=True). Следующий вызов
+    _resolve_day_perms перечитает пресет из БД.
+    """
+    global _DAY_DEFAULT_CACHE, _DAY_DEFAULT_CACHE_LOADED
+    _DAY_DEFAULT_CACHE = None
+    _DAY_DEFAULT_CACHE_LOADED = False
+    logger.info("Day default cache invalidated")
+
+
+async def _load_day_default_cached() -> dict | None:
+    """v4.7.20: возвращает кеш системного «Day default» пресета.
+
+    При первом вызове — загружает из БД и кеширует. При последующих —
+    возвращает закешированное значение. Если пресета в БД нет — кеширует
+    None (чтобы не делать SQL-запрос каждый раз).
+
+    Возвращает dict {field: bool} или None если пресета нет.
+    """
+    global _DAY_DEFAULT_CACHE, _DAY_DEFAULT_CACHE_LOADED
+    if _DAY_DEFAULT_CACHE_LOADED:
+        return _DAY_DEFAULT_CACHE
+    # Загружаем из БД
+    try:
+        async with async_session() as session:
+            from db import PermissionPreset
+            preset = (await session.execute(
+                select(PermissionPreset).where(
+                    PermissionPreset.name == "Day default",
+                    PermissionPreset.scope == "day",
+                )
+            )).scalar_one_or_none()
+            if preset and preset.permissions:
+                data = json.loads(preset.permissions)
+                _DAY_DEFAULT_CACHE = {
+                    k: bool(data.get(k, False)) for k in _PERM_FIELDS
+                }
+            else:
+                _DAY_DEFAULT_CACHE = None
+    except Exception as e:
+        logger.warning("Failed to load 'Day default' preset for cache: %s", e)
+        _DAY_DEFAULT_CACHE = None
+    _DAY_DEFAULT_CACHE_LOADED = True
+    return _DAY_DEFAULT_CACHE
+
+
 async def _resolve_day_perms(cs: ChatSettings) -> tuple[object, str]:
     """v4.7.12: возвращает дневные права чата (ChatPermissions) с приоритетом:
 
       1. cs.day_permissions — явно привязанный к чату day preset (JSON-копия)
       2. Системный пресет «Day default» (scope='day', is_system=True) из БД
+         (v4.7.20: кешируется в _DAY_DEFAULT_CACHE)
       3. Hardcoded _DAY_DEFAULT_HARDCODED (на случай пустой БД)
 
     Returns: (ChatPermissions, source) где source = 'chat_preset' | 'system_default'
@@ -398,27 +562,11 @@ async def _resolve_day_perms(cs: ChatSettings) -> tuple[object, str]:
                 cs.chat_id, cs.day_permissions,
             )
 
-    # 2. Системный пресет «Day default».
-    try:
-        async with async_session() as session:
-            from db import PermissionPreset
-            preset = (await session.execute(
-                select(PermissionPreset).where(
-                    PermissionPreset.name == "Day default",
-                    PermissionPreset.scope == "day",
-                )
-            )).scalar_one_or_none()
-            if preset and preset.permissions:
-                data = json.loads(preset.permissions)
-                perms = _tg_types.ChatPermissions(
-                    **{k: bool(data.get(k, False)) for k in _PERM_FIELDS}
-                )
-                return perms, "system_default"
-    except Exception as e:
-        logger.warning(
-            "Chat %s: failed to load system 'Day default' preset: %s — using hardcoded",
-            cs.chat_id, e,
-        )
+    # 2. Системный пресет «Day default» (v4.7.20: из кеша).
+    cached = await _load_day_default_cached()
+    if cached is not None:
+        perms = _tg_types.ChatPermissions(**{k: cached[k] for k in _PERM_FIELDS})
+        return perms, "system_default"
 
     # 3. Hardcoded fallback.
     perms = _tg_types.ChatPermissions(
@@ -485,7 +633,7 @@ async def _restore_day_state(cs: ChatSettings) -> str:
                 "Day state: slow_mode restored to %ds for chat %s (source=%s)",
                 target_slow, cs.chat_id, slow_source,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning(
                 "Day state: set_chat_slow_mode_delay(%ds) failed for chat %s: %s",
                 target_slow, cs.chat_id, e,
@@ -602,12 +750,15 @@ async def _exit_night_mode(cs: ChatSettings, allow_auto_enter: bool = True) -> N
                         "(source chat %s)",
                         report_chat_id, cs.chat_id,
                     )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
+                # v4.7.19: ловим базовый класс (см. комментарий в _enter_night_mode).
                 logger.warning(
-                    "Night mode exit notify failed for chat %s: %s",
-                    cs.chat_id, e,
+                    "Night mode exit notify failed: source_chat=%s, "
+                    "report_chat=%s, error=%s",
+                    cs.chat_id, report_chat_id, e,
                 )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.19: та же логика — ловим базовый класс.
         logger.error("Night mode exit failed for chat %s: %s", cs.chat_id, e)
 
 
@@ -807,7 +958,8 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
             "Sanitary day ON for chat %s (lockdown applied, snapshot saved)",
             cs.chat_id,
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.19: базовый класс — покрывает NotFound, Forbidden и т.п.
         logger.error("Sanitary day enter failed for chat %s: %s", cs.chat_id, e)
 
 
@@ -868,14 +1020,15 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
             )
             try:
                 await _enter_night_mode(cs)
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
+                # v4.7.19: базовый класс — покрывает NotFound, Forbidden и т.п.
                 logger.error(
                     "Sanitary→night transition failed for chat %s: %s — falling back to day",
                     cs.chat_id, e,
                 )
                 try:
                     await _restore_day_state(cs)
-                except TelegramBadRequest as e2:
+                except TelegramAPIError as e2:
                     logger.error(
                         "Day restore fallback failed for chat %s: %s",
                         cs.chat_id, e2,
@@ -889,7 +1042,8 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
             "Sanitary day OFF for chat %s (day restored, source=%s)",
             cs.chat_id, source,
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.19: базовый класс — покрывает NotFound, Forbidden и т.п.
         logger.error("Sanitary day exit failed for chat %s: %s", cs.chat_id, e)
 
 
@@ -949,8 +1103,91 @@ async def _startup_recovery() -> None:
         except Exception as e:
             logger.error("Startup recovery: tick failed: %s", e)
     except Exception as e:
-        logger.warning("Startup recovery: check failed: %s", e)
+        logger.error("Startup recovery: DB error: %s", e)
 
+
+async def _verify_env_chats():
+    """v4.7.20: проверка чатов из CHAT_HASHTAGS env при старте.
+
+    Проблема: если env содержит чаты, в которых бот больше не состоит
+    (тестовые чаты, удалённые группы, чаты откуда бот кикнут) — бот при
+    каждом апдейте из такого чата будет пересоздавать chat_settings строку.
+    Это приводило к "воскресанию" удалённых чатов в веб-панели.
+
+    Решение: при старте пробуем bot.get_chat() для каждого chat_id из
+    _CHAT_HASHTAGS. Если ошибка (чат удалён / бот кикнут / неверный ID) —
+    помечаем is_enabled=False чтобы веб-панель показывала чат как disabled,
+    а обработчики игнорировали апдейты из него.
+
+    НЕ удаляем строку полностью — сохраняем историю (варны, баны и т.д.).
+    SU может включить чат обратно через веб-панель если это была ошибка.
+    """
+    if not _CHAT_HASHTAGS:
+        return  # env пустой — ничего проверять
+
+    logger.info(
+        "Verifying %d env-chat(s) from CHAT_HASHTAGS: %s",
+        len(_CHAT_HASHTAGS), list(_CHAT_HASHTAGS.keys()),
+    )
+
+    disabled_count = 0
+    for chat_id, hashtag in _CHAT_HASHTAGS.items():
+        try:
+            chat_info = await bot.get_chat(chat_id=chat_id)
+            logger.info(
+                "Env chat %s (hashtag=%s) OK: title='%s' type='%s'",
+                chat_id, hashtag, chat_info.title or "", chat_info.type,
+            )
+        except Exception as e:
+            # Чат недоступен — помечаем is_enabled=False
+            logger.warning(
+                "Env chat %s (hashtag=%s) NOT accessible: %s — marking as disabled",
+                chat_id, hashtag, e,
+            )
+            try:
+                async with async_session() as session:
+                    cs = (await session.execute(
+                        select(ChatSettings).where(
+                            ChatSettings.chat_id == chat_id
+                        )
+                    )).scalar_one_or_none()
+                    if cs is None:
+                        # Создаём строку сразу disabled — чтобы веб-панель
+                        # показывала её с правильным статусом.
+                        cs = ChatSettings(
+                            chat_id=chat_id,
+                            hashtag=hashtag,
+                            is_enabled=False,
+                        )
+                        session.add(cs)
+                        logger.info(
+                            "Env chat %s: created chat_settings with is_enabled=False",
+                            chat_id,
+                        )
+                    elif cs.is_enabled:
+                        cs.is_enabled = False
+                        logger.info(
+                            "Env chat %s: set is_enabled=False (was True)",
+                            chat_id,
+                        )
+                    else:
+                        logger.info(
+                            "Env chat %s: already disabled, no change",
+                            chat_id,
+                        )
+                    await session.commit()
+                disabled_count += 1
+            except Exception as inner_e:
+                logger.error(
+                    "Env chat %s: failed to mark disabled in DB: %s",
+                    chat_id, inner_e,
+                )
+
+    if disabled_count > 0:
+        logger.warning(
+            "Env-chats verification: %d/%d disabled (not accessible by bot)",
+            disabled_count, len(_CHAT_HASHTAGS),
+        )
 
 # ── Lifespan ────────────────────────────────────────────────────────────────
 @asynccontextmanager
@@ -965,6 +1202,12 @@ async def lifespan(app):
     # SIGTERM в предыдущем запуске. Должен идти ДО запуска background loop,
     # чтобы loop не подхватил полузавершённое состояние.
     await _startup_recovery()
+
+    # v4.7.20: проверка чатов из CHAT_HASHTAGS env — помечаем is_enabled=False
+    # для чатов, в которых бот больше не состоит (тестовые чаты, удалённые
+    # группы). Без этого удалённые чаты "воскресали" в веб-панели при каждом
+    # апдейте из них (env принудительно создавал chat_settings).
+    await _verify_env_chats()
 
     # Убираем команды из меню (стелс)
     try:

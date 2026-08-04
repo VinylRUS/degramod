@@ -87,7 +87,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import Router, types, F, BaseMiddleware
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import (
     InputRichMessage,
@@ -231,6 +231,16 @@ _CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
 _CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
 _CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
+# v4.7.20: !alarm on [duration] / !alarm off
+# Длительность: опциональная, форматы "1ч" / "1h" / "30м" / "30m" / "2д" / "2d".
+# Если не указана — alarm активен до ручного !alarm off.
+# Примеры: "!alarm on", "!alarm on 1ч", "!alarm on 2h", "!alarm off"
+_CMD_ALARM = re.compile(
+    r"^!alarm\s+(on|off|вкл|выкл)"           # on/off (или русские алиасы)
+    r"(?:\s+(\d+)\s*(ч|h|м|m|д|d))?"         # опциональная длительность
+    r"\s*$",
+    re.IGNORECASE,
+)
 
 
 # ── Список всех команд модерации (для ранней проверки, что текст вообще ────
@@ -239,6 +249,7 @@ _ALL_MOD_COMMANDS: tuple[re.Pattern, ...] = (
     _CMD_MUTE, _CMD_WARN, _CMD_BAN,
     _CMD_UNMUTE, _CMD_UNBAN, _CMD_UNWARN,
     _CMD_WARNS, _CMD_RESETWARNS,
+    _CMD_ALARM,
 )
 
 
@@ -345,6 +356,214 @@ def _restore_permissions(snapshot_json: str) -> types.ChatPermissions:
     """Десериализует JSON-снапшот в объект ChatPermissions."""
     data = json.loads(snapshot_json)
     return types.ChatPermissions(**{k: data.get(k, False) for k in _PERM_FIELDS})
+
+
+# ── v4.7.20: !alarm helpers ────────────────────────────────────────────────
+# !alarm — экстренная "паническая кнопка" для модераторов. При включении:
+#   • отключаются ВСЕ медиа (фото, видео, стикеры, голосовые, документы и т.д.)
+#   • остаётся только текст (can_send_messages=True)
+#   • ставится slow_mode_delay=30 сек
+# Аналогично ночному режиму, но включается вручную и НЕ должно конфликтовать
+# с night mode: при входе в night mode активный alarm автоматически снимается
+# (т.к. night mode и так ограничивает права — alarm избыточен).
+#
+# Используется когда в чате начинается флуд медиа (стикерами, гифками) и
+# нужно быстро всё заглушить, не прибегая к санитарному дню (который
+# требует планирования дат) или ночному режиму (который работает по расписанию).
+
+# Slow mode при alarm (секунд). 30 — достаточно чтобы дать флудеру остыть,
+# но не слишком долго чтобы мешать нормальному диалогу.
+_ALARM_SLOW_MODE_DELAY = 30
+
+
+def _alarm_permissions() -> types.ChatPermissions:
+    """ChatPermissions для !alarm: только текст, всё медиа запрещено.
+
+    Аналог strict night mode, но задаётся явно (не через пресет) —
+    чтобы !alarm работал даже если в чате нет настроенного night mode.
+    can_send_messages=True (текст разрешён), всё остальное False.
+    Админские права (can_change_info / can_invite_users / can_pin_messages)
+    НЕ трогаем — это отдельный уровень прав через promote_chat_member.
+    """
+    return types.ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        # v4.7.14: НЕ включаем админские поля — restrict_chat_member
+        # их не должен касаться. См. _mute_permissions().
+    )
+
+
+def _parse_alarm_duration(value: str | None, unit: str | None) -> timedelta | None:
+    """Парсит длительность для !alarm on N<unit>.
+
+    Поддерживаемые единицы:
+      • "ч" / "h" — часы
+      • "м" / "m" — минуты
+      • "д" / "d" — дни
+
+    Возвращает timedelta или None (если value/unit пустые).
+    Raises ValueError если value не число или <= 0.
+    """
+    if not value or not unit:
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Некорректное число длительности: {value!r}")
+    if n <= 0:
+        raise ValueError(f"Длительность должна быть > 0, получено {n}")
+    unit_lower = unit.lower()
+    if unit_lower in ("ч", "h"):
+        return timedelta(hours=n)
+    if unit_lower in ("м", "m"):
+        return timedelta(minutes=n)
+    if unit_lower in ("д", "d"):
+        return timedelta(days=n)
+    raise ValueError(f"Неизвестная единица длительности: {unit!r}")
+
+
+def _format_alarm_duration(td: timedelta) -> str:
+    """Человекочитаемое описание длительности для DM-уведомления."""
+    total_sec = int(td.total_seconds())
+    if total_sec >= 86400:
+        days, rem = divmod(total_sec, 86400)
+        if rem == 0:
+            return f"{days}д"
+        hours = rem // 3600
+        return f"{days}д {hours}ч"
+    if total_sec >= 3600:
+        hours, rem = divmod(total_sec, 3600)
+        if rem == 0:
+            return f"{hours}ч"
+        minutes = rem // 60
+        return f"{hours}ч {minutes}м"
+    minutes = total_sec // 60
+    return f"{minutes}м"
+
+
+async def _deactivate_alarm(
+    session,
+    cs: ChatSettings,
+    bot: types.Bot,
+    chat_id: int,
+    *,
+    reason: str = "manual",
+) -> bool:
+    """Снимает alarm и восстанавливает права чата.
+
+    Логика восстановления (приоритет):
+      1. cs.day_permissions (если задан пресет)
+      2. cs.alarm_saved_permissions (snapshot ДО alarm)
+      3. Системный пресет "Day default"
+      4. Hardcoded _DAY_DEFAULT (всё разрешено, без админских полей)
+
+    Slow mode восстанавливается из:
+      1. cs.day_slow_mode_delay (если > 0)
+      2. cs.alarm_saved_slow_mode_delay (snapshot)
+      3. 0 (выключить)
+
+    Возвращает True если успешно, False если что-то упало.
+    Логирует все шаги.
+    """
+    if not cs.alarm_currently_active:
+        logger.info("Alarm deactivate: chat %s not active (reason=%s)", chat_id, reason)
+        return False
+
+    # Шаг 1: определяем права для восстановления
+    perms_to_restore: types.ChatPermissions | None = None
+    perms_source = ""
+
+    if cs.day_permissions:
+        try:
+            perms_to_restore = _restore_permissions(cs.day_permissions)
+            perms_source = "day_permissions preset"
+        except (ValueError, TypeError) as e:
+            logger.warning("Alarm deactivate: bad day_permissions JSON for chat %s: %s", chat_id, e)
+
+    if perms_to_restore is None and cs.alarm_saved_permissions:
+        try:
+            perms_to_restore = _restore_permissions(cs.alarm_saved_permissions)
+            perms_source = "alarm_saved_permissions snapshot"
+        except (ValueError, TypeError) as e:
+            logger.warning("Alarm deactivate: bad alarm_saved_permissions JSON for chat %s: %s", chat_id, e)
+
+    if perms_to_restore is None:
+        # Fallback: всё разрешено (текст + медиа), без админских полей.
+        # Не используем _resolve_day_perms из bot.py (там зависимость от сессии)
+        # — здесь проще явно задать дефолт.
+        perms_to_restore = types.ChatPermissions(
+            can_send_messages=True,
+            can_send_audios=True,
+            can_send_documents=True,
+            can_send_photos=True,
+            can_send_videos=True,
+            can_send_video_notes=True,
+            can_send_voice_notes=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+        )
+        perms_source = "hardcoded default (all allowed)"
+
+    # Шаг 2: определяем slow_mode для восстановления
+    slow_to_restore: int = 0
+    slow_source = "default 0"
+    if cs.day_slow_mode_delay and cs.day_slow_mode_delay > 0:
+        slow_to_restore = cs.day_slow_mode_delay
+        slow_source = f"day_slow_mode_delay={slow_to_restore}"
+    elif cs.alarm_saved_slow_mode_delay is not None:
+        slow_to_restore = cs.alarm_saved_slow_mode_delay
+        slow_source = f"alarm_saved_slow_mode_delay={slow_to_restore}"
+
+    # Шаг 3: применяем права
+    try:
+        await bot.set_chat_permissions(chat_id=chat_id, permissions=perms_to_restore)
+        logger.info(
+            "Alarm deactivate: chat %s perms restored from %s",
+            chat_id, perms_source,
+        )
+    except TelegramAPIError as e:
+        logger.error(
+            "Alarm deactivate: set_chat_permissions failed for chat %s: %s",
+            chat_id, e,
+        )
+        return False
+
+    # Шаг 4: применяем slow_mode
+    try:
+        await bot.set_chat_slow_mode_delay(chat_id=chat_id, slow_mode_delay=slow_to_restore)
+        logger.info(
+            "Alarm deactivate: chat %s slow_mode restored to %s (from %s)",
+            chat_id, slow_to_restore, slow_source,
+        )
+    except TelegramAPIError as e:
+        logger.warning(
+            "Alarm deactivate: set_chat_slow_mode_delay failed for chat %s: %s "
+            "(continuing — alarm fields will still be cleared)",
+            chat_id, e,
+        )
+
+    # Шаг 5: очищаем поля alarm в БД
+    cs.alarm_currently_active = False
+    cs.alarm_saved_permissions = None
+    cs.alarm_saved_slow_mode_delay = None
+    cs.alarm_active_until = None
+    cs.alarm_started_by = None
+    await session.commit()
+
+    logger.info(
+        "Alarm deactivated: chat %s reason=%s started_by=%s",
+        chat_id, reason, cs.alarm_started_by,
+    )
+    return True
 
 
 def _user_mention_html(user: types.User) -> str:
@@ -1896,7 +2115,7 @@ async def _send_audit_to_report(
             text=text,
             parse_mode="HTML",
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         logger.info(
             "audit message to report chat %s failed: %s",
             chat_id, e,
@@ -2124,7 +2343,7 @@ async def _send_report(
 
     try:
         await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         logger.error("Failed to send rich report to chat %s: %s", report_dest, e)
         # ── Fallback: простой plain-text отчёт ──────────────
         try:
@@ -2142,7 +2361,7 @@ async def _send_report(
                 time_str=time_str,
                 hashtag=hashtag,
             )
-        except TelegramBadRequest as e2:
+        except TelegramAPIError as e2:
             logger.error("Plain-text fallback also failed: %s", e2)
 
     # ── Стикер: отправляем отдельным сообщением после rich-отчёта ──
@@ -2153,7 +2372,7 @@ async def _send_report(
     if sticker_file_id:
         try:
             await bot.send_sticker(chat_id=report_dest, sticker=sticker_file_id)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("Failed to attach sticker to report chat %s: %s",
                            report_dest, e)
 
@@ -2207,6 +2426,74 @@ async def _send_report_plain_fallback(
     await bot.send_message(chat_id=report_dest, text="\n".join(parts))
 
 
+async def _schedule_ephemeral_delete(
+    bot: types.Bot,
+    chat_id: int,
+    message_id: int,
+    delete_after: float,
+    *,
+    label: str = "ephemeral",
+) -> None:
+    """v4.7.20: общая функция для планировки авто-удаления ephemeral-сообщения.
+
+    Используется и в _send_ephemeral (модератору), и в _send_user_warn_notification
+    (нарушителю). Раньше логика дублировалась в двух местах — теперь в одном.
+
+    Логика:
+      • Если delete_after <= 0 или message_id falsy — ничего не делаем.
+      • Иначе: создаём fire-and-forget корутину которая ждёт delete_after сек
+        (через Semaphore(100) — ограничение на одновременные sleep'ы),
+        затем вызывает bot.delete_ephemeral_message (Bot API 10.2).
+      • На success: logger.info("{label} deleted: ...").
+      • На TelegramAPIError: logger.warning (message may already be gone).
+      • На CancelledError: logger.debug (shutdown) + re-raise.
+      • На прочее Exception: logger.warning.
+
+    Параметр label — для логов ("ephemeral" для модераторских подтверждений,
+    "Warn ephemeral" для уведомлений нарушителю). Без label логи будут менее
+    информативны при диагностике.
+    """
+    if not (delete_after and delete_after > 0 and message_id):
+        return
+
+    async def _del_ephemeral():
+        try:
+            async with _EPHEMERAL_DELETE_SEM:
+                await asyncio.sleep(delete_after)
+                await bot.delete_ephemeral_message(
+                    chat_id=chat_id, message_id=message_id,
+                )
+            logger.info(
+                "%s deleted: chat=%s msg=%s",
+                label.capitalize() if label else "Ephemeral",
+                chat_id, message_id,
+            )
+        except asyncio.CancelledError:
+            # Shutdown в процессе — сообщение останется (acceptable для
+            # ephemeral, оно видно только одному юзеру). Sem уже освобождён.
+            logger.debug(
+                "%s auto-delete cancelled (shutdown?) chat=%s msg=%s",
+                label.capitalize() if label else "Ephemeral",
+                chat_id, message_id,
+            )
+            raise  # propagate cancellation корректно
+        except TelegramAPIError as e:
+            logger.warning(
+                "%s auto-delete in chat %s msg %s failed: %s "
+                "(message may already be gone, or method unavailable)",
+                label.capitalize() if label else "Ephemeral",
+                chat_id, message_id, e,
+            )
+        except Exception as e:
+            logger.warning(
+                "%s auto-delete unexpected error: %s",
+                label.capitalize() if label else "Ephemeral",
+                e,
+            )
+
+    asyncio.create_task(_del_ephemeral())
+
+
 async def _send_ephemeral(
     *,
     bot: types.Bot,
@@ -2234,6 +2521,11 @@ async def _send_ephemeral(
     перезапуске клиента / скроллинге. Поэтому бот сам удаляет их через
     ``delete_after`` секунд фоновой таской. ``delete_after=0`` отключает
     авто-удаление (полезно для тестов).
+
+    v4.7.20: авто-удаление вынесено в общую функцию _schedule_ephemeral_delete
+    (используется также в _send_user_warn_notification). Используется
+    bot.delete_ephemeral_message (Bot API 10.2) — обычный delete_message
+    для ephemeral НЕ работает (см. BUG#2 в аудите v4.7.20).
     """
     try:
         sent = await bot.send_message(
@@ -2242,7 +2534,12 @@ async def _send_ephemeral(
             receiver_user_id=recipient.id,
             parse_mode="HTML",
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.20: TelegramAPIError (базовый класс) ловит все подклассы —
+        # TelegramBadRequest, TelegramNotFound, TelegramForbiddenError,
+        # TelegramConflictError. Раньше ловили только TelegramBadRequest —
+        # но Forbidden (юзер заблокировал бота) и NotFound пробивались выше
+        # и роняли весь handler. См. v4.7.19 фикс для night mode.
         logger.info(
             "Ephemeral message to moderator %s in chat %s failed: %s "
             "(this is normal if user restricted ephemeral messages)",
@@ -2253,34 +2550,21 @@ async def _send_ephemeral(
         logger.warning("Ephemeral message unexpected error: %s", e)
         return
 
-    # ── v4.5.6: планируем авто-удаление ──────────────────────────────
-    # v4.7.3: Semaphore(100) ограничивает кол-во ОДНОВРЕМЕННО ожидающих
-    # auto-delete-задач. acquire() берётся ДО sleep — пока задача ждёт слот,
-    # она не считается «спящей» (не потребляет память под sleep-timer).
-    # На shutdown sem корректно освобождается через async with __aexit__.
-    if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
-        async def _del_ephemeral():
-            try:
-                async with _EPHEMERAL_DELETE_SEM:
-                    await asyncio.sleep(delete_after)
-                    await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
-            except asyncio.CancelledError:
-                # Shutdown в процессе — сообщение останется (acceptable для
-                # ephemeral, оно видно только одному юзеру). Sem уже освобождён.
-                logger.debug(
-                    "Ephemeral auto-delete cancelled (shutdown?) chat=%s msg=%s",
-                    chat_id, sent.message_id,
-                )
-                raise  # propagate cancellation корректно
-            except TelegramBadRequest as e:
-                logger.info(
-                    "Ephemeral auto-delete in chat %s msg %s failed: %s "
-                    "(message may already be gone)",
-                    chat_id, sent.message_id, e,
-                )
-            except Exception as e:
-                logger.warning("Ephemeral auto-delete unexpected error: %s", e)
-        asyncio.create_task(_del_ephemeral())
+    # v4.7.20: логируем успех отправки — нужно для диагностики BUG#2
+    # (когда ephemeral отправляется, но не удаляется). Без этого лога
+    # было непонятно: отправка упала или авто-удаление не сработало.
+    logger.info(
+        "Ephemeral sent: chat=%s recipient=%s msg=%s (will delete in %ss)",
+        chat_id, recipient.id, getattr(sent, "message_id", None), delete_after,
+    )
+
+    # v4.7.20: планировка авто-удаления через общую функцию.
+    await _schedule_ephemeral_delete(
+        bot=bot, chat_id=chat_id,
+        message_id=getattr(sent, "message_id", None),
+        delete_after=delete_after,
+        label="ephemeral",
+    )
 
 
 # ── v4.4.9: уведомление НАРУШИТЕЛЮ при !warn (видно только ему) ──────────
@@ -2356,7 +2640,11 @@ async def _send_user_warn_notification(
             receiver_user_id=target.id,
             parse_mode="HTML",
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
+        # v4.7.20: TelegramAPIError ловит все подклассы (BadRequest,
+        # Forbidden, NotFound, Conflict). Раньше только TelegramBadRequest —
+        # но если юзер заблокировал бота (Forbidden), исключение пробивалось
+        # выше и ронило весь handler. См. _send_ephemeral для деталей.
         logger.info(
             "Warn notification to user %s in chat %s failed: %s "
             "(this is normal if user restricted ephemeral messages)",
@@ -2367,29 +2655,20 @@ async def _send_user_warn_notification(
         logger.warning("Warn notification to user unexpected error: %s", e)
         return
 
-    # ── v4.5.6: планируем авто-удаление ──────────────────────────────
-    # v4.7.3: Semaphore(100) — см. _send_ephemeral.
-    if delete_after and delete_after > 0 and getattr(sent, "message_id", None):
-        async def _del_warn_msg():
-            try:
-                async with _EPHEMERAL_DELETE_SEM:
-                    await asyncio.sleep(delete_after)
-                    await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
-            except asyncio.CancelledError:
-                logger.debug(
-                    "Warn notification auto-delete cancelled (shutdown?) chat=%s msg=%s",
-                    chat_id, sent.message_id,
-                )
-                raise
-            except TelegramBadRequest as e:
-                logger.info(
-                    "Warn notification auto-delete in chat %s msg %s failed: %s "
-                    "(message may already be gone)",
-                    chat_id, sent.message_id, e,
-                )
-            except Exception as e:
-                logger.warning("Warn notification auto-delete unexpected error: %s", e)
-        asyncio.create_task(_del_warn_msg())
+    # v4.7.20: логируем успех отправки — для диагностики BUG#2
+    logger.info(
+        "Warn ephemeral sent: chat=%s target=%s msg=%s (will delete in %ss)",
+        chat_id, target.id, getattr(sent, "message_id", None), delete_after,
+    )
+
+    # v4.7.20: планировка авто-удаления через общую функцию _schedule_ephemeral_delete
+    # (shared с _send_ephemeral). Раньше логика дублировалась.
+    await _schedule_ephemeral_delete(
+        bot=bot, chat_id=chat_id,
+        message_id=getattr(sent, "message_id", None),
+        delete_after=delete_after,
+        label="Warn ephemeral",
+    )
 
 
 # ── Авто-санкция при превышении порога варнов ──────────────────────────────
@@ -2411,7 +2690,7 @@ async def _check_warn_threshold(
             try:
                 member = await bot.get_chat_member(chat_id=chat_id, user_id=target.id)
                 perm_snapshot = _snapshot_permissions(member)
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
 
             try:
@@ -2449,7 +2728,7 @@ async def _check_warn_threshold(
                         f"({total_warns} варнов)."
                     ),
                 )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
                 logger.error("Auto-ban failed: %s", e)
             return
 
@@ -2460,7 +2739,7 @@ async def _check_warn_threshold(
             try:
                 member = await bot.get_chat_member(chat_id=chat_id, user_id=target.id)
                 perm_snapshot = _snapshot_permissions(member)
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
 
             mute_dur = settings.mute_duration_seconds or 3600
@@ -2507,7 +2786,7 @@ async def _check_warn_threshold(
                         f"({total_warns} варнов, {_format_duration(mute_dur)})."
                     ),
                 )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
                 logger.error("Auto-mute failed: %s", e)
 
 
@@ -2599,7 +2878,7 @@ async def handle_group_command(message: types.Message) -> None:
             # Удаляем сообщение модератора с командой (всё равно)
             try:
                 await message.delete()
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
         # friendly-fire: target тоже админ в этом чате?
@@ -2618,7 +2897,7 @@ async def handle_group_command(message: types.Message) -> None:
                 pass
             try:
                 await message.delete()
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2632,7 +2911,7 @@ async def handle_group_command(message: types.Message) -> None:
     if auto_del:
         try:
             await message.delete()
-        except TelegramBadRequest:
+        except TelegramAPIError:
             logger.warning("Не удалось удалить сообщение модератора %s в чате %s",
                            mod.id, chat_id)
 
@@ -2649,7 +2928,7 @@ async def handle_group_command(message: types.Message) -> None:
                     text=f"❌ Не удалось распознать длительность: {dur_str}\n"
                          f"💡 Формат: 1m, 30м, 1d, 2ч, 1d12h30m (рус/англ)",
                 )
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2657,7 +2936,7 @@ async def handle_group_command(message: types.Message) -> None:
         try:
             member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
             perm_snapshot = _snapshot_permissions(member)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("get_chat_member before mute failed: %s", e)
 
         until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
@@ -2667,14 +2946,14 @@ async def handle_group_command(message: types.Message) -> None:
                 permissions=_mute_permissions(),
                 until_date=until_date,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("restrict_chat_member failed: %s", e)
             try:
                 await message.bot.send_message(
                     chat_id=mod.id,
                     text=f"❌ Мут не удался: {e}",
                 )
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2715,7 +2994,7 @@ async def handle_group_command(message: types.Message) -> None:
         # и медиа), и только потом оригинал удаляется из модерируемого чата.
         try:
             await message.reply_to_message.delete()
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
                            target.id, chat_id, e)
 
@@ -2782,7 +3061,7 @@ async def handle_group_command(message: types.Message) -> None:
         # операция, после того как отчёт ушел и пороги проверены.
         try:
             await message.reply_to_message.delete()
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
                            target.id, chat_id, e)
 
@@ -2797,19 +3076,19 @@ async def handle_group_command(message: types.Message) -> None:
         try:
             member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
             perm_snapshot = _snapshot_permissions(member)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("get_chat_member before ban failed: %s", e)
 
         try:
             await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("ban_chat_member failed: %s", e)
             try:
                 await message.bot.send_message(
                     chat_id=mod.id,
                     text=f"❌ Бан не удался: {e}",
                 )
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2885,7 +3164,7 @@ async def handle_group_command(message: types.Message) -> None:
         # модератору, и только в самом конце — удаление оригинала.
         try:
             await message.reply_to_message.delete()
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
                            target.id, chat_id, e)
 
@@ -2922,11 +3201,11 @@ async def handle_group_command(message: types.Message) -> None:
                 # Админские права — НЕ передаются (Telegram проигнорирует,
                 # но мы явно не ставим их в True).
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("get_chat for unmute failed: %s", e)
             try:
                 await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался (get_chat): {e}")
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2935,11 +3214,11 @@ async def handle_group_command(message: types.Message) -> None:
                 chat_id=chat_id, user_id=target.id,
                 permissions=chat_perms,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("unmute restrict failed: %s", e)
             try:
                 await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался: {e}")
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -2988,14 +3267,14 @@ async def handle_group_command(message: types.Message) -> None:
             await message.bot.unban_chat_member(
                 chat_id=chat_id, user_id=target.id, only_if_banned=True,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("unban_chat_member failed: %s", e)
             try:
                 await message.bot.send_message(
                     chat_id=mod.id,
                     text=f"❌ Разбан не удался: {e}",
                 )
-            except TelegramBadRequest:
+            except TelegramAPIError:
                 pass
             return
 
@@ -3109,7 +3388,7 @@ async def handle_group_command(message: types.Message) -> None:
                      f"{' @' + target.username if target.username else ''}\n"
                      + "\n".join(info_parts),
             )
-        except TelegramBadRequest:
+        except TelegramAPIError:
             # Если бот не может написать в личку — ответ в чат (будет удалён)
             sent = await message.bot.send_message(
                 chat_id=chat_id,
@@ -3126,14 +3405,14 @@ async def handle_group_command(message: types.Message) -> None:
                             await message.bot.delete_message(
                                 chat_id=chat_id, message_id=sent.message_id,
                             )
-                        except TelegramBadRequest:
+                        except TelegramAPIError:
                             pass
                 except asyncio.CancelledError:
                     raise
             asyncio.create_task(_del_msg())
         try:
             await message.delete()
-        except TelegramBadRequest:
+        except TelegramAPIError:
             pass
         return
 
@@ -3205,7 +3484,7 @@ async def handle_group_command(message: types.Message) -> None:
                      f"{' @' + target.username if target.username else ''}"
                      f" (сброшено {total_reset} записей)",
             )
-        except TelegramBadRequest:
+        except TelegramAPIError:
             pass
 
         # v4.5.1: audit в репорт-чат
@@ -3219,9 +3498,306 @@ async def handle_group_command(message: types.Message) -> None:
 
         try:
             await message.delete()
-        except TelegramBadRequest:
+        except TelegramAPIError:
             pass
         return
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v4.7.20: !alarm on/off — отдельный handler (не требует reply)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.message(F.chat.type.in_(["group", "supergroup"]))
+async def handle_alarm_command(message: types.Message) -> None:
+    """!alarm on [duration] / !alarm off — экстренная блокировка медиа в чате.
+
+    Доступ: любой модератор (ChatAdmin или ADMIN_IDS). Не требует reply
+    на сообщение нарушителя — это "режимная" команда, применяется ко всему чату.
+
+    Поведение !alarm on:
+      • Если чат в night mode → отказ (DM модератору: "сейчас ночной режим,
+        alarm избыточен"). Ночной режим сам по себе ограничивает права.
+      • Если alarm уже активен → обновляем alarm_active_until (продлеваем
+        или сокращаем — в зависимости от новой duration).
+      • Иначе: snapshot текущих прав → применяем alarm_permissions + slow_mode 30s
+      • Логируем, отправляем подтверждение в DM модератору
+
+    Поведение !alarm off:
+      • Если alarm не активен → DM: "Alarm не активен"
+      • Иначе: восстанавливаем права (через _deactivate_alarm) → DM: "Alarm снят"
+
+    Стелс: обычные юзеры (не модераторы) полностью игнорируются — бот
+    не отвечает им в чате, не шлёт DM, не удаляет их сообщение. Только
+    модераторы получают DM-подтверждение.
+    """
+    text = message.text
+    if not text:
+        return
+
+    m = _CMD_ALARM.match(text)
+    if not m:
+        return  # Не команда !alarm — пусть другие handler'ы разбираются
+
+    # Парсим аргументы
+    action_raw = m.group(1).lower()
+    duration_value = m.group(2)
+    duration_unit = m.group(3)
+
+    is_on = action_raw in ("on", "вкл")
+    is_off = action_raw in ("off", "выкл")
+    if not (is_on or is_off):
+        return  # На всякий случай — regex должен гарантировать
+
+    chat_id = message.chat.id
+    mod = message.from_user
+
+    # ── Проверка прав: только модераторы (ChatAdmin в БД или ADMIN_IDS env) ──
+    # Стелс: если пишет не модератор — полностью игнорируем (return).
+    async with async_session() as session:
+        is_adm = await _is_admin(session, chat_id, mod.id)
+    if not is_adm:
+        return  # Молча игнорируем — стелс
+
+    # ── Удаляем сообщение модератора с командой (если auto_delete_commands) ──
+    async with async_session() as session:
+        cs = await _get_chat_settings(session, chat_id)
+        auto_del = cs.auto_delete_commands if cs else True
+    if auto_del:
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            logger.warning("Alarm: cannot delete command message in chat %s", chat_id)
+
+    # ── !alarm off ─────────────────────────────────────────────────────────
+    if is_off:
+        async with async_session() as session:
+            cs = await _get_chat_settings(session, chat_id)
+            if not cs.alarm_currently_active:
+                # Alarm не активен — уведомляем модератора в DM
+                await _send_alarm_dm(
+                    bot=message.bot, user_id=mod.id,
+                    text="ℹ️ Alarm не активен в чате — снимать нечего.",
+                )
+                return
+            ok = await _deactivate_alarm(session, cs, message.bot, chat_id, reason="manual")
+        if ok:
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=(
+                    f"✅ Alarm снят в чате.\n"
+                    f"Права и slow_mode восстановлены из сохранённого snapshot."
+                ),
+            )
+        else:
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=(
+                    f"⚠️ Alarm не удалось снять — ошибка при восстановлении прав. "
+                    f"Проверьте логи и при необходимости восстановите права вручную."
+                ),
+            )
+        return
+
+    # ── !alarm on ──────────────────────────────────────────────────────────
+    # Парсим длительность (опциональная)
+    duration_td: timedelta | None = None
+    if duration_value and duration_unit:
+        try:
+            duration_td = _parse_alarm_duration(duration_value, duration_unit)
+        except ValueError as e:
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=f"❌ Некорректная длительность: {e}\n"
+                     f"Поддерживаемые форматы: 1ч, 1h, 30м, 30m, 2д, 2d.",
+            )
+            return
+
+    async with async_session() as session:
+        cs = await _get_chat_settings(session, chat_id)
+
+        # ── Проверка: нельзя включить alarm в night mode ──────────────────
+        if cs.night_mode_currently_active:
+            logger.info(
+                "Alarm on rejected: chat %s is in night mode (mod=%s)",
+                chat_id, mod.id,
+            )
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=(
+                    f"🌙 Сейчас активен ночной режим — !alarm включить нельзя.\n"
+                    f"Ночной режим уже ограничивает права чата (медиа отключены, "
+                    f"slow_mode активен). Alarm будет избыточен.\n"
+                    f"Дождитесь окончания ночного режима или отключите его."
+                ),
+            )
+            return
+
+        # ── Проверка: нельзя включить alarm в sanitary day ────────────────
+        if cs.sanitary_days_currently_active:
+            logger.info(
+                "Alarm on rejected: chat %s is in sanitary day (mod=%s)",
+                chat_id, mod.id,
+            )
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=(
+                    f"🚫 Сейчас активен санитарный день — !alarm включить нельзя.\n"
+                    f"Санитарный день уже ограничивает права чата (полный локдаун). "
+                    f"Alarm будет избыточен."
+                ),
+            )
+            return
+
+        # ── Если alarm уже активен — продлеваем/обновляем duration ────────
+        if cs.alarm_currently_active:
+            old_started_by = cs.alarm_started_by
+            if duration_td:
+                new_until = datetime.now(timezone.utc) + duration_td
+                cs.alarm_active_until = new_until
+                await session.commit()
+                logger.info(
+                    "Alarm extended: chat %s new_until=%s (mod=%s, prev_started_by=%s)",
+                    chat_id, new_until.isoformat(), mod.id, old_started_by,
+                )
+                await _send_alarm_dm(
+                    bot=message.bot, user_id=mod.id,
+                    text=(
+                        f"⏱ Alarm уже был активен — продлён до {_format_alarm_duration(duration_td)}.\n"
+                        f"Alarm active until: {new_until.isoformat()}."
+                    ),
+                )
+            else:
+                # Снимаем auto-off, alarm будет до ручного отключения
+                cs.alarm_active_until = None
+                await session.commit()
+                logger.info(
+                    "Alarm set to manual off: chat %s (was timed, mod=%s)",
+                    chat_id, mod.id,
+                )
+                await _send_alarm_dm(
+                    bot=message.bot, user_id=mod.id,
+                    text=(
+                        f"⏱ Alarm уже был активен — auto-off отключён.\n"
+                        f"Теперь alarm будет активен до ручного !alarm off."
+                    ),
+                )
+            return
+
+        # ── Включаем alarm с нуля: snapshot → apply ───────────────────────
+        # Шаг 1: snapshot текущих прав чата
+        snapshot_perms: str | None = None
+        snapshot_slow: int = 0
+        try:
+            chat_info = await message.bot.get_chat(chat_id)
+            # chat_info.permissions — это ChatPermissions объекта чата.
+            # Для групп это "default permissions" — то что нам нужно.
+            if chat_info.permissions:
+                perms = chat_info.permissions
+                data = {field: bool(getattr(perms, field, False)) for field in _PERM_FIELDS}
+                snapshot_perms = json.dumps(data, ensure_ascii=False)
+            snapshot_slow = getattr(chat_info, "slow_mode_delay", 0) or 0
+            # v4.7.20: валидация типа (см. BUG#5 — MagicMock в тестах / None в реальности)
+            if not isinstance(snapshot_slow, int):
+                snapshot_slow = 0
+        except TelegramAPIError as e:
+            logger.error(
+                "Alarm on: get_chat failed for chat %s: %s — cannot snapshot, aborting",
+                chat_id, e,
+            )
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=f"❌ Не удалось получить текущие права чата: {e}",
+            )
+            return
+
+        # Шаг 2: применяем alarm_permissions
+        try:
+            await message.bot.set_chat_permissions(
+                chat_id=chat_id, permissions=_alarm_permissions(),
+            )
+        except TelegramAPIError as e:
+            logger.error(
+                "Alarm on: set_chat_permissions failed for chat %s: %s",
+                chat_id, e,
+            )
+            await _send_alarm_dm(
+                bot=message.bot, user_id=mod.id,
+                text=(
+                    f"❌ Не удалось применить ограничения alarm: {e}\n"
+                    f"У бота нет прав администратора в чате?"
+                ),
+            )
+            return
+
+        # Шаг 3: применяем slow_mode 30s
+        try:
+            await message.bot.set_chat_slow_mode_delay(
+                chat_id=chat_id, slow_mode_delay=_ALARM_SLOW_MODE_DELAY,
+            )
+        except TelegramAPIError as e:
+            logger.warning(
+                "Alarm on: set_chat_slow_mode_delay failed for chat %s: %s "
+                "(continuing — perms already applied)",
+                chat_id, e,
+            )
+
+        # Шаг 4: сохраняем состояние в БД
+        cs.alarm_currently_active = True
+        cs.alarm_saved_permissions = snapshot_perms
+        cs.alarm_saved_slow_mode_delay = snapshot_slow
+        cs.alarm_started_by = mod.id
+        if duration_td:
+            cs.alarm_active_until = datetime.now(timezone.utc) + duration_td
+        else:
+            cs.alarm_active_until = None
+        await session.commit()
+
+        logger.info(
+            "Alarm activated: chat %s mod=%s duration=%s snapshot_slow=%s",
+            chat_id, mod.id,
+            _format_alarm_duration(duration_td) if duration_td else "manual",
+            snapshot_slow,
+        )
+
+    # Шаг 5: DM модератору
+    if duration_td:
+        await _send_alarm_dm(
+            bot=message.bot, user_id=mod.id,
+            text=(
+                f"🚨 Alarm включён в чате на {_format_alarm_duration(duration_td)}.\n"
+                f"• Медиа отключены (только текст)\n"
+                f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n"
+                f"• Auto-off: {cs.alarm_active_until.isoformat() if cs.alarm_active_until else 'N/A'}\n\n"
+                f"Снять раньше: !alarm off"
+            ),
+        )
+    else:
+        await _send_alarm_dm(
+            bot=message.bot, user_id=mod.id,
+            text=(
+                f"🚨 Alarm включён в чате (без авто-отключения).\n"
+                f"• Медиа отключены (только текст)\n"
+                f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n\n"
+                f"Снять: !alarm off"
+            ),
+        )
+
+
+async def _send_alarm_dm(bot: types.Bot, user_id: int, text: str) -> None:
+    """Отправляет DM модератору с уведомлением об alarm.
+
+    Если юзер не запускал бота в DM (Forbidden) — логируем warning.
+    Не падаем, не пробрасываем исключение выше.
+    """
+    try:
+        await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    except TelegramAPIError as e:
+        logger.warning(
+            "Alarm DM to user %s failed: %s (user may not have started bot in DM)",
+            user_id, e,
+        )
+    except Exception as e:
+        logger.warning("Alarm DM to user %s unexpected error: %s", user_id, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3473,7 +4049,7 @@ async def cmd_setreport(message: types.Message) -> None:
             # Проверяем, что бот может достучаться до указанного чата
             try:
                 await message.bot.get_chat(report_chat_id)
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
                 await message.reply(
                     f"❌ Бот не может найти чат {report_chat_id}.\n"
                     f"Убедитесь, что бот добавлен в этот чат и имеет права отправки.\n"
@@ -5074,7 +5650,7 @@ async def private_start_handler(message: types.Message) -> None:
                         ),
                     ]),
                 )
-            except TelegramBadRequest as e:
+            except TelegramAPIError as e:
                 logger.warning(
                     "private_start: send already-active DM failed for tg_uid=%s: %s",
                     tg_uid, e,
@@ -5157,7 +5733,7 @@ async def private_start_handler(message: types.Message) -> None:
                 ),
             ]),
         )
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         logger.warning(
             "private_start: send credentials DM failed for tg_uid=%s: %s",
             tg_uid, e,
@@ -5242,12 +5818,12 @@ async def handle_new_members(message: types.Message) -> None:
                 action_type="ban", reason=f"CAS auto-ban: {reason}",
                 mod=None,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("CAS ban failed for user %s: %s", member.id, e)
     # Удаляем join-сообщение в любом случае (если CAS включён — чище чат)
     try:
         await message.delete()
-    except TelegramBadRequest:
+    except TelegramAPIError:
         pass
 
 
@@ -5281,7 +5857,7 @@ async def handle_sticker_message(message: types.Message) -> None:
     # Удаляем сообщение со стикером
     try:
         await message.delete()
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         logger.warning("Cannot delete sticker message: %s", e)
 
     # Применяем наказание
@@ -5334,7 +5910,7 @@ async def handle_sticker_message(message: types.Message) -> None:
                 "Sticker pack '%s' mute issued in chat %s (user %s, %s)",
                 sticker.set_name, chat_id, target.id, _format_duration(mute_dur),
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("Sticker mute failed: %s", e)
         return
 
@@ -5352,7 +5928,7 @@ async def handle_sticker_message(message: types.Message) -> None:
                 "Sticker pack '%s' ban issued in chat %s (user %s)",
                 sticker.set_name, chat_id, target.id,
             )
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("Sticker ban failed: %s", e)
         return
 
@@ -5412,7 +5988,7 @@ async def handle_content_filters(message: types.Message) -> None:
     # Удаляем сообщение (для всех действий кроме бан — бан и так кикает)
     try:
         await message.delete()
-    except TelegramBadRequest as e:
+    except TelegramAPIError as e:
         logger.warning("Cannot delete filtered message: %s", e)
 
     target_content = text[:500] if text else None
@@ -5454,7 +6030,7 @@ async def handle_content_filters(message: types.Message) -> None:
                 )
             logger.info("Content filter (mute %s) in chat %s (user %s): %s",
                         _format_duration(dur), chat_id, target.id, reason)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("Content filter mute failed: %s", e)
         return
 
@@ -5468,7 +6044,7 @@ async def handle_content_filters(message: types.Message) -> None:
                 )
             logger.info("Content filter (ban) in chat %s (user %s): %s",
                         chat_id, target.id, reason)
-        except TelegramBadRequest as e:
+        except TelegramAPIError as e:
             logger.error("Content filter ban failed: %s", e)
         return
 

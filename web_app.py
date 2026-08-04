@@ -97,8 +97,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.18"
-APP_RELEASE_DATE = "2026-08-04"
+APP_VERSION = "v4.7.20"
+APP_RELEASE_DATE = "2026-08-05"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -3306,6 +3306,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 name, scope, slow_mode_value, _auth.username,
             )
 
+        # v4.7.20: если создали пресет с name="Day default" (маловероятно т.к.
+        # системный уже существует, но на всякий случай) — инвалидируем кеш.
+        # Lazy import чтобы избежать circular import (bot.py импортирует web_app).
+        if name == "Day default" and scope == "day":
+            try:
+                import bot as _bot_module
+                _bot_module._invalidate_day_default_cache()
+            except Exception:
+                pass  # бот может быть не загружен в тестовом окружении
+
         return RedirectResponse(
             url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+created",
             status_code=303,
@@ -3439,6 +3449,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 slow_mode_value, _auth.username,
             )
 
+        # v4.7.20: если изменился name/scope/permissions пресета с name="Day default"
+        # (или newName="Day default") — инвалидируем кеш _DAY_DEFAULT_CACHE.
+        # Системные пресеты редактировать нельзя, но на всякий случай.
+        if (old_name == "Day default" or name == "Day default") and (old_scope == "day" or scope == "day"):
+            try:
+                import bot as _bot_module
+                _bot_module._invalidate_day_default_cache()
+            except Exception:
+                pass
+
         return RedirectResponse(
             url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+updated",
             status_code=303,
@@ -3465,12 +3485,22 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     status_code=303,
                 )
             name = preset.name
+            scope = preset.scope
             await session.delete(preset)
             await session.commit()
             _req_logger.info(
                 "presets_delete: id=%d name=%r by=%s",
                 preset_id, name, _auth.username,
             )
+
+        # v4.7.20: если удалили пресет с name="Day default" (пользовательский,
+        # не системный) — инвалидируем кеш _DAY_DEFAULT_CACHE.
+        if name == "Day default" and scope == "day":
+            try:
+                import bot as _bot_module
+                _bot_module._invalidate_day_default_cache()
+            except Exception:
+                pass
 
         return RedirectResponse(
             url=f"/admin/presets?flash=Preset+{name.replace(' ', '+')}+deleted",

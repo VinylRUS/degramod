@@ -262,6 +262,27 @@ class ChatSettings(Base):
     # если санитарный день уже прошёл в текущем месяце. NULL = никогда.
     last_sanitary_month = Column(String(7), nullable=True)
 
+    # ── v4.7.20: !alarm команда ──────────────────────────────────────────
+    # Модераторская команда !alarm on/off — экстренное ограничение чата:
+    # отключение медиа + slow_mode 30 сек. Аналог "панической кнопки" когда
+    # в чате начинается флуд стикерами/гифками/медиа и нужно быстро всё
+    # заглушить не прибегая к санитарному дню или ночному режиму.
+    #
+    # alarm_currently_active — True если !alarm сейчас активен. Используется
+    #   _night_mode_tick для решения: снимать alarm перед входом в night.
+    # alarm_saved_permissions — JSON-снапшот ChatPermissions чата ДО alarm.
+    #   Восстанавливается при !alarm off. NULL если alarm не активен.
+    # alarm_saved_slow_mode_delay — snapshot chat.slow_mode_delay ДО alarm.
+    #   Восстанавливается при !alarm off (если day_slow_mode_delay=0).
+    # alarm_active_until — datetime когда alarm должен автоматически сняться.
+    #   NULL = до ручного !alarm off. _night_mode_tick проверяет каждую минуту.
+    # alarm_started_by — user_id модератора, который включил alarm (для логов).
+    alarm_currently_active = Column(Boolean, default=False, nullable=False)
+    alarm_saved_permissions = Column(Text, nullable=True)
+    alarm_saved_slow_mode_delay = Column(Integer, nullable=True)
+    alarm_active_until = Column(DateTime, nullable=True)
+    alarm_started_by = Column(BigInteger, nullable=True)
+
 
 class PermissionPreset(Base):
     """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
@@ -728,6 +749,25 @@ async def init_db() -> None:
             await conn.execute(text(
                 "ALTER TABLE permission_presets ADD COLUMN slow_mode_delay INTEGER NULL"
             ))
+
+    # ── Миграция: v4.7.20 !alarm columns ──────────────────────────────
+    # Идемпотентно (PRAGMA check + ALTER TABLE). alarm_currently_active
+    # по умолчанию 0 (False) — alarm выключен. Остальные колонки nullable.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        v4720_alarm_cols = [
+            ("alarm_currently_active",      "BOOLEAN NOT NULL DEFAULT 0"),
+            ("alarm_saved_permissions",     "TEXT NULL"),
+            ("alarm_saved_slow_mode_delay", "INTEGER NULL"),
+            ("alarm_active_until",          "DATETIME NULL"),
+            ("alarm_started_by",            "BIGINT NULL"),
+        ]
+        for col_name, col_type in v4720_alarm_cols:
+            if col_name not in columns:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
 
     # ── v4.5.2: новые таблицы (word_filters, link_allowlist, banned_sticker_packs)
     # create_all() выше уже создаст их для новой БД; для существующей БД
