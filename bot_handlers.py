@@ -538,8 +538,14 @@ async def _deactivate_alarm(
         return False
 
     # Шаг 4: применяем slow_mode
+    # v4.7.21 hotfix: aiogram 3.30 не имеет bot.set_chat_slow_mode_delay() —
+    # используем обёртку SetChatSlowModeDelay из bot.py (TelegramMethod[bool]).
+    # Late import чтобы избежать circular import (bot.py импортирует router из bot_handlers).
     try:
-        await bot.set_chat_slow_mode_delay(chat_id=chat_id, slow_mode_delay=slow_to_restore)
+        from bot import SetChatSlowModeDelay
+        await bot(SetChatSlowModeDelay(
+            chat_id=chat_id, slow_mode_delay=slow_to_restore,
+        ))
         logger.info(
             "Alarm deactivate: chat %s slow_mode restored to %s (from %s)",
             chat_id, slow_to_restore, slow_source,
@@ -3730,10 +3736,14 @@ async def handle_alarm_command(message: types.Message) -> None:
             return
 
         # Шаг 3: применяем slow_mode 30s
+        # v4.7.21 hotfix: aiogram 3.30 не имеет bot.set_chat_slow_mode_delay() —
+        # используем обёртку SetChatSlowModeDelay из bot.py (TelegramMethod[bool]).
+        # Late import чтобы избежать circular import (bot.py импортирует router из bot_handlers).
         try:
-            await message.bot.set_chat_slow_mode_delay(
+            from bot import SetChatSlowModeDelay
+            await message.bot(SetChatSlowModeDelay(
                 chat_id=chat_id, slow_mode_delay=_ALARM_SLOW_MODE_DELAY,
-            )
+            ))
         except TelegramAPIError as e:
             logger.warning(
                 "Alarm on: set_chat_slow_mode_delay failed for chat %s: %s "
