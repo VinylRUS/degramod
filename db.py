@@ -667,38 +667,56 @@ async def init_db() -> None:
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
 
-    # ── Миграция: sanitary_days_enabled + сброс night_mode_enabled (v4.7.2)
+    # ── Миграция: sanitary_days_enabled + one-time сброс toggles (v4.7.2 / v4.7.23)
     # v4.7.2: явные toggle для night mode и sanitary days.
     #   - Добавляем колонку sanitary_days_enabled (Boolean, default 0).
-    #   - Сбрасываем night_mode_enabled=0 для всех чатов (пользователь решил
+    #   - ONE-TIME сброс night_mode_enabled=0 для всех чатов (пользователь решил
     #     что при обновлении все функции должны быть выключены — нужно явно
     #     включать через /admin/chats после обновления).
-    #   - Сбрасываем night_mode_currently_active=0 (на случай если чат был
-    #     в ночном режиме во время обновления — иначе при выключенном
-    #     night_mode_enabledtick не снимет активное состояние).
-    #   - Сбрасываем sanitary_days_currently_active=0 по той же причине.
-    # Идемпотентно: если колонка уже есть — пропускаем ALTER.
+    #
+    # v4.7.23 HOTFIX: предыдущая реализация (v4.7.2) использовала
+    # "SELECT COUNT(*) WHERE night_mode_enabled=1 OR sanitary_days_currently_active=1"
+    # как маркер "первого запуска после апгрейда до v4.7.2". Но этот маркер
+    # некорректен: как только любой чат получает night_mode_enabled=1 (пользователь
+    # нормально включил режим через web-панель или !nightmode on), КАЖДЫЙ рестарт
+    # триггерил UPDATE ... SET night_mode_enabled=0 → toggle пользователя сбрасывался.
+    # Пользователь сообщил: "при каждой перезагрузке скидывается переключатель
+    # автопереключения ночного/дневного режима". Фикс: reset перемещён внутрь
+    # блока `if "sanitary_days_enabled" not in columns:` — настоящий маркер
+    # "первой миграции" это "колонка ещё не добавлена", а не "есть чат с
+    # включённым night_mode".
+    #
+    # night_mode_currently_active / sanitary_days_currently_active — это
+    # RUNTIME state, не user toggle. Если бот был оффлайн во время
+    # scheduled exit window, эти флаги могут остаться stale=1. Сбрасываем
+    # их при каждом запуске — _night_mode_tick / _sanitary_days_tick
+    # переопределят их в течение 60 сек согласно расписанию.
     async with engine.begin() as conn:
         result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
         columns = [row[1] for row in result.fetchall()]
         if "sanitary_days_enabled" not in columns:
+            # ── Первый запуск после апгрейда до v4.7.2 ──
+            # Добавляем колонку И делаем one-time reset всех toggle/state.
             await conn.execute(text(
                 "ALTER TABLE chat_settings ADD COLUMN sanitary_days_enabled "
                 "BOOLEAN NOT NULL DEFAULT 0"
             ))
-        # Сброс toggles для всех существующих чатов (кроме default chat_id=0).
-        # Делаем это всегда при запуске — но update атомарный, не вредит.
-        # ВНИМАНИЕ: только в первый апгрейд до v4.7.2. Если уже сброшено —
-        # UPDATE просто перепишет 0 на 0 (no-op).
-        # Используем маркер: проверяем есть ли в БД хоть одна запись с
-        # night_mode_enabled=1 — если да, это первый запуск после апгрейда.
-        rows = (await conn.execute(text(
-            "SELECT COUNT(*) FROM chat_settings WHERE night_mode_enabled=1 "
-            "OR sanitary_days_currently_active=1"
-        ))).scalar()
-        if rows and rows > 0:
+            # v4.7.2 one-time reset: пользователь явно запросил, чтобы при
+            # обновлении все функции были выключены — нужно явно включать
+            # через /admin/chats после обновления.
             await conn.execute(text(
                 "UPDATE chat_settings SET night_mode_enabled=0, "
+                "night_mode_currently_active=0, sanitary_days_currently_active=0 "
+                "WHERE chat_id != 0"
+            ))
+        else:
+            # ── Обычный рестарт (миграция v4.7.2 уже применена ранее) ──
+            # НЕ трогаем night_mode_enabled / sanitary_days_enabled — это
+            # user toggles, они должны сохраняться между рестартами.
+            # Только сбрасываем runtime state (currently_active) на случай
+            # stale-флага после краша во время активного режима.
+            await conn.execute(text(
+                "UPDATE chat_settings SET "
                 "night_mode_currently_active=0, sanitary_days_currently_active=0 "
                 "WHERE chat_id != 0"
             ))
