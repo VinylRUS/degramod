@@ -12,6 +12,7 @@ import logging
 import os
 import secrets
 import socket
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -21,6 +22,35 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from sqlalchemy import select
 import fastapi
+
+# v4.7.22: SAFETY NET — регистрируем текущий модуль в sys.modules под именем
+# "bot", чтобы late import `from bot import X` из bot_handlers.py (или любого
+# другого модуля) находил уже загруженный модуль и НЕ вызывал повторный import
+# bot.py со side-effectами (dp.include_router, startup tasks, etc.).
+#
+# Контекст: Docker CMD = `python bot.py`, поэтому Python загружает bot.py как
+# __main__, а sys.modules['bot'] остаётся пустым. Любой late import
+# `from bot import X` (внутри функций) приводил к повторному import bot.py как
+# отдельного модуля "bot" → dp = Dispatcher() создавал НОВЫЙ Dispatcher →
+# dp.include_router(mod_router) пытался прицепить тот же mod_router к новому
+# Dispatcher → RuntimeError: Router is already attached.
+#
+# Эта строка решает проблему для ВСЕХ существующих и будущих late imports:
+# `_exit_night_mode`, `_exit_sanitary_day`, `_enter_sanitary_day` (L4730, L5313,
+# L5351, L5359 в bot_handlers.py) и любых других. После неё late import
+# `from bot import X` просто находит X в уже загруженном __main__ модуле.
+#
+# В test-окружении (importlib.util.spec_from_file_location) __name__ может
+# быть 'bot_module' и модуля ещё нет в sys.modules — в этом случае safety net
+# пропускается (тесты не вызывают функции с late imports, только AST-анализ).
+#
+# Альтернатива (более чистая архитектурно) — перенести ВСЕ общие символы в
+# bot_handlers.py (как сделано для SetChatSlowModeDelay в v4.7.22). Но это
+# требует большого рефакторинга (_exit_night_mode и др. — крупные функции,
+# использующие bot.py-специфичные объекты). Safety net — минимальный фикс.
+_self_module = sys.modules.get(__name__)
+if _self_module is not None:
+    sys.modules.setdefault("bot", _self_module)
 
 from bot_handlers import router as mod_router
 from db import init_db, async_session, ChatSettings
@@ -49,6 +79,15 @@ from bot_handlers import (
     # чатов из env (CHAT_HASHTAGS=-1003972381175:Test), и SU не мог их
     # удалить из веб-панели — они "воскресали" при следующем сообщении.
     _CHAT_HASHTAGS,
+    # v4.7.22: SetChatSlowModeDelay — обёртка над setChatSlowModeDelay Telegram
+    # Bot API method (aiogram 3.30 не имеет её). Раньше класс был определён в
+    # bot.py, но late import `from bot import SetChatSlowModeDelay` из
+    # bot_handlers.py вызывал повторный import bot.py как отдельный модуль
+    # (т.к. bot.py запускается как __main__, не как bot) → side-effectы
+    # (dp.include_router) выполнялись повторно → RuntimeError: Router is
+    # already attached. Теперь класс живёт в bot_handlers.py — bot.py
+    # импортирует его как обычный symbol.
+    SetChatSlowModeDelay,
 )
 from datetime import datetime, timezone, timedelta, date
 import json
@@ -61,28 +100,6 @@ from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 # TelegramBadRequest. Из-за этого исключение пробивалось наверх в
 # _night_mode_tick и засоряло лог ERROR'ами каждую минуту. Теперь ловим
 # базовый класс — любая ошибка Telegram логируется как warning и не валит tick.
-from aiogram.methods.base import TelegramMethod
-
-
-# v4.7.16: aiogram 3.30 не имеет обёртки для setChatSlowModeDelay (появилась
-# в более поздних версиях). Создаём минимальный TelegramMethod-класс — он
-# проходит через стандартный pipeline aiogram (session, retry, error handling).
-# Возвращает True (как и все set_chat_* методы Telegram).
-# После апгрейда aiogram — заменить на bot.set_chat_slow_mode_delay(...).
-class SetChatSlowModeDelay(TelegramMethod[bool]):
-    """Обёртка над Telegram Bot API method setChatSlowModeDelay.
-
-    Use this method to change the slow mode delay in a chat. The bot must
-    be an administrator in the chat for this to work and must have the
-    can_restrict_members administrator right. Returns True on success.
-
-    Source: https://core.telegram.org/bots/api#setchatslowmodedelay
-    """
-    __returning__ = bool
-    __api_method__ = "setChatSlowModeDelay"
-
-    chat_id: int | str
-    slow_mode_delay: int
 
 logging.basicConfig(
     level=logging.INFO,

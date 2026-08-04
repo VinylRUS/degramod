@@ -122,6 +122,41 @@ from db import (
     _hash_password,
 )
 
+# v4.7.22: aiogram 3.30 не имеет обёртки для setChatSlowModeDelay (появилась
+# в более поздних версиях). Создаём минимальный TelegramMethod-класс — он
+# проходит через стандартный pipeline aiogram (session, retry, error handling).
+# Возвращает True (как и все set_chat_* методы Telegram).
+# После апгрейда aiogram — заменить на bot.set_chat_slow_mode_delay(...).
+#
+# ВАЖНО: класс живёт в bot_handlers.py (НЕ в bot.py), потому что:
+# 1. bot.py запускается как __main__ — late import `from bot import X` из
+#    bot_handlers.py вызывал бы повторный import bot.py как отдельный модуль
+#    со всеми side-effectами (dp.include_router, startup tasks, etc.) →
+#    RuntimeError: Router is already attached.
+# 2. bot_handlers.py импортируется bot.py ОДИН раз при старте — class definition
+#    выполняется один раз, и bot.py может импортировать класс через existing
+#    `from bot_handlers import ...` line.
+# 3. Все потребители (handle_alarm_command, _deactivate_alarm в bot_handlers.py;
+#    _enter_night_mode, _restore_day_state в bot.py) получают класс без late import.
+from aiogram.methods.base import TelegramMethod
+
+
+class SetChatSlowModeDelay(TelegramMethod[bool]):
+    """Обёртка над Telegram Bot API method setChatSlowModeDelay.
+
+    Use this method to change the slow mode delay in a chat. The bot must
+    be an administrator in the chat for this to work and must have the
+    can_restrict_members administrator right. Returns True on success.
+
+    Source: https://core.telegram.org/bots/api#setchatslowmodedelay
+    """
+    __returning__ = bool
+    __api_method__ = "setChatSlowModeDelay"
+
+    chat_id: int | str
+    slow_mode_delay: int
+
+
 logger = logging.getLogger("shadow_logger.bot_handlers")
 
 router = Router()
@@ -538,11 +573,11 @@ async def _deactivate_alarm(
         return False
 
     # Шаг 4: применяем slow_mode
-    # v4.7.21 hotfix: aiogram 3.30 не имеет bot.set_chat_slow_mode_delay() —
-    # используем обёртку SetChatSlowModeDelay из bot.py (TelegramMethod[bool]).
-    # Late import чтобы избежать circular import (bot.py импортирует router из bot_handlers).
+    # v4.7.22: SetChatSlowModeDelay определён в bot_handlers.py (top-level),
+    # импорт не нужен. Раньше был late import `from bot import SetChatSlowModeDelay`,
+    # но это вызывало повторный import bot.py как отдельный модуль (bot.py запускается
+    # как __main__) → RuntimeError: Router is already attached.
     try:
-        from bot import SetChatSlowModeDelay
         await bot(SetChatSlowModeDelay(
             chat_id=chat_id, slow_mode_delay=slow_to_restore,
         ))
@@ -3736,11 +3771,11 @@ async def handle_alarm_command(message: types.Message) -> None:
             return
 
         # Шаг 3: применяем slow_mode 30s
-        # v4.7.21 hotfix: aiogram 3.30 не имеет bot.set_chat_slow_mode_delay() —
-        # используем обёртку SetChatSlowModeDelay из bot.py (TelegramMethod[bool]).
-        # Late import чтобы избежать circular import (bot.py импортирует router из bot_handlers).
+        # v4.7.22: SetChatSlowModeDelay определён в bot_handlers.py (top-level),
+        # импорт не нужен. Раньше был late import `from bot import SetChatSlowModeDelay`,
+        # но это вызывало повторный import bot.py как отдельный модуль (bot.py запускается
+        # как __main__) → RuntimeError: Router is already attached.
         try:
-            from bot import SetChatSlowModeDelay
             await message.bot(SetChatSlowModeDelay(
                 chat_id=chat_id, slow_mode_delay=_ALARM_SLOW_MODE_DELAY,
             ))
