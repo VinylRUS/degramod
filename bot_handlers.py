@@ -227,6 +227,35 @@ def _format_duration(seconds: int) -> str:
     return "".join(parts) if parts else "0м"
 
 
+# ── v4.7.24: Via-bot rate-limit (in-memory) ─────────────────────────────────
+# Хранит timestamp последнего РАЗРЕШЁННОГО via-bot сообщения для каждого
+# (chat_id, user_id, bot_id). Если записи нет или она старше
+# chat_settings.via_bot_rate_limit_seconds — сообщение разрешаем и обновляем
+# timestamp. Иначе — delete + mute.
+#
+# Ключ: (chat_id, user_id, bot_id). bot_id берётся из message.via_bot.id.
+# Per-bot: юзер может отправить 1 сообщение @Bot1 + 1 сообщение @Bot2
+# в одном окне (если оба бота используются). Это более user-friendly.
+#
+# Словарь не персистится между restart'ами — это намеренно: при рестарте
+# grace-окно сбрасывается, что не страшно (просто позволяет юзеру ещё
+# одно сообщение). При росте словаря старые записи (>1 часа) удаляются
+# в _via_bot_rate_limit_cleanup() при каждом вызове.
+_via_bot_rate_limit: dict[tuple[int, int, int], datetime] = {}
+
+
+def _via_bot_rate_limit_cleanup(now: datetime | None = None) -> None:
+    """Удаляет записи старше 1 часа — чтобы словарь не рос безгранично."""
+    if not _via_bot_rate_limit:
+        return
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    stale = [k for k, ts in _via_bot_rate_limit.items() if ts < cutoff]
+    for k in stale:
+        del _via_bot_rate_limit[k]
+
+
 # ── Full mute permissions — запретить ВСЕ виды отправки ──────────────────────
 def _mute_permissions() -> types.ChatPermissions:
     """ChatPermissions для полного мьюта: запрещает отправку всех типов контента.
@@ -560,7 +589,15 @@ async def _deactivate_alarm(
 
     # Шаг 3: применяем права
     try:
-        await bot.set_chat_permissions(chat_id=chat_id, permissions=perms_to_restore)
+        # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
+        # can_send_messages=True в _alarm_permissions() может неявно подтянуть
+        # другие права через правило импликации. См. подробности в bot.py
+        # (_restore_day_state).
+        await bot.set_chat_permissions(
+            chat_id=chat_id,
+            permissions=perms_to_restore,
+            use_independent_chat_permissions=True,
+        )
         logger.info(
             "Alarm deactivate: chat %s perms restored from %s",
             chat_id, perms_source,
@@ -3753,8 +3790,13 @@ async def handle_alarm_command(message: types.Message) -> None:
 
         # Шаг 2: применяем alarm_permissions
         try:
+            # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
+            # can_send_messages=True в _alarm_permissions() может неявно подтянуть
+            # другие права через правило импликации. См. bot.py (_restore_day_state).
             await message.bot.set_chat_permissions(
-                chat_id=chat_id, permissions=_alarm_permissions(),
+                chat_id=chat_id,
+                permissions=_alarm_permissions(),
+                use_independent_chat_permissions=True,
             )
         except TelegramAPIError as e:
             logger.error(
@@ -5978,6 +6020,106 @@ async def handle_sticker_message(message: types.Message) -> None:
         return
 
 
+async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
+    """v4.7.24: Via-bot rate-limit filter.
+
+    Возвращает True если сообщение обработано (delete + mute) и обработку
+    следует остановить. False — можно продолжать к word/link filter.
+
+    Логика:
+      • message.via_bot is None → False (не our case)
+      • message.from_user is None → False (edge case — channel post)
+      • filter disabled → False
+      • user is admin → False (админам можно)
+      • запись в _via_bot_rate_limit свежее rate_limit секунд → True (block)
+      • иначе → False (allow, обновляем timestamp)
+
+    Rate-limit — per (chat_id, user_id, bot_id). Юзер может отправить
+    1 сообщение @Bot1 + 1 сообщение @Bot2 в одном окне. Это более
+    user-friendly, чем «1 сообщение всем ботам суммарно».
+
+    Stealth: сообщение молча удаляется, юзер мутичится без уведомления.
+    """
+    vb = message.via_bot
+    fu = message.from_user
+    if vb is None or fu is None:
+        return False
+
+    try:
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            if not settings or not settings.via_bot_filter_enabled:
+                return False
+            # Админам — всегда можно
+            if await _is_admin(session, chat_id, fu.id):
+                return False
+            rate_limit = settings.via_bot_rate_limit_seconds or 300
+            mute_min = settings.via_bot_mute_minutes or 10
+    except Exception as e:
+        logger.warning("Via-bot filter: DB error: %s (fail-open)", e)
+        return False
+
+    bot_id = vb.id
+    bot_username = (vb.username or "").lower() or "unknown"
+
+    _via_bot_rate_limit_cleanup()
+    key = (chat_id, fu.id, bot_id)
+    now = datetime.now(timezone.utc)
+    last = _via_bot_rate_limit.get(key)
+
+    if last is None or (now - last).total_seconds() >= rate_limit:
+        # Разрешаем, обновляем timestamp
+        _via_bot_rate_limit[key] = now
+        logger.debug(
+            "Via-bot filter: allowed @%s in chat %s (user %s, last=%s, gap=%ss)",
+            bot_username, chat_id, fu.id, last, 
+            int((now - last).total_seconds()) if last else -1,
+        )
+        return False
+
+    # Превышение rate-limit — delete + mute + save punishment
+    gap_sec = int((now - last).total_seconds()) if last else 0
+    reason = (
+        f"Via-bot filter: @{bot_username} (rate-limit {rate_limit}s exceeded, "
+        f"last message {gap_sec}s ago)"
+    )
+    target_content = (message.text or message.caption or "")[:500] or None
+
+    try:
+        await message.delete()
+    except TelegramAPIError as e:
+        logger.warning("Via-bot filter: cannot delete message: %s", e)
+
+    dur = max(mute_min, 1) * 60
+    until_date = int(now.timestamp()) + dur
+    try:
+        await message.bot.restrict_chat_member(
+            chat_id=chat_id, user_id=fu.id,
+            permissions=_mute_permissions(),
+            until_date=until_date,
+        )
+        async with async_session() as session:
+            await _upsert_user(session, fu.id, fu.username,
+                               fu.first_name, fu.last_name)
+            await _upsert_moderator(session, 0, None, "Via-bot Filter")
+            await session.commit()
+        async with async_session() as session:
+            await _save_punishment(
+                session, fu.id, 0, chat_id,
+                "mute", dur, reason, target_content,
+            )
+        logger.info(
+            "Via-bot filter (mute %s) in chat %s (user %s, bot @%s): "
+            "rate-limit exceeded (last=%ss ago, limit=%ss)",
+            _format_duration(dur), chat_id, fu.id, bot_username,
+            gap_sec, rate_limit,
+        )
+    except TelegramAPIError as e:
+        logger.error("Via-bot filter mute failed: %s", e)
+
+    return True
+
+
 @router.message(F.chat.type.in_(["group", "supergroup"]))
 async def handle_content_filters(message: types.Message) -> None:
     """v4.5.2 (#7, #8): Word filter + Link filter для текстовых сообщений.
@@ -5987,11 +6129,21 @@ async def handle_content_filters(message: types.Message) -> None:
     применяется chat_settings.link_filter_action. Первым проверяется word
     filter (он более специфичный), потом link filter.
 
+    v4.7.24: ПЕРВЫМ проверяется via-bot rate-limit filter (для сообщений
+    с message.via_bot is not None). Если rate-limit превышен — delete + mute,
+    word/link filter не запускается. Если в пределах grace-окна —
+    пропускаем к word/link filter (сообщение может нарушить и их).
+
     Если ни один фильтр не сработал — возвращаем управление (return),
     давая шанс stealth_catchall_group.
     """
-    # Не фильтруем сообщения от админов (они могут писать что угодно)
     chat_id = message.chat.id
+
+    # v4.7.24: via-bot rate-limit filter — ПЕРВЫЙ (до text-check, т.к.
+    # via_bot может быть на медиа-сообщениях без text/caption).
+    if await _check_via_bot_filter(message, chat_id):
+        return  # Сообщение удалено, юзер замучен — стоп.
+
     text = message.text or message.caption or ""
     if not text:
         return

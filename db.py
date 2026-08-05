@@ -283,6 +283,29 @@ class ChatSettings(Base):
     alarm_active_until = Column(DateTime, nullable=True)
     alarm_started_by = Column(BigInteger, nullable=True)
 
+    # ── v4.7.24: Via-bot filter (rate-limit all «via @Bot» messages) ────
+    # Когда юзер пишет в чат сообщение через стороннего бота (message.via_bot
+    # is not None — например @HowYourBot, @vote, @like), бот применяет
+    # rate-limit: разрешает не более 1 сообщения боту в N секунд на юзера.
+    # Если юзер пытается чаще — сообщение удаляется, юзер мутичится на
+    # M минут. Полный stealth — юзер не получает никакого уведомления.
+    #
+    # Дизайн (v4.7.24 — изменён по запросу пользователя):
+    #   • Все боты в «чёрном списке» по умолчанию — фильтр работает на ВСЕХ
+    #     via_bot сообщениях, явный список ботов не нужен.
+    #   • Rate-limit grace: 1 сообщение в via_bot_filter_rate_limit_seconds
+    #     (по умолчанию 300 = 5 минут) на (chat_id, user_id, bot_user_id).
+    #     Внутри grace-окна — позволяем; за пределами — блокируем.
+    #   • Действие при превышении: delete + mute на via_bot_mute_minutes
+    #     (по умолчанию 10 минут). Без warn — сразу mute.
+    #   • Управление: только через web-панель /admin/chats (toggle VIA-BOT
+    #     в action buttons, настройки в разделе «Наказания»).
+    #   • Stealth: молча удаляем. Юзер не понимает, кто удалил и почему.
+    #   • Default: OFF (via_bot_filter_enabled=False). Per-chat.
+    via_bot_filter_enabled = Column(Boolean, default=False, nullable=False)
+    via_bot_rate_limit_seconds = Column(Integer, default=300, nullable=False)  # grace window (def 5 min)
+    via_bot_mute_minutes = Column(Integer, default=10, nullable=False)         # mute duration (def 10 min)
+
 
 class PermissionPreset(Base):
     """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
@@ -836,6 +859,30 @@ async def init_db() -> None:
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS ix_banned_sticker_packs_chat_id ON banned_sticker_packs (chat_id)"
         ))
+
+    # ── v4.7.24: Via-bot filter (изменённый дизайн) ─────────────────────
+    # Добавляем 3 новые колонки в chat_settings для rate-limit-фильтра
+    # «via @Bot» сообщений. Идемпотентная миграция — проверяем существование
+    # каждой колонки через PRAGMA table_info перед ALTER TABLE.
+    # Если колонка уже есть — пропускаем (можно запускать при каждом старте).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        if "via_bot_filter_enabled" not in existing_cols:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN via_bot_filter_enabled "
+                "BOOLEAN NOT NULL DEFAULT 0"
+            ))
+        if "via_bot_rate_limit_seconds" not in existing_cols:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN via_bot_rate_limit_seconds "
+                "INTEGER NOT NULL DEFAULT 300"
+            ))
+        if "via_bot_mute_minutes" not in existing_cols:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN via_bot_mute_minutes "
+                "INTEGER NOT NULL DEFAULT 10"
+            ))
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

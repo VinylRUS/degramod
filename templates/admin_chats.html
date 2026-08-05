@@ -49,6 +49,7 @@
             {% if c.is_report_chat %}<span class="badge badge-active">REPORT</span>{% endif %}
             {% if c.cas_check_enabled %}<span class="badge" style="background: rgba(51,153,204,.15); color: var(--info); border: 1px solid var(--info);">CAS</span>{% endif %}
             {% if c.link_filter_enabled %}<span class="badge" style="background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">LINK</span>{% endif %}
+            {% if c.via_bot_filter_enabled %}<span class="badge" style="background: rgba(204,51,51,.15); color: var(--danger); border: 1px solid var(--danger);">VIA {{ c.via_bot_rate_limit_seconds }}s/{{ c.via_bot_mute_minutes }}m</span>{% endif %}
             {% if c.night_mode_enabled %}<span class="badge" style="background: rgba(102,102,102,.15); color: var(--text-dim); border: 1px solid var(--text-dim);">NIGHT {{ c.night_mode_start }}-{{ c.night_mode_end }}{% if c.night_mode_tz and c.night_mode_tz != 'Europe/Moscow' %} {{ c.night_mode_tz }}{% endif %}{% if c.night_mode_notify %} 🔔{% endif %}{% if c.night_mode_currently_active %} ●{% endif %}</span>{% endif %}
             {% if c.sanitary_days_enabled and c.sanitary_days %}<span class="badge" style="background: {% if c.sanitary_days_currently_active %}rgba(220,38,38,.18){% else %}rgba(102,102,102,.15){% endif %}; color: {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %}; border: 1px solid {% if c.sanitary_days_currently_active %}var(--danger){% else %}var(--text-dim){% endif %};">SAN{% if c.sanitary_days_currently_active %} ●{% endif %}</span>{% endif %}
             {% if c.warn_decay_days and c.warn_decay_days > 0 %}<span class="badge" style="background: rgba(0,204,102,.08); color: var(--accent); border: 1px solid var(--accent);">DECAY {{ c.warn_decay_days }}d</span>{% endif %}
@@ -102,7 +103,7 @@
             <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
                 <span>📋 Общее</span>
                 <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    {{ c.hashtag or '—' }} · {% if c.cas_check_enabled %}CAS{% endif %}{% if c.link_filter_enabled %} · LINK{% endif %} · day={% if c.day_permissions %}preset{% else %}snapshot{% endif %}
+                    {{ c.hashtag or '—' }} · {% if c.cas_check_enabled %}CAS{% endif %}{% if c.link_filter_enabled %} · LINK{% endif %}{% if c.via_bot_filter_enabled %} · VIA{% endif %} · day={% if c.day_permissions %}preset{% else %}snapshot{% endif %}
                 </span>
             </summary>
             <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
@@ -129,8 +130,9 @@
                 {% else %}
                 {# v4.7.6: упразднена система private/non-private.
                    NIGHT и SAN toggles перенесены сюда из <details> секций.
-                   Лейблы сокращены: LINK-FILT → LINK, "make report" → REPORT. #}
-                <div style="display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; margin-bottom: var(--sp-3);">
+                   Лейблы сокращены: LINK-FILT → LINK, "make report" → REPORT.
+                   v4.7.24: добавлен VIA-BOT toggle (7-я кнопка). #}
+                <div style="display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-bottom: var(--sp-3);">
                     <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="enabled"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; color: {% if c.is_enabled %}var(--danger){% else %}#2ea043{% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         {% if c.is_enabled %}■ Disable{% else %}□ Enable{% endif %}
@@ -143,6 +145,11 @@
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.link_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.link_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         LINK {% if c.link_filter_enabled %}●{% else %}○{% endif %}
                     </button>
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="via_bot_filter"
+                            title="v4.7.24: Rate-limit «via @Bot» messages. 1 msg per N sec/bot/user, then delete + mute."
+                            style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                        VIA {% if c.via_bot_filter_enabled %}●{% else %}○{% endif %}
+                    </button>
                     <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="night_mode"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         NIGHT {% if c.night_mode_enabled %}●{% else %}○{% endif %}
@@ -152,7 +159,7 @@
                         SAN {% if c.sanitary_days_enabled %}●{% else %}○{% endif %}
                     </button>
                     <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="report_chat"
-                            onclick="return confirm('Make this chat a report chat? \n\nOther settings (CAS, link-filter, night mode, sanitary days, punishments) will be HIDDEN — report chat is not moderated.');"
+                            onclick="return confirm('Make this chat a report chat? \n\nOther settings (CAS, link-filter, via-bot, night mode, sanitary days, punishments) will be HIDDEN — report chat is not moderated.');"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         ☆ REPORT
                     </button>
@@ -209,7 +216,7 @@
             <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
                 <span>⚖ Наказания</span>
                 <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    {{ c.warns_to_mute }} / {{ c.mute_duration_seconds }} / {{ c.warns_to_ban }}{% if c.warn_decay_days %} · decay {{ c.warn_decay_days }}d{% endif %} · link={{ c.link_filter_action }}
+                    {{ c.warns_to_mute }} / {{ c.mute_duration_seconds }} / {{ c.warns_to_ban }}{% if c.warn_decay_days %} · decay {{ c.warn_decay_days }}d{% endif %} · link={{ c.link_filter_action }}{% if c.via_bot_filter_enabled %} · via_bot={{ c.via_bot_rate_limit_seconds }}s/{{ c.via_bot_mute_minutes }}m{% endif %}
                 </span>
             </summary>
             <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
@@ -246,6 +253,32 @@
                         </select>
                     </div>
                 </div>
+                {# v4.7.24: Via-bot rate-limit filter settings.
+                   Включается кнопкой VIA в action buttons выше. Здесь —
+                   только числовые параметры (grace-окно + длительность мьюта). #}
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; margin-bottom: 4px;">
+                            Via-bot rate-limit (sec) {% if not c.via_bot_filter_enabled %}· OFF{% endif %}
+                        </label>
+                        <input type="text" name="via_bot_rate_limit_seconds" value="{{ c.via_bot_rate_limit_seconds or 300 }}" pattern="[0-9]+"
+                               title="Grace window: 1 msg per N sec per (user, bot). Default 300 (5 min)."
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; margin-bottom: 4px;">
+                            Via-bot mute (min) {% if not c.via_bot_filter_enabled %}· OFF{% endif %}
+                        </label>
+                        <input type="text" name="via_bot_mute_minutes" value="{{ c.via_bot_mute_minutes or 10 }}" pattern="[0-9]+"
+                               title="Mute duration when rate-limit exceeded. Default 10 min."
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                </div>
+                {% if not c.via_bot_filter_enabled %}
+                <div style="margin-top: var(--sp-2); font-size: 10px; color: var(--text-dim); line-height: 1.5;">
+                    ℹ Via-bot filter выключен. Включите его кнопкой <code style="background: var(--bg); padding: 1px 4px; border-radius: 3px;">VIA</code> вверху карточки. Настройки сохранятся, но не активны.
+                </div>
+                {% endif %}
             </div>
         </details>
 

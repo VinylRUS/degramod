@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.23"
+APP_VERSION = "v4.7.25"
 APP_RELEASE_DATE = "2026-08-05"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -1751,6 +1751,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # v4.5.4: sanitary days textarea. Multiline-текст, одна запись на
         # строку ('YYYY-MM-DD' или 'YYYY-MM-DD - YYYY-MM-DD').
         sanitary_days_text: str = Form(""),
+        # v4.7.24: via-bot rate-limit filter (настройки в разделе «Наказания»).
+        # via_bot_rate_limit_seconds — grace-окно (по умолчанию 300 = 5 мин).
+        # via_bot_mute_minutes — длительность мьюта при превышении (по умолчанию 10).
+        via_bot_rate_limit_seconds: str = Form("300"),
+        via_bot_mute_minutes: str = Form("10"),
         # v4.6.1: пресеты прав — только выбор из dropdown. Custom grids убраны,
         # свои наборы прав создаются на странице /admin/presets.
         # preset_id="" или "__none__" → NULL (старое поведение, через snapshot).
@@ -1789,11 +1794,20 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             wtb = _parse_int(warns_to_ban, "warns_to_ban", 0)
             rc = _parse_int(report_chat_id, "report_chat_id", -10**15)
             decay = _parse_int(warn_decay_days, "warn_decay_days", 0)
+            # v4.7.24: via-bot rate-limit settings (1..86400 sec / 1..1440 min)
+            vb_rl = _parse_int(via_bot_rate_limit_seconds, "via_bot_rate_limit_seconds", 1)
+            vb_mm = _parse_int(via_bot_mute_minutes, "via_bot_mute_minutes", 1)
         except ValueError as e:
             return RedirectResponse(
                 url=f"/admin/chats?flash={e}",
                 status_code=303,
             )
+
+        # v4.7.24: sanity-clip — rate-limit не больше 24h, mute не больше 24h
+        if vb_rl is not None and vb_rl > 86400:
+            vb_rl = 86400
+        if vb_mm is not None and vb_mm > 1440:
+            vb_mm = 1440
 
         # v4.5.2: валидация link_filter_action.
         # v4.6.1: night_mode_preset валидация убрана — presetId из БД валидируется ниже.
@@ -2009,6 +2023,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             # 0 = выкл. >0 = N сек. См. PermissionPreset.slow_mode_delay.
             cs.day_slow_mode_delay = day_slow if day_slow is not None else 0
             cs.night_mode_slow_mode_delay = night_slow if night_slow is not None else 0
+            # v4.7.24: via-bot rate-limit settings (toggle ставится отдельно
+            # через /toggle поле=via_bot_filter).
+            cs.via_bot_rate_limit_seconds = vb_rl if vb_rl is not None else 300
+            cs.via_bot_mute_minutes = vb_mm if vb_mm is not None else 10
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
 
@@ -2017,7 +2035,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
             "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
             "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s, "
-            "night_preset_id=%s, day_slow=%s, night_slow=%s)",
+            "night_preset_id=%s, day_slow=%s, night_slow=%s, "
+            "via_bot_rl=%ss, via_bot_mute=%smin)",
             chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
             decay, link_filter_action, nm_start, nm_end,
             night_preset_id or "(none)",
@@ -2029,6 +2048,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             night_preset_id or "(none)",
             day_slow if day_slow is not None else "(unchanged)",
             night_slow if night_slow is not None else "(unchanged)",
+            vb_rl if vb_rl is not None else 300,
+            vb_mm if vb_mm is not None else 10,
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Chat+{chat_id}+settings+updated",
@@ -2045,8 +2066,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         v4.5.2: добавлены toggle для cas, link_filter, night_mode.
         v4.7.2: добавлен toggle для sanitary_days.
         v4.7.6: упразднён toggle 'private' (система private/non-private удалена).
+        v4.7.24: добавлен toggle для via_bot_filter (rate-limit «via @Bot»).
 
-        Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days — что переключать.
+        Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days|via_bot_filter — что переключать.
         """
         try:
             chat_id = int(chat_id_str)
@@ -2057,7 +2079,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         form = await request.form()
         field = (form.get("field") or "").strip().lower()
-        valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days"}
+        valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days", "via_bot_filter"}
         if field not in valid_fields:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Invalid+toggle+field",
@@ -2129,6 +2151,15 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     else:
                         cs.sanitary_days_currently_active = False
                 msg = f"Chat+{chat_id}+Sanitary+days+{'enabled' if cs.sanitary_days_enabled else 'disabled'}"
+            elif field == "via_bot_filter":
+                # v4.7.24: toggle for via-bot rate-limit filter.
+                # Включает/выключает фильтр «via @Bot» сообщений. Настройки
+                # (rate_limit, mute_minutes) сохраняются в /update отдельно.
+                cs.via_bot_filter_enabled = not cs.via_bot_filter_enabled
+                msg = (
+                    f"Chat+{chat_id}+Via-bot+filter+"
+                    f"{'enabled' if cs.via_bot_filter_enabled else 'disabled'}"
+                )
             else:  # report_chat
                 if cs.is_report_chat:
                     cs.is_report_chat = False

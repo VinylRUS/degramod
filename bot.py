@@ -371,7 +371,16 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
 
         # Применяем ночные права
         night_perms = _parse_night_mode_permissions(cs.night_mode_permissions)
-        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=night_perms)
+        # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
+        # Telegram применяет правило импликации: can_send_other_messages=True
+        # автоматически выдаёт can_send_video_notes=True (и др.), игнорируя наш
+        # явный False. Это приводило к лишним правам (видеосообщения, голосовые)
+        # при переключении ночь↔день.
+        await bot.set_chat_permissions(
+            chat_id=cs.chat_id,
+            permissions=night_perms,
+            use_independent_chat_permissions=True,
+        )
 
         # v4.7.16: применяем ночной slow_mode если задан (>0).
         # 0 = не трогать slow_mode (backward compat, чат остаётся как есть).
@@ -627,7 +636,19 @@ async def _restore_day_state(cs: ChatSettings) -> str:
     сохранённому снимку (если preset не задан, но был snapshot).
     """
     restore_perms, source = await _resolve_day_perms(cs)
-    await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=restore_perms)
+    # v4.7.25: use_independent_chat_permissions=True — критично для корректного
+    # восстановления дневных прав. Без этого Telegram работает в legacy-режиме,
+    # где can_send_other_messages=True (стикеры/GIFs в Day default) автоматически
+    # подразумевает can_send_video_notes=True, переопределяя наш явный False.
+    # Результат: после выхода из ночного режима юзеры могли отправлять
+    # видеосообщения и (в некоторых сценариях) голосовые, хотя пресет их
+    # запрещал. Independent-режим убирает правило импликации — каждое право
+    # устанавливается ровно так, как передано (True/False).
+    await bot.set_chat_permissions(
+        chat_id=cs.chat_id,
+        permissions=restore_perms,
+        use_independent_chat_permissions=True,
+    )
 
     # v4.7.16: восстанавливаем slow_mode.
     day_slow = int(cs.day_slow_mode_delay or 0)
@@ -960,7 +981,15 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
             lockdown_perms = _tg_types.ChatPermissions(
                 **{k: False for k in _PERM_FIELDS}
             )
-        await bot.set_chat_permissions(chat_id=cs.chat_id, permissions=lockdown_perms)
+        # v4.7.25: independent mode — см. комментарий в _restore_day_state.
+        # Для lockdown (sanitary day) это особенно важно: мы хотим полный мьют,
+        # и любая импликация can_send_other_messages=False→остальное не грозит,
+        # но для симметричности и защиты от будущих изменений пресетов — тоже True.
+        await bot.set_chat_permissions(
+            chat_id=cs.chat_id,
+            permissions=lockdown_perms,
+            use_independent_chat_permissions=True,
+        )
 
         # 4. Сохраняем snapshot и флаг.
         async with async_session() as session:
