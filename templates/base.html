@@ -635,6 +635,35 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.7.26</strong> — 5 августа 2026 (CRITICAL hotfix: via_bot / word / link фильтры не работали)</p>
+                <ul>
+                    <li><strong>КРИТИЧЕСКИЙ БАГ: фильтры контента (via_bot / word / link) НЕ срабатывали</strong> ни на одном сообщении в группе. Пользователь сообщил: «эта тема с via-bot не работает нормально, проверь как это реализовано». При проверке выяснилось, что не работал не только via_bot фильтр (введён в v4.7.24), но и word filter, и link filter — все они не вызывались вообще. Сообщения с запрещёнными словами/ссылками/через @HowYourBot спокойно проходили в чат.</li>
+                    <li><strong>Корневая причина</strong>: в aiogram 3.x первый matching handler в router останавливает propagation — после него следующие handlers НЕ вызываются. В кодовой базе было 2 handler'а с слишком общими фильтрами, которые перехватывали ВСЕ сообщения в группе и return'или без обработки:
+                        <ul>
+                            <li><code>handle_alarm_command</code> (L3588) — фильтр <code>F.chat.type.in_(["group", "supergroup"])</code>. Для любого текстового сообщения в группе handler запускался, проверял <code>if not _CMD_ALARM.match(text): return</code> — и return'ил. После return propagation останавливался, <code>handle_content_filters</code> не вызывался.</li>
+                            <li><code>handle_group_command</code> (L2909) — фильтр <code>F.chat.type.in_(...) + F.reply_to_message</code>. Для любого reply-сообщения (даже без команды) handler запускался, проверял <code>if not _is_moderation_command(text): return</code> — и return'ил. Propagation останавливался.</li>
+                        </ul>
+                        Таким образом, word/link/via_bot фильтры не работали для <strong>всех</strong> текстовых сообщений (через alarm handler) и <strong>всех</strong> reply-сообщений (через group command handler). Это покрывало практически 100% сообщений в типичном чате.</li>
+                    <li><strong>Фикс</strong>: добавлены 2 custom-фильтра на основе <code>BaseFilter</code>:
+                        <ul>
+                            <li><code>_AlarmCommandFilter</code> — матчит только если <code>message.text</code> реально является <code>!alarm</code> командой (использует существующий <code>_CMD_ALARM</code> regex, case-insensitive, с поддержкой русских алиасов вкл/выкл).</li>
+                            <li><code>_ModerationCommandFilter</code> — матчит только если <code>message.text</code> является одной из модераторских команд (<code>!mute</code>, <code>!warn</code>, <code>!ban</code>, <code>!unmute</code>, <code>!unban</code>, <code>!unwarn</code>, <code>!warns</code>, <code>!resetwarns</code>, <code>!alarm</code>).</li>
+                        </ul>
+                        Фильтры добавлены в декораторы <code>@router.message(...)</code>. Теперь handler запускается ТОЛЬКО когда сообщение реально является командой — иначе propagation продолжается к следующему handler'у (<code>handle_content_filters</code>, затем <code>stealth_catchall_group</code>).</li>
+                    <li><strong>Тесты</strong>: создан <code>scripts/test_v4726_handler_propagation.py</code> с end-to-end тестами через настоящий aiogram <code>Dispatcher</code>. Проверяется что для каждого типа сообщения вызывается ровно тот handler, который должен:
+                        <ul>
+                            <li>Обычный текст → <code>handle_content_filters</code> (раньше: <code>handle_alarm_command</code> перехватывал)</li>
+                            <li>Reply без команды → <code>handle_content_filters</code> (раньше: <code>handle_group_command</code> перехватывал)</li>
+                            <li>Reply с <code>!mute</code> → <code>handle_group_command</code> (как и должно быть)</li>
+                            <li><code>!alarm on</code> → <code>handle_alarm_command</code> (как и должно быть)</li>
+                            <li>Сообщение с <code>via_bot</code> → <code>handle_content_filters</code> (где via_bot фильтр сработает)</li>
+                            <li>Photo с <code>via_bot</code> → <code>handle_content_filters</code></li>
+                            <li><code>!ALARm on</code> (case-insensitive) → <code>handle_alarm_command</code></li>
+                            <li><code>!alarmXYZ</code> (не команда) → <code>handle_content_filters</code></li>
+                        </ul>
+                    </li>
+                    <li><strong>Урок на будущее</strong>: в aiogram 3.x <strong>первый matching handler останавливает propagation</strong>. Если handler имеет общий фильтр (например, только <code>F.chat.type.in_(...)</code>) и return'ит без обработки — следующие handlers НЕ вызываются. Любой handler, который должен срабатывать только для определённых сообщений (команды, specific content types), <strong>обязан</strong> иметь specific-фильтр в декораторе, а не проверять условие внутри тела handler'а. Иначе он молча блокирует всю цепочку обработки.</li>
+                </ul>
                 <p><strong>v4.7.25</strong> — 5 августа 2026 (hotfix: лишние права при выходе из ночного режима)</p>
                 <ul>
                     <li><strong>Баг: при переключении ночь → день юзерам выдавались лишние права</strong>, не указанные в дневном пресете — <strong>голосовые сообщения</strong> (<code>can_send_voice_notes</code>) и <strong>видеосообщения</strong> (<code>can_send_video_notes</code>). Пользователь сообщил: «Выдаются лишние права не указанные в дневном пресете при переключении ночь→день. Лишние права: голосовые сообщения, видеосообщения». Day default preset явно ставит оба поля в <code>False</code>, но Telegram всё равно их разрешал.</li>

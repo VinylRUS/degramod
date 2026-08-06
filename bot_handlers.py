@@ -88,7 +88,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiogram import Router, types, F, BaseMiddleware
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command
+from aiogram.filters import Command, BaseFilter
 from aiogram.types import (
     InputRichMessage,
     InputRichBlockSectionHeading,
@@ -330,6 +330,47 @@ def _is_moderation_command(text: str) -> bool:
         return False
     # Точное соответствие одному из зарегистрированных паттернов.
     return any(p.match(stripped) for p in _ALL_MOD_COMMANDS)
+
+
+# ── v4.7.26: Custom-фильтры для команд — исправляют баг с propagation ──────
+# Проблема: handle_group_command (L2909) и handle_alarm_command (L3588)
+# использовали общий фильтр F.chat.type.in_(...) + (F.reply_to_message).
+# В aiogram 3.x первый matching handler останавливает propagation — поэтому
+# для любого reply-сообщения (даже без команды) handle_group_command
+# перехватывал управление и return'ил, не давая handle_content_filters
+# (word/link/via_bot filter) сработать. Аналогично handle_alarm_command
+# перехватывал ВСЕ group messages (даже без !alarm).
+# Фикс: фильтр должен матчить ТОЛЬКО когда текст реально является командой.
+# Тогда не-команды проваливаются к следующему handler'у.
+class _ModerationCommandFilter(BaseFilter):
+    """v4.7.26: матчит только сообщения, содержащие модераторскую команду.
+
+    Проверяет text на соответствие любому из _ALL_MOD_COMMANDS паттернов.
+    Используется в handle_group_command чтобы НЕ перехватывать обычные
+    reply-сообщения (тогда они проваливаются в handle_content_filters
+    для word/link/via_bot проверки).
+    """
+
+    async def __call__(self, message: types.Message) -> bool:
+        text = message.text
+        if not text:
+            return False
+        return _is_moderation_command(text)
+
+
+class _AlarmCommandFilter(BaseFilter):
+    """v4.7.26: матчит только сообщения вида '!alarm on|off|вкл|выкл ...'.
+
+    Используется в handle_alarm_command чтобы НЕ перехватывать обычные
+    текстовые сообщения (тогда они проваливаются в handle_content_filters
+    для word/link/via_bot проверки).
+    """
+
+    async def __call__(self, message: types.Message) -> bool:
+        text = message.text
+        if not text:
+            return False
+        return bool(_CMD_ALARM.match(text))
 
 
 # ── v4.4.8: middleware для полной блокировки disabled-чатов ──────────────
@@ -2906,18 +2947,29 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 # Обработчики команд в ГРУППАХ
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.message(F.chat.type.in_(["group", "supergroup"]), F.reply_to_message)
+@router.message(
+    F.chat.type.in_(["group", "supergroup"]),
+    F.reply_to_message,
+    _ModerationCommandFilter(),
+)
 async def handle_group_command(message: types.Message) -> None:
-    """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах."""
-    text = message.text
-    if not text:
-        return
+    """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах.
 
+    v4.7.26: фильтр _ModerationCommandFilter теперь стоит в декораторе —
+    handler вызывается ТОЛЬКО когда сообщение является командой. Раньше
+    handler перехватывал все reply-сообщения и return'ил без обработки,
+    что в aiogram 3.x останавливает propagation → handle_content_filters
+    (word/link/via_bot filter) не вызывался для reply-сообщений.
+    """
+    text = message.text
+    # text не None — гарантировано _ModerationCommandFilter'ом.
     # ── v4.4.8 FIX: не трогаем сообщения модератора, если это не команда ──
     # Раньше бот удалял ЛЮБОЙ ответ модератора в чате (т.к. удаление шло
     # ДО проверки на соответствие команде). Теперь сначала проверяем, что
     # текст реально является одной из модераторских команд — и только тогда
     # удаляем. Обычные ответы модератора больше не исчезают.
+    # v4.7.26: проверка _is_moderation_command уже в фильтре — но оставляем
+    # как defensive guard (вдруг filter изменят).
     if not _is_moderation_command(text):
         return
 
@@ -3585,7 +3637,10 @@ async def handle_group_command(message: types.Message) -> None:
 # v4.7.20: !alarm on/off — отдельный handler (не требует reply)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.message(F.chat.type.in_(["group", "supergroup"]))
+@router.message(
+    F.chat.type.in_(["group", "supergroup"]),
+    _AlarmCommandFilter(),
+)
 async def handle_alarm_command(message: types.Message) -> None:
     """!alarm on [duration] / !alarm off — экстренная блокировка медиа в чате.
 
@@ -3607,14 +3662,19 @@ async def handle_alarm_command(message: types.Message) -> None:
     Стелс: обычные юзеры (не модераторы) полностью игнорируются — бот
     не отвечает им в чате, не шлёт DM, не удаляет их сообщение. Только
     модераторы получают DM-подтверждение.
+
+    v4.7.26: фильтр _AlarmCommandFilter теперь стоит в декораторе —
+    handler вызывается ТОЛЬКО когда сообщение является !alarm командой.
+    Раньше handler перехватывал ВСЕ group messages (даже не !alarm) и
+    return'ил, что в aiogram 3.x останавливает propagation →
+    handle_content_filters (word/link/via_bot filter) не вызывался.
     """
     text = message.text
-    if not text:
-        return
+    # text не None — гарантировано _AlarmCommandFilter'ом.
 
     m = _CMD_ALARM.match(text)
     if not m:
-        return  # Не команда !alarm — пусть другие handler'ы разбираются
+        return  # Defensive — filter уже это проверил, но на всякий случай.
 
     # Парсим аргументы
     action_raw = m.group(1).lower()
