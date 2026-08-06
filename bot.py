@@ -154,7 +154,14 @@ async def _start_polling():
     """Запуск Long Polling."""
     logger.info("Starting Long Polling...")
     try:
-        await dp.start_polling(bot, handle_signals=False)
+        # v4.7.27: явно указываем allowed_updates — иначе aiogram getUpdates
+        # по умолчанию НЕ возвращает chat_member updates (только message,
+        # my_chat_member). Это ломает детектирование ручных банов.
+        await dp.start_polling(
+            bot,
+            handle_signals=False,
+            allowed_updates=["message", "my_chat_member", "chat_member"],
+        )
     except Exception as e:
         logger.error("Polling error: %s", e)
 
@@ -1294,9 +1301,14 @@ async def lifespan(app):
             # v4.5.1: передаём secret_token — Telegram будет слать его
             # в заголовке X-Telegram-Bot-Api-Secret-Token на каждый запрос.
             # Без проверки кто угодно может POST-нуть фейковый Update.
+            # v4.7.27: добавлен "chat_member" — чтобы получать обновления
+            # статусов других участников чата (не только себя). Без этого бот
+            # не видит ручные баны, выдаваемые админами через Telegram-клиент
+            # (правой кнопкой → "Заблокировать"). Это позволяет отправлять
+            # компактный отчёт о ручном бане в reporting chat.
             await bot.set_webhook(
                 url=WEBHOOK_URL,
-                allowed_updates=["message", "my_chat_member"],
+                allowed_updates=["message", "my_chat_member", "chat_member"],
                 secret_token=WEBHOOK_SECRET,
             )
             info = await bot.get_webhook_info()

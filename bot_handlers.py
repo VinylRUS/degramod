@@ -82,6 +82,7 @@ import os
 import re
 import logging
 import secrets
+import time
 from datetime import datetime, timezone, timedelta, date
 from urllib.parse import urlparse
 
@@ -254,6 +255,67 @@ def _via_bot_rate_limit_cleanup(now: datetime | None = None) -> None:
     stale = [k for k, ts in _via_bot_rate_limit.items() if ts < cutoff]
     for k in stale:
         del _via_bot_rate_limit[k]
+
+
+# ── v4.7.27: Дедупликация ручных банов ──────────────────────────────────────
+# Когда бот сам банит пользователя через !ban / autoban / CAS / sticker-pack /
+# content-filter — Telegram присылает ChatMemberUpdated с new_status="kicked".
+# Без дедупликации бот отправил бы ВТОРОЙ отчёт в reporting chat с пометкой
+# «ручной бан», хотя на самом деле бан выполнен самим ботом.
+#
+# Решение: каждый вызов bot.ban_chat_member() в кодовой базе помечается через
+# _mark_bot_ban(chat_id, user_id). Когда прилетает ChatMemberUpdated с
+# status="kicked", handler _consume_bot_ban проверяет — был ли недавний бот-бан.
+# Если да — запись удаляется, и handler молча возвращает (отчёт уже отправлен
+# в обычном flow). Если нет — это ручной бан админом через Telegram-клиент,
+# отправляем компактный отчёт.
+#
+# TTL = 10 секунд: достаточно для нормального прохождения update от Telegram
+# (обычно <2 сек), при этом не слишком долго — чтобы «честный» ручной бан
+# через 11 сек после !ban не был пропущен.
+_recent_bot_bans: dict[tuple[int, int], float] = {}
+_BOT_BAN_DEDUP_TTL_SEC: float = 10.0
+
+
+def _mark_bot_ban(chat_id: int, user_id: int) -> None:
+    """Отметить, что бот сам забанил пользователя — чтобы ChatMemberUpdated
+    handler не отправил повторный отчёт о «ручном бане».
+
+    Вызывается сразу после успешного ``await bot.ban_chat_member(...)`` во
+    ВСЕХ точках кодовой базы:
+      * ``handle_group_command`` (!ban команда модератора)
+      * ``_check_warn_threshold`` (автобан по порогу варнов)
+      * ``handle_new_members`` (CAS auto-ban)
+      * ``handle_sticker_message`` (ban за banned sticker pack)
+      * ``handle_content_filters`` (ban за запрещённое слово/ссылку)
+
+    См. также ``_consume_bot_ban`` — вызывается из ``on_chat_member_updated``.
+    """
+    _recent_bot_bans[(chat_id, user_id)] = time.monotonic()
+
+
+def _consume_bot_ban(chat_id: int, user_id: int) -> bool:
+    """Проверяет, был ли недавний бот-бан для (chat_id, user_id).
+
+    Если да — удаляет запись (она больше не нужна, бан уже обработан в
+    обычном flow) и возвращает True.
+    Если нет — возвращает False (это ручной бан от админа через клиент).
+
+    Заодно чистит просроченные записи (TTL = ``_BOT_BAN_DEDUP_TTL_SEC``).
+    Используется ``time.monotonic`` (а не ``time.time``) — monotonic не
+    прыгает при смене системных часов (NTP), что важно для TTL-логики.
+    """
+    now = time.monotonic()
+    # Чистим просроченные записи (раз уж зашли)
+    if _recent_bot_bans:
+        expired = [
+            k for k, ts in _recent_bot_bans.items()
+            if now - ts > _BOT_BAN_DEDUP_TTL_SEC
+        ]
+        for k in expired:
+            _recent_bot_bans.pop(k, None)
+    ts = _recent_bot_bans.pop((chat_id, user_id), None)
+    return ts is not None
 
 
 # ── Full mute permissions — запретить ВСЕ виды отправки ──────────────────────
@@ -2545,6 +2607,191 @@ async def _send_report_plain_fallback(
     await bot.send_message(chat_id=report_dest, text="\n".join(parts))
 
 
+# ── v4.7.27: Отчёт о ручном бане ───────────────────────────────────────────
+async def _send_manual_ban_report(
+    *,
+    bot: types.Bot,
+    chat_id: int,
+    target: types.User,
+    admin: types.User | None,
+    report_dest: int,
+    hashtag: str,
+) -> None:
+    """Компактный отчёт о ручном бане (админ забанил через Telegram-клиент).
+
+    Отличается от обычного отчёта (``_send_report``):
+
+      • Заголовок ``🚫 БАН (ручной)`` — чтобы визуально отличать от бана,
+        выполненного ботом.
+      • НЕТ причины — Telegram Bot API не сообщает, за что админ забанил
+        пользователя (поле ``reason`` отсутствует в ChatMemberUpdated).
+      • НЕТ текста/медиа сообщения — бот не знает, какое сообщение
+        triggered бан (админ мог вообще не от чего банить, а просто
+        длинным тапом по юзернейму).
+      • Зато добавлено поле ``🛡 Админ`` (если ``admin`` не None и не бот):
+        имя + @username + ID. Это позволяет видеть, КТО из админов банил.
+        Берётся из ``event.from_user`` поля ChatMemberUpdated — Telegram
+        всегда его передаёт для действий админов.
+      • Footer содержит кликабельное имя админа (как в обычном отчёте).
+
+    Структура Rich-сообщения (mirror v4.4.10 редизайна, но урезанная):
+
+      1. SectionHeading — «🚫 БАН (ручной)»
+      2. Divider
+      3. List:
+         • Нарушитель (имя кликабельно + @username + ID моноширинно)
+         • 🛡 Админ (если есть) — имя кликабельно + @username + ID
+         • 🌐 Веб-профиль (если WEB_PUBLIC_URL задан)
+      4. Divider
+      5. Details — «Доп. инфо»: только chat_id (нет длительности/варнов)
+      6. Divider
+      7. Footer — время МСК + хэштег + кликабельное имя админа
+
+    Fallback: если ``send_rich_message`` падает — plain text в том же духе.
+    """
+    # ── Нарушитель ─────────────────────────────────────────────
+    full_name = (target.first_name or "") + (
+        f" {target.last_name}" if target.last_name else ""
+    )
+    display_name = full_name.strip() or "(без имени)"
+
+    # ── Список блоков (v4.4.10 редизайн, урезанная версия) ────
+    blocks: list = []
+    blocks.append(InputRichBlockSectionHeading(text="🚫 БАН (ручной)", size=2))
+    blocks.append(InputRichBlockDivider())
+
+    # ── List: нарушитель / админ / веб-профиль ─────────────────
+    list_items: list[InputRichBlockListItem] = []
+
+    # Пункт 1: нарушитель (имя кликабельно + @username + ID моноширинно)
+    offender_item_text: list = [
+        "👤 ",
+        RichTextUrl(
+            text=display_name,
+            url=f"tg://user?id={target.id}",
+        ),
+    ]
+    if target.username:
+        offender_item_text.append(f"  @{target.username}")
+    offender_item_text.append("  ")
+    offender_item_text.append(RichTextCode(text=f"ID: {target.id}"))
+    list_items.append(
+        InputRichBlockListItem(
+            blocks=[InputRichBlockParagraph(text=offender_item_text)]
+        )
+    )
+
+    # Пункт 2: админ (если есть и не бот)
+    if admin is not None and not admin.is_bot:
+        admin_full_name = (admin.first_name or "") + (
+            f" {admin.last_name}" if admin.last_name else ""
+        )
+        admin_display = admin_full_name.strip() or "(без имени)"
+        admin_item_text: list = [
+            "🛡 ",
+            RichTextUrl(
+                text=admin_display,
+                url=f"tg://user?id={admin.id}",
+            ),
+        ]
+        if admin.username:
+            admin_item_text.append(f"  @{admin.username}")
+        admin_item_text.append("  ")
+        admin_item_text.append(RichTextCode(text=f"ID: {admin.id}"))
+        list_items.append(
+            InputRichBlockListItem(
+                blocks=[InputRichBlockParagraph(text=admin_item_text)]
+            )
+        )
+
+    # Пункт 3: веб-профиль
+    if WEB_PUBLIC_URL:
+        web_url = f"{WEB_PUBLIC_URL}/user/{target.id}"
+        list_items.append(
+            InputRichBlockListItem(
+                blocks=[InputRichBlockParagraph(
+                    text=[
+                        "🌐 ",
+                        RichTextUrl(text="Открыть профиль →", url=web_url),
+                    ]
+                )]
+            )
+        )
+
+    blocks.append(InputRichBlockList(items=list_items))
+
+    # ── Details: доп. инфо (только chat_id — без длительности/варнов) ──
+    details_lines: list[str] = [f"Чат: {chat_id}"]
+    blocks.append(InputRichBlockDivider())
+    blocks.append(
+        InputRichBlockDetails(
+            summary="Доп. инфо",
+            blocks=[InputRichBlockParagraph(text="\n".join(details_lines))],
+        )
+    )
+
+    # ── Footer: время МСК + хэштег + кликабельное имя админа ───
+    now_msk = datetime.now(MSK)
+    time_str = now_msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+    footer_text: list = [f"🕐 {time_str}"]
+    if hashtag:
+        footer_text.append(f" | {hashtag}")
+    if admin is not None and not admin.is_bot:
+        admin_name = _user_display_name(admin)
+        footer_text.append(" | ")
+        footer_text.append(
+            RichTextUrl(text=admin_name, url=f"tg://user?id={admin.id}")
+        )
+    blocks.append(InputRichBlockDivider())
+    blocks.append(InputRichBlockFooter(text=footer_text))
+
+    rich_msg = InputRichMessage(blocks=blocks)
+
+    # ── Plain-text версия для fallback'а ───────────────────────
+    offender_lines_plain: list[str] = [f"👤 {display_name}"]
+    if target.username:
+        offender_lines_plain.append(f"   @{target.username}")
+    offender_lines_plain.append(f"   ID: {target.id}")
+    offender_text_plain = "\n".join(offender_lines_plain)
+
+    admin_text_plain: str | None = None
+    if admin is not None and not admin.is_bot:
+        admin_name = _user_display_name(admin)
+        admin_text_plain = f"🛡 {admin_name}"
+        if admin.username:
+            admin_text_plain += f" @{admin.username}"
+        admin_text_plain += f" ID: {admin.id}"
+
+    web_url_plain: str | None = None
+    if WEB_PUBLIC_URL:
+        web_url_plain = f"{WEB_PUBLIC_URL}/user/{target.id}"
+
+    try:
+        await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
+    except TelegramAPIError as e:
+        logger.error("Failed to send manual-ban report to chat %s: %s",
+                     report_dest, e)
+        # ── Fallback: простой plain-text отчёт ──────────────
+        try:
+            parts: list[str] = []
+            if hashtag:
+                parts.append(hashtag)
+            parts.append("🚫 БАН (ручной)")
+            parts.append("")
+            parts.append(offender_text_plain)
+            if admin_text_plain:
+                parts.append(admin_text_plain)
+            if web_url_plain:
+                parts.append(f"🌐 Открыть профиль: {web_url_plain}")
+            parts.append(f"Чат: {chat_id}")
+            parts.append(f"🕐 {time_str}")
+            await bot.send_message(chat_id=report_dest, text="\n".join(parts))
+        except TelegramAPIError as e2:
+            logger.error("Plain-text manual-ban fallback also failed: %s", e2)
+
+    return None
+
+
 async def _schedule_ephemeral_delete(
     bot: types.Bot,
     chat_id: int,
@@ -2814,6 +3061,8 @@ async def _check_warn_threshold(
 
             try:
                 await bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+                # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
+                _mark_bot_ban(chat_id, target.id)
                 await _upsert_user(session, target.id, target.username,
                                    target.first_name, target.last_name)
                 await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
@@ -3221,6 +3470,10 @@ async def handle_group_command(message: types.Message) -> None:
             except TelegramAPIError:
                 pass
             return
+
+        # v4.7.27: помечаем что бан выполнил сам бот — чтобы ChatMemberUpdated
+        # handler не отправил второй отчёт о «ручном бане» (дедупликация).
+        _mark_bot_ban(chat_id, target.id)
 
         await _send_report(
             bot=message.bot, chat_id=chat_id, target=target,
@@ -5945,6 +6198,8 @@ async def handle_new_members(message: types.Message) -> None:
             await message.bot.ban_chat_member(
                 chat_id=message.chat.id, user_id=member.id,
             )
+            # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
+            _mark_bot_ban(message.chat.id, member.id)
             logger.info(
                 "CAS auto-ban: user_id=%s in chat %s (reason: %s)",
                 member.id, message.chat.id, reason,
@@ -6064,6 +6319,8 @@ async def handle_sticker_message(message: types.Message) -> None:
     if punishment == "ban":
         try:
             await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
+            _mark_bot_ban(chat_id, target.id)
             async with async_session() as session:
                 await _save_punishment(
                     session, target.id, 0, chat_id,
@@ -6294,6 +6551,8 @@ async def handle_content_filters(message: types.Message) -> None:
     if action == "ban":
         try:
             await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
+            _mark_bot_ban(chat_id, target.id)
             async with async_session() as session:
                 await _save_punishment(
                     session, target.id, 0, chat_id,
@@ -6375,3 +6634,151 @@ async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
                     )
         except Exception as e:
             logger.warning("on_my_chat_member: failed: %s", e)
+
+
+# ── v4.7.27: chat_member — обработка ручных банов админами ─────────────────
+@router.chat_member()
+async def on_chat_member_updated(event: types.ChatMemberUpdated) -> None:
+    """v4.7.27: Срабатывает на изменения статуса участников чата (не самого бота).
+
+    Главный use-case — детектирование ручных банов, выдаваемых админами через
+    Telegram-клиент (правой кнопкой на сообщении → «Заблокировать» или через
+    профиль юзера). Telegram присылает ``ChatMemberUpdated`` с
+    ``new_chat_member.status == "kicked"``.
+
+    Без дедупликации бот отправил бы второй отчёт в reporting chat для каждого
+    бана, выполненного самим ботом через ``!ban`` / autoban / CAS / sticker-pack /
+    content-filter — т.к. Telegram присылает ``ChatMemberUpdated`` и для ботов,
+    и для ручных банов одинаково.
+
+    Решение состоит из ДВУХ уровней защиты (v4.7.28 — добавлен 2-й уровень):
+
+    1. **PERSISTENT-проверка ``event.from_user.is_bot``** (основная, v4.7.28):
+       когда бот сам вызывает ``bot.ban_chat_member()``, Telegram присылает
+       ``ChatMemberUpdated`` с ``from_user`` == сам бот (``is_bot=True``).
+       Эта проверка НЕ зависит от in-memory состояния и переживает рестарт
+       бота — когда ``_recent_bot_bans`` dict теряется. Также отсекает баны
+       от ДРУГИХ ботов (если в чате есть второй модератор-бот, который банит
+       независимо) — это тоже не «ручной бан админом через клиент».
+
+    2. **TTL-дедупликация через ``_consume_bot_ban()``** (backup, v4.7.27):
+       каждый ``bot.ban_chat_member()`` в кодовой базе помечается через
+       ``_mark_bot_ban(chat_id, user_id)`` — timestamp в in-memory dict
+       ``_recent_bot_bans``. Здесь вызываем ``_consume_bot_ban()`` — если
+       запись есть (т.е. бот сам банил в последние 10 сек), она удаляется
+       и handler молча выходит. Осталась как backup на случай, если Telegram
+       когда-то решит присылать ``from_user`` без ``is_bot=True``.
+
+    Если ни одна из проверок не сработала — это честный ручной бан админом
+    через клиент, отправляем компактный отчёт через ``_send_manual_ban_report``.
+
+    Прочие изменения статуса (member→administrator, kicked→left через unban,
+    restrict_chat_member и т.д.) пока НЕ обрабатываются — только баны.
+    """
+    new_status = event.new_chat_member.status if event.new_chat_member else None
+    old_status = event.old_chat_member.status if event.old_chat_member else None
+
+    # ── Ручной бан: new_status == "kicked" ─────────────────────
+    if new_status != "kicked":
+        return  # не бан — игнорируем (member/admin/left/restricted)
+
+    # На всякий случай: если old_status уже был "kicked" — это не новый бан
+    # (возможно, Telegram присылает дубль апдейта при каких-то операциях).
+    if old_status == "kicked":
+        return
+
+    target_user = event.new_chat_member.user if event.new_chat_member else None
+    if target_user is None:
+        # Невозможно, но safety net — выходим
+        return
+
+    chat_id = event.chat.id
+    user_id = target_user.id
+
+    # ── v4.7.28: PERSISTENT-дедупликация бот-собственных банов ──
+    # Когда бот сам вызывает `bot.ban_chat_member()` (через !ban / autoban / CAS /
+    # sticker-pack / content-filter), Telegram присылает ChatMemberUpdated с
+    # `from_user` == сам бот. Это НАДЁЖНЫЙ способ узнать «свой» бан — он не
+    # зависит от TTL и переживает рестарт бота (когда `_recent_bot_bans`
+    # in-memory dict теряется). Без этой проверки, если бот перезапустится в
+    # момент между вызовом `ban_chat_member` и приходом ChatMemberUpdated —
+    # бот отправил бы ложный отчёт «ручной бан» для своего же бана.
+    #
+    # Также отсекаем баны от ДРУГИХ ботов (если в чате есть ещё один
+    # модератор-бот, который банит независимо) — это тоже не «ручной бан
+    # админом через клиент», и репортить его как ручной было бы некорректно.
+    actor = event.from_user
+    if actor is not None and actor.is_bot:
+        logger.debug(
+            "on_chat_member_updated: bot-issued ban ignored (actor is bot) "
+            "chat=%s user=%s actor_bot_id=%s",
+            chat_id, user_id, actor.id,
+        )
+        return
+
+    # ── TTL-дедупликация (backup) ─────────────────────────────
+    # Осталась как backup на случай, если Telegram когда-то решит присылать
+    # `from_user` без `is_bot=True` (или вообще без from_user) для ботовских
+    # банов. В нормальном flow основная проверка выше уже отфильтровала баны
+    # ботов — здесь мы ловим только edge-case'ы.
+    if _consume_bot_ban(chat_id, user_id):
+        # Бот сам забанил — отчёт уже отправлен в обычном flow (!ban / autoban /
+        # CAS / sticker / content-filter). Молча выходим, не дублируем.
+        logger.debug(
+            "on_chat_member_updated: bot-own ban deduplicated (TTL backup) for chat=%s user=%s",
+            chat_id, user_id,
+        )
+        return
+
+    # ── Это ручной бан от админа через Telegram-клиент ─────────
+    # Проверяем, что для этого чата задан reporting chat — иначе молча выходим
+    # (как и ``_send_report`` делает).
+    try:
+        async with async_session() as session:
+            report_dest = await _get_report_chat_id(session, chat_id)
+            settings = await _get_chat_settings(session, chat_id)
+            hashtag = settings.hashtag if settings else ""
+    except Exception as e:
+        logger.warning(
+            "on_chat_member_updated: DB error for chat=%s user=%s: %s (skipping manual-ban report)",
+            chat_id, user_id, e,
+        )
+        return
+
+    if not report_dest:
+        # Репорт-чат не задан — молча пропускаем (как _send_report).
+        return
+
+    # event.from_user — админ, который выполнил действие (если это действие
+    # через клиент). Может быть None в редких случаях (например, если бан
+    # выполнил сам владелец чата через какие-то legacy-механизмы Telegram).
+    admin = event.from_user
+
+    logger.info(
+        "on_chat_member_updated: manual ban detected — chat=%s user=%s admin=%s",
+        chat_id, user_id,
+        (admin.id if admin and not admin.is_bot else "unknown/bot"),
+    )
+
+    # upsert'им юзера в БД (для веб-панели — чтобы профиль был доступен)
+    try:
+        async with async_session() as session:
+            await _upsert_user(
+                session, target_user.id, target_user.username,
+                target_user.first_name, target_user.last_name,
+            )
+    except Exception as e:
+        logger.warning(
+            "on_chat_member_updated: failed to upsert user %s: %s",
+            user_id, e,
+        )
+
+    # Отправляем компактный отчёт в reporting chat
+    await _send_manual_ban_report(
+        bot=event.bot,
+        chat_id=chat_id,
+        target=target_user,
+        admin=admin,
+        report_dest=report_dest,
+        hashtag=hashtag or "",
+    )
