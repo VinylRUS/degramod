@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+
+{% block title %}Active bans — Дедушка Вобжак{% endblock %}
+
+{% block content %}
+
+<div class="anchor-nav">
+    <span class="label">Jump:</span>
+    <a href="#intro">What is this</a>
+    {% if bans|length > 0 %}
+    <a href="#bans">Active bans ({{ bans|length }})</a>
+    {% endif %}
+    <a href="#filters">Filters</a>
+</div>
+
+{% if flash %}
+<div style="background: {% if 'rror' in flash or 'failed' in flash|lower %}rgba(204,51,51,.08){% else %}rgba(0,204,102,.08){% endif %}; border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); margin-bottom: var(--sp-5); color: var(--text-dim); font-size: 12px;">
+    {{ flash }}
+</div>
+{% endif %}
+
+<div id="intro" class="section-title">Active bans <a class="anchor" href="#intro">#</a></div>
+
+<div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-4); max-width: 900px; line-height: 1.7;">
+    <p style="margin-bottom: var(--sp-3);">
+        Список всех <strong>активных банов</strong> по всем чатам (где есть записи в БД).
+        Баны берутся из таблицы <code>punishments</code> с <code>action_type='ban'</code>
+        и <code>is_revoked=False</code>. Записи с <code>mod_id=0</code> — системные
+        (CAS auto-ban, content-filter, keyword-watch night auto-ban).
+    </p>
+    <p style="margin-bottom: var(--sp-3);">
+        Кнопка <strong>Unban</strong> в каждой строке:
+        <strong>soft-revoke</strong> исходной записи (помечает <code>is_revoked=True</code>),
+        дёргает Telegram API <code>unban_chat_member(only_if_banned=True)</code>
+        и создаёт новую запись <code>action_type='unban'</code> с указанием модератора
+        и причины (опциональной). Это полный паритет с TG-командой <code>!unban</code>
+        (вызов переиспользуемой функции <code>revoke_user_ban</code>).
+    </p>
+    <p>
+        Доступ: все активные веб-юзеры (admin + SU + moderator).<br>
+        Лимит: 200 строк на страницу (свежие сверху — сортировка по <code>created_at DESC</code>).
+    </p>
+</div>
+
+{# ════════════════════════════════════════════════════════════════════ #}
+{# Filters                                                              #}
+{# ════════════════════════════════════════════════════════════════════ #}
+
+<div id="filters" class="section-title" style="margin-top: var(--sp-7);">Filters <a class="anchor" href="#filters">#</a></div>
+
+<form method="get" action="/admin/bans" style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5); display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: var(--sp-3); align-items: end;">
+    <div>
+        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Chat ID</label>
+        <input type="text" name="chat_id" value="{{ filters.chat_id or '' }}" placeholder="-1001234567890"
+               style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px; box-sizing: border-box; font-family: var(--font-mono);">
+    </div>
+    <div>
+        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">User search (id/name/@)</label>
+        <input type="text" name="q" value="{{ filters.q or '' }}" placeholder="напр. 12345678 или Иван"
+               style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px; box-sizing: border-box;">
+    </div>
+    <div>
+        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Limit</label>
+        <select name="limit"
+                style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px; box-sizing: border-box;">
+            {% for opt in [50, 100, 200, 500] %}
+            <option value="{{ opt }}" {% if filters.limit|int == opt %}selected{% endif %}>{{ opt }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    <div style="display: flex; gap: var(--sp-2);">
+        <button type="submit"
+                style="padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+            Apply
+        </button>
+        <a href="/admin/bans"
+           style="padding: 8px 16px; background: transparent; border: 1px solid var(--border); color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; text-decoration: none; border-radius: var(--r-xs); display: inline-flex; align-items: center;">
+            Reset
+        </a>
+    </div>
+</form>
+
+{# ════════════════════════════════════════════════════════════════════ #}
+{# Active bans list                                                     #}
+{# ════════════════════════════════════════════════════════════════════ #}
+
+<div id="bans" class="section-title" style="margin-top: var(--sp-7);">Active bans ({{ bans|length }}{% if total_count > bans|length %} of {{ total_count }}{% endif %}) <a class="anchor" href="#bans">#</a></div>
+
+{% if not bans %}
+<div style="padding: var(--sp-4); background: var(--bg2); border: 1px dashed var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: 12px;">
+    Нет активных банов по заданным фильтрам. Либо ни один пользователь не забанен,
+    либо все баны уже сняты (is_revoked=True).
+</div>
+{% else %}
+<div style="overflow-x: auto;">
+<table style="width: 100%; border-collapse: collapse; font-size: 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden;">
+    <thead>
+        <tr style="background: var(--bg); color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; font-size: 10px;">
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">#</th>
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">Time (MSK)</th>
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">User</th>
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">Chat</th>
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">Moderator</th>
+            <th style="padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);">Reason</th>
+            <th style="padding: 10px 12px; text-align: right; border-bottom: 1px solid var(--border);">Action</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for ban in bans %}
+        <tr style="border-bottom: 1px solid var(--border); {% if loop.index is odd %}background: var(--bg2);{% else %}background: var(--bg);{% endif %}">
+            <td style="padding: 8px 12px; color: var(--text-dim); font-family: var(--font-mono); font-size: 11px;">{{ ban.id }}</td>
+            <td style="padding: 8px 12px; color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; white-space: nowrap;">
+                {{ ban.created_at|msk }}
+            </td>
+            <td style="padding: 8px 12px;">
+                {% if ban.user_first_name or ban.user_last_name %}
+                    <div style="color: var(--text); font-size: 12px;">
+                        {{ ban.user_first_name or '' }}{% if ban.user_last_name %} {{ ban.user_last_name }}{% endif %}
+                    </div>
+                {% endif %}
+                {% if ban.user_username %}
+                    <div style="color: var(--text-dim); font-size: 10px; font-family: var(--font-mono);">@{{ ban.user_username }}</div>
+                {% endif %}
+                <div style="color: var(--text-dim); font-size: 10px; font-family: var(--font-mono);">id: {{ ban.user_id }}</div>
+            </td>
+            <td style="padding: 8px 12px; color: var(--text); font-family: var(--font-mono); font-size: 11px;">
+                {{ ban.chat_id }}
+            </td>
+            <td style="padding: 8px 12px; color: var(--text); font-size: 12px;">
+                {% if ban.mod_id == 0 %}
+                    <span style="color: var(--text-dim); font-style: italic;">System</span>
+                {% elif ban.mod_first_name %}
+                    {{ ban.mod_first_name }}
+                    {% if ban.mod_username %}<div style="color: var(--text-dim); font-size: 10px; font-family: var(--font-mono);">@{{ ban.mod_username }}</div>{% endif %}
+                {% else %}
+                    <span style="color: var(--text-dim); font-family: var(--font-mono); font-size: 11px;">id: {{ ban.mod_id }}</span>
+                {% endif %}
+            </td>
+            <td style="padding: 8px 12px; color: var(--text-dim); font-size: 11px; max-width: 320px; word-break: break-word;">
+                {% if ban.reason %}{{ ban.reason }}{% else %}<span style="color: var(--text-dim); font-style: italic;">(без причины)</span>{% endif %}
+            </td>
+            <td style="padding: 8px 12px; text-align: right;">
+                <form method="post" action="/api/unban" style="display: inline;"
+                      onsubmit="return submit_unban({{ ban.id }}, {{ ban.user_id }}, {{ ban.chat_id }}, '{{ (ban.user_first_name or '')|e|replace("'", "\\'") }}');">
+                    <input type="hidden" name="punishment_id" value="{{ ban.id }}">
+                    <input type="hidden" name="user_id" value="{{ ban.user_id }}">
+                    <input type="hidden" name="chat_id" value="{{ ban.chat_id }}">
+                    <input type="hidden" name="reason" id="reason_{{ ban.id }}" value="">
+                    <button type="submit"
+                            style="padding: 4px 10px; background: transparent; border: 1px solid var(--accent); color: var(--accent); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
+                        Unban
+                    </button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</div>
+
+{% if total_count > bans|length %}
+<div style="margin-top: var(--sp-3); padding: var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: 11px; text-align: center;">
+    Показаны первые {{ bans|length }} из {{ total_count }} записей. Уточните фильтры
+    (chat_id, user search) или увеличьте limit чтобы увидеть остальные.
+</div>
+{% endif %}
+{% endif %}
+
+{# JS для confirm dialog с причиной разбана #}
+<script>
+function submit_unban(ban_id, user_id, chat_id, user_name) {
+    var reason = prompt(
+        'Разбанить пользователя ' + (user_name || 'id:' + user_id) + '?\n' +
+        'Chat: ' + chat_id + '\n' +
+        'User ID: ' + user_id + '\n\n' +
+        'Причина (опционально):',
+        ''
+    );
+    if (reason === null) {
+        return false;  // Cancel — не отправляем форму
+    }
+    var reason_input = document.getElementById('reason_' + ban_id);
+    if (reason_input) {
+        reason_input.value = reason;
+    }
+    return true;  // Отправляем форму
+}
+</script>
+
+{# Help block at bottom #}
+<div style="margin-top: var(--sp-7); padding: var(--sp-4); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); font-size: 11px; color: var(--text-dim); line-height: 1.7;">
+    <strong style="color: var(--text);">Подсказки:</strong>
+    <ul style="margin: var(--sp-2) 0 0 var(--sp-5);">
+        <li>Сортировка — свежие сверху (по <code>created_at DESC</code>).</li>
+        <li>Записи с <code>mod_id=0</code> — системные (CAS auto-ban, content-filter, keyword-watch night auto-ban, via-bot filter). Их тоже можно разбанить.</li>
+        <li>Unban через веб-API <strong>не отправляет</strong> отчёт в репорт-чат (это специфика TG-команды <code>!unban</code>). Все остальные шаги (soft-revoke + Telegram unban + новая запись action_type='unban') — идентичны.</li>
+        <li>Если у пользователя нет аватарки или профиля в БД — это нормально. Профиль создаётся при первом взаимодействии с ботом. Unban сработает даже без профиля.</li>
+        <li>Для batch-операций (массовый разбан) — используйте SSH-скрипт <code>scripts/cleanup_test_data.py</code> или прямой SQL. Веб-UI не поддерживает batch.</li>
+    </ul>
+</div>
+
+{% endblock %}

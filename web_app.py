@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.0"
+APP_VERSION = "v4.8.1"
 APP_RELEASE_DATE = "2026-08-08"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -4012,5 +4012,233 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 for p in presets
             ]
         })
+
+    # ════════════════════════════════════════════════════════════════════
+    # v4.8.1: Web unban (#3) — список активных банов + API разбана
+    # ════════════════════════════════════════════════════════════════════
+
+    @app.get("/admin/bans", response_class=HTMLResponse)
+    async def admin_bans_page(
+        request: Request,
+        chat_id: str = "",
+        q: str = "",
+        limit: int = 200,
+        flash: str = "",
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        """v4.8.1: страница активных банов (#3).
+
+        Показывает все активные баны (action_type='ban', is_revoked=False)
+        по всем чатам, с фильтрами по chat_id и поиску по юзеру.
+
+        Доступ: все аутентифицированные веб-юзеры (admin + SU + moderator).
+        Кнопка разбана через POST /api/unban.
+        """
+        # Нормализуем параметры.
+        try:
+            limit_int = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit_int = 200
+        chat_id_int: int | None = None
+        if chat_id:
+            try:
+                chat_id_int = int(chat_id)
+            except ValueError:
+                pass  # игнорим некорректный — показываем без фильтра
+        q_lower = (q or "").strip().lower()
+
+        bans = []
+        total_count = 0
+        async with async_session() as session:
+            # Базовый запрос: только активные баны (is_revoked=False).
+            # JOIN с User и Moderator для подстановки имён/юзернеймов.
+            from sqlalchemy import func as _f
+            base_filter = [
+                Punishment.action_type == "ban",
+                Punishment.is_revoked.is_(False),
+            ]
+            if chat_id_int is not None:
+                base_filter.append(Punishment.chat_id == chat_id_int)
+
+            # Считаем total_count (без LIMIT).
+            count_q = select(_f.count(Punishment.id)).where(*base_filter)
+            total_count = (await session.execute(count_q)).scalar_one()
+
+            # Поиск по юзеру (user_id, username, first_name) — добавляем к фильтру.
+            if q_lower:
+                # Простая подстрока. user_id — числовое поле, проверяем если
+                # q — число. Иначе — ILIKE по username/first_name.
+                from db import User as _U, Moderator as _M
+                user_cond = []
+                try:
+                    q_int = int(q_lower)
+                    user_cond.append(_U.user_id == q_int)
+                except ValueError:
+                    pass
+                user_cond.append(_U.username.ilike(f"%{q_lower}%"))
+                user_cond.append(_U.first_name.ilike(f"%{q_lower}%"))
+                from sqlalchemy import or_ as _or
+                from sqlalchemy import case as _case
+
+                main_q = (
+                    select(
+                        Punishment,
+                        _U.user_id.label("u_user_id"),
+                        _U.username.label("u_username"),
+                        _U.first_name.label("u_first_name"),
+                        _U.last_name.label("u_last_name"),
+                        _M.mod_id.label("m_mod_id"),
+                        _M.username.label("m_username"),
+                        _M.first_name.label("m_first_name"),
+                    )
+                    .select_from(Punishment)
+                    .outerjoin(_U, Punishment.user_id == _U.user_id)
+                    .outerjoin(_M, Punishment.mod_id == _M.mod_id)
+                    .where(*base_filter)
+                    .where(_or(*user_cond))
+                    .order_by(Punishment.created_at.desc())
+                    .limit(limit_int)
+                )
+            else:
+                from db import User as _U, Moderator as _M
+                main_q = (
+                    select(
+                        Punishment,
+                        _U.user_id.label("u_user_id"),
+                        _U.username.label("u_username"),
+                        _U.first_name.label("u_first_name"),
+                        _U.last_name.label("u_last_name"),
+                        _M.mod_id.label("m_mod_id"),
+                        _M.username.label("m_username"),
+                        _M.first_name.label("m_first_name"),
+                    )
+                    .select_from(Punishment)
+                    .outerjoin(_U, Punishment.user_id == _U.user_id)
+                    .outerjoin(_M, Punishment.mod_id == _M.mod_id)
+                    .where(*base_filter)
+                    .order_by(Punishment.created_at.desc())
+                    .limit(limit_int)
+                )
+            rows = (await session.execute(main_q)).all()
+            for row in rows:
+                p = row[0]
+                bans.append({
+                    "id": p.id,
+                    "user_id": p.user_id,
+                    "chat_id": p.chat_id,
+                    "mod_id": p.mod_id,
+                    "reason": p.reason,
+                    "created_at": p.created_at,
+                    "user_username": row.u_username,
+                    "user_first_name": row.u_first_name,
+                    "user_last_name": row.u_last_name,
+                    "mod_username": row.m_username,
+                    "mod_first_name": row.m_first_name,
+                })
+
+        return templates.TemplateResponse("admin_bans.html", {
+            "request": request,
+            "auth_user": _auth,
+            "app_version": APP_VERSION,
+            "flash": flash or None,
+            "bans": bans,
+            "total_count": total_count,
+            "filters": {
+                "chat_id": chat_id,
+                "q": q,
+                "limit": limit_int,
+            },
+        })
+
+    @app.post("/api/unban")
+    async def api_unban(
+        request: Request,
+        punishment_id: int = Form(...),
+        user_id: int = Form(...),
+        chat_id: int = Form(...),
+        reason: str = Form(""),
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        """v4.8.1: API для разбана юзера (вызывается из /admin/bans).
+
+        Делегирует в bot_handlers.revoke_user_ban — ту же функцию использует
+        и TG-команда !unban. Это гарантирует паритет:
+          • unban_chat_member (Telegram API) с only_if_banned=True.
+          • _revoke_last_action (помечает последний активный бан как снятый).
+          • _save_punishment с action_type='unban' (видно в веб-панели).
+
+        Возвращает JSON с {ok: True} или {ok: False, error: ...}.
+        """
+        # v4.8.1: создаём ephemeral aiogram.Bot если основной недоступен.
+        # На самом деле, нам нужен экземпляр Bot для вызова unban_chat_member.
+        # create_app получает bot как параметр — используем его.
+        # Если bot is None — отказ (нельзя разбанить без Bot API токена).
+        if bot is None:
+            _req_logger.error(
+                "api_unban: bot is None — create_app called without bot? "
+                "user_id=%s chat_id=%s by=%s",
+                user_id, chat_id, _auth.username,
+            )
+            return JSONResponse(
+                {"ok": False, "error": "Bot instance not available — cannot call unban_chat_member"},
+                status_code=503,
+            )
+
+        # mod_id: для БД нужен ID модератора. У веб-юзера это tg_user_id
+        # (привязанный Telegram-аккаунт). Если нет — fallback на -1 (web).
+        mod_id = _auth.tg_user_id or -1
+
+        # Импортируем revoke_user_ban (lazy — чтобы не подтягивать весь модуль
+        # при импорте web_app).
+        try:
+            from bot_handlers import revoke_user_ban
+        except ImportError as e:
+            _req_logger.error("api_unban: cannot import revoke_user_ban: %s", e)
+            return JSONResponse(
+                {"ok": False, "error": f"Internal error: {e}"},
+                status_code=500,
+            )
+
+        # Нормализуем reason — пустая строка → None.
+        reason_clean = (reason or "").strip() or None
+
+        # Логируем попытку (до вызова — для аудита даже при падении).
+        _req_logger.info(
+            "api_unban: attempt — punishment_id=%s user_id=%s chat_id=%s mod_id=%s (by=%s) reason=%r",
+            punishment_id, user_id, chat_id, mod_id, _auth.username, reason_clean,
+        )
+
+        result = await revoke_user_ban(
+            bot=bot,
+            chat_id=chat_id,
+            user_id=user_id,
+            mod_id=mod_id,
+            reason=reason_clean,
+            target_user=None,  # веб-юзер не имеет types.User объекта
+        )
+
+        if result.get("ok"):
+            _req_logger.info(
+                "api_unban: success — punishment_id=%s user_id=%s chat_id=%s by=%s",
+                punishment_id, user_id, chat_id, _auth.username,
+            )
+            # Redirect обратно на /admin/bans с flash-сообщением.
+            flash_msg = f"Разбан выполнен: user_id={user_id}, chat_id={chat_id}"
+            if reason_clean:
+                flash_msg += f", причина: {reason_clean}"
+            return RedirectResponse(
+                url=f"/admin/bans?flash={flash_msg}&chat_id={chat_id}",
+                status_code=303,
+            )
+        else:
+            _req_logger.warning(
+                "api_unban: failed — punishment_id=%s user_id=%s chat_id=%s error=%s",
+                punishment_id, user_id, chat_id, result.get("error"),
+            )
+            flash_msg = f"❌ Ошибка разбана: {result.get('error', 'unknown')}"
+            return RedirectResponse(
+                url=f"/admin/bans?flash={flash_msg}&chat_id={chat_id}",
+                status_code=303,
+            )
 
     return app
