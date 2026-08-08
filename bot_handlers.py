@@ -616,6 +616,56 @@ def _format_alarm_duration(td: timedelta) -> str:
     return f"{minutes}м"
 
 
+def _alarm_perms_source_to_human(source: str) -> str:
+    """v4.7.30: переводит техническую source-строку из _deactivate_alarm
+    в человекочитаемое описание для DM-уведомления модератору.
+
+    Зачем: раньше DM при !alarm off всегда писал "восстановлено из snapshot",
+    но реально права могли восстановиться из day_permissions preset. Был Баг #5
+    аудита v4.7.30 — недостоверная информация модератору.
+
+    Возвращает читаемое описание. Если source неизвестен — fallback.
+    """
+    if not source:
+        return "(источник неизвестен)"
+    if source == "day_permissions preset":
+        return "из day_permissions пресета чата"
+    if source == "alarm_saved_permissions snapshot":
+        return "из сохранённого snapshot (состояние до alarm)"
+    if source == "hardcoded default (all allowed)":
+        return "из системного дефолта (всё разрешено)"
+    # Fallback — показываем как есть, чтобы ничего не потерять.
+    return f"из источника: {source}"
+
+
+def _alarm_slow_source_to_human(source: str) -> str:
+    """v4.7.30: переводит техническую slow_source-строку из _deactivate_alarm
+    в человекочитаемое описание для DM-уведомления модератору.
+
+    Аналогично _alarm_perms_source_to_human — для slow_mode_delay.
+    """
+    if not source:
+        return "0 сек (выключен)"
+    if source == "default 0":
+        return "0 сек (выключен)"
+    if source.startswith("day_slow_mode_delay="):
+        # Формат: "day_slow_mode_delay=60"
+        try:
+            val = int(source.split("=", 1)[1])
+            return f"{val} сек (из day_slow_mode_delay пресета)"
+        except (ValueError, IndexError):
+            return source
+    if source.startswith("alarm_saved_slow_mode_delay="):
+        # Формат: "alarm_saved_slow_mode_delay=30"
+        try:
+            val = int(source.split("=", 1)[1])
+            return f"{val} сек (из сохранённого snapshot до alarm)"
+        except (ValueError, IndexError):
+            return source
+    # Fallback
+    return source
+
+
 async def _deactivate_alarm(
     session,
     cs: ChatSettings,
@@ -623,7 +673,7 @@ async def _deactivate_alarm(
     chat_id: int,
     *,
     reason: str = "manual",
-) -> bool:
+) -> tuple[bool, str, str]:
     """Снимает alarm и восстанавливает права чата.
 
     Логика восстановления (приоритет):
@@ -637,12 +687,29 @@ async def _deactivate_alarm(
       2. cs.alarm_saved_slow_mode_delay (snapshot)
       3. 0 (выключить)
 
-    Возвращает True если успешно, False если что-то упало.
+    v4.7.30: возвращает кортеж (success, perms_source, slow_source) вместо
+    просто bool (Баг #5 аудита v4.7.30). Нужно для достоверного DM-сообщения
+    в handle_alarm_command — раньше бот всегда писал "восстановлено из
+    snapshot" даже если реально восстановил из preset. Теперь вызывающий
+    код знает, откуда реально восстановлены права, и пишет правду.
+
+    Параметры:
+      session — async SQLAlchemy session (вызывающий код управляет транзакцией)
+      cs — объект ChatSettings (поле alarm_currently_active должно быть True)
+      bot — экземпляр Bot для вызова set_chat_permissions / SetChatSlowModeDelay
+      chat_id — ID чата
+      reason — причина деактивации ("manual", "auto_off_timeout",
+               "night_mode_enter", "sanitary_day_enter") — для логов
+
+    Возвращает:
+      (True, perms_source_str, slow_source_str) при успехе
+      (False, "", "") при неудаче (например, set_chat_permissions упал)
+
     Логирует все шаги.
     """
     if not cs.alarm_currently_active:
         logger.info("Alarm deactivate: chat %s not active (reason=%s)", chat_id, reason)
-        return False
+        return False, "", ""
 
     # Шаг 1: определяем права для восстановления
     perms_to_restore: types.ChatPermissions | None = None
@@ -710,7 +777,7 @@ async def _deactivate_alarm(
             "Alarm deactivate: set_chat_permissions failed for chat %s: %s",
             chat_id, e,
         )
-        return False
+        return False, "", ""
 
     # Шаг 4: применяем slow_mode
     # v4.7.22: SetChatSlowModeDelay определён в bot_handlers.py (top-level),
@@ -733,6 +800,8 @@ async def _deactivate_alarm(
         )
 
     # Шаг 5: очищаем поля alarm в БД
+    # Сохраняем started_by ДО зануления — для лога ниже.
+    started_by_log = cs.alarm_started_by
     cs.alarm_currently_active = False
     cs.alarm_saved_permissions = None
     cs.alarm_saved_slow_mode_delay = None
@@ -741,10 +810,10 @@ async def _deactivate_alarm(
     await session.commit()
 
     logger.info(
-        "Alarm deactivated: chat %s reason=%s started_by=%s",
-        chat_id, reason, cs.alarm_started_by,
+        "Alarm deactivated: chat %s reason=%s started_by=%s (perms=%s, slow=%s)",
+        chat_id, reason, started_by_log, perms_source, slow_source,
     )
-    return True
+    return True, perms_source, slow_source
 
 
 def _user_mention_html(user: types.User) -> str:
@@ -3970,13 +4039,24 @@ async def handle_alarm_command(message: types.Message) -> None:
                     text="ℹ️ Alarm не активен в чате — снимать нечего.",
                 )
                 return
-            ok = await _deactivate_alarm(session, cs, message.bot, chat_id, reason="manual")
+            # v4.7.30: _deactivate_alarm теперь возвращает (ok, perms_source, slow_source)
+            # — используем их для достоверного DM (Баг #5 аудита v4.7.30).
+            ok, perms_source, slow_source = await _deactivate_alarm(
+                session, cs, message.bot, chat_id, reason="manual",
+            )
         if ok:
+            # v4.7.30: переводим source-строки в человекочитаемые описания,
+            # чтобы модератор понимал, ОТКУДА реально восстановлены права.
+            # Раньше всегда писали "из snapshot" — это было неправдой если
+            # был задан day_permissions preset.
+            perms_desc = _alarm_perms_source_to_human(perms_source)
+            slow_desc = _alarm_slow_source_to_human(slow_source)
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
                     f"✅ Alarm снят в чате.\n"
-                    f"Права и slow_mode восстановлены из сохранённого snapshot."
+                    f"• Права восстановлены: {perms_desc}\n"
+                    f"• Slow mode восстановлен: {slow_desc}"
                 ),
             )
         else:
@@ -4042,6 +4122,30 @@ async def handle_alarm_command(message: types.Message) -> None:
         # ── Если alarm уже активен — продлеваем/обновляем duration ────────
         if cs.alarm_currently_active:
             old_started_by = cs.alarm_started_by
+            # v4.7.30: узнать кто включил alarm до нас — для DM (Баг #7 аудита
+            # v4.7.30). Пытаемся найти профиль модератора в БД. Best-effort:
+            # если не нашли (старая запись, удалённый юзер) — fallback на ID.
+            prev_mod_display = f"id:{old_started_by}" if old_started_by else "неизвестно"
+            if old_started_by:
+                try:
+                    prev_mod = (await session.execute(
+                        select(Moderator).where(Moderator.tg_user_id == old_started_by)
+                    )).scalar_one_or_none()
+                    if prev_mod:
+                        # Собираем "Имя @username (id:NNN)" — максимум информации.
+                        parts = []
+                        if prev_mod.first_name:
+                            parts.append(prev_mod.first_name)
+                        if prev_mod.username:
+                            parts.append(f"@{prev_mod.username}")
+                        parts.append(f"id:{old_started_by}")
+                        prev_mod_display = " ".join(parts)
+                except Exception as e:
+                    logger.debug(
+                        "Alarm extend: could not load prev moderator profile for %s: %s "
+                        "(using fallback display)",
+                        old_started_by, e,
+                    )
             if duration_td:
                 new_until = datetime.now(timezone.utc) + duration_td
                 cs.alarm_active_until = new_until
@@ -4054,7 +4158,8 @@ async def handle_alarm_command(message: types.Message) -> None:
                     bot=message.bot, user_id=mod.id,
                     text=(
                         f"⏱ Alarm уже был активен — продлён до {_format_alarm_duration(duration_td)}.\n"
-                        f"Alarm active until: {new_until.isoformat()}."
+                        f"• Предыдущий alarm включил: {prev_mod_display}\n"
+                        f"• Alarm active until: {new_until.isoformat()}"
                     ),
                 )
             else:
@@ -4069,7 +4174,8 @@ async def handle_alarm_command(message: types.Message) -> None:
                     bot=message.bot, user_id=mod.id,
                     text=(
                         f"⏱ Alarm уже был активен — auto-off отключён.\n"
-                        f"Теперь alarm будет активен до ручного !alarm off."
+                        f"• Предыдущий alarm включил: {prev_mod_display}\n"
+                        f"• Теперь alarm будет активен до ручного !alarm off."
                     ),
                 )
             return
@@ -6190,6 +6296,27 @@ async def handle_new_members(message: types.Message) -> None:
         # Не проверяем ботов (они не бывают в CAS-базе, а проверка лишняя)
         if member.is_bot:
             continue
+        # v4.7.30: exempt модераторов/админов от CAS-проверки.
+        # Сценарий: модератор был ранее замечен в CAS-базе (в других чатах,
+        # давно), но в нашем чате он теперь полноценный модератор через
+        # ChatAdmin или ADMIN_IDS. Без exempt бот его забанит при входе.
+        # Проверка best-effort — если БД лежит, fail-open (пропускаем, не банним).
+        try:
+            async with async_session() as admin_session:
+                member_is_adm = await _is_admin(admin_session, message.chat.id, member.id)
+        except Exception as e:
+            logger.warning(
+                "CAS check: _is_admin lookup failed for new member %s in chat %s: %s "
+                "(fail-open — will skip CAS check for this user)",
+                member.id, message.chat.id, e,
+            )
+            member_is_adm = True  # fail-open: лучше пропустить, чем забанить
+        if member_is_adm:
+            logger.info(
+                "CAS check: exempt admin/mod %s joining chat %s (skipping CAS check)",
+                member.id, message.chat.id,
+            )
+            continue
         is_banned, reason = await _cas_check_user(member.id)
         if not is_banned:
             continue
@@ -6237,6 +6364,12 @@ async def handle_sticker_message(message: types.Message) -> None:
     находится в BannedStickerPack для этого чата (или global) —
     применяется настроенное наказание (delete/warn/mute/ban) и сообщение
     удаляется. Анонимные стикеры (без set_name) не проверяются.
+
+    v4.7.30: модераторы/админы чата exempt от наказания за забаненные
+    стикерпаки (Баг #4 аудита v4.7.30). Без этого модератор, тестирующий
+    фильтр, мог быть забанен/замьючен собственным ботом. Сообщение
+    модератора тоже НЕ удаляется — чтобы он видел что стикер вообще
+    отправился. Логируем warning для аудита.
     """
     sticker = message.sticker
     if not sticker or not sticker.set_name:
@@ -6254,6 +6387,29 @@ async def handle_sticker_message(message: types.Message) -> None:
         return  # пак не в бан-листе — пропускаем к catchall
 
     target = message.from_user
+
+    # v4.7.30: exempt модераторов/админов (Баг #4 аудита v4.7.30).
+    # Аналогично _check_via_bot_filter — админам можно всё.
+    # ВАЖНО: проверяем ДО удаления сообщения — иначе модератор не увидит
+    # что его стикер вообще дошёл, и подумает что бот сломан.
+    try:
+        async with async_session() as session:
+            is_adm = await _is_admin(session, chat_id, target.id)
+    except Exception as e:
+        logger.warning(
+            "handle_sticker_message: _is_admin check failed for user %s in chat %s: %s "
+            "(fail-open — will apply punishment)",
+            target.id, chat_id, e,
+        )
+        is_adm = False
+    if is_adm:
+        logger.info(
+            "Sticker filter: exempt admin/mod %s in chat %s (pack='%s' is banned "
+            "but user has moderator rights — skipping punishment and deletion)",
+            target.id, chat_id, sticker.set_name,
+        )
+        return  # не удаляем, не наказываем — пропускаем к catchall
+
     target_content = f"🎭 [Стикер из пака: {sticker.set_name}]"
 
     # Удаляем сообщение со стикером
@@ -6451,6 +6607,13 @@ async def handle_content_filters(message: types.Message) -> None:
     word/link filter не запускается. Если в пределах grace-окна —
     пропускаем к word/link filter (сообщение может нарушить и их).
 
+    v4.7.30: модераторы/админы чата exempt от word/link фильтров (Баг #4
+    аудита v4.7.30). Без этого модератор, тестирующий фильтр запрещённым
+    словом или ссылкой, мог быть забанен/замьючен собственным ботом.
+    Проверка делается ПОСЛЕ via-bot фильтра (он уже имеет свой exempt)
+    и ДО word/link проверки — чтобы лишний раз не дёргать БД если юзер
+    не модератор.
+
     Если ни один фильтр не сработал — возвращаем управление (return),
     давая шанс stealth_catchall_group.
     """
@@ -6464,6 +6627,31 @@ async def handle_content_filters(message: types.Message) -> None:
     text = message.text or message.caption or ""
     if not text:
         return
+
+    # v4.7.30: exempt модераторов/админов от word/link фильтров (Баг #4).
+    # _check_via_bot_filter уже имеет свой exempt, но он работает только
+    # для via-bot сообщений. Здесь покрываем обычные текстовые сообщения.
+    target_for_exempt = message.from_user
+    if target_for_exempt is not None:
+        try:
+            async with async_session() as session:
+                is_adm = await _is_admin(session, chat_id, target_for_exempt.id)
+        except Exception as e:
+            logger.warning(
+                "handle_content_filters: _is_admin check failed for user %s in chat %s: %s "
+                "(fail-open — will apply filters)",
+                target_for_exempt.id, chat_id, e,
+            )
+            is_adm = False
+        if is_adm:
+            # Модератору можно — пропускаем word/link проверку.
+            # Не логируем на INFO (часто — модераторы пишут в чат нормально),
+            # но debug-уровень оставляем для отладки.
+            logger.debug(
+                "Content filter: exempt admin/mod %s in chat %s (skipping word/link check)",
+                target_for_exempt.id, chat_id,
+            )
+            return
 
     try:
         async with async_session() as session:

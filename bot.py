@@ -189,12 +189,79 @@ async def _night_mode_loop():
     logger.info("Night mode background task started (interval=60s)")
     while True:
         try:
-            # v4.5.4: sanitary day tick ПЕРВЫМ — он может снять night mode.
+            # v4.7.30: alarm auto-off ПЕРВЫМ — снимает зависшие alarm'ы
+            # с истёкшим alarm_active_until. Должно идти ДО sanitary/night,
+            # чтобы alarm снялся до любых других манипуляций с правами чата.
+            await _alarm_auto_off_tick()
+            # v4.5.4: sanitary day tick ВТОРЫМ — он может снять night mode.
             await _sanitary_day_tick()
             await _night_mode_tick()
         except Exception as e:
-            logger.error("Night/sanitary mode tick error: %s", e)
+            logger.error("Alarm/sanitary/night mode tick error: %s", e)
         await asyncio.sleep(60)
+
+
+async def _alarm_auto_off_tick():
+    """v4.7.30: проверяет ВСЕ чаты с активным alarm и истёкшим alarm_active_until.
+
+    Вынесено из _night_mode_tick в отдельную функцию — Баг #1 аудита v4.7.30:
+    раньше auto-off работал только для чатов с night_mode_enabled=True
+    (т.к. был встроен в query _night_mode_tick). Чаты без night_mode вообще
+    не проверялись, alarm зависал навсегда даже при указанной длительности.
+
+    Теперь: отдельный query по всем чатам с alarm_currently_active=True и
+    alarm_active_until IS NOT NULL. Если now >= alarm_active_until —
+    вызываем _deactivate_alarm(reason="auto_off_timeout").
+
+    Вызывается из _night_mode_loop ПЕРЕД _sanitary_day_tick и _night_mode_tick
+    — чтобы alarm снялся до любых других манипуляций с правами чата.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with async_session() as session:
+            stmt = select(ChatSettings).where(
+                ChatSettings.alarm_currently_active.is_(True),
+                ChatSettings.alarm_active_until.is_not(None),
+                ChatSettings.chat_id != 0,  # пропускаем global default
+                ChatSettings.is_enabled.is_(True),  # чат активен
+            )
+            chats = (await session.execute(stmt)).scalars().all()
+    except Exception as e:
+        logger.warning("Alarm auto-off tick: DB error loading chats: %s", e)
+        return
+
+    for cs in chats:
+        if cs.alarm_active_until is None or now < cs.alarm_active_until:
+            continue  # не вышло время (двойная проверка на случай race)
+        logger.info(
+            "Alarm auto-off: chat %s alarm_active_until=%s (now=%s)",
+            cs.chat_id, cs.alarm_active_until.isoformat(), now.isoformat(),
+        )
+        try:
+            async with async_session() as alarm_session:
+                alarm_cs = (await alarm_session.execute(
+                    select(ChatSettings).where(
+                        ChatSettings.chat_id == cs.chat_id
+                    )
+                )).scalar_one_or_none()
+                if alarm_cs and alarm_cs.alarm_currently_active:
+                    # Используем _deactivate_alarm из bot_handlers.
+                    # Восстанавливает права из snapshot/preset.
+                    await _deactivate_alarm(
+                        alarm_session, alarm_cs, bot,
+                        cs.chat_id, reason="auto_off_timeout",
+                    )
+                    # Синхронизируем cs в памяти (на случай если кто-то
+                    # дальше в этом тике будет читать — defensive).
+                    cs.alarm_currently_active = False
+                    cs.alarm_saved_permissions = None
+                    cs.alarm_saved_slow_mode_delay = None
+                    cs.alarm_active_until = None
+        except Exception as e:
+            logger.error(
+                "Alarm auto-off failed for chat %s: %s",
+                cs.chat_id, e,
+            )
 
 
 async def _night_mode_tick():
@@ -204,6 +271,10 @@ async def _night_mode_tick():
 
     v4.5.3: использует _night_mode_in_window вместо _time_str_in_range —
     это учитывает night_mode_tz и night_mode_weekend_start/end.
+
+    v4.7.30: auto-off alarm вынесен в _alarm_auto_off_tick (отдельная функция
+    в _night_mode_loop). Здесь осталась только логика "перед входом в night
+    mode снять активный alarm" (т.к. это специфично именно для night mode).
     """
     now = datetime.now(timezone.utc)
     try:
@@ -224,42 +295,6 @@ async def _night_mode_tick():
             # дёргать права пока активен sanitary day.
             if cs.sanitary_days_currently_active:
                 continue
-
-            # v4.7.20: auto-off alarm если alarm_active_until истёк.
-            # Проверяем ПЕРЕД night mode логикой — чтобы alarm не конфликтовал
-            # с night. Если alarm_active_until is None — alarm до ручного off.
-            if (cs.alarm_currently_active
-                    and cs.alarm_active_until is not None
-                    and now >= cs.alarm_active_until):
-                logger.info(
-                    "Alarm auto-off: chat %s alarm_active_until=%s (now=%s)",
-                    cs.chat_id, cs.alarm_active_until.isoformat(), now.isoformat(),
-                )
-                try:
-                    async with async_session() as alarm_session:
-                        alarm_cs = (await alarm_session.execute(
-                            select(ChatSettings).where(
-                                ChatSettings.chat_id == cs.chat_id
-                            )
-                        )).scalar_one_or_none()
-                        if alarm_cs and alarm_cs.alarm_currently_active:
-                            # Используем _deactivate_alarm из bot_handlers.
-                            # Восстанавливает права из snapshot/preset.
-                            await _deactivate_alarm(
-                                alarm_session, alarm_cs, bot,
-                                cs.chat_id, reason="auto_off_timeout",
-                            )
-                            # Синхронизируем cs в памяти — чтобы后续 night mode
-                            # логика видела, что alarm снят.
-                            cs.alarm_currently_active = False
-                            cs.alarm_saved_permissions = None
-                            cs.alarm_saved_slow_mode_delay = None
-                            cs.alarm_active_until = None
-                except Exception as e:
-                    logger.error(
-                        "Alarm auto-off failed for chat %s: %s",
-                        cs.chat_id, e,
-                    )
 
             tz_name = cs.night_mode_tz or "Europe/Moscow"
             in_window = _night_mode_in_window(
@@ -922,10 +957,16 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
     1. Если night mode сейчас активен — сначала выходим из него (восстанавливаем
        day-права, чистим night-флаги). Это гарантирует, что sanitary snapshot
        содержит настоящие day-права, а не ночные.
-    2. Делаем snapshot текущих ChatPermissions.
-    3. Ставим все права в False (полный lockdown) — ИЛИ используем granular
+    2. v4.7.30: если alarm сейчас активен — сначала деактивируем его (Баг #3
+       аудита v4.7.30). Без этого sanitary snapshot сохранит alarm-состояние
+       (text-only) как "оригинальные дневные права", и при выходе из sanitary
+       day чат восстановит text-only вместо настоящих day-прав. Кроме того,
+       alarm-поля в БД останутся set, что приведёт к непредсказуемому
+       поведению при последующем !alarm off.
+    3. Делаем snapshot текущих ChatPermissions.
+    4. Ставим все права в False (полный lockdown) — ИЛИ используем granular
        sanitary_days_permissions если задан (v4.6.0).
-    4. Сохраняем snapshot и флаг.
+    5. Сохраняем snapshot и флаг.
     """
     try:
         # 1. Если night mode активен — сначала выходим из него.
@@ -945,6 +986,40 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                 )).scalar_one_or_none()
                 if fresh:
                     cs = fresh
+
+        # 2. v4.7.30: если alarm активен — деактивируем перед snapshot'ом.
+        # Аналогично логике в _night_mode_tick перед входом в night mode.
+        # Восстанавливает права из alarm-snapshot (это настоящие day-права,
+        # которые были ДО alarm). После этого cs.alarm_* поля очищены,
+        # права чата восстановлены — sanitary snapshot будет корректным.
+        if cs.alarm_currently_active:
+            logger.info(
+                "Sanitary day: auto-deactivating alarm before entering lockdown "
+                "for chat %s (alarm_started_by=%s)",
+                cs.chat_id, cs.alarm_started_by,
+            )
+            try:
+                async with async_session() as alarm_session:
+                    alarm_cs = (await alarm_session.execute(
+                        select(ChatSettings).where(
+                            ChatSettings.chat_id == cs.chat_id
+                        )
+                    )).scalar_one_or_none()
+                    if alarm_cs and alarm_cs.alarm_currently_active:
+                        await _deactivate_alarm(
+                            alarm_session, alarm_cs, bot,
+                            cs.chat_id, reason="sanitary_day_enter",
+                        )
+                        cs.alarm_currently_active = False
+                        cs.alarm_saved_permissions = None
+                        cs.alarm_saved_slow_mode_delay = None
+                        cs.alarm_active_until = None
+            except Exception as e:
+                logger.warning(
+                    "Sanitary day: could not deactivate alarm first for chat %s: %s "
+                    "(will proceed anyway — snapshot may capture alarm state)",
+                    cs.chat_id, e,
+                )
 
         # 2. Snapshot текущих прав.
         # v4.6.0: если есть явное day_permissions — используем его как snapshot.
@@ -1120,6 +1195,14 @@ async def _startup_recovery() -> None:
     night mode — _night_mode_tick() восстановит права из snapshot и снимет
     флаг. Если до сих пор в окне — ничего не произойдёт (already active).
     Аналогично для sanitary_days_currently_active.
+
+    v4.7.30: добавлен alarm_currently_active в проверку — Баг #2 аудита
+    v4.7.30. Если бот крашнулся в момент когда alarm был активен — при
+    рестарте _alarm_auto_off_tick() снимет его если alarm_active_until
+    истёк, или оставит активным если ещё не вышло время (или alarm без
+    длительности). Если alarm завис без alarm_active_until (manual off) —
+    он останется активным (это правильно, модератор должен снять вручную),
+    но в логе startup recovery будет видно что он есть.
     """
     try:
         async with async_session() as session:
@@ -1128,6 +1211,7 @@ async def _startup_recovery() -> None:
                 or_(
                     ChatSettings.night_mode_currently_active.is_(True),
                     ChatSettings.sanitary_days_currently_active.is_(True),
+                    ChatSettings.alarm_currently_active.is_(True),
                 ),
                 ChatSettings.chat_id != 0,  # пропускаем global default
             )
@@ -1141,15 +1225,21 @@ async def _startup_recovery() -> None:
         )
         for cs in stuck:
             logger.warning(
-                "  chat %s: night_active=%s sanitary_active=%s",
+                "  chat %s: night_active=%s sanitary_active=%s alarm_active=%s "
+                "(alarm_until=%s, alarm_started_by=%s)",
                 cs.chat_id,
                 bool(cs.night_mode_currently_active),
                 bool(cs.sanitary_days_currently_active),
+                bool(cs.alarm_currently_active),
+                cs.alarm_active_until.isoformat() if cs.alarm_active_until else "N/A",
+                cs.alarm_started_by,
             )
-        # Прогоняем tick — sanitary ПЕРВЫМ (он имеет приоритет над night).
-        # Tick сам разберётся: снимет active-флаг если окно вышло,
-        # оставит если всё ещё в окне.
+        # Прогоняем tick'и в правильном порядке:
+        # 1. alarm auto-off ПЕРВЫМ — снимет alarm'ы с истёкшим alarm_active_until
+        # 2. sanitary day tick — снимет sanitary если окно вышло
+        # 3. night mode tick — снимет night если окно вышло
         try:
+            await _alarm_auto_off_tick()
             await _sanitary_day_tick()
             await _night_mode_tick()
             logger.info("Startup recovery: tick completed, state reconciled")

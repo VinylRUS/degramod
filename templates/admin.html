@@ -6,6 +6,7 @@
 
 <div class="anchor-nav">
     <span class="label">Jump:</span>
+    <a href="#create">How to add</a>
     <a href="#list">Users</a>
     {% if tg_only_moderators %}
     <a href="#tg-only">TG-only mods</a>
@@ -19,22 +20,22 @@
 </div>
 {% endif %}
 
-{# ── v4.7.0: ручное создание упразднено — замещение через sync admins в /admin/chats ── #}
-<div id="create" class="section-title">User management <a class="anchor" href="#create">#</a></div>
+{# ── v4.7.29: Краткая инструкция по добавлению модераторов (вместо устаревшего User management) ── #}
+<div id="create" class="section-title">Как добавить модератора <a class="anchor" href="#create">#</a></div>
 <div style="max-width: 800px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-5);">
-    <div style="font-size: 12px; color: var(--text); line-height: 1.7; margin-bottom: var(--sp-3);">
-        <strong>v4.7.0:</strong> ручное создание пользователей упразднено. Учётки теперь создаются автоматически через <strong>Sync admins from TG</strong> — кнопку в карточке чата на странице <a href="/admin/chats" style="color: var(--accent);">/admin/chats</a>.
+    <div style="font-size: 12px; color: var(--text); line-height: 1.7;">
+        <strong>Способ 1 — через веб-панель (рекомендуется):</strong><br>
+        Откройте карточку чата на странице <a href="/admin/chats" style="color: var(--accent);">Чаты</a> и нажмите
+        <strong>«Sync admins from TG»</strong>. Бот сам подтянет список админов из Telegram и создаст для каждого учётную запись.
+        После этого новый админ пишет боту <code>/start</code> в личные сообщения — бот пришлёт ему логин и пароль.
     </div>
-    <div style="font-size: 11px; color: var(--text-dim); line-height: 1.7; padding-left: var(--sp-3); border-left: 2px solid var(--border);">
-        <strong>Как это работает:</strong><br>
-        1. SU открывает карточку чата → «Sync admins from TG».<br>
-        2. Бот получает список TG-админов и создаёт для каждого <em>pending</em>-учётку (is_active=False, без пароля).<br>
-        3. Юзер, который стал админом чата, пишет боту <code>/start</code> в ЛС → бот генерирует пароль, активирует учётку и шлёт DM с логином/паролем.<br>
-        4. Если у юзера есть <code>can_promote_members</code> (=owner) → роль <code>admin</code>, иначе <code>moderator</code> (привязан к своему чату).<br>
-        5. Если TG-owner снимает админа — при следующем sync его WebUser деактивируется.
+    <div style="font-size: 12px; color: var(--text); line-height: 1.7; margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px dashed var(--border);">
+        <strong>Способ 2 — командой бота (только для SU):</strong><br>
+        В личке бота: <code>/addadmin &lt;chat_id&gt; &lt;user_id&gt;</code> — добавит юзера в админы конкретного чата.
+        Убрать: <code>/deladmin &lt;chat_id&gt; &lt;user_id&gt;</code>.
     </div>
-    <div style="margin-top: var(--sp-3); font-size: 10px; color: var(--text-dim); line-height: 1.6;">
-        Ниже в таблице — список всех WebUser (активные, pending и деактивированные). SU может: деактивировать, сменить роль, сбросить пароль, удалить, привязать другой TG ID.
+    <div style="margin-top: var(--sp-3); font-size: 11px; color: var(--text-dim); line-height: 1.6;">
+        ℹ Ниже в таблице — список всех пользователей веб-панели. SU может деактивировать, сменить роль, сбросить пароль или привязать другой Telegram ID.
     </div>
 </div>
 
