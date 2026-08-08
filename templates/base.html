@@ -639,6 +639,17 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.2</strong> — 9 августа 2026 (патч: актуализация <code>/help</code> после реформы команд v4.8.1)</p>
+                <ul>
+                    <li><strong>Актуализация <code>/help</code></strong>. Хелп-тексты (<code>_HELP_FULL_TEXT</code> для админов и <code>_HELP_MODERATOR_TEXT</code> для модераторов) писались для v4.7.9 и не отражали реформу команд v4.8.1. Теперь:</li>
+                    <li>Раздел «В группах» разбит на <strong>громкие</strong> (<code>!ban</code>/<code>!warn</code>/<code>!mute</code> — публичное сообщение, причина обязательна) и <strong>тихие</strong> (<code>!sban</code>/<code>!swarn</code>/<code>!smute</code> — стелс, причина необязательна) команды. Для каждой громкой команды указан формат публикуемого сообщения.</li>
+                    <li>Для <code>!swarn</code> явно отмечено, что нарушитель получает ephemeral (единственное исключение из «тихого» режима).</li>
+                    <li>Удалены упоминания <code>/addword</code>/<code>/delword</code>/<code>/listwords</code> из обоих help-текстов и из TOC в начале <code>bot_handlers.py</code> (команды удалены в v4.8.1). Заменены подсказкой использовать KeywordWatch через <code>/admin/keywords</code> или <code>!addkeyword</code>/<code>!delkeyword</code>/<code>!listkeywords</code>.</li>
+                    <li>Добавлен <code>!alarm on [длительность]</code> / <code>!alarm off</code> (v4.7.20b) — не был описан в help.</li>
+                    <li>Добавлена ссылка на веб-страницу <code>/admin/bans</code> (web unban из v4.8.1) в разделе веб-панели.</li>
+                    <li>Для модераторов добавлен блок про выбор между громким и тихим вариантом: «громкие = прозрачность, тихие = когда не хочется привлекать внимание».</li>
+                </ul>
+
                 <p><strong>v4.8.1</strong> — 8 августа 2026 (патч: реформа команд ban/warn/mute + web unban + удаление word_filter)</p>
                 <ul>
                     <li><strong>Реформа команд ban/warn/mute</strong>. Громкие команды <code>!ban</code>/<code>!warn</code>/<code>!mute</code> теперь публикуют короткое публичное сообщение в чат (<code>Пользователь "X" забанен за "Y"</code>), без ephemeral модератору. Причина для громких — обязательна. Добавлены тихие команды <code>!sban</code>/<code>!swarn</code>/<code>!smute</code> (stealth-режим) — копия v4.8.0 поведения с ephemeral модератору. Причина для тихих — необязательна. Для <code>!swarn</code> сохранено ephemeral-уведомление нарушителю (особое требование). Ephemeral про автодобавление стикерпака при бане за стикер — остаётся для <code>!ban</code> и <code>!sban</code>.</li>
