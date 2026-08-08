@@ -306,6 +306,13 @@ class ChatSettings(Base):
     via_bot_rate_limit_seconds = Column(Integer, default=300, nullable=False)  # grace window (def 5 min)
     via_bot_mute_minutes = Column(Integer, default=10, nullable=False)         # mute duration (def 10 min)
 
+    # ── v4.8.0: Modchat (модераторский чат) + keyword-watch ─────────────
+    # Modchat — отдельный чат для оперативных оповещений модераторам:
+    # события alarm on/off/auto-off/продление + keyword-watch (упоминания
+    # заданных фраз). Взаимоисключается с is_report_chat (проверяется в коде).
+    mod_chat_id = Column(BigInteger, nullable=True)
+    is_mod_chat = Column(Boolean, default=False, nullable=False)
+
 
 class PermissionPreset(Base):
     """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
@@ -354,6 +361,11 @@ class WordFilter(Base):
     chat_id=0 — глобальные паттерны (применяются ко всем чатам, где word_filter
     включён — но мы не делаем per-chat toggle для word filter в этой версии;
     паттерны работают per-chat, для глобального default используется chat_id=0).
+
+    v4.8.0: ВНИМАНИЕ — WordFilter объявлен deprecated. Используйте KeywordWatch
+    (ниже). Код word-filter будет удалён в v4.8.1. Сейчас остаётся для
+    обратной совместимости — но новые фразы нужно вносить через KeywordWatch
+    (через веб-панель admin_keywords.html или команду !addkeyword).
     """
     __tablename__ = "word_filters"
 
@@ -363,6 +375,41 @@ class WordFilter(Base):
     is_regex = Column(Boolean, default=False, nullable=False)  # True — re.search, False — lowercase in
     action = Column(String(16), default="delete", nullable=False)  # delete|warn|mute|ban
     mute_duration = Column(Integer, nullable=True)            # сек, для action=mute (NULL = chat default)
+    created_by = Column(BigInteger, nullable=True)            # mod_id создателя
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    is_active = Column(Boolean, default=True, nullable=False)
+
+
+class KeywordWatch(Base):
+    """v4.8.0: Keyword-watch — замена word_filter.
+
+    Принципиальные отличия от WordFilter:
+      • Глобальный список (один на все чаты — правила везде одни).
+        chat_id=0 всегда, поле оставлено для будущих расширений.
+      • Каждая фраза имеет флаг ban_in_night_mode:
+        - День: только notify в modchat (не банит, не удаляет).
+        - Ночь (active night mode): если ban_in_night_mode=True — применяет
+          автобан. Иначе — только notify.
+      • Match logic:
+        - Если фраза содержит пробел → substring match (case-insensitive).
+          Фраза "срал в торт детишкам" найдёт только эту последовательность.
+        - Если фраза — одно слово → word-boundary match (не сработает на
+          "замодераторили" если в списке "модератор").
+      • Exempt: модераторы/админы/SU пропускаются через _is_admin().
+      • Антиспам modchat'а: rate-limit 60 сек/фраза + multiplexing
+        (3 совпадения в одном сообщении → 1 notify).
+
+    Поле rules_section (v4.8.0+): ID секции на сайте правил, куда публиковать
+    фразу через GitHub sync (см. ROADMAP пункт #11). null = не публиковать.
+    Пока в v4.8.0 не используется (GitHub sync планируется отдельно).
+    """
+    __tablename__ = "keyword_watch"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(BigInteger, nullable=False, default=0, index=True)  # 0 = global (всегда)
+    phrase = Column(String(255), nullable=False)              # отслеживаемая фраза
+    ban_in_night_mode = Column(Boolean, default=False, nullable=False)  # авто-бан ночью
+    rules_section = Column(String(64), nullable=True)         # ID секции сайта правил (для #11)
     created_by = Column(BigInteger, nullable=True)            # mod_id создателя
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True, nullable=False)
@@ -883,6 +930,51 @@ async def init_db() -> None:
                 "ALTER TABLE chat_settings ADD COLUMN via_bot_mute_minutes "
                 "INTEGER NOT NULL DEFAULT 10"
             ))
+
+    # ── v4.8.0: Modchat (модераторский чат) + взаимоисключение с report_chat ──
+    # Modchat — отдельный чат для оперативных оповещений модераторам:
+    # события alarm on/off/auto-off/продление + keyword-watch (упоминания
+    # заданных фраз). Без медиа-превью, краткий текстовый формат.
+    # Взаимоисключение: один и тот же чат не может быть одновременно
+    # репорт-чатом и modchat'ом. Это проверяется в коде (web_app.py +
+    # !setmodchat команда), не на уровне БД.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        v480_modchat_cols = [
+            ("mod_chat_id",  "BIGINT NULL"),   # ID чата, назначенного как modchat
+            ("is_mod_chat",  "BOOLEAN NOT NULL DEFAULT 0"),  # флаг «этот чат — modchat»
+        ]
+        for col_name, col_type in v480_modchat_cols:
+            if col_name not in existing_cols:
+                await conn.execute(text(
+                    f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
+                ))
+
+    # ── v4.8.0: Новая таблица keyword_watch ────────────────────────────
+    # Замена word_filters. См. модель KeywordWatch выше для деталей.
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS keyword_watch (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id BIGINT NOT NULL DEFAULT 0,
+                phrase VARCHAR(255) NOT NULL,
+                ban_in_night_mode BOOLEAN NOT NULL DEFAULT 0,
+                rules_section VARCHAR(64) NULL,
+                created_by BIGINT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_keyword_watch_chat_id "
+            "ON keyword_watch (chat_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_keyword_watch_is_active "
+            "ON keyword_watch (is_active)"
+        ))
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

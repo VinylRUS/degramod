@@ -61,7 +61,7 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
     async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
-    PermissionPreset, WordFilter, LinkAllowlist,
+    PermissionPreset, WordFilter, LinkAllowlist, KeywordWatch,
     _hash_password, _verify_password, DB_PATH,
 )
 
@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.7.30"
+APP_VERSION = "v4.8.0"
 APP_RELEASE_DATE = "2026-08-08"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -2067,8 +2067,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         v4.7.2: добавлен toggle для sanitary_days.
         v4.7.6: упразднён toggle 'private' (система private/non-private удалена).
         v4.7.24: добавлен toggle для via_bot_filter (rate-limit «via @Bot»).
+        v4.8.0: добавлен toggle для mod_chat (взаимоисключение с report_chat).
 
-        Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days|via_bot_filter — что переключать.
+        Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days|via_bot_filter|mod_chat — что переключать.
         """
         try:
             chat_id = int(chat_id_str)
@@ -2079,7 +2080,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
         form = await request.form()
         field = (form.get("field") or "").strip().lower()
-        valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days", "via_bot_filter"}
+        valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days", "via_bot_filter", "mod_chat"}
         if field not in valid_fields:
             return RedirectResponse(
                 url=f"/admin/chats?flash=Invalid+toggle+field",
@@ -2160,10 +2161,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     f"Chat+{chat_id}+Via-bot+filter+"
                     f"{'enabled' if cs.via_bot_filter_enabled else 'disabled'}"
                 )
-            else:  # report_chat
+            elif field == "report_chat":
                 if cs.is_report_chat:
                     cs.is_report_chat = False
                     msg = f"Chat+{chat_id}+no+longer+report+chat"
+                elif cs.is_mod_chat:
+                    # v4.8.0: взаимоисключение — нельзя быть report_chat и
+                    # mod_chat одновременно. Если чат сейчас mod_chat — отказ.
+                    msg = (
+                        f"Chat+{chat_id}+is+mod+chat"
+                        f"%3B+cannot+be+report+chat+too"
+                    )
                 else:
                     # Снимаем флаг с других чатов (репорт-чат может быть только один)
                     others = (await session.execute(
@@ -2176,6 +2184,37 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                         o.is_report_chat = False
                     cs.is_report_chat = True
                     msg = f"Chat+{chat_id}+is+now+the+report+chat"
+            # v4.8.0: mod_chat toggle — взаимоисключение с report_chat.
+            # Нельзя быть одновременно report_chat и mod_chat (разные цели:
+            # report_chat — журнал санкций с rich-превью, modchat — оперативные
+            # оповещения для дежурного модератора в кратком формате).
+            # Если чат уже report_chat — отказ (UI должен скрывать кнопку,
+            # но проверка на бэке обязательна для безопасности).
+            if field == "mod_chat":
+                if cs.is_report_chat:
+                    msg = (
+                        f"Chat+{chat_id}+is+report+chat"
+                        f"%3B+cannot+be+mod+chat+too"
+                    )
+                elif cs.is_mod_chat:
+                    cs.is_mod_chat = False
+                    cs.mod_chat_id = None
+                    msg = f"Chat+{chat_id}+no+longer+mod+chat"
+                else:
+                    # Снимаем флаг с других чатов (modchat тоже может быть
+                    # только один — по аналогии с report_chat).
+                    others = (await session.execute(
+                        select(ChatSettings).where(
+                            ChatSettings.is_mod_chat.is_(True),
+                            ChatSettings.chat_id != chat_id,
+                        )
+                    )).scalars().all()
+                    for o in others:
+                        o.is_mod_chat = False
+                        o.mod_chat_id = None
+                    cs.is_mod_chat = True
+                    cs.mod_chat_id = chat_id
+                    msg = f"Chat+{chat_id}+is+now+the+mod+chat"
             cs.updated_at = datetime.now(timezone.utc)
             await session.commit()
         _req_logger.info(
@@ -2682,6 +2721,180 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         )
         return RedirectResponse(
             url=f"/admin/chats?flash=Sanitary+period+deleted+for+chat+{chat_id}",
+            status_code=303,
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  /admin/keywords — v4.8.0: управление списком keyword-watch фраз.
+    #
+    #  Страница позволяет SU просматривать, добавлять, редактировать и
+    #  удалять фразы из таблицы keyword_watch. Эквивалентна командам бота
+    #  !addkeyword / !delkeyword / !listkeywords, но через веб-панель.
+    #
+    #  Доступ: SU-only (по аналогии с /admin/users — глобальная настройка).
+    # ──────────────────────────────────────────────────────────────────
+    @app.get("/admin/keywords", response_class=HTMLResponse)
+    async def admin_keywords_page(
+        request: Request,
+        flash: str = "",
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.0: страница управления keyword-watch списком.
+
+        Показывает все активные фразы (is_active=True) с флагом
+        ban_in_night_mode, даёт добавить/удалить/переключить флаг.
+        """
+        async with async_session() as session:
+            keywords = (await session.execute(
+                select(KeywordWatch)
+                .where(KeywordWatch.is_active.is_(True))
+                .order_by(KeywordWatch.created_at.desc())
+            )).scalars().all()
+
+            # Также покажем отключённые (для аудита), но визуально отделёнными.
+            inactive_keywords = (await session.execute(
+                select(KeywordWatch)
+                .where(KeywordWatch.is_active.is_(False))
+                .order_by(KeywordWatch.created_at.desc())
+                .limit(50)
+            )).scalars().all()
+
+        return templates.TemplateResponse(
+            "admin_keywords.html",
+            {
+                "request": request,
+                "keywords": keywords,
+                "inactive_keywords": inactive_keywords,
+                "flash": flash,
+                "app_version": APP_VERSION,
+                "app_release_date": APP_RELEASE_DATE,
+                "auth_user": _auth,
+            },
+        )
+
+    @app.post("/admin/keywords/add")
+    async def admin_keywords_add(
+        phrase: str = Form(""),
+        ban_in_night_mode: str = Form(""),
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.0: добавить фразу в keyword-watch список.
+
+        phrase — 1..255 символов, trim + collapse internal whitespace.
+        ban_in_night_mode — чекбокс (presence = True).
+        Если фраза уже существует (case-insensitive, и активна, и
+        неактивна) — реактивируем и обновляем флаг ban_in_night_mode.
+        """
+        # Нормализация: trim, collapse internal whitespace, макс 255.
+        phrase_clean = " ".join((phrase or "").split())
+        if not phrase_clean:
+            return RedirectResponse(
+                url="/admin/keywords?flash=Phrase+cannot+be+empty",
+                status_code=303,
+            )
+        if len(phrase_clean) > 255:
+            return RedirectResponse(
+                url="/admin/keywords?flash=Phrase+too+long+(max+255+chars)",
+                status_code=303,
+            )
+        ban_flag = bool(ban_in_night_mode)
+
+        async with async_session() as session:
+            # Поиск существующей записи (case-insensitive) — SQLite LOWER.
+            existing = (await session.execute(
+                select(KeywordWatch).where(
+                    KeywordWatch.phrase.ilike(phrase_clean)
+                )
+            )).scalars().first()
+
+            if existing:
+                # Реактивируем и обновляем флаг.
+                existing.is_active = True
+                existing.ban_in_night_mode = ban_flag
+                msg = (
+                    f"Keyword+%27{phrase_clean[:60].replace(' ', '+')}%27"
+                    f"+updated+(reactivated)"
+                )
+            else:
+                kw = KeywordWatch(
+                    chat_id=0,  # глобальный список
+                    phrase=phrase_clean,
+                    ban_in_night_mode=ban_flag,
+                    is_active=True,
+                )
+                session.add(kw)
+                msg = (
+                    f"Keyword+%27{phrase_clean[:60].replace(' ', '+')}%27"
+                    f"+added"
+                )
+            await session.commit()
+
+        _req_logger.info(
+            "admin_keywords_add: phrase=%r ban_night=%s by=%s",
+            phrase_clean, ban_flag, _auth.username,
+        )
+        return RedirectResponse(
+            url=f"/admin/keywords?flash={msg}",
+            status_code=303,
+        )
+
+    @app.post("/admin/keywords/{keyword_id:int}/delete")
+    async def admin_keywords_delete(
+        keyword_id: int,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.0: soft-delete фразу из keyword-watch списка.
+
+        Устанавливает is_active=False (audit history preserved).
+        """
+        async with async_session() as session:
+            kw = (await session.execute(
+                select(KeywordWatch).where(KeywordWatch.id == keyword_id)
+            )).scalar_one_or_none()
+            if kw is None:
+                return RedirectResponse(
+                    url="/admin/keywords?flash=Keyword+not+found",
+                    status_code=303,
+                )
+            phrase_log = kw.phrase
+            kw.is_active = False
+            await session.commit()
+
+        _req_logger.info(
+            "admin_keywords_delete: id=%s phrase=%r by=%s",
+            keyword_id, phrase_log, _auth.username,
+        )
+        return RedirectResponse(
+            url="/admin/keywords?flash=Keyword+deleted",
+            status_code=303,
+        )
+
+    @app.post("/admin/keywords/{keyword_id:int}/toggle-ban-night")
+    async def admin_keywords_toggle_ban_night(
+        keyword_id: int,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.0: переключить флаг ban_in_night_mode для фразы."""
+        async with async_session() as session:
+            kw = (await session.execute(
+                select(KeywordWatch).where(KeywordWatch.id == keyword_id)
+            )).scalar_one_or_none()
+            if kw is None:
+                return RedirectResponse(
+                    url="/admin/keywords?flash=Keyword+not+found",
+                    status_code=303,
+                )
+            kw.ban_in_night_mode = not kw.ban_in_night_mode
+            new_state = kw.ban_in_night_mode
+            await session.commit()
+
+        _req_logger.info(
+            "admin_keywords_toggle_ban_night: id=%s new=%s by=%s",
+            keyword_id, new_state, _auth.username,
+        )
+        state_str = "ON" if new_state else "OFF"
+        return RedirectResponse(
+            url=f"/admin/keywords?flash=Ban-night+{state_str}",
             status_code=303,
         )
 

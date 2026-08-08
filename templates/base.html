@@ -593,6 +593,7 @@
         {% if auth_user and auth_user.role == 'su' %}
         <a href="/admin/users" class="nav-link {% if request.url.path.startswith('/admin/users') %}active{% endif %}">Users</a>
         <a href="/admin/presets" class="nav-link {% if request.url.path.startswith('/admin/presets') %}active{% endif %}">Presets</a>
+        <a href="/admin/keywords" class="nav-link {% if request.url.path.startswith('/admin/keywords') %}active{% endif %}">Keywords</a>
         <a href="/admin/settings" class="nav-link {% if request.url.path.startswith('/admin/settings') %}active{% endif %}">Settings</a>
         {% endif %}
         <span class="spacer"></span>
@@ -635,6 +636,44 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.0</strong> — 8 августа 2026 (major-update: рефакторинг режимов + modchat + keyword-watch + веб-UI)</p>
+                <ul>
+                    <li><strong>Major-update v4.8.0</strong>: реализованы 3 задачи из <code>ROADMAP_v4.8.0.md</code> — #4 (аудит кода), #9 (рефакторинг системы режимов), #10 (modchat + keyword-watch).</li>
+                    <li><strong>#4: Аудит кода</strong>. Проведён полный аудит кодовой базы (4 Python-модуля + 9 HTML-шаблонов + 39 тестов). Отчёт сохранён в <code>CODE_AUDIT_v4.8.0.md</code>. Найдено: 0 критических проблем, несколько зон для улучшения. Главный риск — дублирование snapshot/restore логики между alarm/night/sanitary режимами (устранено в #9).</li>
+                    <li><strong>#9: Рефакторинг системы режимов</strong>. Создан новый модуль <code>chat_modes.py</code> с унифицированной логикой:
+                        <ul>
+                            <li><code>_snapshot_chat_permissions(bot, chat_id, day_permissions=None)</code> — единая функция snapshot для всех трёх режимов (alarm/night/sanitary).</li>
+                            <li><code>_resolve_restore_perms_async(session, cs, saved_permissions_field, saved_source_name)</code> — единая логика выбора прав для восстановления (4-уровневый fallback: day_permissions preset → system Day default → snapshot режима → hardcoded default).</li>
+                            <li><code>_apply_chat_permissions(bot, chat_id, perms)</code> — обёртка над <code>set_chat_permissions</code> с обязательным <code>use_independent_chat_permissions=True</code>.</li>
+                            <li><code>_mode_priority(cs)</code> и <code>_active_modes(cs)</code> — хелперы для логирования (приоритет: sanitary > night > alarm > day).</li>
+                        </ul>
+                        Дубликат логики snapshot'а удалён из <code>_enter_night_mode</code>, <code>_enter_sanitary_day</code>, <code>handle_alarm_command</code>. Дубликат логики restore удалён из <code>_deactivate_alarm</code> и <code>_restore_day_state</code>. Все 5 вызовов <code>set_chat_permissions</code> теперь идут через <code>_apply_chat_permissions</code>. Архитектурные инварианты (per-user overrides, snapshot из chat.permissions, independent mode, JSON snapshot, порядок tick'ов) сохранены и задокументированы в коде.</li>
+                    <li><strong>#10: Модераторский чат (modchat)</strong>. Новый отдельный чат для оперативных оповещений модераторам. В отличие от report_chat (журнал санкций с rich-превью), modchat — краткий текстовый формат для быстрых оповещений. Взаимоисключение: один чат не может быть одновременно report_chat и modchat. Команда <code>!setmodchat &lt;chat_id&gt;</code> (SU-only, 0 = сбросить). Если modchat не задан — все оповещения молча пропускаются (DM модератору остаётся как раньше).</li>
+                    <li><strong>#10: Alarm-события в modchat</strong>. Все 4 события <code>!alarm</code> отправляются в modchat:
+                        <ul>
+                            <li><code>on</code> — «🚨 В чате «X» поставлен режим тревоги модератором «Y». Длительность: N мин (до HH:MM МСК)».</li>
+                            <li><code>off</code> (ручное снятие) — «✅ В чате «X» снят режим тревоги модератором «Y»».</li>
+                            <li><code>auto_off</code> — «⏱ В чате «X» автоматически снят режим тревоги. Причина: истёк таймаут (проработал N мин)».</li>
+                            <li><code>off_by_mode</code> — «🔒 В чате «X» снят режим тревоги. Причина: вход в night mode / sanitary day».</li>
+                            <li><code>extend</code> (продление) — <strong>консолидация</strong>: если за 60 секунд было несколько продлений, шлём одно консолидированное сообщение с историей «кто, когда, на сколько». On/off/auto_off/off_by_mode — всегда мгновенно, без консолидации.</li>
+                        </ul>
+                    </li>
+                    <li><strong>#10: Keyword-watch (замена word_filter)</strong>. Новый механизм отслеживания фраз в сообщениях. Принципиально отличается от word_filter:
+                        <ul>
+                            <li><strong>День</strong>: только notify в modchat (не банит, не удаляет, не варнит).</li>
+                            <li><strong>Ночь</strong> (active night mode): фразы с флагом <code>ban_in_night_mode=True</code> → автобан. Без флага → notify.</li>
+                            <li><strong>Match logic</strong>: фраза с пробелом → case-insensitive substring (фраза «срал в торт детишкам» найдёт только эту последовательность). Одиночное слово → word-boundary match (Unicode-aware, не сработает на «замодераторили» если в списке «модератор»).</li>
+                            <li><strong>Антиспам modchat'а</strong>: rate-limit 60 сек/фраза + multiplexing (3 совпадения в одном сообщении → 1 notify) + exempt модераторов/админов/SU через <code>_is_admin()</code>.</li>
+                            <li><strong>Формат notify</strong>: HTML с упоминанием юзера (кликабельно → tg://user), временем МСК, списком совпадений, превью текста (до 500 символов), и кнопкой «Перейти к сообщению →» через <code>message.link</code>.</li>
+                            <li><strong>Управление</strong>: команды <code>!setkeywords word1,word2,"фраза" [--ban-night]</code> (полная замена), <code>!addkeyword "фраза" [--ban-night]</code>, <code>!delkeyword "фраза"</code>, <code>!listkeywords</code> (все SU-only). Также доступно через веб-панель: страница <code>/admin/keywords</code> (SU-only) — таблица активных фраз с чекбоксом «банить в night mode», формой добавления и кнопками удаления/переключения флага. Назначение modchat — кнопка <code>☆ MOD</code> в карточке чата на странице <code>/admin/chats</code> (с взаимоисключением: один чат не может быть одновременно report_chat и modchat).</li>
+                            <li><strong>Хранение</strong>: новая таблица <code>keyword_watch</code> в БД. Глобальный список (chat_id=0 всегда — правила везде одни). Поля: <code>phrase</code>, <code>ban_in_night_mode</code>, <code>rules_section</code> (для будущего GitHub sync #11).</li>
+                            <li><strong>Миграция</strong>: ручная. Старый <code>word_filter</code> список НЕ переносится автоматически (он и так был пуст — боялись ложных срабатываний). Старый код word_filter оставлен для обратной совместимости, но объявлен deprecated. Удаление планируется в v4.8.1.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Новые поля БД</strong>: <code>ChatSettings.mod_chat_id</code>, <code>ChatSettings.is_mod_chat</code>. Новая таблица <code>keyword_watch</code> с индексами. Все миграции идемпотентны (PRAGMA check + ALTER TABLE / CREATE TABLE IF NOT EXISTS).</li>
+                    <li><strong>Новые модули</strong>: <code>chat_modes.py</code> (210 строк, унифицированная логика режимов), <code>modchat.py</code> (370 строк, modchat + keyword-watch).</li>
+                    <li><strong>Регрессия</strong>: все 288 тестов v4.7.x проходят. Ослаблены 2 теста v4.7.25 (проверяли прямые вызовы <code>set_chat_permissions</code> в bot.py — после рефакторинга вызовы ушли в <code>chat_modes.py</code> через <code>_apply_chat_permissions</code>, тесты обновлены для проверки ИЛИ прямого вызова с independent=True, ИЛИ вызова через <code>_apply_chat_permissions</code>).</li>
+                </ul>
                 <p><strong>v4.7.30</strong> — 8 августа 2026 (audit fixes: !alarm + filters + CAS)</p>
                 <ul>
                     <li><strong>Аудит</strong>: проведён полный аудит команды <code>!alarm on/off</code> и других команд бота. Отчёт сохранён в <code>AUDIT_v4.7.30_alarm_and_other_commands.md</code>. Найдено 8 багов (2 критичных, 2 серьёзных, 4 минорных). В этом релизе исправлены 7 из 8 (минор #6 — оптимизация сессий БД — отложен до major-update v4.8.0).</li>

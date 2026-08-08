@@ -56,6 +56,20 @@ from bot_handlers import router as mod_router
 from db import init_db, async_session, ChatSettings
 from web_app import create_app
 
+# v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
+# Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
+# См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
+from chat_modes import (
+    _snapshot_chat_permissions,
+    _resolve_restore_perms_async,
+    _apply_chat_permissions,
+    _restore_permissions_from_json,
+    _hardcoded_day_default,
+    _mode_priority,
+    _active_modes,
+    _PERM_FIELDS as _CHAT_MODES_PERM_FIELDS,
+)
+
 # v4.5.2: helpers для night mode background task (defined in bot_handlers)
 # v4.5.3: добавлен _night_mode_in_window для поддержки per-chat tz + weekend.
 # v4.5.4: добавлены helpers для санитарных дней (chat-level ChatPermissions lockdown).
@@ -245,6 +259,8 @@ async def _alarm_auto_off_tick():
                     )
                 )).scalar_one_or_none()
                 if alarm_cs and alarm_cs.alarm_currently_active:
+                    # Сохраняем started_by ДО деактивации — для modchat-события.
+                    started_by = alarm_cs.alarm_started_by
                     # Используем _deactivate_alarm из bot_handlers.
                     # Восстанавливает права из snapshot/preset.
                     await _deactivate_alarm(
@@ -257,6 +273,19 @@ async def _alarm_auto_off_tick():
                     cs.alarm_saved_permissions = None
                     cs.alarm_saved_slow_mode_delay = None
                     cs.alarm_active_until = None
+                    # v4.8.0: отправляем событие в modchat.
+                    try:
+                        from modchat import _send_alarm_event_to_modchat
+                        await _send_alarm_event_to_modchat(
+                            bot=bot, chat_id=cs.chat_id, event_type="auto_off",
+                            mod_id=started_by,
+                            reason="истёк таймаут",
+                        )
+                    except Exception as modchat_e:
+                        logger.debug(
+                            "Modchat alarm auto-off event failed for chat %s: %s",
+                            cs.chat_id, modchat_e,
+                        )
         except Exception as e:
             logger.error(
                 "Alarm auto-off failed for chat %s: %s",
@@ -316,6 +345,7 @@ async def _night_mode_tick():
                         "Alarm auto-deactivate on night mode enter: chat %s",
                         cs.chat_id,
                     )
+                    started_by_night = None
                     try:
                         async with async_session() as alarm_session:
                             alarm_cs = (await alarm_session.execute(
@@ -324,6 +354,7 @@ async def _night_mode_tick():
                                 )
                             )).scalar_one_or_none()
                             if alarm_cs and alarm_cs.alarm_currently_active:
+                                started_by_night = alarm_cs.alarm_started_by
                                 # reason="night_mode_enter" — в логах будет видно
                                 # что alarm снят именно из-за входа в night, а не
                                 # из-за таймаута или ручного off.
@@ -342,6 +373,20 @@ async def _night_mode_tick():
                             "still apply its own perms)",
                             cs.chat_id, e,
                         )
+                    # v4.8.0: отправляем событие в modchat.
+                    if started_by_night is not None:
+                        try:
+                            from modchat import _send_alarm_event_to_modchat
+                            await _send_alarm_event_to_modchat(
+                                bot=bot, chat_id=cs.chat_id, event_type="off_by_mode",
+                                mod_id=started_by_night,
+                                reason="вход в night mode",
+                            )
+                        except Exception as modchat_e:
+                            logger.debug(
+                                "Modchat alarm off-by-night event failed for chat %s: %s",
+                                cs.chat_id, modchat_e,
+                            )
                 # Вход в ночной режим
                 await _enter_night_mode(cs)
             elif not in_window and cs.night_mode_currently_active:
@@ -383,46 +428,27 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
     применяет slow_mode (минимальный интервал между сообщениями).
     Snapshot текущего slow_mode_delay сохраняется в
     night_mode_saved_slow_mode_delay для восстановления при выходе.
+    v4.8.0: snapshot делается через _snapshot_chat_permissions (chat_modes.py),
+    унифицированно с alarm и sanitary day.
     """
     try:
-        chat_info = await bot.get_chat(chat_id=cs.chat_id)
-        current_perms = chat_info.permissions
-        # v4.7.16: snapshot текущего slow_mode_delay (chat-level свойство,
-        # не входит в ChatPermissions). Берём ПЕРЕД любыми изменениями.
-        current_slow_mode = getattr(chat_info, "slow_mode_delay", 0) or 0
-        # Сохраняем snapshot — что восстанавливать при выходе.
-        # v4.6.0: если есть явное day_permissions — используем его как «истинные»
-        # дневные права (это то что должно быть после выхода из ночного).
-        # Иначе — берём текущие права чата (старое поведение).
-        if cs.day_permissions:
-            try:
-                snapshot_data = json.loads(cs.day_permissions)
-                # Гарантируем что все 13 полей присутствуют.
-                snapshot_data = {k: bool(snapshot_data.get(k, False)) for k in _PERM_FIELDS}
-            except (ValueError, TypeError):
-                snapshot_data = {
-                    field: bool(getattr(current_perms, field, True)) if current_perms else True
-                    for field in _PERM_FIELDS
-                }
-        else:
-            snapshot_data = {
-                field: bool(getattr(current_perms, field, True)) if current_perms else True
-                for field in _PERM_FIELDS
-            }
-        snapshot_json = json.dumps(snapshot_data)
+        # v4.8.0: унифицированный snapshot.
+        # day_permissions передаётся для приоритета preset'а над текущими правами.
+        snapshot_json, current_slow_mode = await _snapshot_chat_permissions(
+            bot=bot, chat_id=cs.chat_id, day_permissions=cs.day_permissions,
+        )
 
         # Применяем ночные права
         night_perms = _parse_night_mode_permissions(cs.night_mode_permissions)
-        # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
-        # Telegram применяет правило импликации: can_send_other_messages=True
-        # автоматически выдаёт can_send_video_notes=True (и др.), игнорируя наш
-        # явный False. Это приводило к лишним правам (видеосообщения, голосовые)
-        # при переключении ночь↔день.
-        await bot.set_chat_permissions(
-            chat_id=cs.chat_id,
-            permissions=night_perms,
-            use_independent_chat_permissions=True,
-        )
+        # v4.8.0: используем унифицированную обёртку _apply_chat_permissions
+        # (use_independent_chat_permissions=True внутри).
+        ok = await _apply_chat_permissions(bot, cs.chat_id, night_perms)
+        if not ok:
+            logger.error(
+                "Night mode: failed to apply permissions for chat %s — aborting",
+                cs.chat_id,
+            )
+            return
 
         # v4.7.16: применяем ночной slow_mode если задан (>0).
         # 0 = не трогать slow_mode (backward compat, чат остаётся как есть).
@@ -456,8 +482,8 @@ async def _enter_night_mode(cs: ChatSettings) -> None:
                 await session.commit()
         logger.info(
             "Night mode ON for chat %s (perms applied, snapshot saved, "
-            "saved_slow_mode=%ds)",
-            cs.chat_id, current_slow_mode,
+            "saved_slow_mode=%ds, mode=%s)",
+            cs.chat_id, current_slow_mode, _mode_priority(cs),
         )
 
         # v4.5.3: уведомление о входе.
@@ -676,21 +702,33 @@ async def _restore_day_state(cs: ChatSettings) -> str:
     Это гарантирует, что при выходе из ночного режима slow_mode
     возвращается к дневному значению (если задан preset) или к
     сохранённому снимку (если preset не задан, но был snapshot).
+
+    v4.8.0: права восстанавливаются через _resolve_restore_perms_async
+    (chat_modes.py) — унифицированно с alarm и sanitary. Системный пресет
+    «Day default» теперь имеет приоритет над snapshot'ом night_mode (что
+    правильно — preset описывает то что ДОЛЖНО быть днём, snapshot — то
+    что было до режима, что может отличаться при ручных правках).
     """
-    restore_perms, source = await _resolve_day_perms(cs)
-    # v4.7.25: use_independent_chat_permissions=True — критично для корректного
-    # восстановления дневных прав. Без этого Telegram работает в legacy-режиме,
-    # где can_send_other_messages=True (стикеры/GIFs в Day default) автоматически
-    # подразумевает can_send_video_notes=True, переопределяя наш явный False.
-    # Результат: после выхода из ночного режима юзеры могли отправлять
-    # видеосообщения и (в некоторых сценариях) голосовые, хотя пресет их
-    # запрещал. Independent-режим убирает правило импликации — каждое право
-    # устанавливается ровно так, как передано (True/False).
-    await bot.set_chat_permissions(
-        chat_id=cs.chat_id,
-        permissions=restore_perms,
-        use_independent_chat_permissions=True,
+    # v4.8.0: унифицированная логика выбора прав для восстановления.
+    restore_perms, source = await _resolve_restore_perms_async(
+        session=None,  # _resolve_restore_perms_async создаст свою session
+        cs=cs,
+        saved_permissions_field=cs.night_mode_saved_permissions,
+        saved_source_name="night snapshot",
     )
+    # NOTE: _resolve_restore_perms_async создаёт свою session внутри,
+    # т.к. ей нужен SQL-запрос к permission_presets. Это не оптимально
+    # (лишний запрос), но безопасно. В будущем можно пропустить session
+    # извне через параметр.
+
+    # v4.8.0: применяем через унифицированную обёртку.
+    ok = await _apply_chat_permissions(bot, cs.chat_id, restore_perms)
+    if not ok:
+        logger.error(
+            "Day state: failed to apply permissions for chat %s — aborting",
+            cs.chat_id,
+        )
+        return source  # возвращаем source для логов, даже если не применилось
 
     # v4.7.16: восстанавливаем slow_mode.
     day_slow = int(cs.day_slow_mode_delay or 0)
@@ -720,8 +758,8 @@ async def _restore_day_state(cs: ChatSettings) -> str:
             )
 
     logger.info(
-        "Day state restored for chat %s (source=%s)",
-        cs.chat_id, source,
+        "Day state restored for chat %s (source=%s, mode=%s)",
+        cs.chat_id, source, _mode_priority(cs),
     )
     return source
 
@@ -998,6 +1036,7 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                 "for chat %s (alarm_started_by=%s)",
                 cs.chat_id, cs.alarm_started_by,
             )
+            started_by_sanitary = None
             try:
                 async with async_session() as alarm_session:
                     alarm_cs = (await alarm_session.execute(
@@ -1006,6 +1045,7 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                         )
                     )).scalar_one_or_none()
                     if alarm_cs and alarm_cs.alarm_currently_active:
+                        started_by_sanitary = alarm_cs.alarm_started_by
                         await _deactivate_alarm(
                             alarm_session, alarm_cs, bot,
                             cs.chat_id, reason="sanitary_day_enter",
@@ -1020,28 +1060,34 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                     "(will proceed anyway — snapshot may capture alarm state)",
                     cs.chat_id, e,
                 )
+            # v4.8.0: отправляем событие в modchat.
+            if started_by_sanitary is not None:
+                try:
+                    from modchat import _send_alarm_event_to_modchat
+                    await _send_alarm_event_to_modchat(
+                        bot=bot, chat_id=cs.chat_id, event_type="off_by_mode",
+                        mod_id=started_by_sanitary,
+                        reason="вход в sanitary day",
+                    )
+                except Exception as modchat_e:
+                    logger.debug(
+                        "Modchat alarm off-by-sanitary event failed for chat %s: %s",
+                        cs.chat_id, modchat_e,
+                    )
 
         # 2. Snapshot текущих прав.
-        # v4.6.0: если есть явное day_permissions — используем его как snapshot.
-        if cs.day_permissions:
-            try:
-                snapshot_data = json.loads(cs.day_permissions)
-                snapshot_data = {k: bool(snapshot_data.get(k, False)) for k in _PERM_FIELDS}
-            except (ValueError, TypeError):
-                chat_info = await bot.get_chat(chat_id=cs.chat_id)
-                current_perms = chat_info.permissions
-                snapshot_data = {
-                    field: bool(getattr(current_perms, field, True)) if current_perms else True
-                    for field in _PERM_FIELDS
-                }
-        else:
-            chat_info = await bot.get_chat(chat_id=cs.chat_id)
-            current_perms = chat_info.permissions
-            snapshot_data = {
-                field: bool(getattr(current_perms, field, True)) if current_perms else True
-                for field in _PERM_FIELDS
-            }
-        snapshot_json = json.dumps(snapshot_data)
+        # v4.8.0: унифицированный snapshot через _snapshot_chat_permissions.
+        # day_permissions передаётся для приоритета preset'а над текущими правами.
+        try:
+            snapshot_json, _ = await _snapshot_chat_permissions(
+                bot=bot, chat_id=cs.chat_id, day_permissions=cs.day_permissions,
+            )
+        except TelegramAPIError as e:
+            logger.error(
+                "Sanitary day: snapshot failed for chat %s: %s — aborting",
+                cs.chat_id, e,
+            )
+            return
 
         # 3. Применяем sanitary-права.
         # v4.6.0: если cs.sanitary_days_permissions задан — используем granular,
@@ -1063,15 +1109,15 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
             lockdown_perms = _tg_types.ChatPermissions(
                 **{k: False for k in _PERM_FIELDS}
             )
-        # v4.7.25: independent mode — см. комментарий в _restore_day_state.
-        # Для lockdown (sanitary day) это особенно важно: мы хотим полный мьют,
-        # и любая импликация can_send_other_messages=False→остальное не грозит,
-        # но для симметричности и защиты от будущих изменений пресетов — тоже True.
-        await bot.set_chat_permissions(
-            chat_id=cs.chat_id,
-            permissions=lockdown_perms,
-            use_independent_chat_permissions=True,
-        )
+        # v4.8.0: унифицированная обёртка (use_independent_chat_permissions=True
+        # внутри). Для lockdown это особенно важно: мы хотим полный мьют.
+        ok = await _apply_chat_permissions(bot, cs.chat_id, lockdown_perms)
+        if not ok:
+            logger.error(
+                "Sanitary day: failed to apply lockdown for chat %s — aborting",
+                cs.chat_id,
+            )
+            return
 
         # 4. Сохраняем snapshot и флаг.
         async with async_session() as session:
@@ -1083,8 +1129,8 @@ async def _enter_sanitary_day(cs: ChatSettings) -> None:
                 db_cs.sanitary_days_currently_active = True
                 await session.commit()
         logger.info(
-            "Sanitary day ON for chat %s (lockdown applied, snapshot saved)",
-            cs.chat_id,
+            "Sanitary day ON for chat %s (lockdown applied, snapshot saved, mode=%s)",
+            cs.chat_id, _mode_priority(cs),
         )
     except TelegramAPIError as e:
         # v4.7.19: базовый класс — покрывает NotFound, Forbidden и т.п.

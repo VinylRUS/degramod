@@ -693,6 +693,13 @@ async def _deactivate_alarm(
     snapshot" даже если реально восстановил из preset. Теперь вызывающий
     код знает, откуда реально восстановлены права, и пишет правду.
 
+    v4.8.0: права восстанавливаются через _resolve_restore_perms_sync
+    (chat_modes.py) — унифицированно с night и sanitary. Системный пресет
+    «Day default» пока НЕ проверяется здесь (sync-вариант без обращения к БД
+    для permission_presets) — это упрощение сделано намеренно, чтобы не
+    дёргать лишний SQL. Если в будущем понадобится — переключить на async
+    вариант. Hardcoded fallback остаётся последним эшелоном.
+
     Параметры:
       session — async SQLAlchemy session (вызывающий код управляет транзакцией)
       cs — объект ChatSettings (поле alarm_currently_active должно быть True)
@@ -711,41 +718,14 @@ async def _deactivate_alarm(
         logger.info("Alarm deactivate: chat %s not active (reason=%s)", chat_id, reason)
         return False, "", ""
 
-    # Шаг 1: определяем права для восстановления
-    perms_to_restore: types.ChatPermissions | None = None
-    perms_source = ""
-
-    if cs.day_permissions:
-        try:
-            perms_to_restore = _restore_permissions(cs.day_permissions)
-            perms_source = "day_permissions preset"
-        except (ValueError, TypeError) as e:
-            logger.warning("Alarm deactivate: bad day_permissions JSON for chat %s: %s", chat_id, e)
-
-    if perms_to_restore is None and cs.alarm_saved_permissions:
-        try:
-            perms_to_restore = _restore_permissions(cs.alarm_saved_permissions)
-            perms_source = "alarm_saved_permissions snapshot"
-        except (ValueError, TypeError) as e:
-            logger.warning("Alarm deactivate: bad alarm_saved_permissions JSON for chat %s: %s", chat_id, e)
-
-    if perms_to_restore is None:
-        # Fallback: всё разрешено (текст + медиа), без админских полей.
-        # Не используем _resolve_day_perms из bot.py (там зависимость от сессии)
-        # — здесь проще явно задать дефолт.
-        perms_to_restore = types.ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True,
-        )
-        perms_source = "hardcoded default (all allowed)"
+    # Шаг 1: определяем права для восстановления.
+    # v4.8.0: используем унифицированную функцию из chat_modes.py.
+    from chat_modes import _resolve_restore_perms_sync, _apply_chat_permissions
+    perms_to_restore, perms_source = _resolve_restore_perms_sync(
+        cs=cs,
+        saved_permissions_field=cs.alarm_saved_permissions,
+        saved_source_name="alarm_saved_permissions snapshot",
+    )
 
     # Шаг 2: определяем slow_mode для восстановления
     slow_to_restore: int = 0
@@ -757,32 +737,19 @@ async def _deactivate_alarm(
         slow_to_restore = cs.alarm_saved_slow_mode_delay
         slow_source = f"alarm_saved_slow_mode_delay={slow_to_restore}"
 
-    # Шаг 3: применяем права
-    try:
-        # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
-        # can_send_messages=True в _alarm_permissions() может неявно подтянуть
-        # другие права через правило импликации. См. подробности в bot.py
-        # (_restore_day_state).
-        await bot.set_chat_permissions(
-            chat_id=chat_id,
-            permissions=perms_to_restore,
-            use_independent_chat_permissions=True,
-        )
-        logger.info(
-            "Alarm deactivate: chat %s perms restored from %s",
-            chat_id, perms_source,
-        )
-    except TelegramAPIError as e:
-        logger.error(
-            "Alarm deactivate: set_chat_permissions failed for chat %s: %s",
-            chat_id, e,
-        )
+    # Шаг 3: применяем права (v4.8.0: через унифицированную обёртку)
+    ok = await _apply_chat_permissions(bot, chat_id, perms_to_restore)
+    if not ok:
         return False, "", ""
+    logger.info(
+        "Alarm deactivate: chat %s perms restored from %s",
+        chat_id, perms_source,
+    )
 
     # Шаг 4: применяем slow_mode
     # v4.7.22: SetChatSlowModeDelay определён в bot_handlers.py (top-level),
     # импорт не нужен. Раньше был late import `from bot import SetChatSlowModeDelay`,
-    # но это вызывало повторный import bot.py как отдельный модуль (bot.py запускается
+    # но это вызывал повторный import bot.py как отдельного модуля (bot.py запускается
     # как __main__) → RuntimeError: Router is already attached.
     try:
         await bot(SetChatSlowModeDelay(
@@ -4059,6 +4026,15 @@ async def handle_alarm_command(message: types.Message) -> None:
                     f"• Slow mode восстановлен: {slow_desc}"
                 ),
             )
+            # v4.8.0: отправляем событие в modchat.
+            try:
+                from modchat import _send_alarm_event_to_modchat
+                await _send_alarm_event_to_modchat(
+                    bot=message.bot, chat_id=chat_id, event_type="off",
+                    mod_user=mod,
+                )
+            except Exception as e:
+                logger.debug("Modchat alarm-off event failed: %s", e)
         else:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
@@ -4162,6 +4138,18 @@ async def handle_alarm_command(message: types.Message) -> None:
                         f"• Alarm active until: {new_until.isoformat()}"
                     ),
                 )
+                # v4.8.0: отправляем продление в modchat (с консолидацией).
+                try:
+                    from modchat import _send_alarm_event_to_modchat
+                    await _send_alarm_event_to_modchat(
+                        bot=message.bot, chat_id=chat_id, event_type="extend",
+                        mod_user=mod,
+                        duration_str=_format_alarm_duration(duration_td),
+                        active_until=new_until,
+                        prev_mod_display=prev_mod_display,
+                    )
+                except Exception as e:
+                    logger.debug("Modchat alarm-extend event failed: %s", e)
             else:
                 # Снимаем auto-off, alarm будет до ручного отключения
                 cs.alarm_active_until = None
@@ -4178,24 +4166,36 @@ async def handle_alarm_command(message: types.Message) -> None:
                         f"• Теперь alarm будет активен до ручного !alarm off."
                     ),
                 )
+                # v4.8.0: продление с пустой длительностью (auto-off отключён) —
+                # тоже отправляем как extend в modchat, но без duration_str.
+                try:
+                    from modchat import _send_alarm_event_to_modchat
+                    await _send_alarm_event_to_modchat(
+                        bot=message.bot, chat_id=chat_id, event_type="extend",
+                        mod_user=mod,
+                        duration_str=None,
+                        active_until=None,
+                        prev_mod_display=prev_mod_display,
+                    )
+                except Exception as e:
+                    logger.debug("Modchat alarm-extend (no duration) event failed: %s", e)
             return
 
         # ── Включаем alarm с нуля: snapshot → apply ───────────────────────
-        # Шаг 1: snapshot текущих прав чата
+        # Шаг 1: snapshot текущих прав чата.
+        # v4.8.0: используем унифицированную функцию из chat_modes.py.
+        # НЕ передаём day_permissions — alarm должен сохранить «то что есть
+        # сейчас», а не «то что должно быть днём по пресету». Это правильно,
+        # потому что alarm — это экстренный режим поверх любого состояния.
+        # При restore (через _deactivate_alarm) приоритет будет у preset'а.
+        from chat_modes import _snapshot_chat_permissions as _v480_snapshot
+        from chat_modes import _apply_chat_permissions as _v480_apply
         snapshot_perms: str | None = None
         snapshot_slow: int = 0
         try:
-            chat_info = await message.bot.get_chat(chat_id)
-            # chat_info.permissions — это ChatPermissions объекта чата.
-            # Для групп это "default permissions" — то что нам нужно.
-            if chat_info.permissions:
-                perms = chat_info.permissions
-                data = {field: bool(getattr(perms, field, False)) for field in _PERM_FIELDS}
-                snapshot_perms = json.dumps(data, ensure_ascii=False)
-            snapshot_slow = getattr(chat_info, "slow_mode_delay", 0) or 0
-            # v4.7.20: валидация типа (см. BUG#5 — MagicMock в тестах / None в реальности)
-            if not isinstance(snapshot_slow, int):
-                snapshot_slow = 0
+            snapshot_perms, snapshot_slow = await _v480_snapshot(
+                bot=message.bot, chat_id=chat_id, day_permissions=None,
+            )
         except TelegramAPIError as e:
             logger.error(
                 "Alarm on: get_chat failed for chat %s: %s — cannot snapshot, aborting",
@@ -4207,34 +4207,26 @@ async def handle_alarm_command(message: types.Message) -> None:
             )
             return
 
-        # Шаг 2: применяем alarm_permissions
-        try:
-            # v4.7.25: use_independent_chat_permissions=True — иначе в legacy-режиме
-            # can_send_messages=True в _alarm_permissions() может неявно подтянуть
-            # другие права через правило импликации. См. bot.py (_restore_day_state).
-            await message.bot.set_chat_permissions(
-                chat_id=chat_id,
-                permissions=_alarm_permissions(),
-                use_independent_chat_permissions=True,
-            )
-        except TelegramAPIError as e:
+        # Шаг 2: применяем alarm_permissions (v4.8.0: унифицированная обёртка).
+        ok = await _v480_apply(message.bot, chat_id, _alarm_permissions())
+        if not ok:
             logger.error(
-                "Alarm on: set_chat_permissions failed for chat %s: %s",
-                chat_id, e,
+                "Alarm on: set_chat_permissions failed for chat %s",
+                chat_id,
             )
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    f"❌ Не удалось применить ограничения alarm: {e}\n"
+                    f"❌ Не удалось применить ограничения alarm.\n"
                     f"У бота нет прав администратора в чате?"
                 ),
             )
             return
 
-        # Шаг 3: применяем slow_mode 30s
+        # Шаг 3: применяем slow_mode 30s.
         # v4.7.22: SetChatSlowModeDelay определён в bot_handlers.py (top-level),
         # импорт не нужен. Раньше был late import `from bot import SetChatSlowModeDelay`,
-        # но это вызывало повторный import bot.py как отдельный модуль (bot.py запускается
+        # но это вызывал повторный import bot.py как отдельного модуля (bot.py запускается
         # как __main__) → RuntimeError: Router is already attached.
         try:
             await message.bot(SetChatSlowModeDelay(
@@ -4287,6 +4279,19 @@ async def handle_alarm_command(message: types.Message) -> None:
                 f"Снять: !alarm off"
             ),
         )
+
+    # v4.8.0: отправляем событие в modchat (если задан).
+    # Не падаем если modchat не задан — это нормально, DM остаётся как раньше.
+    try:
+        from modchat import _send_alarm_event_to_modchat
+        await _send_alarm_event_to_modchat(
+            bot=message.bot, chat_id=chat_id, event_type="on",
+            mod_user=mod,
+            duration_str=_format_alarm_duration(duration_td) if duration_td else None,
+            active_until=cs.alarm_active_until,
+        )
+    except Exception as e:
+        logger.debug("Modchat alarm-on event failed: %s", e)
 
 
 async def _send_alarm_dm(bot: types.Bot, user_id: int, text: str) -> None:
@@ -5090,6 +5095,312 @@ async def cmd_linkallowlist(message: types.Message) -> None:
         scope = "global" if r.chat_id == 0 else f"chat {r.chat_id}"
         lines.append(f"  • <code>{r.domain}</code> [{scope}]")
     await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+# ── v4.8.0: Keyword-watch + Modchat команды ─────────────────────────────────
+# !setkeywords word1,word2,word3 — полная замена списка (SU-only).
+# !addkeyword «фраза» [--ban-night] — добавить фразу (SU-only).
+# !delkeyword «фраза» — удалить фразу (SU-only).
+# !listkeywords — показать список (SU-only).
+# !setmodchat <chat_id> — назначить чат как modchat (SU-only).
+
+@router.message(F.chat.type == "private", Command("setkeywords"))
+async def cmd_setkeywords(message: types.Message) -> None:
+    """v4.8.0: !setkeywords word1,word2,word3 — полная замена списка фраз.
+
+    SU-only. Фразы с пробелами нужно заключать в кавычки или использовать
+    запятую как разделитель. Опциональный суффикс --ban-night после фразы
+    включает автобан ночью для этой фразы.
+
+    Примеры:
+      !setkeywords казино, "срал в торт детишкам" --ban-night, @admin
+    """
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts_str = message.text or ""
+    # Убираем команду из строки.
+    if parts_str.startswith("/setkeywords"):
+        parts_str = parts_str[len("/setkeywords"):].strip()
+    elif parts_str.startswith("!setkeywords"):
+        parts_str = parts_str[len("!setkeywords"):].strip()
+    if not parts_str:
+        await message.reply(
+            "📋 Формат: !setkeywords word1, word2, \"фраза с пробелом\" [--ban-night]\n"
+            "Полная замена списка keyword-watch фраз. Старые фразы будут удалены.",
+            parse_mode=None,
+        )
+        return
+    # Парсим фразы через запятую.
+    phrases_raw = [p.strip() for p in parts_str.split(",") if p.strip()]
+    parsed: list[tuple[str, bool]] = []
+    for ph in phrases_raw:
+        ban_night = False
+        if ph.endswith("--ban-night"):
+            ban_night = True
+            ph = ph[:-len("--ban-night")].strip()
+        # Убираем кавычки если есть.
+        if (ph.startswith('"') and ph.endswith('"')) or (ph.startswith("'") and ph.endswith("'")):
+            ph = ph[1:-1]
+        if ph:
+            parsed.append((ph, ban_night))
+    if not parsed:
+        await message.reply("❌ Не удалось распарсить фразы.", parse_mode=None)
+        return
+    try:
+        from db import KeywordWatch
+        async with async_session() as session:
+            # Удаляем все старые фразы.
+            existing = (await session.execute(
+                select(KeywordWatch).where(KeywordWatch.chat_id == 0)
+            )).scalars().all()
+            for kw in existing:
+                await session.delete(kw)
+            # Добавляем новые.
+            for ph, ban_night in parsed:
+                session.add(KeywordWatch(
+                    chat_id=0, phrase=ph, ban_in_night_mode=ban_night,
+                    created_by=message.from_user.id,
+                ))
+            await session.commit()
+    except Exception as e:
+        logger.error("setkeywords failed: %s", e)
+        await message.reply(f"❌ Ошибка: {e}", parse_mode=None)
+        return
+    await message.reply(
+        f"✅ Keyword-watch список обновлён ({len(parsed)} фраз).\n"
+        f"Из них с автобаном ночью: {sum(1 for _, b in parsed if b)}",
+        parse_mode=None,
+    )
+
+
+@router.message(F.chat.type == "private", Command("addkeyword"))
+async def cmd_addkeyword(message: types.Message) -> None:
+    """v4.8.0: !addkeyword «фраза» [--ban-night] — добавить фразу."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts_str = message.text or ""
+    if parts_str.startswith("/addkeyword"):
+        parts_str = parts_str[len("/addkeyword"):].strip()
+    elif parts_str.startswith("!addkeyword"):
+        parts_str = parts_str[len("!addkeyword"):].strip()
+    if not parts_str:
+        await message.reply(
+            "📋 Формат: !addkeyword \"фраза\" [--ban-night]\n"
+            "Добавляет фразу в keyword-watch список.",
+            parse_mode=None,
+        )
+        return
+    ban_night = False
+    if parts_str.endswith("--ban-night"):
+        ban_night = True
+        parts_str = parts_str[:-len("--ban-night")].strip()
+    if (parts_str.startswith('"') and parts_str.endswith('"')) or (parts_str.startswith("'") and parts_str.endswith("'")):
+        parts_str = parts_str[1:-1]
+    if not parts_str:
+        await message.reply("❌ Пустая фраза.", parse_mode=None)
+        return
+    try:
+        from db import KeywordWatch
+        async with async_session() as session:
+            # Проверяем, есть ли уже такая фраза (case-insensitive).
+            existing = (await session.execute(
+                select(KeywordWatch).where(
+                    KeywordWatch.chat_id == 0,
+                    KeywordWatch.is_active.is_(True),
+                )
+            )).scalars().all()
+            for kw in existing:
+                if kw.phrase.lower() == parts_str.lower():
+                    # Обновляем ban_in_night_mode если различается.
+                    if kw.ban_in_night_mode != ban_night:
+                        kw.ban_in_night_mode = ban_night
+                        await session.commit()
+                        await message.reply(
+                            f"✅ Фраза «{parts_str}» уже была в списке — "
+                            f"обновлён флаг ban_in_night_mode={ban_night}.",
+                            parse_mode=None,
+                        )
+                    else:
+                        await message.reply(
+                            f"ℹ️ Фраза «{parts_str}» уже в списке.",
+                            parse_mode=None,
+                        )
+                    return
+            session.add(KeywordWatch(
+                chat_id=0, phrase=parts_str, ban_in_night_mode=ban_night,
+                created_by=message.from_user.id,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.error("addkeyword failed: %s", e)
+        await message.reply(f"❌ Ошибка: {e}", parse_mode=None)
+        return
+    suffix = " (с автобаном ночью)" if ban_night else ""
+    await message.reply(f"✅ Добавлена фраза «{parts_str}»{suffix}.", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("delkeyword"))
+async def cmd_delkeyword(message: types.Message) -> None:
+    """v4.8.0: !delkeyword «фраза» — удалить фразу."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts_str = message.text or ""
+    if parts_str.startswith("/delkeyword"):
+        parts_str = parts_str[len("/delkeyword"):].strip()
+    elif parts_str.startswith("!delkeyword"):
+        parts_str = parts_str[len("!delkeyword"):].strip()
+    if not parts_str:
+        await message.reply("📋 Формат: !delkeyword \"фраза\"", parse_mode=None)
+        return
+    if (parts_str.startswith('"') and parts_str.endswith('"')) or (parts_str.startswith("'") and parts_str.endswith("'")):
+        parts_str = parts_str[1:-1]
+    try:
+        from db import KeywordWatch
+        async with async_session() as session:
+            existing = (await session.execute(
+                select(KeywordWatch).where(
+                    KeywordWatch.chat_id == 0,
+                    KeywordWatch.is_active.is_(True),
+                )
+            )).scalars().all()
+            found = None
+            for kw in existing:
+                if kw.phrase.lower() == parts_str.lower():
+                    found = kw
+                    break
+            if found is None:
+                await message.reply(f"❌ Фраза «{parts_str}» не найдена.", parse_mode=None)
+                return
+            found.is_active = False
+            await session.commit()
+    except Exception as e:
+        logger.error("delkeyword failed: %s", e)
+        await message.reply(f"❌ Ошибка: {e}", parse_mode=None)
+        return
+    await message.reply(f"✅ Удалена фраза «{parts_str}».", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("listkeywords"))
+async def cmd_listkeywords(message: types.Message) -> None:
+    """v4.8.0: !listkeywords — показать список фраз."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    try:
+        from db import KeywordWatch
+        async with async_session() as session:
+            rows = (await session.execute(
+                select(KeywordWatch).where(
+                    KeywordWatch.chat_id == 0,
+                    KeywordWatch.is_active.is_(True),
+                ).order_by(KeywordWatch.created_at.asc())
+            )).scalars().all()
+    except Exception as e:
+        logger.error("listkeywords failed: %s", e)
+        await message.reply(f"❌ Ошибка: {e}", parse_mode=None)
+        return
+    if not rows:
+        await message.reply("ℹ️ Список keyword-watch пуст.", parse_mode=None)
+        return
+    lines = ["<b>Keyword-watch фразы:</b>"]
+    for i, kw in enumerate(rows, 1):
+        suffix = " 🌙ban" if kw.ban_in_night_mode else ""
+        lines.append(f"{i}. <code>{html.escape(kw.phrase)}</code>{suffix}")
+    await message.reply("\n".join(lines), parse_mode="HTML")
+
+
+@router.message(F.chat.type == "private", Command("setmodchat"))
+async def cmd_setmodchat(message: types.Message) -> None:
+    """v4.8.0: !setmodchat <chat_id> — назначить чат как modchat.
+
+    SU-only. Принимает chat_id числом. 0 = сбросить (снять modchat).
+    Проверяет что чат не является уже report_chat (взаимоисключение).
+    """
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.reply(
+            "📋 Формат: !setmodchat <chat_id>\n"
+            "0 = сбросить modchat.",
+            parse_mode=None,
+        )
+        return
+    try:
+        target_chat_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ chat_id должен быть числом", parse_mode=None)
+        return
+
+    if target_chat_id == 0:
+        # Сброс — снимаем is_mod_chat со всех чатов, чистим mod_chat_id.
+        async with async_session() as session:
+            mods = (await session.execute(
+                select(ChatSettings).where(ChatSettings.is_mod_chat.is_(True))
+            )).scalars().all()
+            for cs in mods:
+                cs.is_mod_chat = False
+            # Также чистим mod_chat_id во всех чатах.
+            all_cs = (await session.execute(
+                select(ChatSettings).where(ChatSettings.mod_chat_id.is_not(None))
+            )).scalars().all()
+            for cs in all_cs:
+                cs.mod_chat_id = None
+            await session.commit()
+        await message.reply("✅ Modchat сброшен.", parse_mode=None)
+        return
+
+    # Проверяем что чат существует и бот в нём состоит.
+    try:
+        chat_info = await message.bot.get_chat(chat_id=target_chat_id)
+    except TelegramAPIError as e:
+        await message.reply(
+            f"❌ Бот не может найти чат {target_chat_id}.\n"
+            f"Возможно, бот не добавлен в чат или чат удалён.\n"
+            f"Ошибка: {e}",
+            parse_mode=None,
+        )
+        return
+
+    # Проверяем взаимоисключение с report_chat.
+    async with async_session() as session:
+        # Если этот чат уже является report_chat — отказ.
+        target_cs = (await session.execute(
+            select(ChatSettings).where(ChatSettings.chat_id == target_chat_id)
+        )).scalar_one_or_none()
+        if target_cs and target_cs.is_report_chat:
+            await message.reply(
+                f"❌ Чат «{chat_info.title or target_chat_id}» уже является "
+                f"репорт-чатом. Назначить его как modchat нельзя "
+                f"(взаимоисключение).",
+                parse_mode=None,
+            )
+            return
+        # Снимаем is_mod_chat со всех других чатов.
+        mods = (await session.execute(
+            select(ChatSettings).where(ChatSettings.is_mod_chat.is_(True))
+        )).scalars().all()
+        for cs in mods:
+            cs.is_mod_chat = False
+        # Назначаем новый modchat.
+        if target_cs is None:
+            target_cs = ChatSettings(chat_id=target_chat_id)
+            session.add(target_cs)
+        target_cs.is_mod_chat = True
+        target_cs.title = chat_info.title or target_cs.title
+        # Также устанавливаем mod_chat_id для global default (chat_id=0).
+        default_cs = (await session.execute(
+            select(ChatSettings).where(ChatSettings.chat_id == 0)
+        )).scalar_one_or_none()
+        if default_cs is None:
+            default_cs = ChatSettings(chat_id=0)
+            session.add(default_cs)
+        default_cs.mod_chat_id = target_chat_id
+        await session.commit()
+    await message.reply(
+        f"✅ Modchat назначен: «{chat_info.title or target_chat_id}» "
+        f"({target_chat_id}).",
+        parse_mode=None,
+    )
 
 
 @router.message(F.chat.type == "private", Command("cas"))
@@ -6614,6 +6925,16 @@ async def handle_content_filters(message: types.Message) -> None:
     и ДО word/link проверки — чтобы лишний раз не дёргать БД если юзер
     не модератор.
 
+    v4.8.0: добавлен keyword-watch (замена word_filter). Keyword-watch
+    проверяется ПОСЛЕ word_filter (legacy, для обратной совместимости) и
+    link_filter. Принцип:
+      • День: только notify в modchat (не банит, не удаляет).
+      • Ночь (active night mode): если ban_in_night_mode=True — автобан.
+        Иначе — notify в modchat.
+      • Exempt: модераторы/админы/SU пропускаются.
+    Keyword-watch НЕ удаляет сообщение и НЕ применяет warn/mute —
+    это чисто notify-механизм (с опциональным автобаном ночью).
+
     Если ни один фильтр не сработал — возвращаем управление (return),
     давая шанс stealth_catchall_group.
     """
@@ -6632,6 +6953,7 @@ async def handle_content_filters(message: types.Message) -> None:
     # _check_via_bot_filter уже имеет свой exempt, но он работает только
     # для via-bot сообщений. Здесь покрываем обычные текстовые сообщения.
     target_for_exempt = message.from_user
+    is_adm = False
     if target_for_exempt is not None:
         try:
             async with async_session() as session:
@@ -6651,6 +6973,7 @@ async def handle_content_filters(message: types.Message) -> None:
                 "Content filter: exempt admin/mod %s in chat %s (skipping word/link check)",
                 target_for_exempt.id, chat_id,
             )
+            # v4.8.0: keyword-watch тоже exempt для модераторов.
             return
 
     try:
@@ -6668,6 +6991,78 @@ async def handle_content_filters(message: types.Message) -> None:
     except Exception as e:
         logger.warning("handle_content_filters: DB error: %s (fail-open)", e)
         return
+
+    # ── v4.8.0: Keyword-watch ───────────────────────────────────────────
+    # Запускается всегда (если есть активные фразы в БД). Не заменяет
+    # word/link filter — работает параллельно. Если word/link сработали —
+    # keyword-watch тоже сработает (но сообщение уже удалено — это OK).
+    #
+    # Day mode: только notify в modchat.
+    # Night mode: если ban_in_night_mode=True — автобан + notify.
+    #             Иначе — notify.
+    try:
+        from modchat import (
+            _keyword_watch_match as _kw_match,
+            _send_keyword_notify_to_modchat as _kw_notify,
+            _check_keyword_rate_limit as _kw_rl,
+        )
+        from db import async_session as _kw_session
+        async with _kw_session() as kw_session:
+            kw_matches = await _kw_match(kw_session, text)
+            # Проверяем night mode (для автобана).
+            cs_kw = await _get_chat_settings(kw_session, chat_id)
+            is_night = bool(cs_kw and cs_kw.night_mode_currently_active)
+        if kw_matches:
+            # Multiplexing: если несколько совпадений — отправляем одно
+            # уведомление. Rate-limit проверяется per-phrase.
+            allowed_phrases: list = []
+            suppressed_counts: dict[str, int] = {}
+            for kw in kw_matches:
+                phrase_lower = kw.phrase.lower()
+                allowed, suppressed = _kw_rl(chat_id, phrase_lower)
+                if allowed:
+                    allowed_phrases.append(kw)
+                if suppressed > 0:
+                    suppressed_counts[kw.phrase] = suppressed
+            if allowed_phrases:
+                try:
+                    await _kw_notify(
+                        bot=message.bot, source_chat_id=chat_id,
+                        message=message, matches=allowed_phrases,
+                        suppressed_counts=suppressed_counts or None,
+                    )
+                except Exception as e:
+                    logger.debug("Keyword notify failed: %s", e)
+            # Автобан ночью для фраз с ban_in_night_mode=True.
+            if is_night:
+                target = message.from_user
+                if target is not None:
+                    ban_phrases = [kw for kw in kw_matches if kw.ban_in_night_mode]
+                    if ban_phrases:
+                        phrases_str = ", ".join(f"«{kw.phrase}»" for kw in ban_phrases)
+                        reason = f"Keyword-watch (night mode auto-ban): {phrases_str}"
+                        try:
+                            await message.bot.ban_chat_member(
+                                chat_id=chat_id, user_id=target.id,
+                            )
+                            # v4.7.27: помечаем бан от бота — для дедупликации.
+                            _mark_bot_ban(chat_id, target.id)
+                            async with async_session() as session:
+                                await _save_punishment(
+                                    session, target.id, 0, chat_id,
+                                    "ban", None, reason, text[:500] if text else None,
+                                )
+                            logger.info(
+                                "Keyword-watch auto-ban (night mode) in chat %s (user %s): %s",
+                                chat_id, target.id, reason,
+                            )
+                        except TelegramAPIError as e:
+                            logger.error(
+                                "Keyword-watch auto-ban failed in chat %s: %s",
+                                chat_id, e,
+                            )
+    except Exception as e:
+        logger.warning("handle_content_filters: keyword-watch error: %s (continuing)", e)
 
     # Если ничего не сработало — выходим, даст шанс catchall
     if wf_match is None and not has_blocked:
