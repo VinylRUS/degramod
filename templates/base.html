@@ -639,6 +639,17 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.3</strong> — 11 августа 2026 (патч: бан по @username/TGID + стикер/скриншот inline в отчёте)</p>
+                <ul>
+                    <li><strong>Бан по @username / TGID</strong>. Команды <code>!ban</code>, <code>!sban</code>, <code>!warn</code>, <code>!swarn</code>, <code>!mute</code>, <code>!smute</code> теперь умеют принимать цель первым аргументом — не только через reply. Примеры: <code>!ban @narushitel Дурачок</code>, <code>!ban 12345678 Дурачок</code>. Если reply есть — он приоритетнее. <code>@username</code> ищется в БД бота (работает если юзер ранее писал в чат). TGID проверяется через <code>bot.get_chat_member</code>. Если цель не найдена — бот отвечает ephemeral с подсказкой.</li>
+                    <li><strong>Стикер inline в отчёте</strong>. Раньше стикер отправлялся отдельным <code>send_sticker</code> после rich-отчёта. Теперь стикер скачивается, конвертируется (static WebP → PNG через Pillow, video WebM → как animation, animated TGS → PNG через rlottie-python) и встраивается <strong>внутрь</strong> Details «📎 Сообщение юзера» — одно сообщение вместо двух. Если rlottie не установлен или упал на TGS — fallback на старый <code>send_sticker</code>.</li>
+                    <li><strong>Скриншот от модератора</strong>. Модератор может приложить фото к команде (caption содержит <code>!ban @user Причина</code>). Фото скачивается в память (BytesIO, на диск не пишем — хостинг не засоряется) и встраивается в отдельный Details «📷 Скриншот от модератора».</li>
+                    <li><strong>Стикерпак-нотификация</strong>. Если при бане за стикер стикерпак был <strong>ново</strong>-добавлен в бан-лист — в List отчёта добавляется пункт «📦 Использованный стикерпак забанен: &lt;pack_name&gt;».</li>
+                    <li><strong>Защита от падения при отсутствии reply</strong>. Команды снятия (<code>!unban</code>, <code>!unmute</code>, <code>!unwarn</code>) по-прежнему требуют reply — если reply нет, бот отвечает ephemeral «Эта команда требует reply».</li>
+                    <li><strong>Новые зависимости</strong>: <code>Pillow&gt;=10.0.0</code> (конвертация WebP→PNG), <code>rlottie-python&gt;=1.0.0</code> (конвертация TGS→PNG). Если rlottie не установится на платформе — fallback на <code>send_sticker</code>.</li>
+                    <li><strong>Перенос B2-бэкапа в v5.0.0</strong>. Авто-бэкап SQLite в Backblaze B2 (#7.1) перенесён из v4.8.3 в <code>ROADMAP_v5.0.0.md</code> — инфраструктурная задача, лучше делать в контексте темы v5.0.0 «облегчение деплоя».</li>
+                </ul>
+                <hr>
                 <p><strong>v4.8.2</strong> — 9 августа 2026 (патч: актуализация <code>/help</code> после реформы команд v4.8.1)</p>
                 <ul>
                     <li><strong>Актуализация <code>/help</code></strong>. Хелп-тексты (<code>_HELP_FULL_TEXT</code> для админов и <code>_HELP_MODERATOR_TEXT</code> для модераторов) писались для v4.7.9 и не отражали реформу команд v4.8.1. Теперь:</li>

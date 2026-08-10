@@ -6,3 +6,8 @@ uvicorn[standard]==0.34.0
 jinja2==3.1.5
 python-multipart==0.0.18
 aiohttp==3.13.3
+# v4.8.3: конвертация WebP-стикеров → PNG для inline-блоков в Rich Messages.
+Pillow>=10.0.0
+# v4.8.3: конвертация анимированных TGS-стикеров → PNG.
+# Если не установится на платформе — fallback на отдельный send_sticker.
+rlottie-python>=1.0.0

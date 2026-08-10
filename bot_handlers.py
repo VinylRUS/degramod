@@ -119,6 +119,7 @@ from aiogram.types import (
     RichTextBold,
     RichTextCode,
     RichTextSpoiler,
+    InputFile,
 )
 from sqlalchemy import select, desc, func
 
@@ -126,6 +127,15 @@ from db import (
     async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser,
     LinkAllowlist, BannedStickerPack,
     _hash_password,
+)
+
+# v4.8.3: модуль для скачивания стикеров/фото в BytesIO и конвертации
+# WebP/TGS → PNG, WebM — как есть. Используется в _build_media_block и
+# _send_report для inline-блоков в Rich Messages.
+from sticker_cache import (
+    download_sticker_for_rich_message,
+    download_photo_bytes,
+    _HAVE_RLOTTIE,
 )
 
 # v4.7.22: aiogram 3.30 не имеет обёртки для setChatSlowModeDelay (появилась
@@ -360,13 +370,42 @@ def _mute_permissions() -> types.ChatPermissions:
 #   • Тихие (!sban/!swarn/!smute) — причина НЕОБЯЗАТЕЛЬНА. После: ephemeral
 #     модератору (и ephemeral нарушителю для !swarn) + отчёт в репорт-чат.
 #     Поведение совпадает с v4.8.0 !ban/!warn/!mute.
-_CMD_MUTE = re.compile(r"^!mute\s+(\S+)\s+(.+)$", re.IGNORECASE)  # dur + reason (оба обязательны)
-_CMD_WARN = re.compile(r"^!warn\s+(.+)$", re.IGNORECASE)         # reason (обязательна)
-_CMD_BAN = re.compile(r"^!ban\s+(.+)$", re.IGNORECASE)           # reason (обязательна)
+#
+# v4.8.3: расширение способов указания цели наказания.
+#   • Раньше все команды работали ТОЛЬКО по reply на сообщение нарушителя.
+#   • Теперь можно указать цель первым аргументом: @username или TGID.
+#   • Reply остаётся приоритетным: если есть reply — цель из аргумента игнорируется.
+#   • Скриншот: модератор может приложить фото к команде (caption содержит !ban ...).
+#
+# Группа target: (?P<target>@\w+|\d+) — @username (начинается с @) или TGID (только цифры).
+# Если target не указан — команда требует reply (для !ban/!warn/!mute) или
+# работает по reply если он есть (для !sban/!swarn/!smute — иначе target=None,
+# что приведёт к ошибке резолва в _resolve_punishment_target).
+_CMD_MUTE = re.compile(
+    r"^!mute\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)\s+(?P<reason>.+)$",
+    re.IGNORECASE,
+)  # dur + reason обязательны; target опционален (если нет — нужен reply).
+_CMD_WARN = re.compile(
+    r"^!warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>.+)$",
+    re.IGNORECASE,
+)  # reason обязательна; target опционален.
+_CMD_BAN = re.compile(
+    r"^!ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>.+)$",
+    re.IGNORECASE,
+)  # reason обязательна; target опционален.
 # v4.8.1: тихие команды (stealth). s = silent/stealth.
-_CMD_SMUTE = re.compile(r"^!smute\s+(\S+)(?:\s+(.+))?$", re.IGNORECASE)  # dur обяз., reason опц.
-_CMD_SWARN = re.compile(r"^!swarn(?:\s+(.+))?$", re.IGNORECASE)         # reason опциональна
-_CMD_SBAN = re.compile(r"^!sban(?:\s+(.+))?$", re.IGNORECASE)           # reason опциональна
+_CMD_SMUTE = re.compile(
+    r"^!smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
+    re.IGNORECASE,
+)  # dur обяз. (если есть target — после него); reason опц.; target опц.
+_CMD_SWARN = re.compile(
+    r"^!swarn(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
+    re.IGNORECASE,
+)  # reason опциональна; target опционален.
+_CMD_SBAN = re.compile(
+    r"^!sban(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
+    re.IGNORECASE,
+)  # reason опциональна; target опционален.
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
 _CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
 _CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
@@ -428,10 +467,14 @@ class _ModerationCommandFilter(BaseFilter):
     Используется в handle_group_command чтобы НЕ перехватывать обычные
     reply-сообщения (тогда они проваливаются в handle_content_filters
     для word/link/via_bot проверки).
+
+    v4.8.3: если message.text пустой — проверяем message.caption.
+    Это позволяет модератору отправить фото (скриншот нарушения) с
+    командой в caption (например «!ban @user Дурачок» под фото).
     """
 
     async def __call__(self, message: types.Message) -> bool:
-        text = message.text
+        text = message.text or message.caption
         if not text:
             return False
         return _is_moderation_command(text)
@@ -1029,6 +1072,123 @@ async def _upsert_moderator(session, mod_id: int,
             mod.first_name = first_name
     await session.flush()
     return mod
+
+
+# ── v4.8.3: Резолв цели наказания ─────────────────────────────────────────
+async def _resolve_punishment_target(
+    message: types.Message,
+    target_str: str | None,
+    chat_id: int,
+) -> tuple[types.User | None, str | None]:
+    """Резолвит цель наказания из reply / @username / TGID.
+
+    Возвращает кортеж (user, error_message):
+      • Если успех — (types.User, None).
+      • Если неудача — (None, str) — error_message для ephemeral модератору.
+
+    Приоритет:
+      1. Если message.reply_to_message существует — берём from_user из reply.
+         (target_str игнорируется — reply приоритетнее.)
+      2. Если target_str начинается с '@' — это username:
+         a) Сначала проверяем entities сообщения — может быть MessageEntityTextMention
+            (inline-mention через клиентское подсказки, содержит user.id напрямую).
+         b) Иначе ищем в БД User.username (нормализуем — убираем @, lower case).
+            Работает только если юзер ранее был в чате и бот его сохранил.
+         c) Если не найден — ошибка.
+      3. Если target_str — чистые цифры — это TGID:
+         Парсим int, проверяем через bot.get_chat_member что юзер в чате.
+         Если да — создаём синтетический User-объект (id, без username/first_name).
+      4. Если target_str is None и reply нет — ошибка «укажите цель».
+    """
+    # 1. Reply — приоритет.
+    if message.reply_to_message is not None:
+        return message.reply_to_message.from_user, None
+
+    # Нет reply — нужен target_str.
+    if not target_str:
+        return None, (
+            "❌ Не указана цель. Используйте reply на сообщение нарушителя, "
+            "либо укажите @username или TGID первым аргументом.\n"
+            "Пример: <code>!ban @username Причина</code> или "
+            "<code>!ban 12345678 Причина</code>"
+        )
+
+    # 2. @username
+    if target_str.startswith("@"):
+        username_raw = target_str[1:]  # убираем @
+        username_lower = username_raw.lower()
+
+        # 2a. Проверяем entities — может быть inline-mention с user.id
+        entities = message.entities or message.caption_entities or []
+        for ent in entities:
+            # MessageEntityTextMention имеет user с id напрямую
+            if ent.type == "text_mention" and ent.user is not None:
+                # Проверяем что это упоминание именно нашего @username
+                # (а не какого-то другого в тексте).
+                # ent.offset/length указывают на подстроку в message.text/caption.
+                full_text = message.text or message.caption or ""
+                mentioned_text = full_text[ent.offset:ent.offset + ent.length]
+                if mentioned_text.lstrip("@").lower() == username_lower:
+                    return ent.user, None
+
+        # 2b. Ищем в БД
+        async with async_session() as session:
+            stmt = select(User).where(func.lower(User.username) == username_lower)
+            result = await session.execute(stmt)
+            db_user = result.scalar_one_or_none()
+
+        if db_user is not None:
+            # Создаём синтетический User-объект из БД-записи.
+            synth_user = types.User(
+                id=db_user.user_id,
+                is_bot=False,
+                first_name=db_user.first_name or "",
+                last_name=db_user.last_name or "",
+                username=db_user.username,
+            )
+            return synth_user, None
+
+        # 2c. Не найден
+        return None, (
+            f"❌ Пользователь <code>{target_str}</code> не найден в БД бота.\n"
+            f"Возможно, он никогда не писал в чат, который бот модерировал.\n"
+            f"Используйте reply на сообщение нарушителя или его TGID."
+        )
+
+    # 3. TGID (чистые цифры)
+    if target_str.isdigit():
+        try:
+            user_id = int(target_str)
+        except ValueError:
+            return None, f"❌ Некорректный TGID: <code>{target_str}</code>"
+
+        if user_id <= 0:
+            return None, f"❌ TGID должен быть положительным числом."
+
+        # Проверяем что юзер есть в чате (иначе банить некого).
+        try:
+            member = await message.bot.get_chat_member(
+                chat_id=chat_id, user_id=user_id,
+            )
+        except TelegramAPIError as e:
+            return None, (
+                f"❌ Не удалось найти пользователя с TGID <code>{user_id}</code> "
+                f"в этом чате: {e}"
+            )
+
+        # member.user — это types.User (даже если юзер покинул чат, но был ранее).
+        if member and member.user:
+            return member.user, None
+
+        return None, (
+            f"❌ Пользователь с TGID <code>{user_id}</code> не найден в чате."
+        )
+
+    # 4. Не распознано
+    return None, (
+        f"❌ Не удалось распознать цель: <code>{target_str}</code>\n"
+        f"Используйте @username (с @), TGID (только цифры), или reply."
+    )
 
 
 async def _save_punishment(session, user_id: int, mod_id: int,
@@ -2216,6 +2376,10 @@ def _build_media_block(msg: types.Message):
 
     Поддерживаются: photo, video, animation, audio, voice.
     Стикеры/документы/кружки — без inline-блока (только текст в blockquote).
+
+    v4.8.3: для стикеров используйте асинхронную _build_sticker_block —
+    она скачивает стикер, конвертирует WebP/TGS → PNG, WebM — как есть,
+    и возвращает InputRichBlockPhoto / InputRichBlockAnimation.
     """
     try:
         if msg.photo:
@@ -2237,6 +2401,76 @@ def _build_media_block(msg: types.Message):
     except Exception as e:
         logger.warning("Could not build media block: %s", e)
     return None
+
+
+# ── v4.8.3: стикер inline в Rich Message ──────────────────────────────────
+async def _build_sticker_block(
+    bot: types.Bot,
+    sticker: types.Sticker,
+) -> tuple[object | None, str | None]:
+    """Скачивает стикер и возвращает inline-блок для Rich Message.
+
+    Returns:
+        (block, None) — успех. block: InputRichBlockPhoto (для PNG) или
+        InputRichBlockAnimation (для WebM).
+        (None, error_message) — неудача. Caller fallback'ит на отдельный
+        send_sticker с sticker.file_id.
+
+    Типы стикеров:
+      • Static WebP → PNG через Pillow → InputRichBlockPhoto.
+      • Video WebM → как есть → InputRichBlockAnimation.
+      • Animated TGS → PNG через rlottie (если установлен) → InputRichBlockPhoto.
+        Если rlottie нет — (None, error), caller fallback'ит на send_sticker.
+    """
+    buf, fmt, err = await download_sticker_for_rich_message(bot, sticker)
+    if buf is None:
+        return None, err or "failed to download sticker"
+
+    try:
+        if fmt == "png":
+            # PNG-стикер — как photo. InputFile обернёт BytesIO.
+            return InputRichBlockPhoto(
+                photo=InputMediaPhoto(media=InputFile(buf, filename="sticker.png"))
+            ), None
+        if fmt == "webm":
+            # WebM-стикер — как animation.
+            return InputRichBlockAnimation(
+                animation=InputMediaAnimation(
+                    media=InputFile(buf, filename="sticker.webm")
+                )
+            ), None
+        return None, f"unknown format: {fmt}"
+    except Exception as e:
+        logger.warning("Could not build sticker rich block: %s", e)
+        return None, f"build block failed: {e}"
+    finally:
+        # BytesIO можно закрыть после того, как InputFile его прочитал.
+        # InputFile читает лениво — закрывать сразу нельзя. Но GC закроет.
+        # Оставляем как есть — GC разберётся.
+        pass
+
+
+async def _build_screenshot_block(
+    bot: types.Bot,
+    photo_sizes: list,
+) -> tuple[object | None, str | None]:
+    """Скачивает largest photo size (скриншот модератора) и возвращает
+    InputRichBlockPhoto для Rich Message.
+
+    Returns:
+        (block, None) — успех.
+        (None, error_message) — неудача.
+    """
+    buf, err = await download_photo_bytes(bot, photo_sizes)
+    if buf is None:
+        return None, err or "failed to download photo"
+    try:
+        return InputRichBlockPhoto(
+            photo=InputMediaPhoto(media=InputFile(buf, filename="screenshot.jpg"))
+        ), None
+    except Exception as e:
+        logger.warning("Could not build screenshot rich block: %s", e)
+        return None, f"build block failed: {e}"
 
 
 async def _get_report_chat_id(session, chat_id: int) -> int | None:
@@ -2334,6 +2568,8 @@ async def _send_report(
     warn_points: int | None = None,
     duration_seconds: int | None = None,
     reply_to_message: types.Message | None = None,
+    sticker_pack_info: tuple[str, bool] | None = None,
+    moderator_screenshot: types.Message | None = None,
 ) -> None:
     """Отправляет Rich-отчёт о санкции в репорт-чат (Bot API 10.2).
 
@@ -2351,13 +2587,28 @@ async def _send_report(
       4. Divider        — разделитель
       5. Details        — «📎 Сообщение юзера» (is_open=False): сворачиваемый блок,
                           куда входит текст сообщения нарушителя (как BlockQuotation)
-                          и фото/видео/гиф из него. По умолчанию скрыт (защита от
-                          шок-контента), разворачивается по тапу.
-      6. Divider        — разделитель
-      7. Details        — «Доп. инфо» (чат/длительность/варнов всего) — сворачиваемо
-      8. Divider        — разделитель
-      9. Footer         — время МСК + хэштег чата + кликабельное имя модератора
+                          и фото/видео/гиф/стикер из него. По умолчанию скрыт
+                          (защита от шок-контента), разворачивается по тапу.
+      6. Divider        — разделитель (только если есть скриншот модератора)
+      6b. Details       — «📷 Скриншот от модератора» (is_open=False) — фото,
+                          приложенное модератором к команде (message.photo + caption).
+      7. Divider        — разделитель
+      8. Details        — «Доп. инфо» (чат/длительность/варнов всего) — сворачиваемо
+      9. Divider        — разделитель
+      10. Footer        — время МСК + хэштег чата + кликабельное имя модератора
                           (без приписки «Модератор:», просто имя).
+
+    v4.8.3: изменения:
+      • Стикеры теперь inline в Details «📎 Сообщение юзера» (через
+        _build_sticker_block: WebP→PNG, WebM, TGS→PNG если rlottie установлен).
+        Если конвертация не удалась — fallback: стикер отправляется отдельным
+        send_sticker после rich-отчёта (как в v4.8.2).
+      • Скриншот от модератора (moderator_screenshot=message, если message.photo
+        и message.caption содержит команду) — отдельный Details «📷 Скриншот
+        от модератора». BytesIO в памяти, на диск не пишем.
+      • Стикерпак-нотификация (sticker_pack_info=(pack_name, was_newly_added)):
+        если was_newly_added=True — добавляем в List пункт
+        «📦 Использованный стикерпак забанен: <pack_name>».
 
     Returns: None (медиа теперь inline в Details-блоке rich message).
     """
@@ -2396,13 +2647,29 @@ async def _send_report(
     # ── Контент нарушителя ─────────────────────────────────────
     text_content: str | None = None
     media_block = None
-    sticker_file_id: str | None = None
+    sticker_file_id: str | None = None  # для fallback если inline не сработал
+    sticker_inline_ok = False  # True если стикер успешно встроен inline
+
     if reply_to_message is not None:
         text_content = reply_to_message.text or reply_to_message.caption
-        media_block = _build_media_block(reply_to_message)
+        # v4.8.3: для стикеров — отдельная (асинхронная) логика с конвертацией.
         if reply_to_message.sticker is not None:
-            sticker_file_id = reply_to_message.sticker.file_id
-        if media_block is None and text_content is None:
+            sticker = reply_to_message.sticker
+            sticker_file_id = sticker.file_id  # сохраняем для fallback'а
+            sticker_block, sticker_err = await _build_sticker_block(bot, sticker)
+            if sticker_block is not None:
+                media_block = sticker_block
+                sticker_inline_ok = True
+            else:
+                # TGS без rlottie или другая ошибка — fallback ниже.
+                logger.info(
+                    "Sticker inline build failed, will use send_sticker fallback: %s",
+                    sticker_err,
+                )
+        else:
+            # Обычное медиа (photo/video/animation/audio/voice) — синхронно.
+            media_block = _build_media_block(reply_to_message)
+        if media_block is None and text_content is None and not sticker_file_id:
             desc = _get_message_content_desc(reply_to_message)
             if desc:
                 text_content = desc
@@ -2412,7 +2679,7 @@ async def _send_report(
     blocks.append(InputRichBlockSectionHeading(text=action_label, size=2))
     blocks.append(InputRichBlockDivider())
 
-    # ── List: нарушитель / причина / веб-профиль ───────────────
+    # ── List: нарушитель / причина / стикерпак / веб-профиль ────
     # Каждый ListItem — отдельный пункт с нативным буллетом. Эмодзи-маркеры
     # выровнены самим Telegram, не «плывут» как в наборе отдельных Paragraph'ов.
     list_items: list[InputRichBlockListItem] = []
@@ -2445,7 +2712,19 @@ async def _send_report(
             )
         )
 
-    # Пункт 3: веб-профиль — короткий текст вместо длинного URL
+    # Пункт 3 (v4.8.3): стикерпак забанен (если был newly_added)
+    if sticker_pack_info is not None:
+        pack_name, was_newly_added = sticker_pack_info
+        if was_newly_added:
+            list_items.append(
+                InputRichBlockListItem(
+                    blocks=[InputRichBlockParagraph(
+                        text=f"📦 Использованный стикерпак забанен: {pack_name}"
+                    )]
+                )
+            )
+
+    # Пункт 4: веб-профиль — короткий текст вместо длинного URL
     if WEB_PUBLIC_URL:
         web_url = f"{WEB_PUBLIC_URL}/user/{target.id}"
         list_items.append(
@@ -2463,7 +2742,7 @@ async def _send_report(
 
     # ── Details: текст+медиа под спойлером ──────────────────────
     # Текст сообщения нарушителя (как BlockQuotation) и все медиа (фото/видео/
-    # гиф) обёрнуты в сворачиваемый Details «📎 Сообщение юзера».
+    # гиф/стикер) обёрнуты в сворачиваемый Details «📎 Сообщение юзера».
     # По умолчанию is_open=False — модератор не видит содержимое, пока не тапнет
     # по заголовку. Защита от шок-контента, который иначе сразу бросается в
     # глаза при открытии репорт-чата.
@@ -2477,6 +2756,13 @@ async def _send_report(
             )
         if media_block is not None:
             media_details_blocks.append(media_block)
+        # Если стикер не удалось встроить inline — добавляем текст-плейсхолдер.
+        if sticker_file_id and not sticker_inline_ok:
+            media_details_blocks.append(
+                InputRichBlockParagraph(
+                    text="📎 Анимированный стикер прикреплён следующим сообщением."
+                )
+            )
         blocks.append(InputRichBlockDivider())
         blocks.append(
             InputRichBlockDetails(
@@ -2485,6 +2771,30 @@ async def _send_report(
                 blocks=media_details_blocks,
             )
         )
+
+    # ── v4.8.3: Details «📷 Скриншот от модератора» (опционально) ──
+    # Если модератор приложил фото к команде (caption содержит !ban ...) —
+    # добавляем отдельный сворачиваемый Details с этим фото. Это НЕ сообщение
+    # юзера, а приложение модератора (доказательство нарушения).
+    screenshot_block = None
+    if moderator_screenshot is not None and moderator_screenshot.photo:
+        screenshot_block, ss_err = await _build_screenshot_block(
+            bot, moderator_screenshot.photo,
+        )
+        if screenshot_block is not None:
+            blocks.append(InputRichBlockDivider())
+            blocks.append(
+                InputRichBlockDetails(
+                    summary="📷 Скриншот от модератора",
+                    is_open=False,
+                    blocks=[screenshot_block],
+                )
+            )
+        else:
+            logger.warning(
+                "Screenshot inline build failed: %s — skip screenshot block",
+                ss_err,
+            )
 
     # ── Details: доп. инфо (сворачиваемое) ─────────────────────
     details_lines: list[str] = [f"Чат: {chat_id}"]
@@ -2564,12 +2874,12 @@ async def _send_report(
         except TelegramAPIError as e2:
             logger.error("Plain-text fallback also failed: %s", e2)
 
-    # ── Стикер: отправляем отдельным сообщением после rich-отчёта ──
-    # Rich Messages не имеют inline-блока для стикеров, поэтому крепим его
-    # отдельным send_sticker. Стикеры редко бывают шок-контентом, поэтому
-    # без has_spoiler — но всё равно после основного отчёта, чтобы не
-    # заслонять его превью в списке сообщений.
-    if sticker_file_id:
+    # ── v4.8.3: send_sticker fallback ТОЛЬКО если inline не сработал ──
+    # Если стикер успешно встроен в Details «📎 Сообщение юзера» — отдельное
+    # сообщение НЕ отправляем (раньше в v4.8.2 отправляли всегда).
+    # Fallback срабатывает для TGS-стикеров, когда rlottie не установлен
+    # или упал при конвертации.
+    if sticker_file_id and not sticker_inline_ok:
         try:
             await bot.send_sticker(chat_id=report_dest, sticker=sticker_file_id)
         except TelegramAPIError as e:
@@ -3380,7 +3690,6 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 
 @router.message(
     F.chat.type.in_(["group", "supergroup"]),
-    F.reply_to_message,
     _ModerationCommandFilter(),
 )
 async def handle_group_command(message: types.Message) -> None:
@@ -3391,9 +3700,19 @@ async def handle_group_command(message: types.Message) -> None:
     handler перехватывал все reply-сообщения и return'ил без обработки,
     что в aiogram 3.x останавливает propagation → handle_content_filters
     (word/link/via_bot filter) не вызывался для reply-сообщений.
+
+    v4.8.3: убрано требование F.reply_to_message из декоратора — теперь
+    команды !ban/!sban/!warn/!swarn/!mute/!smute можно отправлять БЕЗ reply,
+    указав цель первым аргументом (@username или TGID). Команды снятия
+    (!unban/!unmute/!unwarn) по-прежнему требуют reply — проверка внутри.
+    Также: команда может быть в message.caption (если модератор приложил
+    скриншот нарушения) — _ModerationCommandFilter это учитывает.
     """
-    text = message.text
-    # text не None — гарантировано _ModerationCommandFilter'ом.
+    # v4.8.3: команда может быть в message.text ИЛИ message.caption
+    # (если модератор приложил скриншот нарушения).
+    text = message.text or message.caption
+    if not text:
+        return
     # ── v4.4.8 FIX: не трогаем сообщения модератора, если это не команда ──
     # Раньше бот удалял ЛЮБОЙ ответ модератора в чате (т.к. удаление шло
     # ДО проверки на соответствие команде). Теперь сначала проверяем, что
@@ -3411,24 +3730,70 @@ async def handle_group_command(message: types.Message) -> None:
     if not is_adm:
         return
 
-    target: types.User = message.reply_to_message.from_user
     mod = message.from_user
-    target_content = _get_message_content_desc(message.reply_to_message)
 
-    # ── v4.5.1: защита от самонаказания и friendly-fire ────────────────
-    # Запрещаем применять !warn / !mute / !ban к:
-    #   1. Самому себе (mod == target) — модератор не должен наказывать себя.
-    #   2. Другому модератору/админу в этом же чате — чтобы не было конфликта
-    #      интересов и случайных autoban-ов на коллег.
-    # Для снятия (!unmute / !unban / !unwarn / !resetwarns) и просмотра (!warns)
-    # эти ограничения НЕ действуют — там нет вреда, только восстановление.
-    #
-    # Проверяем только если команда — одна из наказательных.
-    # v4.8.1: добавлены тихие варианты !sban/!swarn/!smute.
+    # ── v4.8.3: резолв цели наказания ──────────────────────────────────
+    # Команды снятия (!unmute/!unban/!unwarn/!warns/!resetwarns) — работают
+    # ТОЛЬКО по reply. Если reply нет — отказываем.
+    # Наказательные команды (!ban/!sban/!warn/!swarn/!mute/!smute) —
+    # резолвятся через _resolve_punishment_target (reply → @username → TGID).
     is_punitive_cmd = bool(
         _CMD_MUTE.match(text) or _CMD_WARN.match(text) or _CMD_BAN.match(text)
         or _CMD_SMUTE.match(text) or _CMD_SWARN.match(text) or _CMD_SBAN.match(text)
     )
+
+    if is_punitive_cmd:
+        # Парсим target из команды (если есть) — для передачи в хелпер.
+        # Берём первый matching паттерн и достаём target-группу.
+        cmd_target_str: str | None = None
+        for pat in (_CMD_BAN, _CMD_SBAN, _CMD_WARN, _CMD_SWARN, _CMD_MUTE, _CMD_SMUTE):
+            m_pat = pat.match(text)
+            if m_pat and m_pat.groupdict().get("target"):
+                cmd_target_str = m_pat.group("target")
+                break
+
+        target, target_err = await _resolve_punishment_target(
+            message, cmd_target_str, chat_id,
+        )
+        if target_err is not None:
+            # Не удалось зарезолвить цель — ephemeral модератору и выход.
+            try:
+                await _send_ephemeral(
+                    bot=message.bot, chat_id=chat_id, recipient=mod,
+                    text=target_err,
+                )
+            except Exception:
+                pass
+            try:
+                await message.delete()
+            except TelegramAPIError:
+                pass
+            return
+        # target теперь types.User (либо из reply, либо из БД, либо синтетический
+        # из TGID — _resolve_punishment_target возвращает User-объект).
+        target_content: str | None = None
+        if message.reply_to_message is not None:
+            target_content = _get_message_content_desc(message.reply_to_message)
+    else:
+        # Команды снятия — требуют reply.
+        if message.reply_to_message is None:
+            try:
+                await _send_ephemeral(
+                    bot=message.bot, chat_id=chat_id, recipient=mod,
+                    text=(
+                        "❌ Эта команда требует reply на сообщение пользователя, "
+                        "к которому применяется действие."
+                    ),
+                )
+            except Exception:
+                pass
+            try:
+                await message.delete()
+            except TelegramAPIError:
+                pass
+            return
+        target: types.User = message.reply_to_message.from_user
+        target_content = _get_message_content_desc(message.reply_to_message)
     if is_punitive_cmd:
         if target.id == mod.id:
             try:
@@ -3481,8 +3846,8 @@ async def handle_group_command(message: types.Message) -> None:
     # ── !mute ───────────────────────────────────────────────────────────
     m = _CMD_MUTE.match(text)
     if m:
-        dur_str = m.group(1)
-        reason = m.group(2)  # v4.8.1: reason обязательна (regex гарантирует)
+        dur_str = m.group("dur")
+        reason = m.group("reason")  # v4.8.1: reason обязательна (regex гарантирует)
         duration_seconds = _parse_duration(dur_str)
         if duration_seconds is None:
             try:
@@ -3525,6 +3890,7 @@ async def handle_group_command(message: types.Message) -> None:
             action_type="mute", reason=reason, mod=mod,
             duration_seconds=duration_seconds,
             reply_to_message=message.reply_to_message,
+            moderator_screenshot=message if message.photo else None,
         )
 
         async with async_session() as session:
@@ -3550,11 +3916,13 @@ async def handle_group_command(message: types.Message) -> None:
         # file_id, sticker) — они остаются в памяти после удаления. Но мы
         # перестраховываемся: сначала отчёт уходит в репорт-чат (с текстом
         # и медиа), и только потом оригинал удаляется из модерируемого чата.
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -3563,8 +3931,8 @@ async def handle_group_command(message: types.Message) -> None:
     # причина необязательна. Для обратной совместимости со стелс-режимом.
     m = _CMD_SMUTE.match(text)
     if m:
-        dur_str = m.group(1)
-        reason = m.group(2) or "(без причины)"
+        dur_str = m.group("dur")
+        reason = m.group("reason") or "(без причины)"
         duration_seconds = _parse_duration(dur_str)
         if duration_seconds is None:
             try:
@@ -3607,6 +3975,7 @@ async def handle_group_command(message: types.Message) -> None:
             action_type="mute", reason=reason, mod=mod,
             duration_seconds=duration_seconds,
             reply_to_message=message.reply_to_message,
+            moderator_screenshot=message if message.photo else None,
         )
 
         async with async_session() as session:
@@ -3632,11 +4001,13 @@ async def handle_group_command(message: types.Message) -> None:
             ),
         )
 
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -3646,7 +4017,7 @@ async def handle_group_command(message: types.Message) -> None:
     # Добавлено: публичное сообщение в чат.
     m = _CMD_WARN.match(text)
     if m:
-        reason = m.group(1)
+        reason = m.group("reason")
 
         # Сначала сохраняем наказание — тогда _count_warns внутри _send_report
         # и здесь будет учитывать только что выданный варн.
@@ -3667,6 +4038,7 @@ async def handle_group_command(message: types.Message) -> None:
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="warn", reason=reason, warn_points=1, mod=mod,
             reply_to_message=message.reply_to_message,
+            moderator_screenshot=message if message.photo else None,
         )
 
         # ── v4.8.1: публичное сообщение в чат (вместо ephemeral) ─────
@@ -3683,11 +4055,13 @@ async def handle_group_command(message: types.Message) -> None:
         )
 
         # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций с ним.
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -3698,7 +4072,7 @@ async def handle_group_command(message: types.Message) -> None:
     # Причина необязательна (regex допускает !swarn без аргументов).
     m = _CMD_SWARN.match(text)
     if m:
-        reason = m.group(1) or "(без причины)"
+        reason = m.group("reason") or "(без причины)"
 
         async with async_session() as session:
             await _upsert_user(session, target.id, target.username,
@@ -3715,6 +4089,7 @@ async def handle_group_command(message: types.Message) -> None:
             bot=message.bot, chat_id=chat_id, target=target,
             action_type="warn", reason=reason, warn_points=1, mod=mod,
             reply_to_message=message.reply_to_message,
+            moderator_screenshot=message if message.photo else None,
         )
 
         # ── v4.4.9: Уведомление НАРУШИТЕЛЮ (видно только ему) ────────
@@ -3741,11 +4116,13 @@ async def handle_group_command(message: types.Message) -> None:
             target=target, mod=mod,
         )
 
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -3756,7 +4133,7 @@ async def handle_group_command(message: types.Message) -> None:
     # Добавлено: публичное сообщение в чат.
     m = _CMD_BAN.match(text)
     if m:
-        reason = m.group(1)
+        reason = m.group("reason")
 
         perm_snapshot = None
         try:
@@ -3782,22 +4159,6 @@ async def handle_group_command(message: types.Message) -> None:
         # handler не отправил второй отчёт о «ручном бане» (дедупликация).
         _mark_bot_ban(chat_id, target.id)
 
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="ban", reason=reason, mod=mod,
-            reply_to_message=message.reply_to_message,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "ban", None, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
         # ── v4.5.2: если забанили за стикер — автоматически добавляем пак ──
         # в BannedStickerPack (per-chat, punishment=ban — чтобы следующий
         # юзер с этим же паком тоже был забанен автоматически). Это избавляет
@@ -3809,9 +4170,25 @@ async def handle_group_command(message: types.Message) -> None:
         # сохраняем ссылку заранее).
         # v4.8.1: ephemeral про автодобавление стикерпака ОСТАЁТСЯ для !ban
         # и !sban — это техническое уведомление, не дубликат публичного бана.
-        sticker = getattr(message.reply_to_message, "sticker", None)
+        # v4.8.3: отслеживаем был ли стикерпак newly_added — для sticker_pack_info
+        # в _send_report (пункт «📦 Использованный стикерпак забанен» в List).
+        sticker = getattr(message.reply_to_message, "sticker", None) if message.reply_to_message else None
+        sticker_pack_info: tuple[str, bool] | None = None
         if sticker and sticker.set_name:
             try:
+                # v4.8.3: проверяем — был ли стикерпак уже в бан-листе ДО добавления.
+                async with async_session() as session:
+                    existing_pack = (
+                        await session.execute(
+                            select(BannedStickerPack).where(
+                                BannedStickerPack.chat_id == chat_id,
+                                BannedStickerPack.pack_name == sticker.set_name,
+                                BannedStickerPack.is_active.is_(True),
+                            )
+                        )
+                    ).scalar_one_or_none()
+                was_newly_added = (existing_pack is None)
+
                 async with async_session() as session:
                     await _add_banned_sticker_pack(
                         session,
@@ -3833,10 +4210,30 @@ async def handle_group_command(message: types.Message) -> None:
                         f"автодобавлен в бан-лист (punishment=ban)."
                     ),
                 )
+                # v4.8.3: передаём в _send_report инфу о стикерпаке.
+                sticker_pack_info = (sticker.set_name, was_newly_added)
             except Exception as e:
                 logger.warning(
                     "auto-add sticker pack '%s' failed: %s", sticker.set_name, e
                 )
+
+        await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="ban", reason=reason, mod=mod,
+            reply_to_message=message.reply_to_message,
+            sticker_pack_info=sticker_pack_info,
+            moderator_screenshot=message if message.photo else None,
+        )
+
+        async with async_session() as session:
+            await _upsert_user(session, target.id, target.username,
+                               target.first_name, target.last_name)
+            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+            await _save_punishment(
+                session, target.id, mod.id, chat_id,
+                "ban", None, reason, target_content,
+                permissions_snapshot=perm_snapshot,
+            )
 
         # ── v4.8.1: публичное сообщение в чат (вместо ephemeral) ─────
         # Громкая команда !ban — чат видит, кто и за что забанен.
@@ -3846,11 +4243,13 @@ async def handle_group_command(message: types.Message) -> None:
         )
 
         # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций.
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -3860,7 +4259,7 @@ async def handle_group_command(message: types.Message) -> None:
     # Автодобавление стикерпака при бане за стикер — сохраняется.
     m = _CMD_SBAN.match(text)
     if m:
-        reason = m.group(1) or "(без причины)"
+        reason = m.group("reason") or "(без причины)"
 
         perm_snapshot = None
         try:
@@ -3885,26 +4284,26 @@ async def handle_group_command(message: types.Message) -> None:
         # v4.7.27: дедупликация — помечаем что бан выполнил сам бот.
         _mark_bot_ban(chat_id, target.id)
 
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="ban", reason=reason, mod=mod,
-            reply_to_message=message.reply_to_message,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "ban", None, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
-        # v4.8.1: автодобавление стикерпака (как для !ban).
-        sticker = getattr(message.reply_to_message, "sticker", None)
+        # v4.8.3: автодобавление стикерпака + отслеживание newly_added
+        # (как для !ban). Перенесено ДО _send_report чтобы инфа о стикерпаке
+        # попала в отчёт (пункт «📦 Использованный стикерпак забанен»).
+        sticker = getattr(message.reply_to_message, "sticker", None) if message.reply_to_message else None
+        sticker_pack_info: tuple[str, bool] | None = None
         if sticker and sticker.set_name:
             try:
+                # v4.8.3: проверяем — был ли стикерпак уже в бан-листе ДО добавления.
+                async with async_session() as session:
+                    existing_pack = (
+                        await session.execute(
+                            select(BannedStickerPack).where(
+                                BannedStickerPack.chat_id == chat_id,
+                                BannedStickerPack.pack_name == sticker.set_name,
+                                BannedStickerPack.is_active.is_(True),
+                            )
+                        )
+                    ).scalar_one_or_none()
+                was_newly_added = (existing_pack is None)
+
                 async with async_session() as session:
                     await _add_banned_sticker_pack(
                         session,
@@ -3926,10 +4325,29 @@ async def handle_group_command(message: types.Message) -> None:
                         f"автодобавлен в бан-лист (punishment=ban)."
                     ),
                 )
+                sticker_pack_info = (sticker.set_name, was_newly_added)
             except Exception as e:
                 logger.warning(
                     "auto-add sticker pack '%s' failed (sban): %s", sticker.set_name, e
                 )
+
+        await _send_report(
+            bot=message.bot, chat_id=chat_id, target=target,
+            action_type="ban", reason=reason, mod=mod,
+            reply_to_message=message.reply_to_message,
+            sticker_pack_info=sticker_pack_info,
+            moderator_screenshot=message if message.photo else None,
+        )
+
+        async with async_session() as session:
+            await _upsert_user(session, target.id, target.username,
+                               target.first_name, target.last_name)
+            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+            await _save_punishment(
+                session, target.id, mod.id, chat_id,
+                "ban", None, reason, target_content,
+                permissions_snapshot=perm_snapshot,
+            )
 
         # ── Ephemeral-подтверждение модератору (видно только ему) ────
         # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
@@ -3943,11 +4361,13 @@ async def handle_group_command(message: types.Message) -> None:
             ),
         )
 
-        try:
-            await message.reply_to_message.delete()
-        except TelegramAPIError as e:
-            logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                           target.id, chat_id, e)
+        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
+        if message.reply_to_message is not None:
+            try:
+                await message.reply_to_message.delete()
+            except TelegramAPIError as e:
+                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
+                               target.id, chat_id, e)
 
         return
 
@@ -6506,26 +6926,30 @@ async def cmd_sanitary(message: types.Message) -> None:
 
 _HELP_FULL_TEXT = (
     "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
-    "<b>В группах (reply на сообщение нарушителя):</b>\n\n"
+    "<b>В группах (reply ИЛИ указание цели):</b>\n\n"
+    "  v4.8.3: цель наказания можно указать первым аргументом — не только reply.\n"
+    "  Пример: <code>!ban @username Причина</code> или <code>!ban 12345678 Причина</code>.\n"
+    "  Если reply есть — он приоритетнее. <code>@username</code> ищется в БД бота.\n"
+    "  Скриншот: приложите фото к команде с caption — он попадёт в отчёт.\n\n"
     "  🔊 <b>Громкие</b> (публичное сообщение в чат, причина обязательна):\n"
-    "  <code>!mute &lt;длительность&gt; &lt;причина&gt;</code>\n"
+    "  <code>!mute [target] &lt;длительность&gt; &lt;причина&gt;</code>\n"
     "    Мьют нарушителя. Длительность: <code>1d2h</code>, <code>30м</code>, <code>2h</code>.\n"
     "    Бот публикует: <code>Пользователь \"X\" замутан за \"Y\" на \"D\"</code>.\n"
-    "    Пример: <code>!mute 1d спам</code>.\n"
-    "  <code>!warn &lt;причина&gt;</code>\n"
+    "    Пример: <code>!mute 1d спам</code> или <code>!mute @user 1d спам</code>.\n"
+    "  <code>!warn [target] &lt;причина&gt;</code>\n"
     "    Варн (1 поинт). Сообщение нарушителя удаляется.\n"
     "    Бот публикует: <code>Пользователь \"X\" получил варн за \"Y\"</code>.\n"
     "    При достижении порога <code>warns_to_mute</code> — автомьют.\n"
-    "  <code>!ban &lt;причина&gt;</code>\n"
+    "  <code>!ban [target] &lt;причина&gt;</code>\n"
     "    Бан нарушителя. Если reply на стикер — пак автодобавляется в бан-лист.\n"
     "    Бот публикует: <code>Пользователь \"X\" забанен за \"Y\"</code>.\n\n"
     "  🤫 <b>Тихие</b> (стелс, ephemeral только модератору, причина необязательна):\n"
-    "  <code>!smute &lt;длительность&gt; [причина]</code>\n"
+    "  <code>!smute [target] &lt;длительность&gt; [причина]</code>\n"
     "    Мьют без публичного сообщения. Модератор получает ephemeral-подтверждение.\n"
-    "  <code>!swarn [причина]</code>\n"
+    "  <code>!swarn [target] [причина]</code>\n"
     "    Варн без публичного сообщения. Модератор + <b>нарушитель</b> получают ephemeral\n"
     "    (единственное исключение из «тихого» режима — нарушитель видит причину).\n"
-    "  <code>!sban [причина]</code>\n"
+    "  <code>!sban [target] [причина]</code>\n"
     "    Бан без публичного сообщения. Если reply на стикер — пак автодобавляется.\n\n"
     "  🛠 <b>Прочее в группах:</b>\n"
     "  <code>!unmute</code> / <code>!unban</code> — снять ограничения (reply на сообщение).\n"
@@ -6582,26 +7006,29 @@ _HELP_FULL_TEXT = (
 
 _HELP_MODERATOR_TEXT = (
     "📖 <b>Дедушка Вобжак — команды модератора</b>\n\n"
-    "<b>В группах (reply на сообщение нарушителя):</b>\n\n"
+    "<b>В группах (reply ИЛИ указание цели):</b>\n\n"
+    "  v4.8.3: цель можно указать первым аргументом — <code>@username</code> или TGID.\n"
+    "  Пример: <code>!ban @user Причина</code>, <code>!sban 12345678</code>.\n"
+    "  Если reply есть — он приоритетнее. Скриншот: приложите фото с caption-командой.\n\n"
     "  🔊 <b>Громкие</b> — публичное сообщение в чат, причина обязательна:\n\n"
-    "  <code>!mute &lt;длительность&gt; &lt;причина&gt;</code>\n"
+    "  <code>!mute [target] &lt;длительность&gt; &lt;причина&gt;</code>\n"
     "    Мьют нарушителя. Длительность: <code>1d2h</code>, <code>30м</code>, <code>2h</code>.\n"
     "    Бот публикует в чат: <code>Пользователь \"X\" замутан за \"Y\" на \"D\"</code>.\n"
     "    Пример: <code>!mute 1d спам</code>.\n\n"
-    "  <code>!warn &lt;причина&gt;</code>\n"
+    "  <code>!warn [target] &lt;причина&gt;</code>\n"
     "    Варн (1 поинт). Сообщение нарушителя удаляется.\n"
     "    Бот публикует: <code>Пользователь \"X\" получил варн за \"Y\"</code>.\n"
     "    При достижении порога <code>warns_to_mute</code> — автомьют.\n\n"
-    "  <code>!ban &lt;причина&gt;</code>\n"
+    "  <code>!ban [target] &lt;причина&gt;</code>\n"
     "    Бан нарушителя. Если reply на стикер — пак автодобавляется в бан-лист.\n"
     "    Бот публикует: <code>Пользователь \"X\" забанен за \"Y\"</code>.\n\n"
     "  🤫 <b>Тихие</b> — стелс, без публичного сообщения, причина необязательна:\n\n"
-    "  <code>!smute &lt;длительность&gt; [причина]</code>\n"
+    "  <code>!smute [target] &lt;длительность&gt; [причина]</code>\n"
     "    Мьют. Модератор получает ephemeral-подтверждение (видно только ему).\n\n"
-    "  <code>!swarn [причина]</code>\n"
+    "  <code>!swarn [target] [причина]</code>\n"
     "    Варн. Модератор + <b>нарушитель</b> получают ephemeral (нарушитель видит причину —\n"
     "    единственное исключение из «тихого» режима).\n\n"
-    "  <code>!sban [причина]</code>\n"
+    "  <code>!sban [target] [причина]</code>\n"
     "    Бан. Если reply на стикер — пак автодобавляется.\n\n"
     "  🛠 <b>Снятие наказаний:</b>\n\n"
     "  <code>!unmute</code> / <code>!unban</code>\n"
