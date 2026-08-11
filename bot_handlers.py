@@ -394,18 +394,30 @@ _CMD_BAN = re.compile(
     re.IGNORECASE,
 )  # reason обязательна; target опционален.
 # v4.8.1: тихие команды (stealth). s = silent/stealth.
+# v4.8.3.1 HOTFIX: regex переосмыслен — _CMD_SWARN/_CMD_SBAN в v4.8.3 не матчили
+#   `!swarn Причина` (bare reason без @username/TGID), потому что внутренняя
+#   группа `(?P<reason>.+)` требовала свой собственный `\s+`, но он уже был
+#   съеден внешней `\s+`. Исправлено: target и reason — два независимых
+#   optional-блока на верхнем уровне, каждый со своим `\s+`. Это позволяет
+#   матчить все варианты: `!swarn`, `!swarn Причина`, `!swarn @user`,
+#   `!swarn @user Причина`, `!swarn 12345`, `!swarn 12345 Причина`.
+# v4.8.3.1 HOTFIX: _CMD_SMUTE в v4.8.3 делал всё тело опциональным, поэтому
+#   `!smute` без длительности матчило (dur=None), а handler звал
+#   `_parse_duration(None)` → AttributeError. Regex оставлен как есть
+#   (dur внутри опциональной группы), но handler теперь явно проверяет
+#   `dur is None` и отправляет ephemeral с подсказкой формата.
 _CMD_SMUTE = re.compile(
     r"^!smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
     re.IGNORECASE,
-)  # dur обяз. (если есть target — после него); reason опц.; target опц.
+)  # dur обяз. ЕСЛИ есть аргументы; reason опц.; target опц.
 _CMD_SWARN = re.compile(
-    r"^!swarn(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
+    r"^!swarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
     re.IGNORECASE,
-)  # reason опциональна; target опционален.
+)  # reason опциональна; target опционален; любой из них может быть один.
 _CMD_SBAN = re.compile(
-    r"^!sban(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
+    r"^!sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
     re.IGNORECASE,
-)  # reason опциональна; target опционален.
+)  # reason опциональна; target опционален; любой из них может быть один.
 _CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
 _CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
 _CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
@@ -3929,9 +3941,34 @@ async def handle_group_command(message: types.Message) -> None:
     # ── !smute (v4.8.1: тихий мьют, stealth) ───────────────────────────
     # Копия v4.8.0 !mute: ephemeral модератору, без публичного сообщения,
     # причина необязательна. Для обратной совместимости со стелс-режимом.
+    # v4.8.3.1 HOTFIX: в v4.8.3 regex _CMD_SMUTE сделал всё тело опциональным,
+    # поэтому `!smute` без длительности (с reply или без) матчило с dur=None.
+    # Затем `_parse_duration(None)` падал с AttributeError, роняя весь handler.
+    # Теперь явно проверяем dur is None и отправляем ephemeral с подсказкой.
     m = _CMD_SMUTE.match(text)
     if m:
         dur_str = m.group("dur")
+        # v4.8.3.1: regex может дать dur=None если юзер написал `!smute` без
+        # аргументов. Это не валидный вызов — мьют без длительности не имеет
+        # смысла (нельзя молчать «навсегда» через restrict_chat_member без
+        # until_date — это технически возможно, но ломает логику unmute).
+        if dur_str is None:
+            try:
+                await _send_ephemeral(
+                    bot=message.bot, chat_id=chat_id, recipient=mod,
+                    text=(
+                        "❌ Не указана длительность мьюта.\n"
+                        "💡 Формат: <code>!smute 1d [причина]</code>, "
+                        "<code>!smute @user 2h Причина</code>, "
+                        "<code>!smute 30m</code>.\n"
+                        "Поддерживаемые единицы: <b>м/m</b> (минуты), "
+                        "<b>ч/h</b> (часы), <b>д/d</b> (дни). "
+                        "Комбинированные: <code>1d12h30m</code>."
+                    ),
+                )
+            except Exception:
+                pass
+            return
         reason = m.group("reason") or "(без причины)"
         duration_seconds = _parse_duration(dur_str)
         if duration_seconds is None:
