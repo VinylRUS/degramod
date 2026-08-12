@@ -6960,157 +6960,340 @@ async def cmd_sanitary(message: types.Message) -> None:
 # только модератору, причина необязательна). Удалены упоминания word_filter
 # команд /addword//delword//listwords (заменены на KeywordWatch). Добавлен
 # !alarm (v4.7.20b, не был описан). Добавлена ссылка на /admin/bans.
+#
+# v4.8.3.2: ПОЛНЫЙ РЕДИЗАЙН /help через Rich Message (InputRichMessage).
+# Причина: _HELP_FULL_TEXT был 4621 символ, лимит Telegram — 4096 → SU и
+# admin получали BadRequest "message is too long" и НЕ получали /help.
+# Сокращённая _HELP_MODERATOR_TEXT (2477) вписывалась, модераторы видели.
+# Теперь: обе версии — Rich Message со сворачиваемыми Details-блоками для
+# длинных секций настроек. Без иконок, без intro, лаконичные списки.
+# Footer: ссылка на веб-панель + версия бота.
+#
+# Архитектура: _build_help_full_rich() / _build_help_moderator_rich() —
+# чистые функции, возвращающие InputRichMessage. cmd_help() выбирает по
+# роли и вызывает bot.send_rich_message. Без fallback на HTML (риск что
+# Rich Message не поддерживается — принят; Telegram clients обновлены).
 
-_HELP_FULL_TEXT = (
-    "📖 <b>Дедушка Вобжак — список команд</b>\n\n"
-    "<b>В группах (reply ИЛИ указание цели):</b>\n\n"
-    "  v4.8.3: цель наказания можно указать первым аргументом — не только reply.\n"
-    "  Пример: <code>!ban @username Причина</code> или <code>!ban 12345678 Причина</code>.\n"
-    "  Если reply есть — он приоритетнее. <code>@username</code> ищется в БД бота.\n"
-    "  Скриншот: приложите фото к команде с caption — он попадёт в отчёт.\n\n"
-    "  🔊 <b>Громкие</b> (публичное сообщение в чат, причина обязательна):\n"
-    "  <code>!mute [target] &lt;длительность&gt; &lt;причина&gt;</code>\n"
-    "    Мьют нарушителя. Длительность: <code>1d2h</code>, <code>30м</code>, <code>2h</code>.\n"
-    "    Бот публикует: <code>Пользователь \"X\" замутан за \"Y\" на \"D\"</code>.\n"
-    "    Пример: <code>!mute 1d спам</code> или <code>!mute @user 1d спам</code>.\n"
-    "  <code>!warn [target] &lt;причина&gt;</code>\n"
-    "    Варн (1 поинт). Сообщение нарушителя удаляется.\n"
-    "    Бот публикует: <code>Пользователь \"X\" получил варн за \"Y\"</code>.\n"
-    "    При достижении порога <code>warns_to_mute</code> — автомьют.\n"
-    "  <code>!ban [target] &lt;причина&gt;</code>\n"
-    "    Бан нарушителя. Если reply на стикер — пак автодобавляется в бан-лист.\n"
-    "    Бот публикует: <code>Пользователь \"X\" забанен за \"Y\"</code>.\n\n"
-    "  🤫 <b>Тихие</b> (стелс, ephemeral только модератору, причина необязательна):\n"
-    "  <code>!smute [target] &lt;длительность&gt; [причина]</code>\n"
-    "    Мьют без публичного сообщения. Модератор получает ephemeral-подтверждение.\n"
-    "  <code>!swarn [target] [причина]</code>\n"
-    "    Варн без публичного сообщения. Модератор + <b>нарушитель</b> получают ephemeral\n"
-    "    (единственное исключение из «тихого» режима — нарушитель видит причину).\n"
-    "  <code>!sban [target] [причина]</code>\n"
-    "    Бан без публичного сообщения. Если reply на стикер — пак автодобавляется.\n\n"
-    "  🛠 <b>Прочее в группах:</b>\n"
-    "  <code>!unmute</code> / <code>!unban</code> — снять ограничения (reply на сообщение).\n"
-    "  <code>!unwarn [N]</code> — снять N последних варнов (по умолчанию 1).\n"
-    "  <code>!warns</code> — показать активные варны (в личку, если сможет).\n"
-    "  <code>!resetwarns</code> — обнулить варны (только админы).\n"
-    "  <code>!alarm on [длительность]</code> / <code>!alarm off</code>\n"
-    "    Тревога: режим усиленных ограничений для всего чата.\n"
-    "    Длительность: <code>1ч</code>/<code>1h</code>/<code>30м</code>/<code>30m</code>/<code>2д</code>/<code>2d</code>.\n"
-    "    Без длительности — активен до ручного <code>!alarm off</code>.\n\n"
-    "<b>Веб-панель:</b>\n"
-    "  🔗 <a href=\"https://degraban.bothost.tech\">degraban.bothost.tech</a>\n"
-    "  /admin/chats — настройки чатов (хэштег, пороги, длительность мьюта, админы).\n"
-    "  /admin/keywords — KeywordWatch (замена word_filter): фразы и автобан-режимы.\n"
-    "  /admin/bans — активные баны; кнопка <code>Unban</code> для ручного разбана.\n\n"
-    "<b>В личке (настройки чатов, только для админов):</b>\n"
-    "  💡 Большинство настроек доступно в веб-панели: /admin/chats\n"
-    "  /settings chat_id — показать настройки\n"
-    "  /sethashtag chat_id #tag — хэштег чата\n"
-    "  /setreport chat_id [report_chat_id] — чат для отчётов (0 = сброс)\n"
-    "  /warns_mute chat_id N / /warns_ban chat_id N — пороги\n"
-    "  /mute_duration chat_id 1d2h — длительность мьюта\n"
-    "  /addadmin chat_id user_id / /deladmin chat_id user_id\n\n"
-    "<b>Фильтры (в личке):</b>\n"
-    "  /bansticker &lt;pack|link&gt; [delete|warn|mute|ban] [dur] — забанить стикерпак\n"
-    "  /liststickers [chat_id] / /delsticker &lt;pack&gt; [chat_id]\n"
-    "  💡 Word filter удалён в v4.8.1 — используйте KeywordWatch через веб-панель\n"
-    "    /admin/keywords или групповые команды <code>!addkeyword</code>/<code>!delkeyword</code>/<code>!listkeywords</code>.\n"
-    "  /linkfilter chat_id on|off — фильтр ссылок\n"
-    "  /linkallow chat_id|global &lt;domain&gt; / /linkallowlist [chat_id]\n"
-    "  /cas chat_id on|off — CAS-проверка новых юзеров\n\n"
-    "<b>Ночной режим (в личке):</b>\n"
-    "  /nightmode chat_id &lt;start&gt; &lt;end&gt; [strict|text_only|none|custom]\n"
-    "  /nightmode chat_id off — выключить\n"
-    "  /nightmode chat_id tz &lt;Europe/Moscow&gt; — часовой пояс\n"
-    "  /nightmode chat_id weekend &lt;start&gt; &lt;end&gt; — расписание на сб/вс\n"
-    "  /nightmode chat_id weekend off — сбросить (использовать будничное)\n"
-    "  /nightmode chat_id notify on|off [custom_text] — уведомления входа/выхода\n"
-    "  /nightmode chat_id custom &lt;perm&gt;=0|1 ... — точечные права\n"
-    "    perms: msgs, audios, docs, photos, videos, vnotes, voices, polls, other, links\n"
-    "  /nightmode chat_id slowmode &lt;day_sec&gt; &lt;night_sec&gt; — slow mode (0=выкл, 0..36400)\n"
-    "  /nightmode chat_id slowmode off — выключить slow mode changes\n\n"
-    "<b>Санитарные дни (в личке):</b>\n"
-    "  /sanitary chat_id — показать список\n"
-    "  /sanitary chat_id add &lt;YYYY-MM-DD&gt; — добавить день\n"
-    "  /sanitary chat_id add &lt;start&gt;:&lt;end&gt; — добавить диапазон\n"
-    "  /sanitary chat_id remove &lt;YYYY-MM-DD&gt; — удалить день/диапазон\n"
-    "  /sanitary chat_id clear — очистить список\n"
-    "  /sanitary chat_id toggle — вручную войти/выйти (для теста)\n"
-    "  💡 Lockdown чата (модераторы не страдают); ночной режим пропускается\n\n"
-    "<b>Прочее:</b>\n"
-    "  /warndecay chat_id &lt;days&gt; — срок действия варна (0 = отключено)\n"
-)
+def _help_code(text: str) -> RichTextCode:
+    """Шорткат для inline-моноширинного кода в List-пунктах."""
+    return RichTextCode(text=text)
 
-_HELP_MODERATOR_TEXT = (
-    "📖 <b>Дедушка Вобжак — команды модератора</b>\n\n"
-    "<b>В группах (reply ИЛИ указание цели):</b>\n\n"
-    "  v4.8.3: цель можно указать первым аргументом — <code>@username</code> или TGID.\n"
-    "  Пример: <code>!ban @user Причина</code>, <code>!sban 12345678</code>.\n"
-    "  Если reply есть — он приоритетнее. Скриншот: приложите фото с caption-командой.\n\n"
-    "  🔊 <b>Громкие</b> — публичное сообщение в чат, причина обязательна:\n\n"
-    "  <code>!mute [target] &lt;длительность&gt; &lt;причина&gt;</code>\n"
-    "    Мьют нарушителя. Длительность: <code>1d2h</code>, <code>30м</code>, <code>2h</code>.\n"
-    "    Бот публикует в чат: <code>Пользователь \"X\" замутан за \"Y\" на \"D\"</code>.\n"
-    "    Пример: <code>!mute 1d спам</code>.\n\n"
-    "  <code>!warn [target] &lt;причина&gt;</code>\n"
-    "    Варн (1 поинт). Сообщение нарушителя удаляется.\n"
-    "    Бот публикует: <code>Пользователь \"X\" получил варн за \"Y\"</code>.\n"
-    "    При достижении порога <code>warns_to_mute</code> — автомьют.\n\n"
-    "  <code>!ban [target] &lt;причина&gt;</code>\n"
-    "    Бан нарушителя. Если reply на стикер — пак автодобавляется в бан-лист.\n"
-    "    Бот публикует: <code>Пользователь \"X\" забанен за \"Y\"</code>.\n\n"
-    "  🤫 <b>Тихие</b> — стелс, без публичного сообщения, причина необязательна:\n\n"
-    "  <code>!smute [target] &lt;длительность&gt; [причина]</code>\n"
-    "    Мьют. Модератор получает ephemeral-подтверждение (видно только ему).\n\n"
-    "  <code>!swarn [target] [причина]</code>\n"
-    "    Варн. Модератор + <b>нарушитель</b> получают ephemeral (нарушитель видит причину —\n"
-    "    единственное исключение из «тихого» режима).\n\n"
-    "  <code>!sban [target] [причина]</code>\n"
-    "    Бан. Если reply на стикер — пак автодобавляется.\n\n"
-    "  🛠 <b>Снятие наказаний:</b>\n\n"
-    "  <code>!unmute</code> / <code>!unban</code>\n"
-    "    Снять мьют или бан (reply на сообщение).\n"
-    "  <code>!unwarn [N]</code>\n"
-    "    Снять N последних варнов (по умолчанию 1).\n"
-    "  <code>!warns</code>\n"
-    "    Показать активные варны нарушителя (в личку, если сможет).\n\n"
-    "<b>Веб-панель:</b>\n"
-    "  🔗 <a href=\"https://degraban.bothost.tech\">degraban.bothost.tech</a>\n"
-    "  /admin/bans — активные баны, кнопка <code>Unban</code> для ручного разбана.\n"
-    "  /admin/keywords — KeywordWatch (список отслеживаемых фраз).\n"
-    "  Логин и пароль выдаёт SU при создании аккаунта.\n"
-    "  Если забыли — напишите SU в Telegram.\n\n"
-    "<b>Важно:</b>\n"
-    "  • Наказания нельзя применять к себе и к другим модераторам этого чата.\n"
-    "  • <code>!resetwarns</code> и команды настройки чатов (<code>/sethashtag</code>,\n"
-    "    <code>/nightmode</code>, <code>/sanitary</code>, фильтры) — только для админов.\n"
-    "    Запросите доступ у SU, если нужно менять настройки чата.\n"
-    "  • Выбор между громким и тихим вариантом — за модератором. Громкие команды\n"
-    "    показывают чату, что происходит (прозрачность). Тихие — когда не хочется\n"
-    "    привлекать внимание (например, спам-бот).\n"
-)
+
+def _help_list_item(code_text: str, description: str) -> InputRichBlockListItem:
+    """List-пункт вида: <code>!cmd</code> — описание.
+
+    code_text — команда с аргументами (моноширинно).
+    description — что делает (после тире, обычный текст).
+    """
+    return InputRichBlockListItem(
+        blocks=[InputRichBlockParagraph(text=[
+            _help_code(code_text),
+            f" — {description}",
+        ])]
+    )
+
+
+def _help_section(
+    heading: str,
+    items: list[tuple[str, str]],
+) -> list:
+    """Секция: SectionHeading(size=2) + Divider + List.
+
+    items — список пар (code_text, description).
+    Возвращает список блоков (3 шт) для добавления в blocks[].
+    """
+    return [
+        InputRichBlockSectionHeading(text=heading, size=2),
+        InputRichBlockDivider(),
+        InputRichBlockList(items=[
+            _help_list_item(code, desc) for code, desc in items
+        ]),
+    ]
+
+
+def _help_details(
+    summary: str,
+    items: list[tuple[str, str]],
+    note: list | None = None,
+) -> InputRichBlockDetails:
+    """Сворачиваемый Details-блок с List команд внутри.
+
+    summary — заголовок сворачиваемого блока (виден всегда).
+    items — список пар (code_text, description) для List.
+    note — опциональный параграф (список inline-элементов) после List,
+            например предупреждение про KeywordWatch.
+    """
+    details_blocks: list = [
+        InputRichBlockDivider(),
+        InputRichBlockList(items=[
+            _help_list_item(code, desc) for code, desc in items
+        ]),
+    ]
+    if note is not None:
+        details_blocks.append(InputRichBlockParagraph(text=note))
+    return InputRichBlockDetails(
+        summary=summary,
+        is_open=False,
+        blocks=details_blocks,
+    )
+
+
+def _build_help_full_rich() -> InputRichMessage:
+    """Полная версия /help для SU и admin — через Rich Message.
+
+    Структура:
+      1. H1 заголовок + Divider
+      2. Громкие команды (3 шт) — раскрыто
+      3. Тихие команды (3 шт) — раскрыто
+      4. Снятие наказаний / Прочее (5 шт) — раскрыто
+      5. Details «Настройки чатов (8 команд)»
+      6. Details «Фильтры (7 команд)»
+      7. Details «Ночной режим (9 команд)»
+      8. Details «Санитарные дни (6 команд)»
+      9. Details «Прочее (1 команда)»
+      10. Footer: веб-ссылка + версия бота
+    """
+    # Lazy import — избегаем циклического web_app ↔ bot_handlers.
+    try:
+        from web_app import APP_VERSION
+        version_str = APP_VERSION
+    except Exception:
+        version_str = "v4.8.3.2"
+    web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
+
+    blocks: list = []
+
+    # H1 + Divider
+    blocks.append(InputRichBlockSectionHeading(
+        text="Дедушка Вобжак — список команд", size=1,
+    ))
+    blocks.append(InputRichBlockDivider())
+
+    # 2. Громкие команды (раскрыто)
+    blocks.extend(_help_section(
+        "Громкие команды (reply на нарушителя)",
+        [
+            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
+            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
+            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
+        ],
+    ))
+
+    # 3. Тихие команды (раскрыто)
+    blocks.extend(_help_section(
+        "Тихие команды (стелс, ephemeral модератору)",
+        [
+            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
+            ("!swarn [причина]", "варн. Нарушитель видит причину"),
+            ("!sban [причина]", "бан без публичного сообщения"),
+        ],
+    ))
+
+    # 4. Снятие наказаний / Прочее (раскрыто)
+    blocks.extend(_help_section(
+        "Снятие наказаний / Прочее",
+        [
+            ("!unmute / !unban", "снять ограничения (reply)"),
+            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
+            ("!warns", "показать активные варны (в личку)"),
+            ("!resetwarns", "обнулить варны (только админы)"),
+            ("!alarm on [длит] / !alarm off", "режим тревоги (усиленные ограничения)"),
+        ],
+    ))
+
+    # 5. Details: Настройки чатов (8 команд)
+    blocks.append(_help_details(
+        "Настройки чатов (в ЛС) — 8 команд",
+        [
+            ("/settings chat_id", "показать настройки чата"),
+            ("/sethashtag chat_id #tag", "хэштег чата"),
+            ("/setreport chat_id [report_chat_id]", "чат для отчётов (0 = сброс)"),
+            ("/warns_mute chat_id N", "порог варнов до автомьюта"),
+            ("/warns_ban chat_id N", "порог варнов до автобана"),
+            ("/mute_duration chat_id 1d2h", "длительность мьюта по умолчанию"),
+            ("/addadmin chat_id user_id", "добавить админа чата"),
+            ("/deladmin chat_id user_id", "удалить админа чата"),
+        ],
+    ))
+
+    # 6. Details: Фильтры (7 команд)
+    blocks.append(_help_details(
+        "Фильтры (в ЛС) — 7 команд",
+        [
+            ("/bansticker <pack|link> [delete|warn|mute|ban] [dur]", "забанить стикерпак"),
+            ("/liststickers [chat_id]", "список забаненных стикерпаков"),
+            ("/delsticker <pack> [chat_id]", "удалить стикерпак из бан-листа"),
+            ("/linkfilter chat_id on|off", "фильтр ссылок"),
+            ("/linkallow chat_id|global <domain>", "allowlist домена"),
+            ("/linkallowlist [chat_id]", "показать allowlist"),
+            ("/cas chat_id on|off", "CAS-проверка новых юзеров"),
+        ],
+        note=[
+            RichTextBold(text="Word filter"),
+            " удалён в v4.8.1 — используйте KeywordWatch через веб-панель ",
+            RichTextUrl(text="/admin/keywords", url=f"{web_url}/admin/keywords"),
+            " или групповые команды ",
+            RichTextCode(text="!addkeyword"),
+            " / ",
+            RichTextCode(text="!delkeyword"),
+            " / ",
+            RichTextCode(text="!listkeywords"),
+            ".",
+        ],
+    ))
+
+    # 7. Details: Ночной режим (9 команд)
+    blocks.append(_help_details(
+        "Ночной режим (в ЛС) — 9 команд",
+        [
+            ("/nightmode chat_id <start> <end> [strict|text_only|none|custom]", "включить ночной режим"),
+            ("/nightmode chat_id off", "выключить"),
+            ("/nightmode chat_id tz <Europe/Moscow>", "часовой пояс"),
+            ("/nightmode chat_id weekend <start> <end>", "расписание на сб/вс"),
+            ("/nightmode chat_id weekend off", "сбросить (использовать будничное)"),
+            ("/nightmode chat_id notify on|off [custom_text]", "уведомления входа/выхода"),
+            ("/nightmode chat_id custom <perm>=0|1 ...", "точечные права (msgs, audios, docs, ...)"),
+            ("/nightmode chat_id slowmode <day_sec> <night_sec>", "slow mode (0=выкл, 0..36400)"),
+            ("/nightmode chat_id slowmode off", "выключить slow mode changes"),
+        ],
+    ))
+
+    # 8. Details: Санитарные дни (6 команд)
+    blocks.append(_help_details(
+        "Санитарные дни (в ЛС) — 6 команд",
+        [
+            ("/sanitary chat_id", "показать список"),
+            ("/sanitary chat_id add <YYYY-MM-DD>", "добавить день"),
+            ("/sanitary chat_id add <start>:<end>", "добавить диапазон"),
+            ("/sanitary chat_id remove <YYYY-MM-DD>", "удалить день/диапазон"),
+            ("/sanitary chat_id clear", "очистить список"),
+            ("/sanitary chat_id toggle", "вручную войти/выйти (для теста)"),
+        ],
+        note=[
+            "Lockdown чата (модераторы не страдают); ночной режим пропускается.",
+        ],
+    ))
+
+    # 9. Details: Прочее (1 команда)
+    blocks.append(_help_details(
+        "Прочее (в ЛС) — 1 команда",
+        [
+            ("/warndecay chat_id <days>", "срок действия варна (0 = отключено)"),
+        ],
+    ))
+
+    # 10. Footer: веб-ссылка + версия бота
+    blocks.append(InputRichBlockDivider())
+    blocks.append(InputRichBlockFooter(text=[
+        RichTextUrl(text=web_url, url=web_url),
+        f"  {version_str}",
+    ]))
+
+    return InputRichMessage(blocks=blocks)
+
+
+def _build_help_moderator_rich() -> InputRichMessage:
+    """Сокращённая версия /help для moderator — через Rich Message.
+
+    Только то, что модератор может использовать:
+      • Громкие команды (!mute, !warn, !ban)
+      • Тихие команды (!smute, !swarn, !sban)
+      • Снятие наказаний (!unmute, !unban, !unwarn, !warns)
+    Без !resetwarns (только админы) и !alarm (только админы).
+    Без всех Details-блоков настроек — модератор не может их вызывать.
+    Footer: веб-ссылка + версия + «Логин и пароль выдаёт SU».
+    """
+    try:
+        from web_app import APP_VERSION
+        version_str = APP_VERSION
+    except Exception:
+        version_str = "v4.8.3.2"
+    web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
+
+    blocks: list = []
+
+    # H1 + Divider
+    blocks.append(InputRichBlockSectionHeading(
+        text="Дедушка Вобжак — команды модератора", size=1,
+    ))
+    blocks.append(InputRichBlockDivider())
+
+    # Громкие команды
+    blocks.extend(_help_section(
+        "Громкие команды (reply на нарушителя)",
+        [
+            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
+            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
+            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
+        ],
+    ))
+
+    # Тихие команды
+    blocks.extend(_help_section(
+        "Тихие команды (стелс, ephemeral модератору)",
+        [
+            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
+            ("!swarn [причина]", "варн. Нарушитель видит причину"),
+            ("!sban [причина]", "бан без публичного сообщения"),
+        ],
+    ))
+
+    # Снятие наказаний
+    blocks.extend(_help_section(
+        "Снятие наказаний",
+        [
+            ("!unmute / !unban", "снять ограничения (reply)"),
+            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
+            ("!warns", "показать активные варны (в личку)"),
+        ],
+    ))
+
+    # Footer: веб-ссылка + версия + подсказка про SU
+    blocks.append(InputRichBlockDivider())
+    blocks.append(InputRichBlockFooter(text=[
+        RichTextUrl(text=web_url, url=web_url),
+        f"  {version_str}",
+    ]))
+    blocks.append(InputRichBlockParagraph(text=[
+        "Логин и пароль выдаёт SU при создании аккаунта. ",
+        "Наказания нельзя применять к себе и к другим модераторам этого чата.",
+    ]))
+
+    return InputRichMessage(blocks=blocks)
 
 
 @router.message(F.chat.type == "private", Command("help"))
 async def cmd_help(message: types.Message) -> None:
-    """Показывает список команд.
+    """Показывает список команд через Rich Message.
 
-    v4.7.9: раньше /help видели только ADMIN_IDS (env). Теперь:
-      • ADMIN_IDS env → полный help (как раньше)
+    v4.8.3.2: полный редизайн. Раньше _HELP_FULL_TEXT был 4621 символ
+    (лимит Telegram — 4096) → SU/admin получали BadRequest "message is too long"
+    и НЕ получали /help вообще. Теперь: Rich Message со сворачиваемыми
+    Details-блоками для длинных секций настроек.
+
+    Логика выбора версии (без изменений):
+      • ADMIN_IDS env → полный help
       • WebUser role='su' или 'admin', is_active=True → полный help
       • WebUser role='moderator', is_active=True → сокращённый help
         (только групповые модераторские команды + ссылка на веб-панель)
-      • Все остальные — молчим (стелс сохраняется).
+      • Все остальные (посторонние) — молчим (стелс сохраняется)
 
-    Это закрывает проблему: модераторы, привязанные к чату через chat_admins,
-    могли использовать !mute/!warn в группах, но не видели /help — им было
-    неоткуда узнать синтаксис команд.
+    Без fallback на HTML — Rich Message поддерживается во всех
+    современных клиентах Telegram. Если send_rich_message упадёт —
+    логируем warning, пользователь не получит ответ.
     """
     user_id = message.from_user.id
 
     # 1. Глобальные супер-админы из env — всегда полный help
     if user_id in ADMIN_IDS:
-        await message.reply(_HELP_FULL_TEXT, parse_mode="HTML")
+        try:
+            await message.bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=_build_help_full_rich(),
+            )
+        except TelegramAPIError as e:
+            logger.warning("cmd_help: send_rich_message (full, ADMIN_IDS) failed for user_id=%s: %s",
+                           user_id, e)
         return
 
     # 2. Ищем веб-профиль по tg_user_id
@@ -7125,12 +7308,26 @@ async def cmd_help(message: types.Message) -> None:
 
     # 3. SU / admin → полный help
     if wu.role in ("su", "admin"):
-        await message.reply(_HELP_FULL_TEXT, parse_mode="HTML")
+        try:
+            await message.bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=_build_help_full_rich(),
+            )
+        except TelegramAPIError as e:
+            logger.warning("cmd_help: send_rich_message (full, role=%s) failed for user_id=%s: %s",
+                           wu.role, user_id, e)
         return
 
     # 4. Moderator → сокращённый help
     if wu.role == "moderator":
-        await message.reply(_HELP_MODERATOR_TEXT, parse_mode="HTML")
+        try:
+            await message.bot.send_rich_message(
+                chat_id=message.chat.id,
+                rich_message=_build_help_moderator_rich(),
+            )
+        except TelegramAPIError as e:
+            logger.warning("cmd_help: send_rich_message (moderator) failed for user_id=%s: %s",
+                           user_id, e)
         return
 
     # Неизвестная роль — safe default, молчим.
