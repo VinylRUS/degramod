@@ -285,40 +285,111 @@ async def get_project_node_id(
     Args:
         pat: GitHub PAT.
         owner_login: логин владельца Project (user или organization).
-        project_number: номер Project (из URL: github.com/users/X/projects/N).
+        project_number: номер Project (из URL: github.com/users/X/projects/N
+            или github.com/orgs/X/projects/N).
 
     Returns:
         GraphQL node ID Project v2 (PVT_xxx).
 
     Raises:
-        GithubApiError: если Project не найден или нет прав.
+        GithubApiError: если Project не найден, нет прав, или login не
+            существует ни как user, ни как organization.
+
+    Implementation note (v4.8.5.1):
+        Раньше (v4.8.5) использовался один комбинированный GraphQL-запрос
+        с `user(login) { projectV2 }` + `organization(login) { projectV2 }`.
+        Это ломалось, если owner_login был user-аккаунтом: GitHub
+        возвращал GraphQL error "Could not resolve to an Organization
+        with the login of 'X'" на organization branch, и весь запрос
+        абортился (errors в ответе → GithubApiError), даже если user
+        branch содержал валидный Project.
+
+        Теперь делаем два последовательных запроса: сначала пробуем user,
+        если не нашли (null или GraphQL error) — пробуем organization.
+        Это работает для всех типов owner и не падает на "не того типа".
     """
-    query = """
+    # ── Шаг 1: пробуем как User ────────────────────────────────────────
+    user_query = """
     query($login: String!, $number: Int!) {
       user(login: $login) {
         projectV2(number: $number) { id title }
       }
+    }
+    """
+    try:
+        data = await _graphql(pat, user_query, {
+            "login": owner_login, "number": project_number,
+        })
+        user_proj = (data.get("user") or {}).get("projectV2")
+        if user_proj and "id" in user_proj:
+            return user_proj["id"]
+        # user существует, но Project с таким номером не найден —
+        # не пробуем organization (тот же login не может быть и user, и
+        # org одновременно). Сразу кидаем ошибку.
+        if data.get("user") is not None:
+            raise GithubApiError(
+                f"Project #{project_number} not found for user '{owner_login}'. "
+                "Check the project number in the URL "
+                "(github.com/users/<login>/projects/<N>).",
+                status=200,
+            )
+    except GithubApiError as e:
+        # Если ошибка — это "Could not resolve to a User", значит login
+        # не user, а может быть organization. Продолжаем к шагу 2.
+        # Любая другая ошибка (нет прав, network и т.д.) — пробрасываем.
+        msg = str(e)
+        if "Could not resolve to a User" not in msg and \
+           "Could not resolve to a User with the login" not in msg:
+            # Если это уже наш собственный raise выше (Project not found
+            # for user) — пробрасываем как есть, не пытаемся organization.
+            if "not found for user" in msg:
+                raise
+            # Иначе — непонятная ошибка, тоже пробрасываем.
+            raise
+
+    # ── Шаг 2: пробуем как Organization ────────────────────────────────
+    org_query = """
+    query($login: String!, $number: Int!) {
       organization(login: $login) {
         projectV2(number: $number) { id title }
       }
     }
     """
-    data = await _graphql(pat, query, {
-        "login": owner_login, "number": project_number,
-    })
-    # Project может принадлежать либо user, либо organization —
-    # проверяем оба.
-    user_proj = (data.get("user") or {}).get("projectV2")
-    org_proj = (data.get("organization") or {}).get("projectV2")
-    proj = user_proj or org_proj
-    if not proj or "id" not in proj:
-        raise GithubApiError(
-            f"Project #{project_number} not found for owner '{owner_login}'. "
-            "Check that the owner login is correct, the project number matches, "
-            "and the PAT has 'project' scope.",
-            status=200,
-        )
-    return proj["id"]
+    try:
+        data = await _graphql(pat, org_query, {
+            "login": owner_login, "number": project_number,
+        })
+        org_proj = (data.get("organization") or {}).get("projectV2")
+        if org_proj and "id" in org_proj:
+            return org_proj["id"]
+        # organization существует, но Project не найден.
+        if data.get("organization") is not None:
+            raise GithubApiError(
+                f"Project #{project_number} not found for organization "
+                f"'{owner_login}'. Check the project number in the URL "
+                "(github.com/orgs/<login>/projects/<N>).",
+                status=200,
+            )
+    except GithubApiError as e:
+        msg = str(e)
+        if "Could not resolve to an Organization" in msg:
+            # login не является ни user, ни organization —
+            # значит, такого логина вообще нет на GitHub.
+            raise GithubApiError(
+                f"'{owner_login}' is neither a GitHub user nor an "
+                "organization. Check the spelling (case-sensitive) and "
+                "make sure the account exists.",
+                status=200,
+            ) from e
+        raise
+
+    # ── Если мы здесь — login был user, но Project не найден (шаг 1
+    # должен был кинуть ошибку раньше, но на всякий случай).
+    raise GithubApiError(
+        f"Project #{project_number} not found for owner '{owner_login}'. "
+        "Verify owner login, project number, and PAT 'project' scope.",
+        status=200,
+    )
 
 
 async def test_connection(

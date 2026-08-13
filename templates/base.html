@@ -639,6 +639,21 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.5.1</strong> — 14 августа 2026 (hotfix: резолв Project node_id для user-аккаунтов)</p>
+                <ul>
+                    <li><strong>Баг</strong>: при нажатии «Проверить подключение» в Settings → GitHub Projects авто-резолв <code>project_node_id</code> падал с ошибкой <em>"Could not resolve to an Organization with the login of 'X'"</em>, если <code>project_owner_login</code> был user-аккаунтом (а не организацией). Причина: <code>get_project_node_id()</code> использовал один комбинированный GraphQL-запрос с <code>user(login) { projectV2 }</code> + <code>organization(login) { projectV2 }</code> — GitHub возвращал GraphQL error на organization branch (потому что user — это не org), и весь запрос абортился, даже если user branch содержал валидный Project.</li>
+                    <li><strong>Фикс</strong>: переписан <code>github_client.get_project_node_id()</code> — теперь делает два последовательных запроса: сначала пробует <code>user(login)</code>, если не найден (GraphQL error "Could not resolve to a User") — пробует <code>organization(login)</code>. Если login не является ни user, ни organization — возвращается понятное сообщение об ошибке.</li>
+                    <li><strong>Edge cases</strong>:
+                        <ul>
+                            <li>User существует, но Project с таким номером не найден → ошибка с подсказкой проверить номер в URL <code>github.com/users/&lt;login&gt;/projects/&lt;N&gt;</code>.</li>
+                            <li>Organization существует, но Project не найден → аналогично с <code>github.com/orgs/&lt;login&gt;/projects/&lt;N&gt;</code>.</li>
+                            <li>PAT без scope <code>project</code> → GraphQL error пробрасывается как есть.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Затронутые файлы</strong>: <code>github_client.py</code> (переписан <code>get_project_node_id</code>), <code>web_app.py</code> (APP_VERSION → v4.8.5.1), <code>templates/base.html</code> (этот changelog).</li>
+                    <li><strong>Совместимость</strong>: 100%. API <code>get_project_node_id(pat, owner_login, project_number) → str</code> не изменился. Все остальные функции <code>github_client</code> не тронуты.</li>
+                </ul>
+
                 <p><strong>v4.8.5</strong> — 14 августа 2026 (идеи от модераторов/админов через бота → GitHub Issues)</p>
                 <ul>
                     <li><strong>Новая команда <code>!idea &lt;текст&gt;</code></strong> — отправка идеи в GitHub Issue + GitHub Project v2. Доступ: SU/admin/moderator (через WebUser). Посторонние — молчим (стелс сохраняется, как в <code>/help</code>). Каналы: только ЛС боту (DM) или модераторский чат (modchat) — в обычных чатах команда НЕ доступна. Лимит: 200 символов на текст идеи. Без cooldown, без модерации (доверяем модераторам).</li>
