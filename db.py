@@ -462,6 +462,40 @@ class BannedStickerPack(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
 
+class AutomuteCounter(Base):
+    """v4.8.4: Счётчик автомьютов для прогрессивных мутов.
+
+    Хранит количество раз, которое бот автоматически замьютил юзера
+    в конкретном чате. Используется для прогрессивной формулы:
+
+        mute_duration = base_duration + (count * 60 секунд)
+
+    где ``count`` — значение счётчика ДО текущего мьюта (0 при первом
+    автомьюте, 1 при втором, и т.д.). После применения мута счётчик
+    инкрементируется.
+
+    Ключевые свойства:
+      • **Не сбрасывается** при ``!resetwarns`` — варны и муты считаются
+        независимо. Очистка варнов не обнуляет историю автомьютов.
+      • **Не сбрасывается** при ``!unmute`` — снятие мьюта не обнуляет
+        счётчик.
+      • **Растёт бесконечно** — нет кэпа, нет автобана после N мутов.
+      • **Per-chat**: муты в чате A не влияют на длительность в чате B.
+      • **Только автомьюты**: ручные мьюты (``!mute``, ``!smute``) НЕ
+        инкрементируют счётчик и не используют прогрессивную формулу.
+      • Сбрасывается только через ``!resetmc`` (SU/Admin) или веб-панель.
+
+    PK: ``(chat_id, user_id)`` — одна запись на юзера на чат.
+    """
+    __tablename__ = "automute_counters"
+
+    chat_id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, primary_key=True)
+    count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+
+
 class WebUser(Base):
     """Учётные записи администраторов веб-панели.
 
@@ -980,6 +1014,22 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS ix_keyword_watch_is_active "
             "ON keyword_watch (is_active)"
         ))
+
+    # ── v4.8.4: Новая таблица automute_counters (прогрессивные автомьюты) ──
+    # Хранит per-chat per-user счётчик автомьютов. Используется для формулы:
+    #   mute_duration = base_duration + (count * 60 сек)
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    # PK (chat_id, user_id) — одна запись на юзера на чат.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS automute_counters (
+                chat_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, user_id)
+            )
+        """))
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

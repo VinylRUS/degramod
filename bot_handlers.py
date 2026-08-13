@@ -45,6 +45,7 @@ v4.4.10 РЕДИЗАЙН ОТЧЁТА В РЕПОРТ-ЧАТЕ:
     !unwarn [N]                   — снять N последних варнов (по умолчанию 1; cap = текущее кол-во)
     !warns                        — показать текущее кол-во варнов юзера (в личку админу)
     !resetwarns                   — обнулить варны юзера
+    !resetmc [@user|tgid]         — обнулить счётчик автомьютов (v4.8.4: прогрессивные муты)
     !alarm on [1ч/1h/30м/30m/2д/2d] / !alarm off  — тревога (v4.7.20b): режим усиленных ограничений
 
 Команды в личке (только для ADMIN_IDS):
@@ -125,7 +126,7 @@ from sqlalchemy import select, desc, func
 
 from db import (
     async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser,
-    LinkAllowlist, BannedStickerPack,
+    LinkAllowlist, BannedStickerPack, AutomuteCounter,
     _hash_password,
 )
 
@@ -423,6 +424,13 @@ _CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
 _CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
 _CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
 _CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
+# v4.8.4: !resetmc — сброс счётчика автомьютов (прогрессивные муты).
+# Цель: reply на сообщение, ИЛИ !resetmc @username, ИЛИ !resetmc <tgid>.
+# Доступ: только SU/Admin (как !resetwarns).
+_CMD_RESETMC = re.compile(
+    r"^!resetmc(?:\s+(?P<target>@\w+|\d+))?\s*$",
+    re.IGNORECASE,
+)
 # v4.7.20: !alarm on [duration] / !alarm off
 # Длительность: опциональная, форматы "1ч" / "1h" / "30м" / "30m" / "2д" / "2d".
 # Если не указана — alarm активен до ручного !alarm off.
@@ -438,11 +446,12 @@ _CMD_ALARM = re.compile(
 # ── Список всех команд модерации (для ранней проверки, что текст вообще ────
 #    является командой, ДО удаления сообщения модератора). v4.4.8 FIX.
 # v4.8.1: добавлены тихие команды !sban/!swarn/!smute.
+# v4.8.4: добавлена команда !resetmc (сброс счётчика автомьютов).
 _ALL_MOD_COMMANDS: tuple[re.Pattern, ...] = (
     _CMD_MUTE, _CMD_WARN, _CMD_BAN,
     _CMD_SMUTE, _CMD_SWARN, _CMD_SBAN,
     _CMD_UNMUTE, _CMD_UNBAN, _CMD_UNWARN,
-    _CMD_WARNS, _CMD_RESETWARNS,
+    _CMD_WARNS, _CMD_RESETWARNS, _CMD_RESETMC,
     _CMD_ALARM,
 )
 
@@ -1378,6 +1387,65 @@ async def _revoke_last_action(
     punishment.revoked_by_mod_id = revoked_by_mod_id
     await session.commit()
     return True
+
+
+# ── v4.8.4: Прогрессивные автомьюты — хелперы для счётчика ──────────────────
+# Счётчик automute_counters хранит количество автомьютов per (chat_id, user_id).
+# Формула: mute_duration = base_duration + (count * 60 сек), где count —
+# значение ДО инкремента (0 для первого мута). Не сбрасывается при !resetwarns
+# или !unmute — только через !resetmc или веб-панель.
+
+async def _get_automute_count(session, chat_id: int, user_id: int) -> int:
+    """Возвращает текущее значение счётчика автомьютов (0 если записи нет)."""
+    counter = (await session.execute(
+        select(AutomuteCounter).where(
+            AutomuteCounter.chat_id == chat_id,
+            AutomuteCounter.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    return counter.count if counter else 0
+
+
+async def _increment_automute_count(session, chat_id: int, user_id: int) -> int:
+    """Инкрементирует счётчик автомьютов. Возвращает НОВОЕ значение.
+
+    Создаёт запись если её не было (0 → 1). Вызывающий код должен
+    сделать commit (или коммитит в рамках своей транзакции).
+    """
+    counter = (await session.execute(
+        select(AutomuteCounter).where(
+            AutomuteCounter.chat_id == chat_id,
+            AutomuteCounter.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if counter is None:
+        counter = AutomuteCounter(chat_id=chat_id, user_id=user_id, count=1)
+        session.add(counter)
+    else:
+        counter.count += 1
+    counter.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+    return counter.count
+
+
+async def _reset_automute_count(session, chat_id: int, user_id: int) -> int:
+    """Сбрасывает счётчик автомьютов в 0. Возвращает СТАРОЕ значение.
+
+    Если записи не было — возвращает 0 (нечего сбрасывать).
+    """
+    counter = (await session.execute(
+        select(AutomuteCounter).where(
+            AutomuteCounter.chat_id == chat_id,
+            AutomuteCounter.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if counter is None:
+        return 0
+    old_count = counter.count
+    counter.count = 0
+    counter.updated_at = datetime.now(timezone.utc)
+    await session.flush()
+    return old_count
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3615,6 +3683,10 @@ async def _check_warn_threshold(
                 pass
 
             mute_dur = settings.mute_duration_seconds or 3600
+            # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+            # count = значение ДО инкремента (0 для первого мута).
+            auto_count = await _get_automute_count(session, chat_id, target.id)
+            mute_dur = mute_dur + (auto_count * 60)
             until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
             try:
                 await bot.restrict_chat_member(
@@ -3638,6 +3710,9 @@ async def _check_warn_threshold(
                 consumed = await _mark_warns_consumed(
                     session, target.id, chat_id, "auto_mute",
                 )
+                # v4.8.4: инкремент счётчика автомьютов (после успешного мьюта).
+                new_count = await _increment_automute_count(session, chat_id, target.id)
+                await session.commit()
                 logger.info(
                     "Auto-mute: marked %d warns as consumed_by_action=auto_mute "
                     "for user %s in chat %s",
@@ -3647,10 +3722,15 @@ async def _check_warn_threshold(
                                    f"Автомьют: {total_warns} варнов",
                                    mod=mod,
                                    duration_seconds=mute_dur)
-                logger.info("Auto-mute triggered for user %s in chat %s (%d warns, %s)",
-                            target.id, chat_id, total_warns, _format_duration(mute_dur))
+                logger.info(
+                    "Auto-mute triggered for user %s in chat %s "
+                    "(%d warns, %s, automute_count %d→%d)",
+                    target.id, chat_id, total_warns,
+                    _format_duration(mute_dur), auto_count, new_count,
+                )
                 # ── Ephemeral-уведомление модератору (видно только ему) ────
                 # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
+                # v4.8.4: показываем итоговую длительность мута (без разбивки).
                 await _send_ephemeral(
                     bot=bot, chat_id=chat_id, recipient=mod,
                     text=(
@@ -3749,16 +3829,21 @@ async def handle_group_command(message: types.Message) -> None:
     # ТОЛЬКО по reply. Если reply нет — отказываем.
     # Наказательные команды (!ban/!sban/!warn/!swarn/!mute/!smute) —
     # резолвятся через _resolve_punishment_target (reply → @username → TGID).
+    # v4.8.4: !resetmc — тоже резолвится через _resolve_punishment_target
+    # (reply → @username → TGID), но это не наказательная команда
+    # (сброс счётчика, не мьют/варн/бан).Self/friendly-fire checks не применяются.
     is_punitive_cmd = bool(
         _CMD_MUTE.match(text) or _CMD_WARN.match(text) or _CMD_BAN.match(text)
         or _CMD_SMUTE.match(text) or _CMD_SWARN.match(text) or _CMD_SBAN.match(text)
     )
+    is_resetmc_cmd = bool(_CMD_RESETMC.match(text))
 
-    if is_punitive_cmd:
+    if is_punitive_cmd or is_resetmc_cmd:
         # Парсим target из команды (если есть) — для передачи в хелпер.
         # Берём первый matching паттерн и достаём target-группу.
         cmd_target_str: str | None = None
-        for pat in (_CMD_BAN, _CMD_SBAN, _CMD_WARN, _CMD_SWARN, _CMD_MUTE, _CMD_SMUTE):
+        for pat in (_CMD_BAN, _CMD_SBAN, _CMD_WARN, _CMD_SWARN,
+                    _CMD_MUTE, _CMD_SMUTE, _CMD_RESETMC):
             m_pat = pat.match(text)
             if m_pat and m_pat.groupdict().get("target"):
                 cmd_target_str = m_pat.group("target")
@@ -4721,6 +4806,69 @@ async def handle_group_command(message: types.Message) -> None:
                 detail="команда !resetwarns",
                 count=total_reset,
             )
+
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            pass
+        return
+
+    # ── !resetmc — сброс счётчика автомьютов (v4.8.4) ──────────────────
+    # Прогрессивные муты: base_duration + (count * 60 сек). !resetmc
+    # обнуляет count для (chat_id, target.id). Доступ: SU/Admin только.
+    # Цель: reply, ИЛИ !resetmc @username, ИЛИ !resetmc <tgid>.
+    if _CMD_RESETMC.match(text):
+        # ── Role check (SU/Admin only, как !resetwarns) ──
+        async with async_session() as session:
+            mod_role = await _get_web_user_role(session, mod.id)
+        is_privileged = (mod.id in ADMIN_IDS) or (mod_role in ("su", "admin"))
+        if not is_privileged:
+            try:
+                await _send_ephemeral(
+                    bot=message.bot, chat_id=chat_id, recipient=mod,
+                    text=(
+                        "❌ !resetmc доступен только SU/Admin. "
+                        "Сброс счётчика автомьютов — привилегия администратора."
+                    ),
+                )
+            except Exception:
+                pass
+            try:
+                await message.delete()
+            except TelegramAPIError:
+                pass
+            return
+
+        async with async_session() as session:
+            await _upsert_user(session, target.id, target.username,
+                               target.first_name, target.last_name)
+            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
+
+            # Сбрасываем счётчик автомьютов
+            old_count = await _reset_automute_count(session, chat_id, target.id)
+            await session.commit()
+
+        try:
+            await message.bot.send_message(
+                chat_id=message.from_user.id,
+                text=(
+                    f"✅ Счётчик автомьютов обнулён: "
+                    f"{target.first_name or ''}"
+                    f"{' ' + target.last_name if target.last_name else ''}"
+                    f"{' @' + target.username if target.username else ''}"
+                    f" (было {old_count})"
+                ),
+            )
+        except TelegramAPIError:
+            pass
+
+        # audit в репорт-чат
+        await _send_audit_to_report(
+            bot=message.bot, chat_id=chat_id, mod=mod, target=target,
+            action_label="счётчик автомьютов — сброс",
+            detail=f"команда !resetmc (было {old_count})",
+            count=old_count,
+        )
 
         try:
             await message.delete()
@@ -7045,7 +7193,7 @@ def _build_help_full_rich() -> InputRichMessage:
       1. H1 заголовок + Divider
       2. Громкие команды (3 шт) — раскрыто
       3. Тихие команды (3 шт) — раскрыто
-      4. Снятие наказаний / Прочее (5 шт) — раскрыто
+      4. Снятие наказаний / Прочее (6 шт) — раскрыто
       5. Details «Настройки чатов (8 команд)»
       6. Details «Фильтры (7 команд)»
       7. Details «Ночной режим (9 команд)»
@@ -7097,6 +7245,7 @@ def _build_help_full_rich() -> InputRichMessage:
             ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
             ("!warns", "показать активные варны (в личку)"),
             ("!resetwarns", "обнулить варны (только админы)"),
+            ("!resetmc [@user|tgid]", "обнулить счётчик автомьютов (только админы)"),
             ("!alarm on [длит] / !alarm off", "режим тревоги (усиленные ограничения)"),
         ],
     ))
@@ -7711,6 +7860,10 @@ async def handle_sticker_message(message: types.Message) -> None:
 
     if punishment == "mute":
         mute_dur = pack.mute_duration or 3600
+        # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+        async with async_session() as session:
+            auto_count = await _get_automute_count(session, chat_id, target.id)
+        mute_dur = mute_dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
         try:
             await message.bot.restrict_chat_member(
@@ -7725,9 +7878,14 @@ async def handle_sticker_message(message: types.Message) -> None:
                     f"Banned sticker pack: {sticker.set_name}",
                     target_content,
                 )
+                # v4.8.4: инкремент счётчика автомьютов.
+                new_count = await _increment_automute_count(session, chat_id, target.id)
+                await session.commit()
             logger.info(
-                "Sticker pack '%s' mute issued in chat %s (user %s, %s)",
+                "Sticker pack '%s' mute issued in chat %s (user %s, %s, "
+                "automute_count %d→%d)",
                 sticker.set_name, chat_id, target.id, _format_duration(mute_dur),
+                auto_count, new_count,
             )
         except TelegramAPIError as e:
             logger.error("Sticker mute failed: %s", e)
@@ -7825,6 +7983,10 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
         logger.warning("Via-bot filter: cannot delete message: %s", e)
 
     dur = max(mute_min, 1) * 60
+    # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+    async with async_session() as session:
+        auto_count = await _get_automute_count(session, chat_id, fu.id)
+    dur = dur + (auto_count * 60)
     until_date = int(now.timestamp()) + dur
     try:
         await message.bot.restrict_chat_member(
@@ -7842,11 +8004,15 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
                 session, fu.id, 0, chat_id,
                 "mute", dur, reason, target_content,
             )
+            # v4.8.4: инкремент счётчика автомьютов (после успешного мьюта).
+            new_count = await _increment_automute_count(session, chat_id, fu.id)
+            await session.commit()
         logger.info(
             "Via-bot filter (mute %s) in chat %s (user %s, bot @%s): "
-            "rate-limit exceeded (last=%ss ago, limit=%ss)",
+            "rate-limit exceeded (last=%ss ago, limit=%ss, "
+            "automute_count %d→%d)",
             _format_duration(dur), chat_id, fu.id, bot_username,
-            gap_sec, rate_limit,
+            gap_sec, rate_limit, auto_count, new_count,
         )
         # ── v4.8.1: публичное сообщение в чат (фиксированный текст) ───
         # Формат: «Пользователь "<display_name>" задолбал срать в чат
@@ -8083,6 +8249,10 @@ async def handle_content_filters(message: types.Message) -> None:
 
     if action == "mute":
         dur = mute_dur or 3600
+        # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+        async with async_session() as session:
+            auto_count = await _get_automute_count(session, chat_id, target.id)
+        dur = dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + dur
         try:
             await message.bot.restrict_chat_member(
@@ -8095,8 +8265,15 @@ async def handle_content_filters(message: types.Message) -> None:
                     session, target.id, 0, chat_id,
                     "mute", dur, reason, target_content,
                 )
-            logger.info("Content filter (mute %s) in chat %s (user %s): %s",
-                        _format_duration(dur), chat_id, target.id, reason)
+                # v4.8.4: инкремент счётчика автомьютов.
+                new_count = await _increment_automute_count(session, chat_id, target.id)
+                await session.commit()
+            logger.info(
+                "Content filter (mute %s) in chat %s (user %s): %s "
+                "(automute_count %d→%d)",
+                _format_duration(dur), chat_id, target.id, reason,
+                auto_count, new_count,
+            )
         except TelegramAPIError as e:
             logger.error("Content filter mute failed: %s", e)
         return

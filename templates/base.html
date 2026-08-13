@@ -639,6 +639,17 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.4</strong> — 13 августа 2026 (прогрессивные автомьюты)</p>
+                <ul>
+                    <li><strong>Прогрессивные автомьюты</strong>. Каждый следующий автомьют длительнее предыдущего: <code>mute_duration = base + (count × 60 сек)</code>, где <code>count</code> — количество предыдущих автомьютов юзера в этом чате. Первый автомьют = базовое время (как раньше), второй = base + 1 минута, третий = base + 2 минуты, и так далее. Базовое время берётся из настроек чата (для каждого пути автомьюта — свой источник: порог варнов, via-bot фильтр, стикерпак, контент-фильтр).</li>
+                    <li><strong>Счётчик автомьютов не сбрасывается</strong> при очистке варнов (<code>!resetwarns</code>) или снятии мьюта (<code>!unmute</code>). Растёт бесконечно — без кэпа, без автобана. Сбрасывается только через новую команду <code>!resetmc</code> или веб-панель.</li>
+                    <li><strong>Новая команда <code>!resetmc</code></strong> (сброс счётчика автомьютов). Доступ: SU/Admin. Цель: reply на сообщение, <code>!resetmc @username</code>, или <code>!resetmc &lt;tgid&gt;</code>. Отправляет DM-подтверждение + audit в репорт-чат.</li>
+                    <li><strong>Ручные мьюты (<code>!mute</code>, <code>!smute</code>) не затронуты</strong> — длительность задаёт модератор, счётчик не инкрементируется.</li>
+                    <li><strong>Новая таблица <code>automute_counters</code></strong> (PK: chat_id + user_id) — per-chat per-user счётчик. Миграция через <code>CREATE TABLE IF NOT EXISTS</code>.</li>
+                    <li><strong>Веб-панель: API</strong> <code>POST /api/reset-automute-count</code> (сброс, SU/Admin) и <code>GET /api/automute-count</code> (просмотр).</li>
+                    <li><strong>Затронутые файлы</strong>: <code>db.py</code> (модель <code>AutomuteCounter</code> + миграция), <code>bot_handlers.py</code> (хелперы, 4 пути автомьюта, команда <code>!resetmc</code>, help), <code>web_app.py</code> (APP_VERSION → v4.8.4, API endpoints), <code>templates/base.html</code> (changelog).</li>
+                </ul>
+                <hr>
                 <p><strong>v4.8.3.2</strong> — 13 августа 2026 (hotfix: <code>/help</code> не отдаётся SU/admin + полный редизайн через Rich Message)</p>
                 <ul>
                     <li><strong>BUG: <code>/help</code> молчал для SU и admin</strong>. Текстовая константа <code>_HELP_FULL_TEXT</code> в <code>bot_handlers.py</code> была 4621 символ — Telegram ограничивает одно сообщение 4096 символами. Когда SU или admin писал <code>/help</code> в ЛС боту, <code>message.reply(_HELP_FULL_TEXT, parse_mode="HTML")</code> падал с <code>BadRequest: message is too long</code>, пользователь не получал никакого ответа. Симптом: модераторы (сокращённая <code>_HELP_MODERATOR_TEXT</code>, 2477 символов — в лимите) видели <code>/help</code>, а SU и admin — нет.</li>

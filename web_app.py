@@ -61,7 +61,7 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
     async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
-    PermissionPreset, WordFilter, LinkAllowlist, KeywordWatch,
+    PermissionPreset, WordFilter, LinkAllowlist, KeywordWatch, AutomuteCounter,
     _hash_password, _verify_password, DB_PATH,
 )
 
@@ -97,7 +97,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.3.2"
+APP_VERSION = "v4.8.4"
 APP_RELEASE_DATE = "2026-08-13"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -4239,6 +4239,108 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             return RedirectResponse(
                 url=f"/admin/bans?flash={flash_msg}&chat_id={chat_id}",
                 status_code=303,
+            )
+
+    # ── v4.8.4: API для сброса счётчика автомьютов ──────────────────────
+    # POST /api/reset-automute-count — обнуляет automute_counters для
+    # (chat_id, user_id). Доступ: SU/Admin только.
+    # Параметры: chat_id (int), user_id (int).
+    # Возвращает JSON {ok: true, old_count: N} или {ok: false, error: ...}.
+    @app.post("/api/reset-automute-count")
+    async def api_reset_automute_count(
+        request: Request,
+        chat_id: int = Form(...),
+        user_id: int = Form(...),
+        _auth: AuthUser = Depends(require_admin),
+    ):
+        """v4.8.4: Сброс счётчика автомьютов (прогрессивные муты).
+
+        Обнуляет count в automute_counters для (chat_id, user_id).
+        Формула: mute_duration = base + (count * 60). После сброса
+        следующий автомьют будет = base duration (без штрафа).
+        """
+        from sqlalchemy import select as _sel
+        _req_logger.info(
+            "api_reset_automute_count: attempt — chat_id=%s user_id=%s by=%s",
+            chat_id, user_id, _auth.username,
+        )
+        try:
+            async with async_session() as session:
+                counter = (await session.execute(
+                    _sel(AutomuteCounter).where(
+                        AutomuteCounter.chat_id == chat_id,
+                        AutomuteCounter.user_id == user_id,
+                    )
+                )).scalar_one_or_none()
+                if counter is None:
+                    old_count = 0
+                else:
+                    old_count = counter.count
+                    counter.count = 0
+                    from datetime import datetime, timezone as _tz
+                    counter.updated_at = datetime.now(_tz.utc)
+                    await session.commit()
+            _req_logger.info(
+                "api_reset_automute_count: success — chat_id=%s user_id=%s "
+                "old_count=%d by=%s",
+                chat_id, user_id, old_count, _auth.username,
+            )
+            return JSONResponse({
+                "ok": True,
+                "old_count": old_count,
+                "chat_id": chat_id,
+                "user_id": user_id,
+            })
+        except Exception as e:
+            _req_logger.error(
+                "api_reset_automute_count: error — chat_id=%s user_id=%s: %s",
+                chat_id, user_id, e,
+            )
+            return JSONResponse(
+                {"ok": False, "error": str(e)},
+                status_code=500,
+            )
+
+    # ── v4.8.4: API для просмотра счётчика автомьютов ───────────────────
+    # GET /api/automute-count?chat_id=X&user_id=Y — возвращает текущий count.
+    # Доступ: все аутентифицированные веб-юзеры (как /admin/bans).
+    @app.get("/api/automute-count")
+    async def api_get_automute_count(
+        request: Request,
+        chat_id: int = 0,
+        user_id: int = 0,
+        _auth: AuthUser = Depends(require_auth),
+    ):
+        """v4.8.4: Возвращает счётчик автомьютов для (chat_id, user_id)."""
+        from sqlalchemy import select as _sel
+        if chat_id == 0 or user_id == 0:
+            return JSONResponse(
+                {"ok": False, "error": "chat_id and user_id are required"},
+                status_code=400,
+            )
+        try:
+            async with async_session() as session:
+                counter = (await session.execute(
+                    _sel(AutomuteCounter).where(
+                        AutomuteCounter.chat_id == chat_id,
+                        AutomuteCounter.user_id == user_id,
+                    )
+                )).scalar_one_or_none()
+                count = counter.count if counter else 0
+            return JSONResponse({
+                "ok": True,
+                "count": count,
+                "chat_id": chat_id,
+                "user_id": user_id,
+            })
+        except Exception as e:
+            _req_logger.error(
+                "api_get_automute_count: error — chat_id=%s user_id=%s: %s",
+                chat_id, user_id, e,
+            )
+            return JSONResponse(
+                {"ok": False, "error": str(e)},
+                status_code=500,
             )
 
     return app
