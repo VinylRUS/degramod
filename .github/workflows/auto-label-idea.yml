@@ -1,0 +1,65 @@
+# .github/workflows/auto-label-idea.yml
+#
+# Автоматически вешает label "idea" на каждый новый Issue.
+# Срабатывает на issues.opened — независимо от того, кто создал Issue
+# (бот через PAT, пользователь руками, через API — всем привесится).
+#
+# Перед первым запуском убедитесь, что label "idea" существует в репо:
+#   Settings → Labels → New label → Name: idea → Save.
+# Если label не существует — Action упадёт с 422, но Issue останется
+# (просто без label'а). Можно либо создать вручную, либо раскомментировать
+# шаг "create-label-if-missing" ниже — он создаст label автоматически.
+
+name: Auto-label new issues with "idea"
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  add-idea-label:
+    runs-on: ubuntu-latest
+    steps:
+      # ── Вариант A: label "idea" уже существует в репо ─────────────────
+      # Просто привешиваем. Если label не найден — шаг упадёт, но Issue
+      # останется без label'а (это можно увидеть в Actions tab).
+      - name: Add "idea" label to new issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['idea']
+              });
+              core.info(`✓ Added label "idea" to issue #${context.issue.number}`);
+            } catch (err) {
+              // 404 = label не существует. Создаём и пробуем снова.
+              if (err.status === 404) {
+                core.warning(`Label "idea" not found — creating it.`);
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'idea',
+                  color: '84b6eb',
+                  description: 'Идея от пользователя через бота'
+                });
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  labels: ['idea']
+                });
+                core.info(`✓ Created label "idea" and added to issue #${context.issue.number}`);
+              } else {
+                // Любая другая ошибка — логируем, но не фейлим воркфлоу
+                // (чтобы не блокировать другие Actions).
+                core.setFailed(`Failed to add label: ${err.message}`);
+              }
+            }
