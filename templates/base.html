@@ -639,6 +639,34 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.5</strong> — 14 августа 2026 (идеи от модераторов/админов через бота → GitHub Issues)</p>
+                <ul>
+                    <li><strong>Новая команда <code>!idea &lt;текст&gt;</code></strong> — отправка идеи в GitHub Issue + GitHub Project v2. Доступ: SU/admin/moderator (через WebUser). Посторонние — молчим (стелс сохраняется, как в <code>/help</code>). Каналы: только ЛС боту (DM) или модераторский чат (modchat) — в обычных чатах команда НЕ доступна. Лимит: 200 символов на текст идеи. Без cooldown, без модерации (доверяем модераторам).</li>
+                    <li><strong>Поток обработки идеи</strong>:
+                        <ul>
+                            <li>Создаётся GitHub Issue через REST <code>POST /repos/{owner}/{repo}/issues</code>. Заголовок Issue = текст идеи (без description/body — Issue остаётся чистым).</li>
+                            <li>Issue автоматически добавляется в GitHub Project v2 (GraphQL <code>addProjectV2ItemById</code>) — попадает в колонку «Предложено».</li>
+                            <li>Метаданные (автор, дата, источник, версия бота) сохраняются в БД бота в таблицу <code>idea_log</code>, НЕ в Issue.</li>
+                            <li>Отправителю приходит ответ «Спасибо за идею. Передал.».</li>
+                            <li>Отдельным сообщением в DM каждому SU падает алерт «💡 Новая идея от &lt;имя&gt;. Загляни в проект!» со ссылкой на Issue.</li>
+                            <li>Если создание Issue упало (сеть, невалидный PAT, нет прав) — отправителю «Не получилось передать идею, уже чиним.», в алерте SU — текст ошибки + текст идеи (чтобы не потерять).</li>
+                        </ul>
+                    </li>
+                    <li><strong>Настройка через веб-панель</strong> (вкладка Settings → раздел GitHub Projects): PAT (Personal Access Token), repo owner, repo name, Project owner login, Project number, Project node ID (необязательно — резолвится автоматически из owner+number при «Проверить подключение»). Чекбокс «Активировать интеграцию» — без него <code>!idea</code> возвращает «интеграция не настроена».</li>
+                    <li><strong>Шифрование PAT</strong> через Fernet (AES-128-CBC + HMAC-SHA256) из пакета <code>cryptography</code>. Ключ шифрования берётся из env <code>GITHUB_IDEA_ENC_KEY</code> (32 urlsafe-base64 байта) или генерируется при первом запуске и сохраняется в файл <code>&lt;data_dir&gt;/.github_enc_key</code> (права 0600). При потере ключа — PAT невозможно расшифровать, придется перезавести.</li>
+                    <li><strong>Кнопка «Проверить подключение»</strong> в веб-панели: проверяет что PAT валиден, права на repo есть (через создание + закрытие тестового Issue), и Project существует (если задан node_id). Возвращает детали — PAT scopes, repo full name, project title.</li>
+                    <li><strong>Новый модуль <code>github_client.py</code></strong> — инкапсулирует ВСЕ сетевые вызовы к GitHub. Функции: <code>create_issue()</code> (REST), <code>add_issue_to_project()</code> (GraphQL), <code>get_project_node_id()</code> (GraphQL резолв node ID), <code>test_connection()</code> (комплексная проверка), <code>get_issue_node_id()</code> (GraphQL). Использует <code>aiohttp</code> (уже в зависимостях), таймаут 15 сек на запрос.</li>
+                    <li><strong>Новые таблицы БД</strong>:
+                        <ul>
+                            <li><code>idea_log</code> — лог идей (id, tg_user_id, tg_username, tg_display_name, source, source_chat_id, idea_text, github_issue_url, github_issue_number, github_project_item_id, error_message, bot_version, created_at). Индексы по tg_user_id и created_at.</li>
+                            <li><code>github_settings</code> — singleton (id=1) для PAT (зашифрованный), repo owner/name, project node ID/number/owner login, is_active. Seed при первом запуске.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Обновление <code>/help</code></strong>: команда <code>!idea</code> добавлена в full и moderator версии Rich Message. В full — в секции «Снятие наказаний / Прочее», в moderator — отдельная секция «Предложить идею».</li>
+                    <li><strong>Стелс сохранён</strong>: посторонние (без WebUser или деактивированные) при <code>!idea</code> получают молчание, как и в <code>/help</code>. Никаких ответов до валидации WebUser.</li>
+                    <li><strong>Затронутые файлы</strong>: <code>db.py</code> (модели <code>IdeaLog</code>/<code>GithubSettings</code> + шифрование PAT + миграции), <code>github_client.py</code> (новый модуль), <code>bot_handlers.py</code> (обработчики <code>cmd_idea_dm</code>/<code>cmd_idea_modchat</code>, хелперы, обновление <code>/help</code>), <code>web_app.py</code> (APP_VERSION → v4.8.5, endpoints <code>/admin/settings/github</code> GET/POST + <code>/admin/settings/github/test</code>), <code>templates/admin_settings.html</code> (раздел GitHub Projects), <code>templates/base.html</code> (changelog), <code>requirements.txt</code> (<code>cryptography</code>).</li>
+                </ul>
+                <hr>
                 <p><strong>v4.8.4</strong> — 13 августа 2026 (прогрессивные автомьюты)</p>
                 <ul>
                     <li><strong>Прогрессивные автомьюты</strong>. Каждый следующий автомьют длительнее предыдущего: <code>mute_duration = base + (count × 60 сек)</code>, где <code>count</code> — количество предыдущих автомьютов юзера в этом чате. Первый автомьют = базовое время (как раньше), второй = base + 1 минута, третий = base + 2 минуты, и так далее. Базовое время берётся из настроек чата (для каждого пути автомьюта — свой источник: порог варнов, via-bot фильтр, стикерпак, контент-фильтр).</li>

@@ -12,6 +12,7 @@
     <a href="#backup">Backup</a>
     <a href="#cleanup">Cleanup</a>
     <a href="#vacuum">VACUUM</a>
+    <a href="#github">GitHub</a>
 </div>
 
 {% if flash %}
@@ -191,5 +192,190 @@
         </button>
     </form>
 </div>
+
+{# ── v4.8.5: GitHub Projects ───────────────────────────────────── #}
+<div id="github" class="section-title" style="margin-top: var(--sp-6);">GitHub Projects <a class="anchor" href="#github">#</a></div>
+<div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4);">
+
+    <div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-4); line-height: 1.7;">
+        Интеграция с GitHub для команды <code>!idea</code>. Модераторы и админы
+        пишут <code>!idea &lt;текст&gt;</code> в ЛС боту или в modchat — идея
+        создаётся как GitHub Issue в указанном репозитории и автоматически
+        добавляется в GitHub Project v2 (колонка «Предложено»). Метаданные
+        (автор, дата, источник) сохраняются в БД бота, Issue остаётся чистым.
+        PAT шифруется через Fernet (ключ в <code>{{ db_path_dir }}/.github_enc_key</code>).
+    </div>
+
+    {# Статус ─────────────────────────────────────────────────────── #}
+    <div style="margin-bottom: var(--sp-4); padding: var(--sp-3) var(--sp-4); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: 11px;">
+        <strong>Статус:</strong>
+        {% if github_settings and github_settings.is_active %}
+            <span style="color: #2ea043;">● Активна</span>
+        {% else %}
+            <span style="color: var(--text-dim);">○ Не активна</span>
+        {% endif %}
+        {% if github_settings and github_settings.is_pat_set %}
+            · <span style="color: #2ea043;">PAT задан</span>
+        {% else %}
+            · <span style="color: var(--danger);">PAT не задан</span>
+        {% endif %}
+        {% if github_settings and github_settings.updated_at %}
+            · <span class="dim">Последнее изменение: {{ github_settings.updated_at }} ({{ github_settings.updated_by or '—' }})</span>
+        {% endif %}
+    </div>
+
+    {# Статистика идей ────────────────────────────────────────────── #}
+    {% if idea_stats and idea_stats.total > 0 %}
+    <div style="margin-bottom: var(--sp-4); padding: var(--sp-3) var(--sp-4); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: 11px;">
+        <strong>Идеи:</strong>
+        всего {{ idea_stats.total }}
+        · <span style="color: #2ea043;">успешных {{ idea_stats.succeeded }}</span>
+        · <span style="color: var(--danger);">провальных {{ idea_stats.failed }}</span>
+        · <span class="dim">последняя: {{ idea_stats.last_at or '—' }}</span>
+    </div>
+    {% endif %}
+
+    {# Форма ──────────────────────────────────────────────────────── #}
+    <form method="post" action="/admin/settings/github" id="github-form"
+          style="display: flex; flex-direction: column; gap: var(--sp-4);">
+
+        <div>
+            <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                GitHub PAT (Personal Access Token)
+            </label>
+            <input type="password" name="pat" placeholder="{{ '✓ задан — оставь пустым чтобы не менять' if github_settings and github_settings.is_pat_set else 'ghp_xxx или github_pat_xxx' }}"
+                   style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">
+                Права: <code>repo</code> (Issues) + <code>project</code> (Projects v2). Classic или fine-grained.
+                Оставь пустым при повторном сохранении — старый PAT не затирается.
+            </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4);">
+            <div>
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                    Repo owner
+                </label>
+                <input type="text" name="repo_owner" value="{{ github_settings.repo_owner if github_settings else '' }}" placeholder="degradach"
+                       style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            </div>
+            <div>
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                    Repo name
+                </label>
+                <input type="text" name="repo_name" value="{{ github_settings.repo_name if github_settings else '' }}" placeholder="ded-vobzhak-ideas"
+                       style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            </div>
+        </div>
+
+        <div style="font-size: 10px; color: var(--text-dim); padding: var(--sp-2) var(--sp-3); background: var(--bg); border-left: 2px solid var(--border);">
+            Issues создаются через REST <code>POST /repos/{owner}/{repo}/issues</code>.
+            Заголовок Issue = текст идеи (без description).
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-4);">
+            <div>
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                    Project owner login
+                </label>
+                <input type="text" name="project_owner_login" value="{{ github_settings.project_owner_login if github_settings else '' }}" placeholder="degradach"
+                       style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            </div>
+            <div>
+                <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                    Project number
+                </label>
+                <input type="text" name="project_number" value="{{ github_settings.project_number if github_settings and github_settings.project_number else '' }}" placeholder="1"
+                       style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            </div>
+        </div>
+
+        <div>
+            <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                Project node ID (PVT_xxx) — необязательно
+            </label>
+            <input type="text" name="project_node_id" value="{{ github_settings.project_node_id if github_settings else '' }}" placeholder="PVT_xxx (резолвится автоматически из owner + number)"
+                   style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">
+                Если задан — используется напрямую. Если пустой, но заполнены owner login + number —
+                node ID резолвится автоматически при «Проверить подключение».
+            </div>
+        </div>
+
+        <label style="display: flex; align-items: center; gap: var(--sp-3); cursor: pointer; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
+            <input type="checkbox" name="is_active" value="1"
+                   {% if github_settings and github_settings.is_active %}checked{% endif %}
+                   style="cursor: pointer; width: 16px; height: 16px;">
+            <span style="font-size: 12px; color: var(--text);">
+                <strong>Активировать интеграцию</strong>
+                <span class="dim" style="display: block; font-size: 10px; margin-top: 2px;">
+                    Если включено — <code>!idea</code> создаёт Issues в GitHub.
+                    Если выключено — отправителю возвращается «интеграция не настроена».
+                    Для активации нужны PAT, repo_owner и repo_name.
+                </span>
+            </span>
+        </label>
+
+        <div style="display: flex; gap: var(--sp-3); align-items: center;">
+            <button type="submit"
+                    style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s;">
+                💾 Сохранить
+            </button>
+            <button type="button" id="github-test-btn"
+                    style="padding: 10px 20px; background: transparent; border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: border-color .15s, color .15s;">
+                🔌 Проверить подключение
+            </button>
+        </div>
+    </form>
+
+    <div id="github-test-result" style="margin-top: var(--sp-4); padding: var(--sp-3) var(--sp-4); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: 11px; display: none;">
+        <strong id="github-test-status">Проверка…</strong>
+        <div id="github-test-message" style="margin-top: 4px; color: var(--text-dim);"></div>
+        <pre id="github-test-details" style="margin-top: 6px; font-size: 10px; color: var(--text-dim); white-space: pre-wrap; max-height: 200px; overflow-y: auto;"></pre>
+    </div>
+</div>
+
+<script>
+// v4.8.5: тест подключения к GitHub.
+document.getElementById('github-test-btn')?.addEventListener('click', async function() {
+    const result = document.getElementById('github-test-result');
+    const status = document.getElementById('github-test-status');
+    const message = document.getElementById('github-test-message');
+    const details = document.getElementById('github-test-details');
+    const btn = this;
+
+    result.style.display = 'block';
+    status.textContent = 'Проверка…';
+    status.style.color = 'var(--text-dim)';
+    message.textContent = '';
+    details.textContent = '';
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+
+    try {
+        const resp = await fetch('/admin/settings/github/test', {
+            method: 'POST',
+            credentials: 'same-origin',
+        });
+        const data = await resp.json();
+        if (data.ok) {
+            status.textContent = '✓ ' + data.message;
+            status.style.color = '#2ea043';
+        } else {
+            status.textContent = '✗ ' + (data.message || 'проверка не прошла');
+            status.style.color = 'var(--danger)';
+        }
+        if (data.details && Object.keys(data.details).length > 0) {
+            details.textContent = JSON.stringify(data.details, null, 2);
+        }
+    } catch (e) {
+        status.textContent = '✗ Сетевая ошибка: ' + e;
+        status.style.color = 'var(--danger)';
+    } finally {
+        btn.disabled = false;
+        btn.style.opacity = '1';
+    }
+});
+</script>
 
 {% endblock %}

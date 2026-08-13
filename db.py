@@ -548,6 +548,193 @@ class WebUser(Base):
     auto_discovered = Column(Boolean, default=False, nullable=False)
 
 
+# ── v4.8.5: Шифрование PAT для GitHub интеграции ──────────────────────────
+# Используем Fernet (symmetric AES-128-CBC + HMAC-SHA256) из пакета cryptography.
+# Ключ шифрования берётся из env GITHUB_IDEA_ENC_KEY (32 urlsafe-base64 байта).
+# Если env не задан — генерируется одноразово при первом запуске и сохраняется
+# в файл <data_dir>/.github_enc_key (авто-создаётся, права 0600).
+# При потере ключа — PAT невозможно расшифровать, придется перезавести.
+
+_ENC_KEY_ENV = "GITHUB_IDEA_ENC_KEY"
+_ENC_KEY_FILE = os.path.join(
+    os.path.dirname(os.getenv("DB_PATH", "/app/data/shadow_logs.db")),
+    ".github_enc_key",
+)
+
+
+def _load_or_create_enc_key() -> bytes:
+    """Загружает Fernet-ключ из env или файла. Если нет — генерирует и
+    сохраняет в файл (с правами 0600).
+
+    Returns:
+        32 urlsafe-base64 байта (как требует Fernet).
+    Raises:
+        RuntimeError: если не удалось создать файл ключа.
+    """
+    # 1. Env приоритетнее.
+    env_key = os.getenv(_ENC_KEY_ENV)
+    if env_key:
+        return env_key.strip().encode("utf-8")
+
+    # 2. Файл.
+    try:
+        with open(_ENC_KEY_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip().encode("utf-8")
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Файл есть, но не читается — падаем. Это лучше чем молча перегенерить
+        # ключ и потерять доступ к уже зашифрованным PAT'ам.
+        raise RuntimeError(
+            f"Cannot read GitHub PAT encryption key at {_ENC_KEY_FILE}: "
+            "permission denied. Fix file permissions or set "
+            f"{_ENC_KEY_ENV} env variable."
+        )
+
+    # 3. Генерируем новый ключ.
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as e:
+        raise RuntimeError(
+            "Package 'cryptography' is required for GitHub PAT encryption. "
+            "Install it: pip install cryptography"
+        ) from e
+
+    new_key = Fernet.generate_key()
+    try:
+        # Записываем с правами 0600 — только владелец может читать.
+        fd = os.open(_ENC_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, new_key)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot create GitHub PAT encryption key file at {_ENC_KEY_FILE}: {e}. "
+            f"Set {_ENC_KEY_ENV} env variable as alternative."
+        ) from e
+
+    return new_key
+
+
+def _encrypt_pat(pat: str) -> str:
+    """Шифрует GitHub PAT через Fernet. Возвращает urlsafe-base64 строку.
+
+    Args:
+        pat: GitHub Personal Access Token (plaintext).
+
+    Returns:
+        Fernet-encrypted token (str), сохраняемый в БД.
+
+    Raises:
+        RuntimeError: если cryptography не установлен или ключ недоступен.
+    """
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as e:
+        raise RuntimeError(
+            "Package 'cryptography' is required for GitHub PAT encryption"
+        ) from e
+    key = _load_or_create_enc_key()
+    return Fernet(key).encrypt(pat.encode("utf-8")).decode("utf-8")
+
+
+def _decrypt_pat(encrypted: str) -> str:
+    """Расшифровывает GitHub PAT.
+
+    Args:
+        encrypted: Fernet-encrypted token (str) из БД.
+
+    Returns:
+        Plaintext PAT.
+
+    Raises:
+        RuntimeError: если cryptography не установлен.
+        cryptography.fernet.InvalidToken: если ключ не подходит или данные
+            повреждены.
+    """
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError as e:
+        raise RuntimeError(
+            "Package 'cryptography' is required for GitHub PAT encryption"
+        ) from e
+    key = _load_or_create_enc_key()
+    return Fernet(key).decrypt(encrypted.encode("utf-8")).decode("utf-8")
+
+
+# ── v4.8.5: Лог идей (`!idea` → GitHub Issues) ────────────────────────────
+class IdeaLog(Base):
+    """v4.8.5: Лог идей, отправленных модераторами/админами через `!idea`.
+
+    Каждая запись — один успешный (или неуспешный) вызов `!idea` в ЛС боту
+    или в модераторском чате (modchat). Метаданные НЕ попадают в GitHub
+    Issue (Issue остаётся чистым, только заголовок = текст идеи) —
+    метаданные живут здесь, в БД бота.
+
+    Назначение:
+      • История поданных идей (когда, кто, откуда).
+      • Источник имени отправившего для алерта SU в DM.
+      • Аудит при падениях GitHub API (если Issue создать не удалось —
+        в ``github_issue_url`` остаётся NULL, но текст идеи не потерян).
+
+    PK: auto-increment id. По ``(tg_user_id, created_at)`` можно
+    фильтровать историю конкретного юзера.
+    """
+    __tablename__ = "idea_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tg_user_id = Column(BigInteger, nullable=False, index=True)
+    tg_username = Column(String(255), nullable=True)         # @username (без @, lowercase) или None
+    tg_display_name = Column(String(255), nullable=True)     # first_name + last_name для алерта SU
+    source = Column(String(16), nullable=False)              # "dm" | "modchat"
+    source_chat_id = Column(BigInteger, nullable=True)       # ID чата (для modchat — id modchat, для dm — user_id)
+    idea_text = Column(String(200), nullable=False)          # текст идеи (до 200 символов)
+    github_issue_url = Column(String(512), nullable=True)    # NULL если создать не удалось
+    github_issue_number = Column(Integer, nullable=True)     # NULL если создать не удалось
+    github_project_item_id = Column(String(64), nullable=True)  # GraphQL node ID в Project v2
+    error_message = Column(Text, nullable=True)              # NULL при успехе, текст ошибки при провале
+    bot_version = Column(String(32), nullable=False)         # например, "v4.8.5"
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+# ── v4.8.5: Настройки GitHub Projects интеграции ──────────────────────────
+class GithubSettings(Base):
+    """v4.8.5: Настройки подключения к GitHub для `!idea` → Issues.
+
+    Хранит PAT (зашифрованный через Fernet), реквизиты репозитория и
+    GitHub Project v2. Заполняется через веб-панель (Settings → GitHub
+    Projects). Одна строка в таблице (singleton, id=1) — настройки
+    глобальные на весь бот.
+
+    Поля:
+      • pat_encrypted — Fernet-шифр PAT. Расшифровка через _decrypt_pat().
+      • repo_owner, repo_name — куда создавать Issues (например,
+        ``degradach``/``ded-vobzhak-ideas``).
+      • project_node_id — GraphQL node ID Project v2 (например,
+        ``PVT_xxx``). Получается через GraphQL-запрос или из URL Project.
+      • project_number — number Project в организации/юзере (для отображения
+        в веб-панели и для тестов). Необязательно.
+      • project_owner_login — login владельца Project (для GraphQL query).
+      • is_active — флаг включения интеграции. Если False — `!idea` не
+        пытается отправить в GitHub, отправителю возвращается «не активна».
+      • updated_at, updated_by — audit.
+    """
+    __tablename__ = "github_settings"
+
+    id = Column(Integer, primary_key=True)                  # всегда 1 (singleton)
+    pat_encrypted = Column(Text, nullable=True)             # Fernet-шифр PAT
+    repo_owner = Column(String(128), nullable=True)
+    repo_name = Column(String(128), nullable=True)
+    project_node_id = Column(String(64), nullable=True)     # GraphQL node ID (PVT_...)
+    project_number = Column(Integer, nullable=True)
+    project_owner_login = Column(String(128), nullable=True)
+    is_active = Column(Boolean, default=False, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+    updated_by = Column(String(64), nullable=True)          # username из веб-панели
+
+
 # ── Init / Shutdown ────────────────────────────────────────────────────────
 async def init_db() -> None:
     """Создаёт таблицы при первом запуске + миграции для новых колонок."""
@@ -1030,6 +1217,65 @@ async def init_db() -> None:
                 PRIMARY KEY (chat_id, user_id)
             )
         """))
+
+    # ── v4.8.5: Новая таблица idea_log (лог идей → GitHub Issues) ──────────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS idea_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_user_id BIGINT NOT NULL,
+                tg_username VARCHAR(255) NULL,
+                tg_display_name VARCHAR(255) NULL,
+                source VARCHAR(16) NOT NULL,
+                source_chat_id BIGINT NULL,
+                idea_text VARCHAR(200) NOT NULL,
+                github_issue_url VARCHAR(512) NULL,
+                github_issue_number INTEGER NULL,
+                github_project_item_id VARCHAR(64) NULL,
+                error_message TEXT NULL,
+                bot_version VARCHAR(32) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_idea_log_tg_user_id "
+            "ON idea_log (tg_user_id)"
+        ))
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_idea_log_created_at "
+            "ON idea_log (created_at)"
+        ))
+
+    # ── v4.8.5: Новая таблица github_settings (singleton для PAT и репо) ───
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS github_settings (
+                id INTEGER PRIMARY KEY,
+                pat_encrypted TEXT NULL,
+                repo_owner VARCHAR(128) NULL,
+                repo_name VARCHAR(128) NULL,
+                project_node_id VARCHAR(64) NULL,
+                project_number INTEGER NULL,
+                project_owner_login VARCHAR(128) NULL,
+                is_active BOOLEAN NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_by VARCHAR(64) NULL
+            )
+        """))
+
+    # ── v4.8.5: Seed singleton-строки github_settings (id=1) ───────────────
+    # Гарантируем что строка с id=1 существует — на ней будут UPDATE'ы из
+    # веб-панели. Без этого INSERT через веб-форму упадёт на PK-конфликте
+    # при повторном сохранении.
+    async with async_session() as session:
+        existing_gs = (await session.execute(
+            select(GithubSettings).where(GithubSettings.id == 1)
+        )).scalar_one_or_none()
+        if existing_gs is None:
+            session.add(GithubSettings(id=1, is_active=False))
+            await session.commit()
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

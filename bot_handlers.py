@@ -127,6 +127,7 @@ from sqlalchemy import select, desc, func
 from db import (
     async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser,
     LinkAllowlist, BannedStickerPack, AutomuteCounter,
+    IdeaLog, GithubSettings, _encrypt_pat, _decrypt_pat,
     _hash_password,
 )
 
@@ -6251,6 +6252,377 @@ async def cmd_setmodchat(message: types.Message) -> None:
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v4.8.5: !idea <текст> — отправка идеи в GitHub Issue + Project v2
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Лимит длины текста идеи. Краткость — сестра таланта.
+_IDEA_MAX_LEN = 200
+
+# Текущая версия бота — для записи в idea_log.bot_version.
+# (читаем лениво, чтобы не тянуть круговый import web_app → bot_handlers.)
+def _bot_version() -> str:
+    try:
+        import web_app
+        return getattr(web_app, "APP_VERSION", "v4.8.5")
+    except Exception:
+        return "v4.8.5"
+
+
+async def _resolve_sender_web_user(user_id: int) -> WebUser | None:
+    """Ищем активный WebUser по tg_user_id. None если нет/деактивирован."""
+    async with async_session() as session:
+        wu = (await session.execute(
+            select(WebUser).where(WebUser.tg_user_id == user_id)
+        )).scalar_one_or_none()
+        if wu is None or not wu.is_active:
+            return None
+        return wu
+
+
+def _build_display_name(wu: WebUser, fallback_user: types.User) -> str:
+    """Имя для алерта SU в DM: приоритет — first+last из WebUser,
+    затем first+last из Telegram, затем @username, в крайнем случае — tg_user_id.
+    """
+    if wu.tg_first_name:
+        name = wu.tg_first_name
+        if wu.tg_last_name:
+            name = f"{name} {wu.tg_last_name}"
+        if wu.tg_username:
+            name = f"{name} (@{wu.tg_username})"
+        return name
+    # Fallback — данные из TG message.
+    if fallback_user.first_name:
+        name = fallback_user.first_name
+        if fallback_user.last_name:
+            name = f"{name} {fallback_user.last_name}"
+        if fallback_user.username:
+            name = f"{name} (@{fallback_user.username})"
+        return name
+    if fallback_user.username:
+        return f"@{fallback_user.username}"
+    return f"tg_user_id={fallback_user.id}"
+
+
+async def _load_github_settings() -> GithubSettings | None:
+    """Загружает singleton-настройку GitHub (id=1). None если нет записи
+    или интеграция выключена (is_active=False)."""
+    async with async_session() as session:
+        gs = (await session.execute(
+            select(GithubSettings).where(GithubSettings.id == 1)
+        )).scalar_one_or_none()
+        return gs
+
+
+async def _send_idea_alert_to_su(
+    bot: types.Bot, sender_display: str, idea_text: str,
+    issue_url: str | None, error_msg: str | None,
+) -> None:
+    """Отправляет DM каждому SU с алертом о новой идее.
+
+    Если issue_url=None (создание упало) — алерт содержит текст ошибки и
+    текст идеи (чтобы SU мог пересоздать Issue вручную).
+
+    Доставляемость best-effort: если DM конкретному SU не доставляется
+    (нет приватного чата, юзер заблокировал бота) — логируем warning
+    и идём к следующему. Не падаем.
+    """
+    # Собираем список SU tg_user_id: env ADMIN_IDS + WebUser role='su'.
+    su_tg_ids: set[int] = set(ADMIN_IDS)
+    async with async_session() as session:
+        su_wus = (await session.execute(
+            select(WebUser).where(WebUser.role == "su", WebUser.is_active.is_(True))
+        )).scalars().all()
+        for wu in su_wus:
+            if wu.tg_user_id:
+                su_tg_ids.add(wu.tg_user_id)
+
+    if not su_tg_ids:
+        logger.warning(
+            "send_idea_alert_to_su: no SU configured (ADMIN_IDS empty, "
+            "no WebUser role='su'). Idea alert lost: sender=%s text=%r",
+            sender_display, idea_text[:80],
+        )
+        return
+
+    if issue_url:
+        text = (
+            f"💡 <b>Новая идея от</b> <code>{html.escape(sender_display)}</code>.\n"
+            f"Загляни в проект: {issue_url}"
+        )
+    else:
+        # Провал — включаем в алерт сам текст идеи.
+        text = (
+            f"⚠️ <b>Идея от</b> <code>{html.escape(sender_display)}</code> "
+            f"<b>не дошла до GitHub</b>.\n"
+            f"Ошибка: <code>{html.escape(error_msg or 'неизвестна')}</code>\n"
+            f"Текст идеи: {html.escape(idea_text)}"
+        )
+
+    for su_id in su_tg_ids:
+        try:
+            await bot.send_message(chat_id=su_id, text=text, parse_mode="HTML")
+        except TelegramAPIError as e:
+            logger.warning(
+                "send_idea_alert_to_su: failed to DM su_id=%s: %s",
+                su_id, e,
+            )
+        except Exception as e:
+            logger.warning(
+                "send_idea_alert_to_su: unexpected error for su_id=%s: %s",
+                su_id, e,
+            )
+
+
+async def _process_idea_submission(
+    message: types.Message, idea_text: str, source: str,
+    source_chat_id: int | None,
+) -> None:
+    """Общая логика обработки `!idea` для DM и modchat.
+
+    Args:
+        message: исходное сообщение (для reply).
+        idea_text: уже валидированный текст (1..200 символов).
+        source: 'dm' | 'modchat'.
+        source_chat_id: для modchat — ID чата, для dm — message.chat.id.
+    """
+    user = message.from_user
+    user_id = user.id
+
+    # Стелс: проверяем что юзер — активный WebUser (SU/admin/moderator).
+    wu = await _resolve_sender_web_user(user_id)
+    if wu is None:
+        # Посторонний или деактивированный — молчим, как в /help.
+        return
+
+    # Загружаем настройки GitHub.
+    gs = await _load_github_settings()
+    if gs is None or not gs.is_active:
+        # Интеграция не настроена — не пугаем отправителя, но пишем в лог.
+        logger.info(
+            "idea: GitHub integration not configured (is_active=False or no row). "
+            "user_id=%s idea=%r", user_id, idea_text[:80],
+        )
+        await message.reply(
+            "❌ Интеграция с GitHub ещё не настроена. "
+            "Скажи SU, чтобы завёл PAT в веб-панели.",
+            parse_mode=None,
+        )
+        return
+
+    # Расшифровываем PAT.
+    try:
+        pat = _decrypt_pat(gs.pat_encrypted)
+    except Exception as e:
+        logger.error("idea: failed to decrypt PAT: %s", e)
+        await message.reply(
+            "❌ Не удалось расшифровать PAT. Скажи SU, чтобы перезавёл токен "
+            "в веб-панели.",
+            parse_mode=None,
+        )
+        return
+
+    # Готовим метаданные для лога.
+    display_name = _build_display_name(wu, user)
+    bot_version = _bot_version()
+
+    # Создаём Issue + добавляем в Project.
+    issue_url: str | None = None
+    issue_number: int | None = None
+    project_item_id: str | None = None
+    error_msg: str | None = None
+
+    try:
+        from github_client import (
+            create_issue, add_issue_to_project, get_issue_node_id,
+            GithubApiError,
+        )
+        # 1. REST: создаём Issue (title = idea_text, без body).
+        issue_ref = await create_issue(
+            pat=pat, owner=gs.repo_owner, repo=gs.repo_name,
+            title=idea_text,
+        )
+        issue_url = issue_ref.url
+        issue_number = issue_ref.number
+
+        # 2. GraphQL: добавляем Issue в Project v2.
+        # Нужен node ID Issue. create_issue возвращает его, но иногда
+        # (для нового формата Global ID) он уже подходит. На всякий случай
+        # используем issue_ref.node_id напрямую — он должен быть валидным.
+        if gs.project_node_id:
+            try:
+                project_item_id = await add_issue_to_project(
+                    pat=pat,
+                    project_node_id=gs.project_node_id,
+                    issue_node_id=issue_ref.node_id,
+                )
+            except GithubApiError as e:
+                # Issue создан, но не добавился в Project — не критично.
+                # Логируем warning, но считаем идею доставленной.
+                logger.warning(
+                    "idea: Issue #%s created but add_to_project failed: %s "
+                    "(project_node_id=%s)",
+                    issue_number, e, gs.project_node_id,
+                )
+                project_item_id = None
+    except GithubApiError as e:
+        error_msg = str(e)
+        logger.error(
+            "idea: create_issue failed for user_id=%s: %s",
+            user_id, e,
+        )
+    except Exception as e:
+        error_msg = f"unexpected: {e}"
+        logger.exception("idea: unexpected error for user_id=%s", user_id)
+
+    # Логируем в idea_log (в любом случае — успех или провал).
+    try:
+        async with async_session() as session:
+            session.add(IdeaLog(
+                tg_user_id=user_id,
+                tg_username=wu.tg_username or user.username,
+                tg_display_name=display_name,
+                source=source,
+                source_chat_id=source_chat_id,
+                idea_text=idea_text,
+                github_issue_url=issue_url,
+                github_issue_number=issue_number,
+                github_project_item_id=project_item_id,
+                error_message=error_msg,
+                bot_version=bot_version,
+            ))
+            await session.commit()
+    except Exception as e:
+        logger.exception("idea: failed to write idea_log: %s", e)
+
+    # Ответ отправителю.
+    if issue_url is not None:
+        try:
+            await message.reply("Спасибо за идею. Передал.", parse_mode=None)
+        except TelegramAPIError as e:
+            logger.warning("idea: reply to sender failed: %s", e)
+    else:
+        try:
+            await message.reply(
+                "❌ Не получилось передать идею, уже чиним.",
+                parse_mode=None,
+            )
+        except TelegramAPIError as e:
+            logger.warning("idea: reply to sender failed: %s", e)
+
+    # Алерт SU в DM.
+    await _send_idea_alert_to_su(
+        bot=message.bot,
+        sender_display=display_name,
+        idea_text=idea_text,
+        issue_url=issue_url,
+        error_msg=error_msg,
+    )
+
+
+async def _is_modchat_chat(chat_id: int) -> bool:
+    """Проверяет, является ли chat_id модераторским чатом.
+
+    Использует _get_mod_chat_id из modchat.py: если для этого chat_id
+    резолвится mod_chat_id == chat_id (то есть он сам и есть modchat),
+    возвращаем True.
+    """
+    try:
+        from modchat import _get_mod_chat_id
+        async with async_session() as session:
+            mod_chat_id = await _get_mod_chat_id(session, chat_id)
+            return mod_chat_id is not None and mod_chat_id == chat_id
+    except Exception as e:
+        logger.warning("_is_modchat_chat: lookup failed for chat_id=%s: %s",
+                       chat_id, e)
+        return False
+
+
+# !idea <текст> в ЛС боту.
+@router.message(F.chat.type == "private", Command("idea"))
+async def cmd_idea_dm(message: types.Message) -> None:
+    """v4.8.5: !idea <текст> — отправить идею в GitHub Issue + Project.
+
+    Доступ: SU/admin/moderator (через WebUser). Посторонние — молчим (стелс).
+    Канал: только DM (этот handler). Отдельный handler покрывает modchat.
+
+    Лимит: 200 символов на текст идеи.
+    Без cooldown, без модерации.
+
+    Ответ отправителю: "Спасибо за идею. Передал."
+    Алерт SU в DM: "Новая идея от <имя>. Загляни в проект!" + ссылка.
+    """
+    # Извлекаем текст после /idea.
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(
+            "💡 Формат: !idea <текст идеи>\n"
+            f"Максимум {_IDEA_MAX_LEN} символов.",
+            parse_mode=None,
+        )
+        return
+
+    idea_text = parts[1].strip()
+    if len(idea_text) > _IDEA_MAX_LEN:
+        await message.reply(
+            f"❌ Идея слишком длинная: {len(idea_text)} символов. "
+            f"Максимум {_IDEA_MAX_LEN}.",
+            parse_mode=None,
+        )
+        return
+
+    await _process_idea_submission(
+        message=message, idea_text=idea_text,
+        source="dm", source_chat_id=message.chat.id,
+    )
+
+
+# !idea <текст> в групповом чате (срабатывает ТОЛЬКО если это modchat).
+# Стоит раньше остальных group-обработчиков, но проверка modchat отсечёт
+# все обычные чаты. Не падает, не пишет в чат, если это не modchat.
+@router.message(F.chat.type != "private", Command("idea"))
+async def cmd_idea_modchat(message: types.Message) -> None:
+    """v4.8.5: !idea <текст> в modchat — отправить идею в GitHub Issue + Project.
+
+    Срабатывает в любом групповом чате, но логика выполняется только если
+    чат является modchat (см. _is_modchat_chat). В обычных чатах — молчим
+    и не трогаем сообщение.
+    """
+    if not await _is_modchat_chat(message.chat.id):
+        # Не modchat — молча игнорируем. Не удаляем сообщение, не отвечаем.
+        return
+
+    # Извлекаем текст.
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        # В modchat можно подсказать формат — тут только свои.
+        try:
+            await message.reply(
+                f"💡 Формат: !idea <текст идеи> (макс. {_IDEA_MAX_LEN} символов)",
+                parse_mode=None,
+            )
+        except TelegramAPIError as e:
+            logger.warning("cmd_idea_modchat: format hint failed: %s", e)
+        return
+
+    idea_text = parts[1].strip()
+    if len(idea_text) > _IDEA_MAX_LEN:
+        try:
+            await message.reply(
+                f"❌ Идея слишком длинная: {len(idea_text)} символов. "
+                f"Максимум {_IDEA_MAX_LEN}.",
+                parse_mode=None,
+            )
+        except TelegramAPIError as e:
+            logger.warning("cmd_idea_modchat: too-long reply failed: %s", e)
+        return
+
+    await _process_idea_submission(
+        message=message, idea_text=idea_text,
+        source="modchat", source_chat_id=message.chat.id,
+    )
+
+
 @router.message(F.chat.type == "private", Command("cas"))
 async def cmd_cas(message: types.Message) -> None:
     """v4.5.2 (#2): /cas chat_id on|off — включить/выключить CAS-проверку."""
@@ -7206,7 +7578,7 @@ def _build_help_full_rich() -> InputRichMessage:
         from web_app import APP_VERSION
         version_str = APP_VERSION
     except Exception:
-        version_str = "v4.8.3.2"
+        version_str = "v4.8.5"
     web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
 
     blocks: list = []
@@ -7247,6 +7619,7 @@ def _build_help_full_rich() -> InputRichMessage:
             ("!resetwarns", "обнулить варны (только админы)"),
             ("!resetmc [@user|tgid]", "обнулить счётчик автомьютов (только админы)"),
             ("!alarm on [длит] / !alarm off", "режим тревоги (усиленные ограничения)"),
+            ("!idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
         ],
     ))
 
@@ -7356,7 +7729,7 @@ def _build_help_moderator_rich() -> InputRichMessage:
         from web_app import APP_VERSION
         version_str = APP_VERSION
     except Exception:
-        version_str = "v4.8.3.2"
+        version_str = "v4.8.5"
     web_url = WEB_PUBLIC_URL or "https://degraban.bothost.tech"
 
     blocks: list = []
@@ -7394,6 +7767,14 @@ def _build_help_moderator_rich() -> InputRichMessage:
             ("!unmute / !unban", "снять ограничения (reply)"),
             ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
             ("!warns", "показать активные варны (в личку)"),
+        ],
+    ))
+
+    # Идеи
+    blocks.extend(_help_section(
+        "Предложить идею",
+        [
+            ("!idea <текст>", "отправить идею в GitHub Issue (только ЛС/modchat, до 200 символов)"),
         ],
     ))
 

@@ -62,6 +62,7 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 from db import (
     async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
     PermissionPreset, WordFilter, LinkAllowlist, KeywordWatch, AutomuteCounter,
+    IdeaLog, GithubSettings, _encrypt_pat, _decrypt_pat,
     _hash_password, _verify_password, DB_PATH,
 )
 
@@ -97,8 +98,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.4"
-APP_RELEASE_DATE = "2026-08-13"
+APP_VERSION = "v4.8.5"
+APP_RELEASE_DATE = "2026-08-14"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -3149,7 +3150,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         flash: str = "",
         _auth: AuthUser = Depends(require_su),
     ):
-        """v4.5: страница настроек системы (SU-only)."""
+        """v4.5: страница настроек системы (SU-only). v4.8.5: + GitHub Projects."""
         # Cleanup preview (live counts из БД)
         if not os.path.exists(DB_PATH):
             counts = {
@@ -3164,6 +3165,55 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             finally:
                 conn.close()
 
+        # v4.8.5: текущие настройки GitHub (для pre-fill формы).
+        github_settings: dict = {}
+        try:
+            async with async_session() as session:
+                from db import GithubSettings as _GS
+                gs = (await session.execute(
+                    select(_GS).where(_GS.id == 1)
+                )).scalar_one_or_none()
+                if gs is not None:
+                    github_settings = {
+                        "is_active": gs.is_active,
+                        "is_pat_set": bool(gs.pat_encrypted),
+                        "repo_owner": gs.repo_owner or "",
+                        "repo_name": gs.repo_name or "",
+                        "project_node_id": gs.project_node_id or "",
+                        "project_number": gs.project_number,
+                        "project_owner_login": gs.project_owner_login or "",
+                        "updated_at": gs.updated_at.strftime("%Y-%m-%d %H:%M UTC") if gs.updated_at else None,
+                        "updated_by": gs.updated_by,
+                    }
+        except Exception as e:
+            _req_logger.warning("admin_settings_page: failed to load github_settings: %s", e)
+            github_settings = {}
+
+        # v4.8.5: статистика идей (для отображения в разделе GitHub).
+        idea_stats: dict = {}
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                cur = conn.execute(
+                    "SELECT COUNT(*), "
+                    "SUM(CASE WHEN github_issue_url IS NOT NULL THEN 1 ELSE 0 END), "
+                    "SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END), "
+                    "MAX(created_at) "
+                    "FROM idea_log"
+                )
+                row = cur.fetchone()
+                idea_stats = {
+                    "total": row[0] or 0,
+                    "succeeded": row[1] or 0,
+                    "failed": row[2] or 0,
+                    "last_at": row[3],
+                }
+            finally:
+                conn.close()
+        except sqlite3.Error as e:
+            _req_logger.warning("admin_settings_page: idea_log stats failed: %s", e)
+            idea_stats = {"total": 0, "succeeded": 0, "failed": 0, "last_at": None}
+
         return templates.TemplateResponse("admin_settings.html", {
             "request": request,
             "auth_user": _auth,
@@ -3173,6 +3223,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "db_path": DB_PATH,
             "db_path_dir": os.path.dirname(DB_PATH) or ".",
             "bot_info": _bot_info(),
+            "github_settings": github_settings,
+            "idea_stats": idea_stats,
         })
 
     @app.post("/admin/settings/backup")
@@ -3246,6 +3298,236 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 f"(-{delta}+bytes+freed)",
             status_code=303,
         )
+
+    # ══════════════════════════════════════════════════════════════════
+    #  v4.8.5: GitHub Projects — настройки для !idea → Issues
+    # ══════════════════════════════════════════════════════════════════
+
+    async def _load_github_settings_row(session) -> GithubSettings:
+        """Гарантирует что singleton-строка GithubSettings (id=1) есть в БД
+        и возвращает её. Если нет — создаёт пустую.
+        """
+        gs = (await session.execute(
+            select(GithubSettings).where(GithubSettings.id == 1)
+        )).scalar_one_or_none()
+        if gs is None:
+            gs = GithubSettings(id=1, is_active=False)
+            session.add(gs)
+            await session.commit()
+            await session.refresh(gs)
+        return gs
+
+    @app.get("/admin/settings/github")
+    async def admin_settings_github_get(
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.5: возвращает текущие настройки GitHub Projects как JSON.
+
+        Используется JavaScript-формой для pre-fill значений при загрузке
+        страницы. PAT возвращается в виде признака is_pat_set (True/False),
+        а НЕ в открытом виде.
+        """
+        async with async_session() as session:
+            gs = await _load_github_settings_row(session)
+            return {
+                "is_active": gs.is_active,
+                "is_pat_set": bool(gs.pat_encrypted),
+                "repo_owner": gs.repo_owner or "",
+                "repo_name": gs.repo_name or "",
+                "project_node_id": gs.project_node_id or "",
+                "project_number": gs.project_number,
+                "project_owner_login": gs.project_owner_login or "",
+                "updated_at": gs.updated_at.isoformat() if gs.updated_at else None,
+                "updated_by": gs.updated_by,
+            }
+
+    @app.post("/admin/settings/github")
+    async def admin_settings_github_post(
+        request: Request,
+        pat: str = Form(""),
+        repo_owner: str = Form(""),
+        repo_name: str = Form(""),
+        project_node_id: str = Form(""),
+        project_number: str = Form(""),
+        project_owner_login: str = Form(""),
+        is_active: str = Form(""),
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.5: сохраняет настройки GitHub Projects.
+
+        Логика:
+          • PAT: если поле pat непустое — шифруем и сохраняем. Если пустое —
+            оставляем старый PAT (не затираем). Это чтобы SU мог менять
+            другие поля (repo_owner, project_number) не перезаводя PAT.
+          • repo_owner/repo_name/project_*: просто сохраняем как есть.
+          • is_active: '1' если чекбокс включён, иначе '0'.
+          • Сохранение НЕ запускает test_connection — это отдельный endpoint.
+
+        После сохранения — редирект на /admin/settings#github с flash-статусом.
+        """
+        # Валидация: если is_active=True, то PAT, repo_owner, repo_name должны
+        # быть заполнены (без них `!idea` не сможет создать Issue).
+        is_active_flag = is_active == "1"
+        async with async_session() as session:
+            gs = await _load_github_settings_row(session)
+
+            # PAT: только если задан новый.
+            if pat.strip():
+                try:
+                    gs.pat_encrypted = _encrypt_pat(pat.strip())
+                except Exception as e:
+                    _req_logger.error(
+                        "admin_settings_github_post: encrypt PAT failed: %s", e,
+                    )
+                    return RedirectResponse(
+                        url=f"/admin/settings?flash=PAT+encryption+failed%3A+{e}#github",
+                        status_code=303,
+                    )
+
+            gs.repo_owner = repo_owner.strip() or None
+            gs.repo_name = repo_name.strip() or None
+            gs.project_node_id = project_node_id.strip() or None
+            gs.project_owner_login = project_owner_login.strip() or None
+
+            # project_number — int или None.
+            pn = project_number.strip()
+            if pn:
+                try:
+                    gs.project_number = int(pn)
+                except ValueError:
+                    gs.project_number = None
+            else:
+                gs.project_number = None
+
+            # Если активируется — проверяем что PAT и repo заполнены.
+            if is_active_flag:
+                missing = []
+                if not gs.pat_encrypted:
+                    missing.append("PAT")
+                if not gs.repo_owner:
+                    missing.append("repo_owner")
+                if not gs.repo_name:
+                    missing.append("repo_name")
+                if missing:
+                    _req_logger.warning(
+                        "admin_settings_github_post: cannot activate — missing %s",
+                        ", ".join(missing),
+                    )
+                    return RedirectResponse(
+                        url=f"/admin/settings?flash=Cannot+activate%3A+missing+{'+'.join(missing)}#github",
+                        status_code=303,
+                    )
+
+            gs.is_active = is_active_flag
+            gs.updated_by = _auth.username
+
+            await session.commit()
+
+        _req_logger.info(
+            "admin_settings_github_post: saved (by=%s, active=%s, repo=%s/%s)",
+            _auth.username, is_active_flag, repo_owner, repo_name,
+        )
+        return RedirectResponse(
+            url="/admin/settings?flash=GitHub+settings+saved.#github",
+            status_code=303,
+        )
+
+    @app.post("/admin/settings/github/test")
+    async def admin_settings_github_test(
+        request: Request,
+        _auth: AuthUser = Depends(require_su),
+    ):
+        """v4.8.5: проверка подключения к GitHub.
+
+        Шаги:
+          1. Читаем настройки из БД (PAT расшифровываем).
+          2. Вызываем github_client.test_connection() — он создаёт + закрывает
+             тестовый Issue в репо и проверяет Project (если задан).
+          3. Логируем результат.
+          4. Возвращаем JSON с ok/message/details — фронтенд показывает
+             пользователю.
+
+        Если PAT не задан или не расшифровывается — возвращаем ошибку.
+        """
+        async with async_session() as session:
+            gs = await _load_github_settings_row(session)
+            if not gs.pat_encrypted:
+                return {
+                    "ok": False,
+                    "message": "PAT не задан. Сначала сохраните форму с PAT.",
+                }
+            try:
+                pat = _decrypt_pat(gs.pat_encrypted)
+            except Exception as e:
+                _req_logger.error(
+                    "admin_settings_github_test: decrypt PAT failed: %s", e,
+                )
+                return {
+                    "ok": False,
+                    "message": f"Не удалось расшифровать PAT: {e}. "
+                    "Перезаведите токен через форму.",
+                }
+            if not gs.repo_owner or not gs.repo_name:
+                return {
+                    "ok": False,
+                    "message": "repo_owner и repo_name должны быть заполнены.",
+                }
+
+        # Вызываем test_connection.
+        try:
+            from github_client import test_connection, get_project_node_id, GithubApiError
+            # Если project_node_id пустой, но project_owner_login + project_number
+            # заданы — резолвим node_id автоматически.
+            project_node_id = gs.project_node_id
+            if not project_node_id and gs.project_owner_login and gs.project_number:
+                try:
+                    project_node_id = await get_project_node_id(
+                        pat=pat,
+                        owner_login=gs.project_owner_login,
+                        project_number=gs.project_number,
+                    )
+                    # Сохраняем резолвнутый node_id в БД — при следующем
+                    # тесте не надо резолвить заново.
+                    async with async_session() as session:
+                        gs2 = await _load_github_settings_row(session)
+                        gs2.project_node_id = project_node_id
+                        gs2.updated_by = _auth.username
+                        await session.commit()
+                except GithubApiError as e:
+                    return {
+                        "ok": False,
+                        "message": f"Не удалось резолвить Project node_id "
+                        f"по owner='{gs.project_owner_login}' "
+                        f"number={gs.project_number}: {e}",
+                    }
+
+            result = await test_connection(
+                pat=pat,
+                owner=gs.repo_owner,
+                repo=gs.repo_name,
+                project_node_id=project_node_id,
+            )
+        except GithubApiError as e:
+            _req_logger.warning(
+                "admin_settings_github_test: test_connection failed: %s", e,
+            )
+            return {"ok": False, "message": str(e)}
+        except Exception as e:
+            _req_logger.exception(
+                "admin_settings_github_test: unexpected error: %s", e,
+            )
+            return {"ok": False, "message": f"Unexpected error: {e}"}
+
+        _req_logger.info(
+            "admin_settings_github_test: result ok=%s (by=%s, message=%s)",
+            result.ok, _auth.username, result.message,
+        )
+        return {
+            "ok": result.ok,
+            "message": result.message,
+            "details": result.details,
+        }
 
     # ──────────────────────────────────────────────────────────────────
     #  v4.5: /admin/cleanup → редирект на /admin/settings#cleanup

@@ -11,3 +11,6 @@ Pillow>=10.0.0
 # v4.8.3: конвертация анимированных TGS-стикеров → PNG.
 # Если не установится на платформе — fallback на отдельный send_sticker.
 rlottie-python>=1.0.0
+# v4.8.5: шифрование GitHub PAT в БД (Fernet — AES-128-CBC + HMAC-SHA256).
+# Используется в db._encrypt_pat / _decrypt_pat для хранения PAT из веб-панели.
+cryptography>=42.0.0
