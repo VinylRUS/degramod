@@ -1255,6 +1255,9 @@ async def init_db() -> None:
 
     # ── v4.8.5: Новая таблица github_settings (singleton для PAT и репо) ───
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    # ВАЖНО: здесь указываем ВСЕ колонки, что в модели GithubSettings — иначе при
+    # ручном создании БД (без Base.metadata.create_all) у нас будет таблица без
+    # новой колонки project_status_option_name, и последующий ORM-SELECT упадёт.
     async with engine.begin() as conn:
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS github_settings (
@@ -1265,11 +1268,32 @@ async def init_db() -> None:
                 project_node_id VARCHAR(64) NULL,
                 project_number INTEGER NULL,
                 project_owner_login VARCHAR(128) NULL,
+                project_status_option_name VARCHAR(128) NULL,
                 is_active BOOLEAN NOT NULL DEFAULT 0,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_by VARCHAR(64) NULL
             )
         """))
+
+    # ── v4.8.5.3: миграция — добавляем project_status_option_name в github_settings ──
+    # Идемпотентно (PRAGMA check + ALTER TABLE). Default 'Предложено' —
+    # стандартная колонка, которую мы договаривались использовать.
+    # ВАЖНО: этот блок идёт ДО ORM-SELECT'а singleton-строки ниже — иначе на
+    # существующей БД без этой колонки SELECT падает с
+    # "no such column: github_settings.project_status_option_name".
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(github_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "project_status_option_name" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE github_settings ADD COLUMN "
+                "project_status_option_name VARCHAR(128) NULL"
+            ))
+            # Заполняем default для существующей singleton-строки.
+            await conn.execute(text(
+                "UPDATE github_settings SET project_status_option_name = 'Предложено' "
+                "WHERE project_status_option_name IS NULL"
+            ))
 
     # ── v4.8.5: Seed singleton-строки github_settings (id=1) ───────────────
     # Гарантируем что строка с id=1 существует — на ней будут UPDATE'ы из
@@ -1285,23 +1309,6 @@ async def init_db() -> None:
                 project_status_option_name="Предложено",  # v4.8.5.3 default
             ))
             await session.commit()
-
-    # ── v4.8.5.3: миграция — добавляем project_status_option_name в github_settings ──
-    # Идемпотентно (PRAGMA check + ALTER TABLE). Default 'Предложено' —
-    # стандартная колонка, которую мы договаривались использовать.
-    async with engine.begin() as conn:
-        result = await conn.execute(text("PRAGMA table_info(github_settings)"))
-        columns = [row[1] for row in result.fetchall()]
-        if "project_status_option_name" not in columns:
-            await conn.execute(text(
-                "ALTER TABLE github_settings ADD COLUMN "
-                "project_status_option_name VARCHAR(128) NULL"
-            ))
-            # Заполняем default для существующей singleton-строки.
-            await conn.execute(text(
-                "UPDATE github_settings SET project_status_option_name = 'Предложено' "
-                "WHERE project_status_option_name IS NULL"
-            ))
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

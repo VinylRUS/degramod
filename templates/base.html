@@ -639,6 +639,22 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.5.4</strong> — 14 августа 2026 (hotfix: краш при старте на старой БД без project_status_option_name)</p>
+                <ul>
+                    <li><strong>Баг</strong>: бот падал при старте с ошибкой <code>sqlite3.OperationalError: no such column: github_settings.project_status_option_name</code> на БД, оставшейся от v4.8.5.2 (где этой колонки ещё не было). <code>init_db()</code> не отрабатывал, Uvicorn убивал процесс.</li>
+                    <li><strong>Причина</strong>: в v4.8.5.3 я добавил миграцию <code>ALTER TABLE github_settings ADD COLUMN project_status_option_name</code>, но поместил её <strong>после</strong> ORM-селекта singleton-строки <code>github_settings(id=1)</code>. ORM-селект через <code>select(GithubSettings).where(...)</code> использует SQLAlchemy-модель, у которой колонка <em>есть</em> — поэтому SELECT генерировал SQL вида <code>SELECT ... github_settings.project_status_option_name ... FROM github_settings</code>. На существующей БД без этой колонки запрос падал, и до миграции дело не доходило. На новой БД баг не воспроизводился (<code>Base.metadata.create_all</code> создавал таблицу со всеми колонками).</li>
+                    <li><strong>Фикс</strong>: в <code>init_db()</code> блок миграции (PRAGMA + ALTER TABLE + UPDATE default) поднят <strong>выше</strong> ORM-селекта singleton-строки. Теперь порядок: <code>CREATE TABLE IF NOT EXISTS</code> → <code>ALTER TABLE</code> миграция → ORM-SELECT. Дополнительно колонка <code>project_status_option_name</code> добавлена в явный <code>CREATE TABLE IF NOT EXISTS github_settings</code> (раньше её там не было — relied on <code>Base.metadata.create_all</code>).</li>
+                    <li><strong>Воспроизведение</strong>: regression-тест <code>test_v4854_migration_order.py</code> создаёт временный sqlite-файл со старой схемой <code>github_settings</code> БЕЗ новой колонки, вызывает <code>init_db()</code> и проверяет, что (1) не падает, (2) колонка появилась, (3) default «Предложено» заполнен для существующей singleton-строки. 7/7 проверок проходят.</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>db.py</code> — переставлен порядок блоков в <code>init_db()</code> (миграция выше ORM-селекта), колонка добавлена в <code>CREATE TABLE IF NOT EXISTS</code>.</li>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.5.4.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в API, схеме данных, веб-панели, обработчиках. Только фикс порядка миграции в <code>init_db()</code>.</li>
+                </ul>
+
                 <p><strong>v4.8.5.3</strong> — 14 августа 2026 (auto-set Status='Предложено' для новых карточек в GitHub Project)</p>
                 <ul>
                     <li><strong>Что случилось</strong>: после <code>!idea</code> Issue создавался в GitHub и добавлялся в Project v2, но карточка оказывалась в bucket'е «без статуса» — приходилось вручную перетаскивать её в колонку «Предложено».</li>
