@@ -98,7 +98,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.5.2"
+APP_VERSION = "v4.8.5.3"
 APP_RELEASE_DATE = "2026-08-14"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -3182,6 +3182,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                         "project_node_id": gs.project_node_id or "",
                         "project_number": gs.project_number,
                         "project_owner_login": gs.project_owner_login or "",
+                        # v4.8.5.3: имя Status-опции для авто-присвоения.
+                        "project_status_option_name": gs.project_status_option_name or "Предложено",
                         "updated_at": gs.updated_at.strftime("%Y-%m-%d %H:%M UTC") if gs.updated_at else None,
                         "updated_by": gs.updated_by,
                     }
@@ -3338,6 +3340,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 "project_node_id": gs.project_node_id or "",
                 "project_number": gs.project_number,
                 "project_owner_login": gs.project_owner_login or "",
+                # v4.8.5.3: имя Status-опции для авто-присвоения.
+                "project_status_option_name": gs.project_status_option_name or "Предложено",
                 "updated_at": gs.updated_at.isoformat() if gs.updated_at else None,
                 "updated_by": gs.updated_by,
             }
@@ -3351,6 +3355,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         project_node_id: str = Form(""),
         project_number: str = Form(""),
         project_owner_login: str = Form(""),
+        project_status_option_name: str = Form(""),
         is_active: str = Form(""),
         _auth: AuthUser = Depends(require_su),
     ):
@@ -3362,6 +3367,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             другие поля (repo_owner, project_number) не перезаводя PAT.
           • repo_owner/repo_name/project_*: просто сохраняем как есть.
           • is_active: '1' если чекбокс включён, иначе '0'.
+          • v4.8.5.3: project_status_option_name — имя Status-опции для
+            авто-присвоения (default 'Предложено'). Пустое значение
+            сохраняется как default.
           • Сохранение НЕ запускает test_connection — это отдельный endpoint.
 
         После сохранения — редирект на /admin/settings#github с flash-статусом.
@@ -3389,6 +3397,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             gs.repo_name = repo_name.strip() or None
             gs.project_node_id = project_node_id.strip() or None
             gs.project_owner_login = project_owner_login.strip() or None
+            # v4.8.5.3: имя Status-опции (default 'Предложено' если пусто).
+            gs.project_status_option_name = (
+                project_status_option_name.strip() or "Предложено"
+            )
 
             # project_number — int или None.
             pn = project_number.strip()

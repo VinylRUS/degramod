@@ -6435,6 +6435,7 @@ async def _process_idea_submission(
     try:
         from github_client import (
             create_issue, add_issue_to_project, get_issue_node_id,
+            set_item_status_by_name,
             GithubApiError,
         )
         # 1. REST: создаём Issue (title = idea_text, без body).
@@ -6465,6 +6466,36 @@ async def _process_idea_submission(
                     issue_number, e, gs.project_node_id,
                 )
                 project_item_id = None
+
+            # v4.8.5.3: выставляем Status = 'Предложено' для новой карточки.
+            # Best-effort — если упадёт, Issue уже в Project, просто без
+            # Status (пользователь перетащит руками).
+            if project_item_id:
+                status_name = (
+                    gs.project_status_option_name
+                    or "Предложено"
+                )
+                try:
+                    ok = await set_item_status_by_name(
+                        pat=pat,
+                        project_node_id=gs.project_node_id,
+                        item_id=project_item_id,
+                        status_name=status_name,
+                    )
+                    if not ok:
+                        logger.warning(
+                            "idea: Issue #%s added to Project %s but Status "
+                            "not set (option '%s' missing or field missing).",
+                            issue_number, gs.project_node_id, status_name,
+                        )
+                except Exception as e:
+                    # Defensive: set_item_status_by_name сам ловит
+                    # GithubApiError внутри, но на всякий случай.
+                    logger.warning(
+                        "idea: set_item_status_by_name unexpected error "
+                        "for Issue #%s: %s",
+                        issue_number, e,
+                    )
     except GithubApiError as e:
         error_msg = str(e)
         logger.error(

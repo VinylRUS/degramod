@@ -716,6 +716,9 @@ class GithubSettings(Base):
       • project_number — number Project в организации/юзере (для отображения
         в веб-панели и для тестов). Необязательно.
       • project_owner_login — login владельца Project (для GraphQL query).
+      • project_status_option_name — имя single-select option в поле Status
+        Project v2, в которое автоматически попадают новые Issue (default
+        'Предложено'). v4.8.5.3.
       • is_active — флаг включения интеграции. Если False — `!idea` не
         пытается отправить в GitHub, отправителю возвращается «не активна».
       • updated_at, updated_by — audit.
@@ -729,6 +732,9 @@ class GithubSettings(Base):
     project_node_id = Column(String(64), nullable=True)     # GraphQL node ID (PVT_...)
     project_number = Column(Integer, nullable=True)
     project_owner_login = Column(String(128), nullable=True)
+    # v4.8.5.3: имя Status-опции для авто-присвоения ('Предложено' по умолчанию).
+    # lookup происходит при каждой !idea — find_status_field + set_item_status.
+    project_status_option_name = Column(String(128), nullable=True)
     is_active = Column(Boolean, default=False, nullable=False)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
@@ -1274,8 +1280,28 @@ async def init_db() -> None:
             select(GithubSettings).where(GithubSettings.id == 1)
         )).scalar_one_or_none()
         if existing_gs is None:
-            session.add(GithubSettings(id=1, is_active=False))
+            session.add(GithubSettings(
+                id=1, is_active=False,
+                project_status_option_name="Предложено",  # v4.8.5.3 default
+            ))
             await session.commit()
+
+    # ── v4.8.5.3: миграция — добавляем project_status_option_name в github_settings ──
+    # Идемпотентно (PRAGMA check + ALTER TABLE). Default 'Предложено' —
+    # стандартная колонка, которую мы договаривались использовать.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(github_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "project_status_option_name" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE github_settings ADD COLUMN "
+                "project_status_option_name VARCHAR(128) NULL"
+            ))
+            # Заполняем default для существующей singleton-строки.
+            await conn.execute(text(
+                "UPDATE github_settings SET project_status_option_name = 'Предложено' "
+                "WHERE project_status_option_name IS NULL"
+            ))
 
     # ── v4.5.2: seed глобального allowlist для link filter ─────────────
     # При первом запуске (или если link_allowlist пуст) добавляем базовый

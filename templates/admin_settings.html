@@ -302,6 +302,24 @@
             </div>
         </div>
 
+        {# v4.8.5.3: имя Status-опции для авто-присвоения (default 'Предложено') #}
+        <div>
+            <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
+                Status option name (для авто-присвоения)
+            </label>
+            <input type="text" name="project_status_option_name"
+                   value="{{ github_settings.project_status_option_name if github_settings and github_settings.project_status_option_name else 'Предложено' }}"
+                   placeholder="Предложено"
+                   style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px;">
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px;">
+                Имя опции в поле <strong>Status</strong> Project v2, в которую автоматически
+                попадают новые Issue. Default: <code>Предложено</code>. Должно точно совпадать
+                с именем option в Project (case-sensitive). Если поле Status или option с
+                таким именем не существует — Issue всё равно добавляется в Project, но без
+                Status (можно перетащить руками).
+            </div>
+        </div>
+
         <label style="display: flex; align-items: center; gap: var(--sp-3); cursor: pointer; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
             <input type="checkbox" name="is_active" value="1"
                    {% if github_settings and github_settings.is_active %}checked{% endif %}

@@ -639,6 +639,33 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.5.3</strong> — 14 августа 2026 (auto-set Status='Предложено' для новых карточек в GitHub Project)</p>
+                <ul>
+                    <li><strong>Что случилось</strong>: после <code>!idea</code> Issue создавался в GitHub и добавлялся в Project v2, но карточка оказывалась в bucket'е «без статуса» — приходилось вручную перетаскивать её в колонку «Предложено».</li>
+                    <li><strong>Причина</strong>: GitHub GraphQL mutation <code>addProjectV2ItemById</code> добавляет Issue в Project, но <strong>не выставляет</strong> поле Status. Чтобы карточка попала в нужную колонку, нужно отдельно вызвать <code>updateProjectV2ItemFieldValue</code> и проставить Status = «Предложено» (или другое имя option).</li>
+                    <li><strong>Фикс</strong>: после <code>add_issue_to_project</code> бот вызывает новый хелпер <code>set_item_status_by_name(pat, project_node_id, item_id, status_name)</code> из <code>github_client.py</code>. Хелпер делает два GraphQL-запроса: <code>find_status_field</code> (ищет поле Status и его options) → <code>set_item_status</code> (<code>updateProjectV2ItemFieldValue</code> с <code>singleSelectOptionId</code>).</li>
+                    <li><strong>Best-effort</strong>: если поле Status не существует, option с заданным именем не найдена, или GraphQL упал (нет прав, network) — бот логирует warning, но <strong>не фейлит</strong> отправку идеи. Issue уже в Project, просто без Status — пользователь может перетащить руками.</li>
+                    <li><strong>Настраиваемое имя option</strong>: в веб-панели Settings → GitHub Projects добавлено поле <em>«Status option name»</em> (default «Предложено»). Можно поменять, если колонка в Project названа иначе (case-sensitive).</li>
+                    <li><strong>Новые функции в <code>github_client.py</code></strong>:
+                        <ul>
+                            <li><code>find_status_field(pat, project_node_id) → dict | None</code> — GraphQL query <code>node(id) { ... on ProjectV2 { fields(first: 50) { ... on ProjectV2SingleSelectField { id name options { id name } } } } }</code>. Возвращает <code>{field_id, options: [{id, name}]}</code> или None.</li>
+                            <li><code>set_item_status(pat, project_node_id, item_id, field_id, option_id)</code> — GraphQL mutation <code>updateProjectV2ItemFieldValue</code> с <code>value: { singleSelectOptionId: optionId }</code>.</li>
+                            <li><code>set_item_status_by_name(pat, project_node_id, item_id, status_name="Предложено") → bool</code> — high-level хелпер, комбинирует find + set. Возвращает True/False.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>github_client.py</code> — 3 новые функции + docstrings.</li>
+                            <li><code>db.py</code> — новое поле <code>project_status_option_name</code> в <code>GithubSettings</code> + миграция (CREATE COLUMN + UPDATE default).</li>
+                            <li><code>bot_handlers.py</code> — в <code>_process_idea_submission</code> после <code>add_issue_to_project</code> вызываем <code>set_item_status_by_name</code> best-effort.</li>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.5.3, GET/POST <code>/admin/settings/github</code> принимают <code>project_status_option_name</code>, передают в template context.</li>
+                            <li><code>templates/admin_settings.html</code> — новое поле «Status option name» в форме.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Существующие настройки (<code>github_settings</code> singleton) автоматически получают <code>project_status_option_name='Предложено'</code> при первом запуске v4.8.5.3 (миграция). API <code>github_client</code> обратно совместим — новые функции добавлены, старые не менялись.</li>
+                </ul>
+
                 <p><strong>v4.8.5.2</strong> — 14 августа 2026 (hotfix: !idea не реагировал — Command prefix)</p>
                 <ul>
                     <li><strong>Баг</strong>: бот никак не реагировал на команду <code>!idea</code> — ни в ЛС, ни в modchat. Сообщение просто «проглатывалось» без ответа, без ошибки в логах.</li>

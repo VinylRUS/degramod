@@ -392,6 +392,201 @@ async def get_project_node_id(
     )
 
 
+# ── v4.8.5.3: auto-set Status field on new Project items ────────────────
+# Проблема: addProjectV2ItemById добавляет Issue в Project, но НЕ выставляет
+# поле Status. Карточка оказывается в bucket'е "без статуса", а не в колонке
+# "Предложено". Пользователь вынужден перетаскивать её руками.
+# Фикс: после add_issue_to_project вызываем find_status_field + set_item_status.
+# Оба вызова best-effort — если поле Status или option не найдены, логируем
+# warning, но НЕ фейлим отправку идеи (Issue уже в Project).
+
+
+async def find_status_field(
+    pat: str, project_node_id: str,
+) -> dict | None:
+    """v4.8.5.3: ищет single-select поле Status в Project v2.
+
+    GitHub Project v2 по умолчанию создаёт single-select поле "Status" с
+    options "Todo"/"In Progress"/"Done", но SU может переименовать или
+    удалить его. Эта функция находит поле по имени "Status" (case-sensitive)
+    и возвращает его metadata.
+
+    Args:
+        pat: GitHub PAT.
+        project_node_id: GraphQL node ID Project v2 (PVT_xxx).
+
+    Returns:
+        dict с ключами:
+          • field_id: GraphQL node ID поля (например, 'PVTSSF_xxx').
+          • options: list[dict] с {id, name} для каждой option.
+        None если поле Status не найдено.
+
+    Raises:
+        GithubApiError: при сетевой ошибке или если GraphQL упал.
+    """
+    query = """
+    query($projectId: ID!) {
+      node(id: $projectId) {
+        ... on ProjectV2 {
+          fields(first: 50) {
+            nodes {
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options { id name }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = await _graphql(pat, query, {"projectId": project_node_id})
+    node = data.get("node")
+    if not node:
+        return None
+    fields = (node.get("fields") or {}).get("nodes") or []
+    for f in fields:
+        # inline fragment возвращает поля только для ProjectV2SingleSelectField.
+        # Для других типов полей (text, number, date, iteration) nodes будут {}.
+        if not f:
+            continue
+        if f.get("name") == "Status" and "id" in f:
+            return {
+                "field_id": f["id"],
+                "options": [
+                    {"id": o["id"], "name": o["name"]}
+                    for o in (f.get("options") or []) if "id" in o and "name" in o
+                ],
+            }
+    return None
+
+
+async def set_item_status(
+    pat: str, project_node_id: str, item_id: str,
+    field_id: str, option_id: str,
+) -> None:
+    """v4.8.5.3: выставляет single-select Status поля для карточки в Project.
+
+    Args:
+        pat: GitHub PAT.
+        project_node_id: GraphQL node ID Project v2 (PVT_xxx).
+        item_id: GraphQL node ID карточки (PVTI_xxx) — возвращается из
+            add_issue_to_project.
+        field_id: GraphQL node ID поля Status (PVTSSF_xxx) — из find_status_field.
+        option_id: GraphQL node ID option (например, 'predlozheno-id')
+            — из find_status_field → options → find by name.
+
+    Raises:
+        GithubApiError: при сетевой ошибке или GraphQL error.
+    """
+    mutation = """
+    mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+      updateProjectV2ItemFieldValue(input: {
+        projectId: $projectId,
+        itemId: $itemId,
+        fieldId: $fieldId,
+        value: { singleSelectOptionId: $optionId }
+      }) {
+        projectV2Item { id }
+      }
+    }
+    """
+    data = await _graphql(pat, mutation, {
+        "projectId": project_node_id,
+        "itemId": item_id,
+        "fieldId": field_id,
+        "optionId": option_id,
+    })
+    # updateProjectV2ItemFieldValue возвращает projectV2Item или null при ошибке.
+    item = (data.get("updateProjectV2ItemFieldValue") or {}).get("projectV2Item")
+    if not item or "id" not in item:
+        raise GithubApiError(
+            "updateProjectV2ItemFieldValue returned no item — likely invalid "
+            "field_id, option_id, or missing project permissions",
+            status=200,
+        )
+
+
+async def set_item_status_by_name(
+    pat: str, project_node_id: str, item_id: str,
+    status_name: str = "Предложено",
+) -> bool:
+    """v4.8.5.3: high-level хелпер — выставляет Status = status_name для карточки.
+
+    Комбинирует find_status_field + set_item_status. Best-effort:
+    возвращает False (с warning в лог) если:
+      • поле Status не найдено в Project;
+      • option с именем status_name не найдена;
+      • GraphQL упал (нет прав, network, и т.д.).
+
+    Args:
+        pat: GitHub PAT.
+        project_node_id: GraphQL node ID Project v2 (PVT_xxx).
+        item_id: GraphQL node ID карточки (PVTI_xxx).
+        status_name: имя Status-опции (default 'Предложено').
+            Case-sensitive — должно точно совпадать с именем в Project.
+
+    Returns:
+        True если Status успешно выставлен.
+        False если что-то пошло не так (см. лог для деталей).
+    """
+    try:
+        field_info = await find_status_field(pat, project_node_id)
+    except GithubApiError as e:
+        logger.warning(
+            "set_item_status_by_name: find_status_field failed: %s "
+            "(project=%s, item=%s)", e, project_node_id, item_id,
+        )
+        return False
+
+    if not field_info:
+        logger.warning(
+            "set_item_status_by_name: Status field not found in Project %s. "
+            "Item %s left without Status. Add a single-select field named "
+            "'Status' with an option '%s' to enable auto-status.",
+            project_node_id, item_id, status_name,
+        )
+        return False
+
+    # Ищем option по имени (case-sensitive).
+    option_id = None
+    for opt in field_info["options"]:
+        if opt["name"] == status_name:
+            option_id = opt["id"]
+            break
+    if not option_id:
+        available = ", ".join(o["name"] for o in field_info["options"])
+        logger.warning(
+            "set_item_status_by_name: option '%s' not found in Status field. "
+            "Available options: [%s]. Item %s left without Status.",
+            status_name, available, item_id,
+        )
+        return False
+
+    try:
+        await set_item_status(
+            pat=pat,
+            project_node_id=project_node_id,
+            item_id=item_id,
+            field_id=field_info["field_id"],
+            option_id=option_id,
+        )
+        logger.info(
+            "set_item_status_by_name: Status='%s' set for item %s in Project %s",
+            status_name, item_id, project_node_id,
+        )
+        return True
+    except GithubApiError as e:
+        logger.warning(
+            "set_item_status_by_name: set_item_status failed: %s "
+            "(project=%s, item=%s, field=%s, option=%s)",
+            e, project_node_id, item_id,
+            field_info["field_id"], option_id,
+        )
+        return False
+
+
 async def test_connection(
     pat: str, owner: str, repo: str,
     project_node_id: str | None = None,
