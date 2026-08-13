@@ -6539,7 +6539,10 @@ async def _is_modchat_chat(chat_id: int) -> bool:
 
 
 # !idea <текст> в ЛС боту.
-@router.message(F.chat.type == "private", Command("idea"))
+# v4.8.5.2: prefix="!/" — ловит и !idea, и /idea. Раньше (v4.8.5) был
+# default prefix="/", который НЕ ловил !idea → бот молчал в ответ на !idea
+# (сообщение падало в stealth_catchall_private).
+@router.message(F.chat.type == "private", Command("idea", prefix="!/"))
 async def cmd_idea_dm(message: types.Message) -> None:
     """v4.8.5: !idea <текст> — отправить идею в GitHub Issue + Project.
 
@@ -6580,7 +6583,8 @@ async def cmd_idea_dm(message: types.Message) -> None:
 # !idea <текст> в групповом чате (срабатывает ТОЛЬКО если это modchat).
 # Стоит раньше остальных group-обработчиков, но проверка modchat отсечёт
 # все обычные чаты. Не падает, не пишет в чат, если это не modchat.
-@router.message(F.chat.type != "private", Command("idea"))
+# v4.8.5.2: prefix="!/" — ловит и !idea, и /idea.
+@router.message(F.chat.type != "private", Command("idea", prefix="!/"))
 async def cmd_idea_modchat(message: types.Message) -> None:
     """v4.8.5: !idea <текст> в modchat — отправить идею в GitHub Issue + Project.
 
