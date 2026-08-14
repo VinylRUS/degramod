@@ -120,7 +120,7 @@ from aiogram.types import (
     RichTextBold,
     RichTextCode,
     RichTextSpoiler,
-    InputFile,
+    BufferedInputFile,
 )
 from sqlalchemy import select, desc, func
 
@@ -388,13 +388,18 @@ _CMD_MUTE = re.compile(
     re.IGNORECASE,
 )  # dur + reason обязательны; target опционален (если нет — нужен reply).
 _CMD_WARN = re.compile(
-    r"^!warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>.+)$",
+    r"^!warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
     re.IGNORECASE,
 )  # reason обязательна; target опционален.
+# v4.8.6: добавлен negative lookahead (?!@\w+$|\d+$) в reason — иначе
+# `!warn @username` (без причины) матчило reason="@username" и бан влетал
+# на reply-target с некорректной причиной. Теперь такой ввод не матчится
+# → handler вернёт "укажите причину".
 _CMD_BAN = re.compile(
-    r"^!ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>.+)$",
+    r"^!ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
     re.IGNORECASE,
 )  # reason обязательна; target опционален.
+# v4.8.6: аналогичный фикс как для _CMD_WARN (см. выше).
 # v4.8.1: тихие команды (stealth). s = silent/stealth.
 # v4.8.3.1 HOTFIX: regex переосмыслен — _CMD_SWARN/_CMD_SBAN в v4.8.3 не матчили
 #   `!swarn Причина` (bare reason без @username/TGID), потому что внутренняя
@@ -1492,14 +1497,10 @@ async def _cas_check_user(user_id: int) -> tuple[bool, str | None]:
 
 
 # ── Word filter (#7) ────────────────────────────────────────────────────────
-# v4.8.1: WordFilter объявлен deprecated в v4.8.0 (заменён на KeywordWatch).
-# Код word_filter удалён в v4.8.1. Таблица word_filters в БД оставлена
-# для исторических данных (см. db.py: модель WordFilter помечена deprecated
-# и не используется в коде). Для нового функционала используйте KeywordWatch
-# (через веб-панель /admin/keywords или команды !addkeyword/!listkeywords).
-#
-# Функция _word_filter_match удалена. Если в будущем понадобится legacy-
-# совместимость — восстанавливать из git history v4.8.0.
+# v4.8.6: WordFilter остаётся активной моделью — управляется через web UI
+# /admin/presets (раздел «Запрещённые слова»). Bot-команды /addword /delword
+# /listwords удалены окончательно. KeywordWatch (см. ниже) — отдельная
+# система для night-mode автобана, работает через !addkeyword/!listkeywords.
 
 
 # ── Link filter (#8) ────────────────────────────────────────────────────────
@@ -2509,15 +2510,17 @@ async def _build_sticker_block(
 
     try:
         if fmt == "png":
-            # PNG-стикер — как photo. InputFile обернёт BytesIO.
+            # PNG-стикер — как photo. BufferedInputFile обернёт bytes.
+            # v4.8.6: InputFile стал ABC в aiogram 3.30 — теперь нужен
+            # BufferedInputFile (для bytes) или FSInputFile (для пути).
             return InputRichBlockPhoto(
-                photo=InputMediaPhoto(media=InputFile(buf, filename="sticker.png"))
+                photo=InputMediaPhoto(media=BufferedInputFile(buf, filename="sticker.png"))
             ), None
         if fmt == "webm":
             # WebM-стикер — как animation.
             return InputRichBlockAnimation(
                 animation=InputMediaAnimation(
-                    media=InputFile(buf, filename="sticker.webm")
+                    media=BufferedInputFile(buf, filename="sticker.webm")
                 )
             ), None
         return None, f"unknown format: {fmt}"
@@ -2547,7 +2550,7 @@ async def _build_screenshot_block(
         return None, err or "failed to download photo"
     try:
         return InputRichBlockPhoto(
-            photo=InputMediaPhoto(media=InputFile(buf, filename="screenshot.jpg"))
+            photo=InputMediaPhoto(media=BufferedInputFile(buf, filename="screenshot.jpg"))
         ), None
     except Exception as e:
         logger.warning("Could not build screenshot rich block: %s", e)
@@ -5741,60 +5744,11 @@ async def cmd_delsticker(message: types.Message) -> None:
     )
 
 
-@router.message(F.chat.type == "private", Command("addword"))
-async def cmd_addword(message: types.Message) -> None:
-    """v4.5.2 (#7): /addword chat_id <pattern> [action] [is_regex]
-
-    v4.8.1: WordFilter объявлен deprecated в v4.8.0 (заменён на KeywordWatch).
-    Команда /addword удалена в v4.8.1 — отвечает заглушкой с подсказкой
-    использовать !addkeyword (или веб-панель /admin/keywords).
-    """
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    await message.reply(
-        "ℹ️ <b>/addword удалён в v4.8.1</b>\n"
-        "WordFilter объявлен deprecated в v4.8.0 и заменён на KeywordWatch.\n"
-        "Используйте:\n"
-        "  • <code>!addkeyword «фраза»</code> в любом чате\n"
-        "  • <code>!addkeyword «фраза» --ban-night</code> для автобана ночью\n"
-        "  • Веб-панель: <code>/admin/keywords</code>\n"
-        "  • <code>!listkeywords</code> — показать список",
-        parse_mode="HTML",
-    )
-
-
-@router.message(F.chat.type == "private", Command("delword"))
-async def cmd_delword(message: types.Message) -> None:
-    """v4.5.2 (#7): /delword chat_id <pattern> — убрать слово из фильтра.
-
-    v4.8.1: WordFilter удалён. Команда /delword отвечает заглушкой.
-    """
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    await message.reply(
-        "ℹ️ <b>/delword удалён в v4.8.1</b>\n"
-        "WordFilter объявлен deprecated в v4.8.0 и заменён на KeywordWatch.\n"
-        "Используйте <code>!delkeyword «фраза»</code> в любом чате\n"
-        "или веб-панель <code>/admin/keywords</code>.",
-        parse_mode="HTML",
-    )
-
-
-@router.message(F.chat.type == "private", Command("listwords"))
-async def cmd_listwords(message: types.Message) -> None:
-    """v4.5.2 (#7): /listwords [chat_id] — показать список забаненных слов.
-
-    v4.8.1: WordFilter удалён. Команда /listwords отвечает заглушкой.
-    """
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    await message.reply(
-        "ℹ️ <b>/listwords удалён в v4.8.1</b>\n"
-        "WordFilter объявлен deprecated в v4.8.0 и заменён на KeywordWatch.\n"
-        "Используйте <code>!listkeywords</code> в любом чате\n"
-        "или веб-панель <code>/admin/keywords</code>.",
-        parse_mode="HTML",
-    )
+# v4.8.6: stub-команды /addword, /delword, /listwords удалены окончательно.
+# WordFilter был объявлен deprecated в v4.8.0 и заменён на KeywordWatch
+# (команды !addkeyword/!delkeyword/!listkeywords + веб-панель /admin/keywords).
+# Сами модели WordFilter и таблица word_filters остаются активными —
+# они используются web UI в /admin/presets (Word filter section).
 
 
 @router.message(F.chat.type == "private", Command("linkfilter"))

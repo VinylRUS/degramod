@@ -35,6 +35,7 @@ import os
 import secrets
 import shutil
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -98,7 +99,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.5.4"
+APP_VERSION = "v4.8.6"
 APP_RELEASE_DATE = "2026-08-14"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -576,6 +577,11 @@ async def _fetch_and_save_avatar(bot, tg_user_id: int) -> bool:
         _req_logger.warning("avatar save failed for tg_user_id=%s: %s", tg_user_id, e)
         return False
     return True
+
+
+# ── v4.8.6: время старта web_app для uptime без psutil ──────────────────────
+# Захватывается при импорте модуля (близко к моменту запуска процесса).
+_APP_START_TIME: float = time.time()
 
 
 # ── Создание приложения ─────────────────────────────────────────────────────
@@ -3089,12 +3095,20 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     #    • VACUUM (оптимизация файла БД без удаления данных)
     # ──────────────────────────────────────────────────────────────────
     def _bot_info() -> dict:
-        """Собирает snapshot инфо о боте для страницы Settings."""
+        """Собирает snapshot инфо о боте для страницы Settings.
+
+        v4.8.6: переписано без psutil (его нет в requirements.txt, поэтому
+        uptime всегда показывал 0s). Uptime считается от _APP_START_TIME
+        (время импорта модуля). Memory RSS читается из /proc/self/status
+        (Linux only — на Bothost работает, в Windows dev-окружении fallback 0).
+        """
         info = {
             "version": APP_VERSION,
-            "uptime_seconds": 0,
+            "uptime_seconds": int(time.time() - _APP_START_TIME),
             "db_path": DB_PATH,
             "db_size_bytes": 0,
+            "memory_rss_bytes": 0,
+            "python_version": sys.version.split()[0],
             "chats_total": 0,
             "chats_enabled": 0,
             "chats_disabled": 0,
@@ -3108,13 +3122,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 info["db_size_bytes"] = os.path.getsize(DB_PATH)
         except OSError:
             pass
-        # Uptime: считаем от времени старта процесса (точнее — от создания app)
-        # Просто используем время старта процесса из env если задано, иначе — 0
-        # (не критично — это всего лишь отображение)
+        # Memory RSS: читаем из /proc/self/status (Linux only).
+        # VmRSS line: "VmRSS:\t    12345 kB\n"
         try:
-            import psutil
-            info["uptime_seconds"] = int(time.time() - psutil.Process().create_time())
-        except Exception:
+            with open(f"/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            info["memory_rss_bytes"] = int(parts[1]) * 1024
+                        break
+        except (OSError, ValueError):
             pass
         # Счётчики из БД
         try:
@@ -3222,7 +3240,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "app_version": APP_VERSION,
             "flash": flash or None,
             "counts": counts,
-            "db_path": DB_PATH,
             "db_path_dir": os.path.dirname(DB_PATH) or ".",
             "bot_info": _bot_info(),
             "github_settings": github_settings,
@@ -4046,7 +4063,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         )
 
     # ── v4.7.5: Word filter (ban words) CRUD ─────────────────────────
-    # Паритет с командами /addword, /delword, /listwords.
+    # v4.8.6: stub bot-команды /addword /delword /listwords удалены.
+    # Word filter теперь управляется только через этот web UI.
     # chat_id=0 — глобальный паттерн (применяется ко всем чатам).
     # is_regex=True — pattern интерпретируется как re.search, иначе — case-insensitive substring.
     # action: delete|warn|mute|ban.

@@ -639,6 +639,28 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.6</strong> — 14 августа 2026 (maintenance: чистка Settings, багфиксы, удаление stub-команд)</p>
+                <ul>
+                    <li><strong>Settings UI cleanup</strong>. Вкладка <code>/admin/settings</code> переписана: группировка Backup+Cleanup+VACUUM в один блок «Database maintenance» с цветными sub-секциями; color-aware flash (success=зелёный, error=красный — раньше всегда зелёный); статус-бейдж «● Online» в Bot info; новые строки Memory (RSS) и Python version.</li>
+                    <li><strong>Багфикс: uptime всегда показывал 0s</strong>. В <code>_bot_info()</code> использовался <code>psutil.Process().create_time()</code>, но <code>psutil</code> не в <code>requirements.txt</code> — silent fallback на 0. Фикс: <code>_APP_START_TIME = time.time()</code> на уровне модуля, uptime считается от него. Без новой зависимости.</li>
+                    <li><strong>Багфикс: <code>!ban @username</code> без причины → бан влетал на reply-target</strong>. Regex <code>_CMD_BAN</code> и <code>_CMD_WARN</code> матчили <code>@username</code> как reason (если причина не указана). Фикс: negative lookahead <code>(?!@\w+$|\d+$)</code> в reason-группе — теперь <code>!ban @user</code> без причины не матчится, бот просит указать причину.</li>
+                    <li><strong>Багфикс: <code>InputFile</code> стал ABC в aiogram 3.30</strong>. Прямые вызовы <code>InputFile(buf, filename=...)</code> в <code>_build_screenshot_block</code> и <code>_build_sticker_block</code> падали с <code>TypeError: Can't instantiate abstract class InputFile</code>. Фикс: заменены на <code>BufferedInputFile</code> (3 места). Без этого фикса rich-сообщения со скриншотом/стикером от модератора падали.</li>
+                    <li><strong>Удалены stub-команды <code>/addword</code> / <code>/delword</code> / <code>listwords</code></strong>. Они отвечали заглушкой «удалено в v4.8.1» с v4.8.1. WordFilter модель остаётся активной — управляется через web UI <code>/admin/presets</code> (раздел «Запрещённые слова»).</li>
+                    <li><strong>Чистка контекста</strong>. Из контекста <code>/admin/settings</code> убран неиспользуемый <code>db_path</code> (был дубликатом <code>bot_info.db_path</code>).</li>
+                    <li><strong>Регрессия</strong>: 14/14 тестов проходят (включая 2 новых для v4.8.6 — sanity check Settings cleanup и end-to-end render через TestClient).</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.6, <code>import sys</code>, <code>_APP_START_TIME</code>, переписан <code>_bot_info()</code> (без psutil, +memory_rss_bytes, +python_version), убран <code>db_path</code> из контекста, почищен комментарий про WordFilter CRUD.</li>
+                            <li><code>bot_handlers.py</code> — negative lookahead в <code>_CMD_BAN</code>/<code>_CMD_WARN</code>, <code>BufferedInputFile</code> вместо <code>InputFile</code> (3 места), удалены stub-команды <code>/addword</code>/<code>/delword</code>/<code>/listwords</code>, почищены комментарии про WordFilter.</li>
+                            <li><code>db.py</code> — обновлён docstring <code>WordFilter</code> (модель активна, не deprecated).</li>
+                            <li><code>templates/admin_settings.html</code> — полный rewrite (color-aware flash, status badge, Database maintenance grouping, Memory/Python rows).</li>
+                            <li><code>templates/admin_presets.html</code> — убрано упоминание <code>/addword</code>, <code>/delword</code> в подсказке (заменено на <code>!addkeyword</code>, <code>!delkeyword</code>).</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в схеме БД, API endpoints, обработчиках команд. WordFilter модель и таблица не тронуты.</li>
+                </ul>
+
                 <p><strong>v4.8.5.4</strong> — 14 августа 2026 (hotfix: краш при старте на старой БД без project_status_option_name)</p>
                 <ul>
                     <li><strong>Баг</strong>: бот падал при старте с ошибкой <code>sqlite3.OperationalError: no such column: github_settings.project_status_option_name</code> на БД, оставшейся от v4.8.5.2 (где этой колонки ещё не было). <code>init_db()</code> не отрабатывал, Uvicorn убивал процесс.</li>
