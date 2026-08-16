@@ -1,0 +1,67 @@
+name: CI
+
+# До сих пор в репозитории был только auto-label-idea.yml, вешающий label на
+# Issues. Проверок кода не запускалось ни одной, хотя документация проекта
+# утверждала обратное («CI запускает ruff check на push, красный блокирует
+# merge»). Этот workflow — то, что там подразумевалось.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Версия берётся из .python-version — тот же патч, что в Dockerfile.
+      - run: uv python install
+
+      - run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run --frozen ruff check .
+
+  tests:
+    name: сюита
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv python install
+
+      - run: uv sync --frozen
+
+      # Каждый файл — отдельным процессом: сюита писалась как набор
+      # самостоятельных скриптов и в одном процессе конфликтует по
+      # модульному состоянию. Подробности — в docstring раннера.
+      - name: прогон сюиты
+        run: uv run --frozen python tools/run_tests.py
+
+  build:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Прод разворачивается из этого образа, поэтому сборка проверяется на
+      # каждый push: uv sync --frozen здесь падает, если uv.lock разошёлся
+      # с pyproject.toml.
+      - name: сборка образа
+        run: docker build -t degramod:ci .

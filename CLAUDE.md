@@ -1,0 +1,168 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Что это
+
+Telegram-бот-модератор («Дедушка Вобжак») + веб-панель администрирования в одном
+процессе. Селфхост, обслуживает несколько чатов. Один контейнер: FastAPI (веб-панель
++ webhook-эндпоинт) и Aiogram (бот) делят общий event loop и одну SQLite-базу.
+
+Язык кода и комментариев — русский. Соблюдай это в новом коде.
+
+## Команды
+
+Зависимостями управляет **uv**. Python пришпилен к 3.14.7 в `.python-version` и в
+`Dockerfile` — локально, в CI и в проде один и тот же интерпретатор.
+
+```bash
+uv sync                  # поднять окружение из uv.lock
+uv run python bot.py     # запуск: единственная точка входа, поднимает и бота, и веб-панель
+uv run ruff check .      # линт
+uv run ruff check --fix . # починить автоисправимое
+
+# Docker (так деплоится в прод)
+docker build -t degramod .
+docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
+```
+
+`pyproject.toml` содержит `[tool.uv] package = false` — модули лежат в корне, а не в
+пакете, и без этого `uv sync` пытается собрать проект как библиотеку.
+
+В конфиге ruff отключены `RUF001–003` (ругаются на кириллицу, похожую на латиницу —
+в русскоязычном коде это 1296 срабатываний и ноль сигнала) и `B008` (запрещает вызов
+в аргументе по умолчанию, то есть `Depends(...)` — основную идиому FastAPI).
+Базовый уровень на момент перехода — **78 замечаний** по легаси, из них 47
+автоисправимы.
+
+Тестов в репозитории **нет**. Каталог `scripts/` с ~30 тест-файлами был удалён из
+git (коммит `351b6d8`), хотя changelog в `templates/base.html` на них ссылается.
+Не верь упоминаниям «14/14 тестов проходят» — проверить это нечем. Линтера,
+`pyproject.toml` и CI для кода тоже нет; единственный workflow
+(`.github/workflows/auto-label-idea.yml`) вешает label `idea` на новые Issues.
+
+## Переменные окружения
+
+| Переменная | Обязательна | Назначение |
+|---|---|---|
+| `BOT_TOKEN` | **да** — иначе `RuntimeError` на старте | токен Telegram-бота |
+| `WEB_PASSWORD` | де-факто да | пароль SU для веб-панели (логин `su`), сравнивается с env напрямую, не хешируется |
+| `ADMIN_IDS` | да | TG ID глобальных супер-админов через запятую; обходят все проверки прав |
+| `SESSION_SECRET` | нет, но нужна | без неё генерируется случайная при старте → все сессии слетают при рестарте |
+| `DB_PATH` | нет | по умолчанию `/app/data/shadow_logs.db` |
+| `WEBHOOK_URL` | нет | если задан и вебхук установился → webhook-режим, иначе long polling |
+| `WEBHOOK_SECRET` | нет | проверяется в `X-Telegram-Bot-Api-Secret-Token`; без env генерируется случайный |
+| `CHAT_HASHTAGS` | нет | `-100123:Тег,-100456:Тег2` — принудительно создаёт `chat_settings` для этих чатов |
+| `WEB_PUBLIC_URL` | нет | база для ссылок в отчётах; дефолт захардкожен на прод-домен |
+| `PORT` | нет | дефолт 3000 |
+
+Есть и не-env секрет: ключ шифрования GitHub PAT (`db.py:_load_or_create_enc_key`)
+берётся из env или файла рядом с БД, при отсутствии генерируется с правами 0600.
+
+## Архитектура
+
+### Точка входа и цикл импортов
+
+`bot.py` запускается как `__main__`, но `bot_handlers.py` делает late import
+`from bot import X` внутри функций. Без обхода Python грузил бы `bot.py` второй раз
+как модуль `bot` и повторно выполнял `dp.include_router(...)` →
+`RuntimeError: Router is already attached`. Обход — `bot.py:53`:
+
+```python
+sys.modules.setdefault("bot", _self_module)
+```
+
+**Это костыль.** Любой новый `from bot import ...` работает только благодаря ему.
+Правильное решение — вынести общие символы в `bot_handlers.py` (так уже сделали для
+`SetChatSlowModeDelay`) или в третий модуль. Не добавляй новые late imports из `bot`.
+
+### Карта модулей
+
+- `bot.py` (1.6k) — точка входа, `lifespan`, фоновые тики режимов, webhook-роут.
+- `bot_handlers.py` (8.9k) — все хендлеры и вся бизнес-логика модерации.
+- `web_app.py` (4.7k) — веб-панель. Все ~50 роутов вложены внутрь одной функции
+  `create_app()` (строка 588, ~4000 строк) через замыкание на `bot`.
+- `db.py` (1.4k) — модели SQLAlchemy + `init_db()`.
+- `chat_modes.py` — единая логика snapshot/restore/apply прав чата (v4.8.0).
+- `modchat.py` — отправка в модчат, keyword-watch, rate-limit алармов.
+- `github_client.py` — GitHub REST + GraphQL (Issues + Projects v2).
+- `sticker_cache.py` — конвертация стикеров (webp/tgs/webm) в PNG через BytesIO.
+
+### Режимы чата — главный инвариант проекта
+
+Три режима меняют **chat-default permissions** (`set_chat_permissions`), а не
+персональные рестрикты. Инварианты описаны в docstring `chat_modes.py:1-36` и в
+`roadmap.md` §2. Нарушать нельзя:
+
+1. Режимы не трогают per-user рестрикты. `!alarm off` не снимает персональные мьюты.
+2. Snapshot берётся из `chat.permissions`, не из members.
+3. `use_independent_chat_permissions=True` обязателен — централизован в
+   `_apply_chat_permissions`.
+4. Snapshot хранится в БД как JSON из 13 полей `_PERM_FIELDS`. Список полей
+   продублирован в `chat_modes.py` и `bot_handlers.py` — при правке синхронизируй оба.
+5. **Порядок тиков в `_night_mode_loop` (`bot.py`): alarm → sanitary → night.**
+   Иначе sanitary снимет snapshot с alarm-состояния и права «залипнут».
+6. Приоритет режимов: `sanitary > night > alarm > day`.
+
+Восстановление дневных прав — четырёхуровневый fallback:
+`day_permissions` пресет → сохранённый snapshot → системный пресет `Day default`
+→ хардкод `_DAY_DEFAULT_HARDCODED` (продублирован в `bot.py` и `chat_modes.py`).
+
+### Права доступа
+
+Две независимые системы, которые нужно держать в голове одновременно:
+
+- **В боте** — `_is_admin(session, chat_id, user_id)` (`bot_handlers.py:914`):
+  `ADMIN_IDS` env → выключенный чат → `WebUser.role` (`su`/`admin` везде,
+  `moderator` только при записи в `chat_admins`) → fallback на TG-only модератора
+  из `chat_admins`. Деактивированный `WebUser` закрывает доступ окончательно.
+- **В веб-панели** — зависимости `require_auth` / `require_admin` / `require_su`.
+  Роль перечитывается из БД на каждый запрос, токен только подтверждает вход.
+
+### База данных
+
+SQLite + `aiosqlite`, WAL, `foreign_keys=ON` через listener на `connect`.
+Миграции — рукописные, в `init_db()` (`db.py:743`, ~660 строк): для каждой колонки
+`PRAGMA table_info(...)` → `ALTER TABLE ... ADD COLUMN`. Alembic нет.
+
+При добавлении колонки: (1) поле в модель, (2) идемпотентный блок миграции в
+`init_db()`, (3) **блок миграции обязан идти до любого ORM-запроса к этой таблице** —
+ORM подставляет в SELECT все колонки модели и падает на старой БД. Именно этот
+порядок ломал старт бота в v4.8.5.4.
+
+### Changelog
+
+Живёт в `templates/base.html` (модалка в футере, ~строки 640–1200) и это фактический
+источник истины по релизам — он подробнее `roadmap.md` и обычно свежее его.
+Версия — `APP_VERSION` в `web_app.py`.
+
+## Известные ловушки
+
+- **Нет обработки `TelegramRetryAfter`** нигде в проекте. При flood control хендлер
+  просто падает в лог.
+- **`asyncio.create_task` без сохранения ссылки** — `bot_handlers.py:3273, 4727,
+  7962, 8692, 8728`. Задачу может собрать GC на середине. В `bot.py` фоновые задачи
+  уже переведены на `TaskGroup`, в хендлерах — нет.
+- **Блокирующий синхронный SQLite в async-роутах** — `web_app.py:3139, 3607, 3651,
+  3683`, плюс `shutil.copy2` и `VACUUM`. На время бэкапа/вакуума встаёт весь бот,
+  включая обработку сообщений. Движок создан без `busy_timeout`.
+- **Сессия не истекает**: `_verify_token` (`web_app.py:192`) кладёт в payload время
+  выдачи `t`, но никогда его не проверяет.
+- **`_client_ip` доверяет `X-Forwarded-For` безусловно** (`web_app.py:134`) —
+  rate-limit логина обходится подстановкой заголовка.
+- **CSRF-защиты нет** ни на одном из 34 POST-роутов; держится на `SameSite=lax`.
+- Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
+  `bot_handlers.py` и `modchat.py` — правь обе копии.
+- **FastAPI 0.115.6 использует `asyncio.iscoroutinefunction`** (`fastapi/routing.py:233`),
+  который удалят в Python 3.16. Сейчас это только `DeprecationWarning` и приложение
+  работает, но обновиться придётся. Актуальная версия 0.141.1 тянет Starlette 1.6.0,
+  то есть смену мажорной — делать под тестами, см. Task 17 плана.
+
+## Стиль
+
+- Комментарии-версии (`# v4.7.26: FIX ...`) — сложившаяся практика: правки
+  помечаются версией с объяснением, что было сломано. Их ~250. При новом фиксе
+  придерживайся формата, но не превращай комментарий в пересказ changelog.
+- Ошибки Telegram лови как `TelegramAPIError` (базовый класс), а не
+  `TelegramBadRequest` — `TelegramNotFound` и `TelegramForbiddenError` от него не
+  наследуются, и это уже приводило к падению фоновых тиков.
