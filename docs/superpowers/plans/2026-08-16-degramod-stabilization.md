@@ -781,77 +781,228 @@ git commit -m "fix: серверная проверка срока жизни с
 ### Task 8: Rate-limit логина не обходится заголовком
 
 **Files:**
-- Modify: `web_app.py:134`, `685-707`
+- Modify: `web_app.py:120-141` (`_check_login_rate_limit`, `_client_ip`), `web_app.py:685-707` (роут `/login`), `bot.py:1584` (`uvicorn.run`)
 - Test: `tests/test_web_auth.py`
+
+**Interfaces:**
+- Produces: `_check_login_rate_limit(ip: str, username: str) -> bool` — сигнатура меняется, добавляется второй аргумент.
+
+#### Постановка
 
 `_client_ip` безусловно доверяет `X-Forwarded-For`, поэтому лимит в 5 попыток снимается подстановкой произвольного значения. Плюс пароль SU сравнивается оператором `!=`.
 
-- [ ] **Step 1: Написать падающий тест**
+Первая версия этой задачи предлагала завести свой список `TRUSTED_PROXIES` и разбирать заголовок вручную. От неё отказались по двум причинам, вскрывшимся при разборе.
+
+**Первая: разбор брал не ту сторону заголовка.** Каждый прокси дописывает `X-Forwarded-For` справа, поэтому правая часть заголовка написана нашим прокси и клиентом не подделывается, а левую клиент контролирует целиком. `xff.split(",")[0]` берёт именно левый элемент — то есть проверка доверенного прокси добавлялась бы, а данные всё равно брались бы у атакующего.
+
+**Вторая: это уже реализовано в uvicorn, и реализовано правильно.** `ProxyHeadersMiddleware` включён по умолчанию (`proxy_headers=True`) и подменяет `scope["client"]`, если peer входит в `forwarded_allow_ips`. Его алгоритм (`uvicorn/middleware/proxy_headers.py:125`) идёт по заголовку в обратном порядке и возвращает первый недоверенный адрес:
+
+```python
+# Note: each proxy appends to the header list so check it in reverse order
+for host in reversed(x_forwarded_for_hosts):
+    if host not in self:
+        return host
+```
+
+Поэтому правильное решение — не дублировать middleware, а **убрать разбор из `web_app.py` и настроить uvicorn**.
+
+#### Риск, из-за которого задача переделана
+
+Если приложение стоит за обратным прокси (у Bothost это Traefik — упоминается в `bot.py:7`), а `forwarded_allow_ips` настроен неверно, то `request.client.host` будет одинаковым для всех. При ключе лимита по одному только IP пяти неудачных попыток случайного человека хватит, чтобы **заблокировать вход всем администраторам на пять минут**. Сейчас такого нет: лимит просто не работает. То есть наивная починка меняет дыру на отказ в обслуживании.
+
+Поэтому лимит переводится на ключ `(ip, username)` — тогда неверная настройка прокси деградирует до «можно заблокировать один атакуемый аккаунт» вместо «можно заблокировать всех». Топология перестаёт быть вопросом жизни и смерти.
+
+- [ ] **Step 1: Выяснить реальный peer-адрес**
+
+Значение `forwarded_allow_ips` не угадывается и не запрашивается у поддержки Bothost: в `X-Forwarded-For` лежат адреса клиентов, а нужен адрес того, кто устанавливает TCP-соединение с uvicorn. Он виден в логах.
+
+Временно добавить первой строкой в обработчик `/login`:
+
+```python
+_req_logger.info(
+    "DIAG peer=%s xff=%r",
+    request.client.host if request.client else None,
+    request.headers.get("X-Forwarded-For"),
+)
+```
+
+Задеплоить, открыть `/login`, прочитать логи контейнера. Ожидаемо `peer` окажется `127.0.0.1` (прокси в том же контейнере) либо адресом контейнерной сети вида `172.x.x.x`. Записать значение, строку убрать.
+
+- [ ] **Step 2: Написать падающие тесты**
+
+Три сценария: заголовок не влияет на лимит, перебор одного логина не блокирует остальных, перебор логинов с одного адреса упирается в общий потолок.
 
 ```python
 def test_подделка_xff_не_обходит_лимит(client):
-    for i in range(12):
-        client.post(
-            "/login",
-            data={"username": "su", "password": "неверный"},
-            headers={"X-Forwarded-For": f"10.0.0.{i}"},
-        )
-    resp = client.post(
-        "/login",
-        data={"username": "su", "password": "неверный"},
-        headers={"X-Forwarded-For": "10.0.0.99"},
-    )
+    """_client_ip не смотрит в заголовок, поэтому разные значения
+    X-Forwarded-For не дают атакующему лишних попыток."""
+    for i in range(5):
+        client.post("/login",
+                    data={"username": "su", "password": "неверный"},
+                    headers={"X-Forwarded-For": f"10.0.0.{i}"})
+    resp = client.post("/login",
+                       data={"username": "su", "password": "неверный"},
+                       headers={"X-Forwarded-For": "10.0.0.99"})
     assert resp.status_code == 429, "лимит обошли подстановкой X-Forwarded-For"
+
+
+def test_лимит_не_блокирует_другие_аккаунты(client):
+    """Ключ — пара (ip, username). Даже когда адрес у всех общий (панель
+    за прокси), перебор одного логина не должен закрывать вход остальным."""
+    for _ in range(6):
+        client.post("/login", data={"username": "su", "password": "неверный"})
+
+    resp = client.post("/login",
+                       data={"username": "moderator1", "password": "неверный"})
+    assert resp.status_code != 429, "перебор одного аккаунта заблокировал другой"
+
+
+def test_перебор_логинов_с_одного_адреса_упирается_в_потолок(client):
+    """Общий счётчик по адресу закрывает перебор имён пользователей."""
+    for i in range(20):
+        client.post("/login", data={"username": f"user{i}", "password": "неверный"})
+    resp = client.post("/login", data={"username": "ещё_один", "password": "неверный"})
+    assert resp.status_code == 429
 ```
 
-- [ ] **Step 2: Запустить, убедиться что падает**
+- [ ] **Step 3: Запустить, убедиться что падают**
 
-Run: `uv run pytest tests/test_web_auth.py::test_подделка_xff_не_обходит_лимит -v`
-Expected: FAIL — получаем 200, лимит не сработал.
+Run: `uv run pytest tests/test_web_auth.py -v -k "лимит or xff"`
+Expected: FAIL. Первый — потому что заголовок сейчас читается; второй — потому что ключ сейчас только по IP; третий — потому что общего потолка нет.
 
-- [ ] **Step 3: Доверять заголовку только от известного прокси**
+- [ ] **Step 4: Убрать разбор заголовка из `web_app.py`**
 
 ```python
-# Список доверенных прокси. Пусто (дефолт) — заголовок игнорируется целиком,
-# берётся реальный адрес соединения. Заполняется только если панель реально
-# стоит за reverse proxy: TRUSTED_PROXIES=10.0.0.1,10.0.0.2
-_TRUSTED_PROXIES = {
-    ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
-}
-
-
 def _client_ip(request: Request) -> str:
-    """IP клиента. X-Forwarded-For учитывается только от доверенного прокси —
-    иначе любой запрос мог бы назначить себе произвольный адрес и обойти
-    rate-limit на /login."""
-    peer = request.client.host if request.client else "unknown"
-    if peer in _TRUSTED_PROXIES:
-        xff = request.headers.get("X-Forwarded-For", "")
-        if xff:
-            return xff.split(",")[0].strip()
-    return peer
+    """Адрес клиента.
+
+    X-Forwarded-For здесь намеренно НЕ разбирается. Этим занимается
+    ProxyHeadersMiddleware в uvicorn: он идёт по заголовку справа налево
+    и берёт первый недоверенный адрес. Правую часть дописывает наш прокси,
+    и подделать её клиент не может — в отличие от левой, которую он
+    контролирует полностью. Разбор здесь дублировал бы middleware, а взяв
+    левый элемент (как было до v4.9), сводил бы защиту на нет.
+
+    Кого считать прокси — задаётся через forwarded_allow_ips в bot.py.
+    """
+    return request.client.host if request.client else "unknown"
 ```
 
-- [ ] **Step 4: Сделать сравнение пароля SU постоянного времени**
+- [ ] **Step 5: Перевести лимит на ключ `(ip, username)`**
+
+```python
+_LOGIN_RATELIMIT_MAX = 5          # попыток на пару (ip, username)
+_LOGIN_RATELIMIT_IP_MAX = 20      # попыток с одного адреса по всем логинам
+_LOGIN_RATELIMIT_WINDOW = 300     # 5 минут
+
+_login_attempts: dict[tuple[str, str], list[float]] = {}
+_login_attempts_by_ip: dict[str, list[float]] = {}
+
+
+def _check_login_rate_limit(ip: str, username: str) -> bool:
+    """True — попытка разрешена, False — лимит исчерпан.
+
+    Ключ — пара (ip, username), а не один ip. Если панель окажется за
+    прокси с неверно настроенным forwarded_allow_ips, все запросы придут
+    с одного адреса; при ключе только по ip пяти неудачных попыток хватило
+    бы, чтобы заблокировать вход всем администраторам сразу. С парой
+    блокируется лишь атакуемый аккаунт.
+
+    Второй счётчик, по одному ip на все логины, закрывает перебор имён.
+    Его срабатывание логируется: если он выбивается при нормальной
+    нагрузке — это признак того, что адреса схлопнулись в прокси.
+    """
+    now = time.time()
+
+    def _fresh(bucket: list[float]) -> list[float]:
+        return [t for t in bucket if now - t < _LOGIN_RATELIMIT_WINDOW]
+
+    key = (ip, username)
+    per_user = _fresh(_login_attempts.get(key, []))
+    per_ip = _fresh(_login_attempts_by_ip.get(ip, []))
+    _login_attempts[key] = per_user
+    _login_attempts_by_ip[ip] = per_ip
+
+    if len(per_user) >= _LOGIN_RATELIMIT_MAX:
+        return False
+
+    if len(per_ip) >= _LOGIN_RATELIMIT_IP_MAX:
+        _req_logger.warning(
+            "login: исчерпан общий лимит для ip=%s (%d попыток за %ds). "
+            "Если это один и тот же адрес для всех пользователей — проверьте "
+            "forwarded_allow_ips в bot.py",
+            ip, len(per_ip), _LOGIN_RATELIMIT_WINDOW,
+        )
+        return False
+
+    per_user.append(now)
+    per_ip.append(now)
+    return True
+```
+
+- [ ] **Step 6: Подвинуть проверку лимита после разбора формы**
+
+Сейчас `_check_login_rate_limit(ip)` вызывается до `await request.form()`. Новой сигнатуре нужен `username`, поэтому порядок в роуте `/login` меняется: сначала форма, затем проверка лимита.
+
+```python
+form = await request.form()
+username = (form.get("username") or "").strip().lower()
+password = form.get("password", "")
+
+ip = _client_ip(request)
+if not _check_login_rate_limit(ip, username):
+    _req_logger.warning("login rate-limited for ip=%s username=%s", ip, username)
+    return templates.TemplateResponse(
+        "login.html",
+        {
+            "request": request,
+            "error": True,
+            "error_msg": "Too many login attempts. Try again in 5 minutes.",
+        },
+        status_code=429,
+    )
+```
+
+- [ ] **Step 7: Настроить uvicorn**
+
+В `bot.py`, в вызове `uvicorn.run`:
+
+```python
+uvicorn.run(
+    app,
+    host="0.0.0.0",
+    port=PORT,
+    log_level="info",
+    timeout_keep_alive=30,
+    # Кому доверяем X-Forwarded-For. Дефолт uvicorn — "127.0.0.1"; если
+    # Traefik у Bothost стоит отдельным контейнером, сюда нужен адрес его
+    # подсети. Реальное значение получено в Step 1 из логов.
+    forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1"),
+)
+```
+
+Значение `"*"` не использовать: оно велит доверять заголовку от кого угодно, и дыра возвращается ровно в исходном виде.
+
+- [ ] **Step 8: Сделать сравнение пароля SU постоянного времени**
 
 ```python
 if not WEB_PASSWORD or not hmac.compare_digest(password, WEB_PASSWORD):
 ```
 
-- [ ] **Step 5: Запустить тесты**
+- [ ] **Step 9: Запустить тесты**
 
 Run: `uv run pytest tests/test_web_auth.py -v`
-Expected: все зелёные.
+Expected: все зелёные, включая тесты срока жизни сессии из Task 7.
 
-- [ ] **Step 6: Отметить новую переменную в CLAUDE.md**
+- [ ] **Step 10: Отметить новую переменную в CLAUDE.md**
 
-В таблицу переменных окружения добавляется строка `TRUSTED_PROXIES`.
+В таблицу переменных окружения добавляется `FORWARDED_ALLOW_IPS` — кому доверять `X-Forwarded-For`, по умолчанию `127.0.0.1`, значение выясняется по логам (Step 1).
 
-- [ ] **Step 7: Коммит**
+- [ ] **Step 11: Коммит**
 
 ```bash
-git add web_app.py tests/test_web_auth.py CLAUDE.md
-git commit -m "fix: X-Forwarded-For только от доверенного прокси, постоянное сравнение пароля SU"
+git add web_app.py bot.py tests/test_web_auth.py CLAUDE.md
+git commit -m "fix: разбор X-Forwarded-For отдан uvicorn, лимит логина по паре (ip, username)"
 ```
 
 ### Task 9: CSRF-токены на изменяющих запросах
