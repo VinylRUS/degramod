@@ -3924,6 +3924,175 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# v4.8.10 (бонус): !mywarns — самопроверка варнов обычными юзерами
+# ═══════════════════════════════════════════════════════════════════════════
+# Доступна ВСЕМ юзерам (не только модераторам). Запрос @Gleb (11 авг 2026).
+#
+# Поведение:
+#   - В группе: бот удаляет команду → отправляет DM юзеру с инфо по текущему чату.
+#     Если DM невозможен (юзер не запускал /start) — молча игнорирует.
+#   - В DM: бот отвечает напрямую, сводка по всем чатам с активными варнами.
+#
+# Содержимое (per-chat):
+#   - Количество активных варнов
+#   - Дата последнего варна (без причины, без модератора — приватность)
+#
+# Таймаут: per-user per-chat, 5 минут, silent (молча игнорирует при превышении).
+
+_CMD_MYWARNS = re.compile(r"^!mywarns\s*$", re.IGNORECASE)
+_MYWARNS_TIMEOUT_SECONDS = 300  # 5 минут
+_mywarns_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
+
+
+async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> str | None:
+    """Форматирует сводку варнов юзера для конкретного чата.
+
+    Возвращает None если варнов нет. Иначе строку вида:
+      «• Варнов: 2
+        • Последний: 12 авг 2026, 15:30»
+    """
+    total = await _count_warns(session, user_id, chat_id)
+    if total == 0:
+        return None
+
+    # Последний варн (для даты)
+    last_warn = (await session.execute(
+        select(Punishment)
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.chat_id == chat_id,
+            Punishment.action_type == "warn",
+            Punishment.is_revoked.is_(False),
+            Punishment.consumed_by_action.is_(None),
+        )
+        .order_by(Punishment.created_at.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+    lines = [f"• Варнов: {total}"]
+    if last_warn and last_warn.created_at:
+        # Конвертируем UTC → МСК для отображения
+        msk_dt = last_warn.created_at.astimezone(MSK) if last_warn.created_at.tzinfo else last_warn.created_at.replace(tzinfo=timezone.utc).astimezone(MSK)
+        lines.append(f"• Последний: {msk_dt.strftime('%d %b %Y, %H:%M')}")
+
+    return "\n".join(lines)
+
+
+async def _format_user_warns_summary(session, user_id: int) -> str:
+    """Форматирует сводку варнов юзера по всем чатам (для DM).
+
+    Возвращает строку для ответа в DM. Если варнов нет — «✅ У вас нет активных варнов.»
+    """
+    # Находим все чаты, где у юзера есть активные варны
+    chat_ids_with_warns = (await session.execute(
+        select(Punishment.chat_id)
+        .where(
+            Punishment.user_id == user_id,
+            Punishment.action_type == "warn",
+            Punishment.is_revoked.is_(False),
+            Punishment.consumed_by_action.is_(None),
+        )
+        .distinct()
+    )).scalars().all()
+
+    if not chat_ids_with_warns:
+        return "✅ У вас нет активных варнов."
+
+    # Для каждого чата — форматирование
+    parts = ["📊 Ваши активные варны:"]
+    for chat_id in chat_ids_with_warns:
+        # Пытаемся получить название чата из ChatSettings
+        cs = await _get_chat_settings(session, chat_id)
+        chat_title = cs.title if cs and cs.title else f"Чат {chat_id}"
+
+        warn_info = await _format_user_warns_for_chat(session, user_id, chat_id)
+        if warn_info:
+            parts.append(f"\nЧат «{chat_title}»:")
+            parts.append(warn_info)
+
+    return "\n".join(parts)
+
+
+@router.message(F.chat.type.in_(["group", "supergroup"]), F.text.regexp(r"^!mywarns\s*$"))
+async def handle_mywarns_group(message: types.Message) -> None:
+    """!mywarns в группе — удаляет команду, отправляет DM с варнами в этом чате.
+
+    v4.8.10 (бонус): доступна всем юзерам. Per-user per-chat timeout 5 мин, silent.
+    """
+    if not message.from_user or not message.text:
+        return
+    if not _CMD_MYWARNS.match(message.text):
+        return
+
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # Timeout: per-user per-chat, 5 минут, silent
+    now = time.time()
+    key = (user_id, chat_id)
+    last = _mywarns_last_call.get(key, 0)
+    if now - last < _MYWARNS_TIMEOUT_SECONDS:
+        # Silent — молча игнорируем, не отвечаем и не удаляем команду
+        # (чтобы юзер не понял что произошёл таймаут).
+        logger.debug("mywarns timeout for user %s in chat %s (%.0f sec left)",
+                     user_id, chat_id, _MYWARNS_TIMEOUT_SECONDS - (now - last))
+        return
+    _mywarns_last_call[key] = now
+
+    # Удаляем команду (privacy — не показываем другим что юзер проверяет варны)
+    try:
+        await message.delete()
+    except TelegramAPIError as e:
+        logger.warning("mywarns: cannot delete command message in chat %s: %s", chat_id, e)
+
+    # Получаем варны для этого чата
+    async with async_session() as session:
+        warn_info = await _format_user_warns_for_chat(session, user_id, chat_id)
+
+    if warn_info is None:
+        text = "✅ У вас нет активных варнов в этом чате."
+    else:
+        text = f"📊 Ваши варны в этом чате:\n{warn_info}"
+
+    # Отправляем DM. Если невозможно — молча игнорируем.
+    try:
+        await message.bot.send_message(chat_id=user_id, text=text)
+    except TelegramAPIError as e:
+        logger.debug("mywarns: cannot send DM to user %s: %s", user_id, e)
+
+
+@router.message(F.chat.type == "private", F.text.regexp(r"^!mywarns\s*$"))
+async def handle_mywarns_dm(message: types.Message) -> None:
+    """!mywarns в DM — отвечает напрямую, сводка по всем чатам.
+
+    v4.8.10 (бонус): доступна всем юзерам. Per-user timeout 5 мин (per-chat=DM chat id), silent.
+    """
+    if not message.from_user or not message.text:
+        return
+    if not _CMD_MYWARNS.match(message.text):
+        return
+
+    user_id = message.from_user.id
+    chat_id = message.chat.id  # Для DM это = user_id, но используем как ключ таймаута
+
+    # Timeout: per-user per-chat (DM chat id), 5 минут, silent
+    now = time.time()
+    key = (user_id, chat_id)
+    last = _mywarns_last_call.get(key, 0)
+    if now - last < _MYWARNS_TIMEOUT_SECONDS:
+        logger.debug("mywarns DM timeout for user %s (%.0f sec left)",
+                     user_id, _MYWARNS_TIMEOUT_SECONDS - (now - last))
+        return
+    _mywarns_last_call[key] = now
+
+    # Сводка по всем чатам
+    async with async_session() as session:
+        text = await _format_user_warns_summary(session, user_id)
+
+    await message.reply(text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Обработчики команд в ГРУППАХ
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -4087,851 +4256,69 @@ async def handle_group_command(message: types.Message) -> None:
             logger.warning("Не удалось удалить сообщение модератора %s в чате %s",
                            mod.id, chat_id)
 
-    # ── !mute ───────────────────────────────────────────────────────────
-    m = _CMD_MUTE.match(text)
-    if m:
-        dur_str = m.group("dur")
-        reason = m.group("reason")  # v4.8.1: reason обязательна (regex гарантирует)
-        duration_seconds = _parse_duration(dur_str)
-        if duration_seconds is None:
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Не удалось распознать длительность: {dur_str}\n"
-                         f"💡 Формат: 1m, 30м, 1d, 2ч, 1d12h30m (рус/англ)",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        perm_snapshot = None
-        try:
-            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
-            perm_snapshot = _snapshot_permissions(member)
-        except TelegramAPIError as e:
-            logger.warning("get_chat_member before mute failed: %s", e)
-
-        until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
-        try:
-            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
-            await tg_safe_call(
-                lambda: message.bot.restrict_chat_member(
-                    chat_id=chat_id, user_id=target.id,
-                    permissions=_mute_permissions(),
-                    until_date=until_date,
-                ),
-                label="!mute",
-            )
-        except TelegramAPIError as e:
-            logger.error("restrict_chat_member failed: %s", e)
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Мут не удался: {e}",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="mute", reason=reason, mod=mod,
-            duration_seconds=duration_seconds,
-            reply_to_message=message.reply_to_message,
-            moderator_screenshot=message if message.photo else None,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "mute", duration_seconds, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
-        # ── v4.8.1: публичное сообщение в чат (вместо ephemeral) ─────
-        # Громкая команда !mute — публикаем короткое сообщение, чтобы чат
-        # видел, что нарушитель замучен и за что. Без пересланного сообщения.
-        await _send_public_punishment_notice(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action="mute", reason=reason, duration=duration_seconds,
-        )
-
-        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ отчёта. _send_report
-        # читает атрибуты из Python-объекта reply_to_message (text, photo,
-        # file_id, sticker) — они остаются в памяти после удаления. Но мы
-        # перестраховываемся: сначала отчёт уходит в репорт-чат (с текстом
-        # и медиа), и только потом оригинал удаляется из модерируемого чата.
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
-        return
-
-    # ── !smute (v4.8.1: тихий мьют, stealth) ───────────────────────────
-    # Копия v4.8.0 !mute: ephemeral модератору, без публичного сообщения,
-    # причина необязательна. Для обратной совместимости со стелс-режимом.
-    # v4.8.3.1 HOTFIX: в v4.8.3 regex _CMD_SMUTE сделал всё тело опциональным,
-    # поэтому `!smute` без длительности (с reply или без) матчило с dur=None.
-    # Затем `_parse_duration(None)` падал с AttributeError, роняя весь handler.
-    # Теперь явно проверяем dur is None и отправляем ephemeral с подсказкой.
-    m = _CMD_SMUTE.match(text)
-    if m:
-        dur_str = m.group("dur")
-        # v4.8.3.1: regex может дать dur=None если юзер написал `!smute` без
-        # аргументов. Это не валидный вызов — мьют без длительности не имеет
-        # смысла (нельзя молчать «навсегда» через restrict_chat_member без
-        # until_date — это технически возможно, но ломает логику unmute).
-        if dur_str is None:
-            try:
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        "❌ Не указана длительность мьюта.\n"
-                        "💡 Формат: <code>!smute 1d [причина]</code>, "
-                        "<code>!smute @user 2h Причина</code>, "
-                        "<code>!smute 30m</code>.\n"
-                        "Поддерживаемые единицы: <b>м/m</b> (минуты), "
-                        "<b>ч/h</b> (часы), <b>д/d</b> (дни). "
-                        "Комбинированные: <code>1d12h30m</code>."
-                    ),
-                )
-            except Exception:
-                pass
-            return
-        reason = m.group("reason") or "(без причины)"
-        duration_seconds = _parse_duration(dur_str)
-        if duration_seconds is None:
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Не удалось распознать длительность: {dur_str}\n"
-                         f"💡 Формат: 1m, 30м, 1d, 2ч, 1d12h30m (рус/англ)",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        perm_snapshot = None
-        try:
-            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
-            perm_snapshot = _snapshot_permissions(member)
-        except TelegramAPIError as e:
-            logger.warning("get_chat_member before smute failed: %s", e)
-
-        until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
-        try:
-            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
-            await tg_safe_call(
-                lambda: message.bot.restrict_chat_member(
-                    chat_id=chat_id, user_id=target.id,
-                    permissions=_mute_permissions(),
-                    until_date=until_date,
-                ),
-                label="!smute",
-            )
-        except TelegramAPIError as e:
-            logger.error("restrict_chat_member failed (smute): %s", e)
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Мут не удался: {e}",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="mute", reason=reason, mod=mod,
-            duration_seconds=duration_seconds,
-            reply_to_message=message.reply_to_message,
-            moderator_screenshot=message if message.photo else None,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "mute", duration_seconds, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
-        # ── Ephemeral-подтверждение модератору (видно только ему) ────
-        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
-        reason_safe = html.escape(reason, quote=False) if reason and reason != "(без причины)" else ""
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=(
-                f"✅ Замьютил {_user_mention_html(target)} на "
-                f"{_format_duration(duration_seconds)}"
-                + (f" за: {reason_safe}" if reason_safe else "")
-                + "."
-            ),
-        )
-
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
-        return
-
-    # ── !warn ───────────────────────────────────────────────────────────
-    # v4.8.1: громкая команда. Причина обязательна (regex гарантирует).
-    # Убрано: ephemeral модератору, уведомление нарушителю.
-    # Добавлено: публичное сообщение в чат.
-    m = _CMD_WARN.match(text)
-    if m:
-        reason = m.group("reason")
-
-        # Сначала сохраняем наказание — тогда _count_warns внутри _send_report
-        # и здесь будет учитывать только что выданный варн.
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "warn", 1, reason, target_content,
-            )
-            total_warns_now = await _count_warns(session, target.id, chat_id)
-            # Подтягиваем настройки чата — нужны пороги для проверки below.
-            chat_settings = await _get_chat_settings(session, chat_id)
-
-        # Теперь отчёт — в нём будет правильный счётчик варнов
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="warn", reason=reason, warn_points=1, mod=mod,
-            reply_to_message=message.reply_to_message,
-            moderator_screenshot=message if message.photo else None,
-        )
-
-        # ── v4.8.1: публичное сообщение в чат (вместо ephemeral) ─────
-        # Громкая команда !warn — чат видит, кто и за что получил варн.
-        await _send_public_punishment_notice(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action="warn", reason=reason,
-        )
-
-        # Проверяем порог варнов (тоже использует обновлённый счётчик)
-        await _check_warn_threshold(
-            bot=message.bot, chat_id=chat_id,
-            target=target, mod=mod,
-        )
-
-        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций с ним.
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
-        return
-
-    # ── !swarn (v4.8.1: тихий варн, stealth) ───────────────────────────
-    # Копия v4.8.0 !warn: ephemeral модератору + уведомление нарушителю
-    # (ОСОБОЕ требование пользователя — у !swarn уведомление нарушителю
-    # ОСТАЁТСЯ, в отличие от громкого !warn, где оно убрано).
-    # Причина необязательна (regex допускает !swarn без аргументов).
-    m = _CMD_SWARN.match(text)
-    if m:
-        reason = m.group("reason") or "(без причины)"
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "warn", 1, reason, target_content,
-            )
-            total_warns_now = await _count_warns(session, target.id, chat_id)
-            chat_settings = await _get_chat_settings(session, chat_id)
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="warn", reason=reason, warn_points=1, mod=mod,
-            reply_to_message=message.reply_to_message,
-            moderator_screenshot=message if message.photo else None,
-        )
-
-        # ── v4.4.9: Уведомление НАРУШИТЕЛЮ (видно только ему) ────────
-        # Остаётся только для тихой команды !swarn (особое требование).
-        await _send_user_warn_notification(
-            bot=message.bot, chat_id=chat_id, target=target,
-            reason=reason, total_warns=total_warns_now,
-            settings=chat_settings,
-        )
-
-        # ── Ephemeral-подтверждение модератору (видно только ему) ────
-        reason_safe = html.escape(reason, quote=False) if reason and reason != "(без причины)" else ""
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=(
-                f"✅ Варн выдан {_user_mention_html(target)}"
-                + (f" за: {reason_safe}" if reason_safe else "")
-                + f". Варнов всего: {total_warns_now}"
-            ),
-        )
-
-        await _check_warn_threshold(
-            bot=message.bot, chat_id=chat_id,
-            target=target, mod=mod,
-        )
-
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
-        return
-
-    # ── !ban ────────────────────────────────────────────────────────────
-    # v4.8.1: громкая команда. Причина обязательна (regex гарантирует).
-    # Убрано: ephemeral подтверждение модератору (техническое ephemeral про
-    # автодобавление стикерпака — ОСТАЁТСЯ, это не дубликат публичного бана).
-    # Добавлено: публичное сообщение в чат.
+    # ── v4.8.10: 11 команд вынесены в mod_commands.py ──────────────────────
+    # Раньше тут были inline-блоки для !mute, !smute, !warn, !swarn, !sban,
+    # !unmute, !unban, !unwarn, !warns, !resetwarns, !resetmc — суммарно
+    # ~850 строк. Теперь все они в mod_commands.COMMANDS dict, и handle_group_command
+    # просто вызывает нужную функцию по имени команды.
+    # cmd_ban уже был вынесен в v4.8.9 — он тоже в COMMANDS.
     #
-    # v4.8.9: блок !ban вынесен в mod_commands.cmd_ban (декомпозиция
-    # handle_group_command, см. 03_TASK_v4.8.9.md §1). Остальные 11 команд
-    # пока обрабатываются inline ниже — TODO v4.9.0.
-    if _CMD_BAN.match(text):
-        from mod_commands import ModContext, cmd_ban
-        ctx = ModContext(
-            chat_id=chat_id,
-            mod=mod,
-            target=target,
-            target_content=target_content,
-            text=text,
-        )
-        await cmd_ban(message, ctx)
-        return
+    # Порядок проверок сохранён: бан-команды первыми, потом мьют/варн, потом
+    # команды снятия/информации. Это важно для regex-приоритета (например,
+    # !ban матчится раньше !bansticker, если бы он был мод-командой).
+    from mod_commands import COMMANDS as _MOD_COMMANDS
+    from mod_commands import ModContext as _ModContext
 
-    # ── !sban (v4.8.1: тихий бан, stealth) ─────────────────────────────
-    # Копия v4.8.0 !ban: ephemeral модератору, без публичного сообщения.
-    # Причина необязательна (regex допускает !sban без аргументов).
-    # Автодобавление стикерпака при бане за стикер — сохраняется.
-    m = _CMD_SBAN.match(text)
-    if m:
-        reason = m.group("reason") or "(без причины)"
+    _ctx = _ModContext(
+        chat_id=chat_id,
+        mod=mod,
+        target=target,
+        target_content=target_content,
+        text=text,
+    )
 
-        perm_snapshot = None
-        try:
-            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
-            perm_snapshot = _snapshot_permissions(member)
-        except TelegramAPIError as e:
-            logger.warning("get_chat_member before sban failed: %s", e)
-
-        try:
-            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
-            await tg_safe_call(
-                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
-                label="!sban",
-            )
-        except TelegramAPIError as e:
-            logger.error("ban_chat_member failed (sban): %s", e)
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Бан не удался: {e}",
-                )
-            except TelegramAPIError:
-                pass
+    # Проверяем команды в порядке объявления в handle_group_command (важно для regex).
+    # Каждая cmd_X сама проверяет свой regex через ctx.text и возвращает None если не матчит.
+    _cmd_handlers_in_order = [
+        _MOD_COMMANDS["mute"],
+        _MOD_COMMANDS["smute"],
+        _MOD_COMMANDS["warn"],
+        _MOD_COMMANDS["swarn"],
+        _MOD_COMMANDS["sban"],
+        _MOD_COMMANDS["unmute"],
+        _MOD_COMMANDS["unban"],
+        _MOD_COMMANDS["unwarn"],
+        _MOD_COMMANDS["warns"],
+        _MOD_COMMANDS["resetwarns"],
+        _MOD_COMMANDS["resetmc"],
+    ]
+    for _handler in _cmd_handlers_in_order:
+        _matched_before = _handler.__name__.replace("cmd_", "")
+        # Каждая cmd_X внутри себя делает regex-проверку и возвращает None если не матчит.
+        # Если сматчилась — выполняет команду и return'ит (внутри функции).
+        # Но мы не видим return из функции здесь. Поэтому проверяем regex здесь
+        # и вызываем только если матчит.
+        _cmd_regex_map = {
+            "mute": _CMD_MUTE,
+            "smute": _CMD_SMUTE,
+            "warn": _CMD_WARN,
+            "swarn": _CMD_SWARN,
+            "sban": _CMD_SBAN,
+            "unmute": _CMD_UNMUTE,
+            "unban": _CMD_UNBAN,
+            "unwarn": _CMD_UNWARN,
+            "warns": _CMD_WARNS,
+            "resetwarns": _CMD_RESETWARNS,
+            "resetmc": _CMD_RESETMC,
+        }
+        _regex = _cmd_regex_map.get(_matched_before)
+        if _regex and _regex.match(text):
+            await _handler(message, _ctx)
             return
 
-        # v4.7.27: дедупликация — помечаем что бан выполнил сам бот.
-        _mark_bot_ban(chat_id, target.id)
-
-        # v4.8.3: автодобавление стикерпака + отслеживание newly_added
-        # (как для !ban). Перенесено ДО _send_report чтобы инфа о стикерпаке
-        # попала в отчёт (пункт «📦 Использованный стикерпак забанен»).
-        sticker = getattr(message.reply_to_message, "sticker", None) if message.reply_to_message else None
-        sticker_pack_info: tuple[str, bool] | None = None
-        if sticker and sticker.set_name:
-            try:
-                # v4.8.3: проверяем — был ли стикерпак уже в бан-листе ДО добавления.
-                async with async_session() as session:
-                    existing_pack = (
-                        await session.execute(
-                            select(BannedStickerPack).where(
-                                BannedStickerPack.chat_id == chat_id,
-                                BannedStickerPack.pack_name == sticker.set_name,
-                                BannedStickerPack.is_active.is_(True),
-                            )
-                        )
-                    ).scalar_one_or_none()
-                was_newly_added = (existing_pack is None)
-
-                async with async_session() as session:
-                    await _add_banned_sticker_pack(
-                        session,
-                        chat_id=chat_id,
-                        pack_name=sticker.set_name,
-                        punishment="ban",
-                        reason=f"Auto-added via !sban by mod {mod.id}: {reason}",
-                        added_by_mod_id=mod.id,
-                        added_via="auto_ban",
-                    )
-                logger.info(
-                    "v4.5.2 auto-banned sticker pack '%s' in chat %s (via !sban by mod %s)",
-                    sticker.set_name, chat_id, mod.id,
-                )
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        f"🎭 Стикерпак <code>{sticker.set_name}</code> "
-                        f"автодобавлен в бан-лист (punishment=ban)."
-                    ),
-                )
-                sticker_pack_info = (sticker.set_name, was_newly_added)
-            except Exception as e:
-                logger.warning(
-                    "auto-add sticker pack '%s' failed (sban): %s", sticker.set_name, e
-                )
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="ban", reason=reason, mod=mod,
-            reply_to_message=message.reply_to_message,
-            sticker_pack_info=sticker_pack_info,
-            moderator_screenshot=message if message.photo else None,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "ban", None, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
-        # ── Ephemeral-подтверждение модератору (видно только ему) ────
-        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
-        reason_safe = html.escape(reason, quote=False) if reason and reason != "(без причины)" else ""
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=(
-                f"✅ Забанен {_user_mention_html(target)}"
-                + (f" за: {reason_safe}" if reason_safe else "")
-                + "."
-            ),
-        )
-
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам удаление.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
-        return
-
-    # ── !unmute ─────────────────────────────────────────────────────────
-    # Размут выдаёт ТЕКУЩИЕ дефолтные права чата (Chat.permissions),
-    # а не индивидуальный снапшот — так ночной режим и прочие
-    # ограничения чата не ломаются при размуте посреди ночи.
-    if _CMD_UNMUTE.match(text):
-        try:
-            chat_info = await message.bot.get_chat(chat_id=chat_id)
-            chat_perms = chat_info.permissions
-            if chat_perms is None:
-                # Группа с супер-админом без дефолтных прав — даём всё
-                chat_perms = types.ChatPermissions(can_send_messages=True)
-            # v4.7.14: зануляем админские права — они НЕ должны
-            # восстанавливаться через restrict_chat_member. Если у чата
-            # в дефолтных правах вдруг есть can_change_info/can_invite_users/
-            # can_pin_messages (что бывает, если владелец открыл их для всех),
-            # то без этой очистки unmute мог бы "случайно" раздать админ-права
-            # размьюченному. Админ-права выдаются только через promote.
-            chat_perms = types.ChatPermissions(
-                can_send_messages=getattr(chat_perms, "can_send_messages", False),
-                can_send_audios=getattr(chat_perms, "can_send_audios", False),
-                can_send_documents=getattr(chat_perms, "can_send_documents", False),
-                can_send_photos=getattr(chat_perms, "can_send_photos", False),
-                can_send_videos=getattr(chat_perms, "can_send_videos", False),
-                can_send_video_notes=getattr(chat_perms, "can_send_video_notes", False),
-                can_send_voice_notes=getattr(chat_perms, "can_send_voice_notes", False),
-                can_send_polls=getattr(chat_perms, "can_send_polls", False),
-                can_send_other_messages=getattr(chat_perms, "can_send_other_messages", False),
-                can_add_web_page_previews=getattr(chat_perms, "can_add_web_page_previews", False),
-                # Админские права — НЕ передаются (Telegram проигнорирует,
-                # но мы явно не ставим их в True).
-            )
-        except TelegramAPIError as e:
-            logger.error("get_chat for unmute failed: %s", e)
-            try:
-                await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался (get_chat): {e}")
-            except TelegramAPIError:
-                pass
-            return
-
-        try:
-            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
-            await tg_safe_call(
-                lambda: message.bot.restrict_chat_member(
-                    chat_id=chat_id, user_id=target.id,
-                    permissions=chat_perms,
-                ),
-                label="!unmute",
-            )
-        except TelegramAPIError as e:
-            logger.error("unmute restrict failed: %s", e)
-            try:
-                await message.bot.send_message(chat_id=mod.id, text=f"❌ Размут не удался: {e}")
-            except TelegramAPIError:
-                pass
-            return
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="unmute", mod=mod,
-            reply_to_message=message.reply_to_message,
-        )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            # Пометим последний активный мьют как снятый (для истории/веб-панели)
-            await _revoke_last_action(
-                session, target.id, chat_id, "mute", revoked_by_mod_id=mod.id,
-            )
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "unmute", None, None, target_content,
-            )
-
-        # ── Ephemeral-подтверждение модератору (видно только ему) ────
-        # Нарушитель НЕ уведомляется — стелс-режим бота сохраняется.
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=f"✅ Размьючен {_user_mention_html(target)}.",
-        )
-
-        # v4.5.1: audit в репорт-чат (кратко: кто что снял вручную)
-        await _send_audit_to_report(
-            bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-            action_label="мьют", detail="команда !unmute",
-        )
-
-        return
-
-    # ── !unban — разбанить юзера (reply) ──────────────────────────────
-    # Telegram: unban_chat_member снимает бан. Если юзер не забанен —
-    # команда безопасна (ничего не делает, но Bot API может вернуть ошибку,
-    # которую мы просто логируем).
-    if _CMD_UNBAN.match(text):
-        # v4.8.1: используем переиспользуемую revoke_user_ban (паритет с
-        # веб-панелью POST /api/unban). Техническая часть (unban_chat_member
-        # + DB) — в функции. Специфичные для TG-команды вещи (report в
-        # репорт-чат, ephemeral модератору, audit) — здесь, после успеха.
-        result = await revoke_user_ban(
-            bot=message.bot, chat_id=chat_id, user_id=target.id,
-            mod_id=mod.id, reason=None, target_user=target,
-        )
-        if not result.get("ok"):
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Разбан не удался: {result.get('error', 'unknown')}",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="unban", mod=mod,
-            reply_to_message=message.reply_to_message,
-        )
-
-        # ── Ephemeral-подтверждение модератору ────
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=f"✅ Разбанен {_user_mention_html(target)}.",
-        )
-
-        # v4.5.1: audit в репорт-чат
-        await _send_audit_to_report(
-            bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-            action_label="бан", detail="команда !unban",
-        )
-
-        return
-
-    # ── !unwarn [N] — снять N последних варнов (reply) ────────────────
-    # По умолчанию N=1. Снятые варны помечаются is_revoked=True и больше
-    # не учитываются в _count_warns / _check_warn_threshold.
-    # v4.5.1: cap = текущее количество активных варнов на юзере (раньше было 100).
-    # Если попросили снять больше, чем есть, — снимаем сколько есть, без ошибки.
-    m = _CMD_UNWARN.match(text)
-    if m:
-        n_str = m.group(1)
-        n = int(n_str) if n_str else 1
-        if n < 1:
-            n = 1
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            # v4.5.1: cap = текущее количество активных (не снятых, не погашенных) варнов.
-            # Так !unwarn 999 у юзера с 3 варнами снимет 3, а не упадёт.
-            current_warns = await _count_warns(session, target.id, chat_id)
-            n_effective = min(n, max(current_warns, 1))
-            revoked_count = await _revoke_last_warns(
-                session, target.id, chat_id, n_effective, revoked_by_mod_id=mod.id,
-            )
-            # Сохраняем запись о снятии (как отдельную "санкцию" типа unwarn)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "unwarn", revoked_count, f"Снято {revoked_count} варн(а/ов)", None,
-            )
-            total_warns_now = await _count_warns(session, target.id, chat_id)
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="unwarn", reason=f"Снято {revoked_count} варн(а/ов)",
-            warn_points=revoked_count, mod=mod,
-            reply_to_message=message.reply_to_message,
-        )
-
-        # ── Ephemeral-подтверждение модератору ────
-        await _send_ephemeral(
-            bot=message.bot, chat_id=chat_id, recipient=mod,
-            text=(
-                f"✅ Снято {revoked_count} варн(а/ов) с {_user_mention_html(target)}."
-                f" Варнов всего: {total_warns_now}"
-            ),
-        )
-
-        # v4.5.1: audit в репорт-чат
-        await _send_audit_to_report(
-            bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-            action_label="варн(а/ов)", detail="команда !unwarn",
-            count=revoked_count,
-        )
-
-        return
-
-    # ── !warns — показать текущее количество варнов юзера ─────────────
-    if _CMD_WARNS.match(text):
-        async with async_session() as session:
-            total_warns = await _count_warns(session, target.id, chat_id)
-            settings = await _get_chat_settings(session, chat_id)
-
-        warn_mute = settings.warns_to_mute if settings.warns_to_mute > 0 else None
-        warn_ban = settings.warns_to_ban if settings.warns_to_ban > 0 else None
-
-        info_parts = [f"⚠️ Варнов: {total_warns}"]
-        if warn_mute:
-            info_parts.append(f"Автомьют при {warn_mute}")
-        if warn_ban:
-            info_parts.append(f"Автобан при {warn_ban}")
-
-        try:
-            await message.bot.send_message(
-                chat_id=message.from_user.id,
-                text=f"👤 {target.first_name or ''}{' ' + target.last_name if target.last_name else ''}"
-                     f"{' @' + target.username if target.username else ''}\n"
-                     + "\n".join(info_parts),
-            )
-        except TelegramAPIError:
-            # Если бот не может написать в личку — ответ в чат (будет удалён)
-            sent = await message.bot.send_message(
-                chat_id=chat_id,
-                text=f"⚠️ {target.first_name or target.id}: {total_warns} варнов",
-            )
-            # Удаляем ответ через 30 секунд
-            # v4.7.3: Semaphore(100) — тот же лимит что и для ephemeral,
-            # т.к. это тоже auto-delete фоновой задачей.
-            async def _del_msg():
-                try:
-                    async with _EPHEMERAL_DELETE_SEM:
-                        await asyncio.sleep(30)
-                        try:
-                            await message.bot.delete_message(
-                                chat_id=chat_id, message_id=sent.message_id,
-                            )
-                        except TelegramAPIError:
-                            pass
-                except asyncio.CancelledError:
-                    raise
-            _spawn_background_task(_del_msg(), label="del_msg")
-        try:
-            await message.delete()
-        except TelegramAPIError:
-            pass
-        return
-
-    # ── !resetwarns — обнулить варны юзера ────────────────────────────
-    # v4.5.1: переписано. Раньше занулял duration_seconds (ломало фильтр
-    # active/revoked в веб-панели, не писало audit, не закрывало варны
-    # корректно для !unwarn). Теперь помечаем все активные варны юзера
-    # is_revoked=True с revoked_by_mod_id и шлём audit в репорт-чат.
-    # Доступ: только ADMIN_IDS env или WebUser с role su/admin. Рядовой
-    # модератор не может обнулить чужие варны (включая свои собственные —
-    # слишком легко заметать следы).
-    if _CMD_RESETWARNS.match(text):
-        # ── Role check ──
-        async with async_session() as session:
-            mod_role = await _get_web_user_role(session, mod.id)
-        is_privileged = (mod.id in ADMIN_IDS) or (mod_role in ("su", "admin"))
-        if not is_privileged:
-            try:
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        "❌ !resetwarns доступен только SU/Admin. "
-                        "Используйте !unwarn N для снятия отдельных варнов."
-                    ),
-                )
-            except Exception:
-                pass
-            return
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-
-            # Помечаем все активные warn-записи юзера в чате как снятые
-            stmt = (
-                select(Punishment)
-                .where(
-                    Punishment.user_id == target.id,
-                    Punishment.chat_id == chat_id,
-                    Punishment.action_type == "warn",
-                    Punishment.is_revoked.is_(False),
-                )
-            )
-            result = await session.execute(stmt)
-            warns = result.scalars().all()
-            now = datetime.now(timezone.utc)
-            for w in warns:
-                w.is_revoked = True
-                w.revoked_at = now
-                w.revoked_by_mod_id = mod.id
-            if warns:
-                await session.commit()
-            total_reset = len(warns)
-
-            # Сохраняем запись о сбросе (как отдельную "санкцию" типа unwarn)
-            if total_reset > 0:
-                await _save_punishment(
-                    session, target.id, mod.id, chat_id,
-                    "unwarn", total_reset,
-                    f"Полный сброс варнов ({total_reset} шт.)", None,
-                )
-
-        try:
-            await message.bot.send_message(
-                chat_id=message.from_user.id,
-                text=f"✅ Варны обнулены: {target.first_name or ''}"
-                     f"{' ' + target.last_name if target.last_name else ''}"
-                     f"{' @' + target.username if target.username else ''}"
-                     f" (сброшено {total_reset} записей)",
-            )
-        except TelegramAPIError:
-            pass
-
-        # v4.5.1: audit в репорт-чат
-        if total_reset > 0:
-            await _send_audit_to_report(
-                bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-                action_label="варн(а/ов) — полный сброс",
-                detail="команда !resetwarns",
-                count=total_reset,
-            )
-
-        try:
-            await message.delete()
-        except TelegramAPIError:
-            pass
-        return
-
-    # ── !resetmc — сброс счётчика автомьютов (v4.8.4) ──────────────────
-    # Прогрессивные муты: base_duration + (count * 60 сек). !resetmc
-    # обнуляет count для (chat_id, target.id). Доступ: SU/Admin только.
-    # Цель: reply, ИЛИ !resetmc @username, ИЛИ !resetmc <tgid>.
-    if _CMD_RESETMC.match(text):
-        # ── Role check (SU/Admin only, как !resetwarns) ──
-        async with async_session() as session:
-            mod_role = await _get_web_user_role(session, mod.id)
-        is_privileged = (mod.id in ADMIN_IDS) or (mod_role in ("su", "admin"))
-        if not is_privileged:
-            try:
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        "❌ !resetmc доступен только SU/Admin. "
-                        "Сброс счётчика автомьютов — привилегия администратора."
-                    ),
-                )
-            except Exception:
-                pass
-            try:
-                await message.delete()
-            except TelegramAPIError:
-                pass
-            return
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-
-            # Сбрасываем счётчик автомьютов
-            old_count = await _reset_automute_count(session, chat_id, target.id)
-            await session.commit()
-
-        try:
-            await message.bot.send_message(
-                chat_id=message.from_user.id,
-                text=(
-                    f"✅ Счётчик автомьютов обнулён: "
-                    f"{target.first_name or ''}"
-                    f"{' ' + target.last_name if target.last_name else ''}"
-                    f"{' @' + target.username if target.username else ''}"
-                    f" (было {old_count})"
-                ),
-            )
-        except TelegramAPIError:
-            pass
-
-        # audit в репорт-чат
-        await _send_audit_to_report(
-            bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-            action_label="счётчик автомьютов — сброс",
-            detail=f"команда !resetmc (было {old_count})",
-            count=old_count,
-        )
-
-        try:
-            await message.delete()
-        except TelegramAPIError:
-            pass
-        return
+    # Ни одна команда не сматчилась — это не мод-команда.
+    # (filter _ModerationCommandFilter в декораторе уже должен был отсечь,
+    # но это defensive guard для случая если filter изменят.)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

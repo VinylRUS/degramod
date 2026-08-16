@@ -640,6 +640,15 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.10</strong> — 16 августа 2026 (завершение декомпозиции + behavioral-тесты + !mywarns бонус)</p>
+                <ul>
+                    <li><strong>Декомпозиция handle_group_command завершена</strong>. Все 11 оставшихся команд (!sban, !mute, !smute, !warn, !swarn, !unmute, !unban, !unwarn, !warns, !resetwarns, !resetmc) перенесены из 1011-строчного монолита в <code>mod_commands.py</code>. <code>handle_group_command</code> теперь ~65-строчный dispatcher. Все 12 команд в одном файле.</li>
+                    <li><strong>Частичная декомпозиция create_app()</strong>. 4 роута перенесены в <code>web/</code> package: <code>/</code> и <code>/avatar/*</code> → <code>web/me.py</code>; <code>/api/presets</code> и <code>/api/automute-count</code> → <code>web/api.py</code>. Вместе с v4.8.9 — 6 из 53 роутов. Остальные 47 — TODO v4.9.0.</li>
+                    <li><strong>Behavioral-тесты</strong>. 14 новых проверок: все 54 роута зарегистрированы, protected GET → 303 /login, /admin/* рендерятся с SU, POST → 403 без CSRF, перенесённые роуты работают. Regression теперь 60/60.</li>
+                    <li><strong>!mywarns (бонус)</strong>. Команда доступна всем юзерам — самопроверка варнов. В группе: удаляет команду + DM с инфо по текущему чату. В DM: сводка по всем чатам. Per-user per-chat timeout 5 мин, silent. Пока не анонсируется — пробная фича.</li>
+                    <li><strong>Alembic: DB_USE_LEGACY_MIGRATIONS=1 recommended</strong> для прод-деплоя до v5.0.0. Старый <code>init_db()</code> не упадёт на существующей БД. Alembic остаётся для локальной разработки.</li>
+                    <li><strong>Совместимость</strong>: 100%. Регрессия 60/60. <code>ruff check</code> чистый.</li>
+                </ul>
                 <p><strong>v4.8.9.1</strong> — 16 августа 2026 (hotfix: auto-stamp для существующих БД без alembic_version)</p>
                 <ul>
                     <li><strong>Auto-stamp в init_db_with_fallback()</strong>. v4.8.9 требовала ручного выполнения <code>alembic stamp head</code> на существующей прод-БД перед первым деплоем. Без этого Alembic пытался применить <code>initial migration</code> к уже существующей схеме → <code>table already exists</code> → циклический рестарт контейнера. Теперь: <code>init_db_with_fallback()</code> автоматически определяет существующую БД (есть таблицы, но нет <code>alembic_version</code>) и помечает её как актуальную через <code>alembic stamp head</code>. После этого <code>upgrade head</code> — no-op. <strong>Действий при деплое больше не требуется</strong> — просто залить файлы и обновить Git.</li>

@@ -55,7 +55,7 @@ from aiogram.types import (
     RichTextUrl,
 )
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 
@@ -128,7 +128,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.9.2"
+APP_VERSION = "v4.8.10"
 APP_RELEASE_DATE = "2026-08-16"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -861,30 +861,24 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
     # ── v4.8.9: Routers из web/ package ──────────────────────────────────
     # Декомпозиция create_app() — см. 03_TASK_v4.8.9.md §2 и web/__init__.py.
-    # Пока перенесены 2 роута (/health и /logout) как proof-of-concept.
-    # Остальные 52 роута — inline ниже, TODO v4.9.0.
+    # v4.8.9: /health и /logout перенесены.
+    # v4.8.10: / (root), /avatar/*, /api/presets, /api/automute-count перенесены.
+    # Остальные 47 роутов — inline ниже, TODO v4.9.0.
+    from web.api import router as api_router
     from web.auth import router as auth_router
     from web.health import router as health_router
+    from web.me import router as me_router
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(me_router)
+    app.include_router(api_router)
 
-    # ── v4.5: Endpoint для отдачи аватарок ────────────────────────────
-    # Возвращает файл <AVATARS_DIR>/<tg_user_id>.jpg. Если файла нет —
-    # 404 (шаблон должен проверить avatar_url перед рендером <img>).
-    # v4.5.1: добавлена проверка require_auth — чтобы посторонние не могли
-    # перебирать tg_user_id и тащить аватарки. Шаблоны используют тот же
-    # домен, так что браузер автоматически шлёт cookie с сессией.
-    @app.get("/avatar/{tg_user_id:int}")
-    async def get_avatar(tg_user_id: int, _auth: AuthUser = Depends(require_auth)):
-        path = _avatar_path(tg_user_id)
-        if not os.path.exists(path):
-            raise HTTPException(status_code=404)
-        return FileResponse(path, media_type="image/jpeg")
+    # ── v4.5: Endpoint для отдачи аватарок — v4.8.10 перенесён в web/me.py ─
+    # Раньше тут был inline @app.get("/avatar/{tg_user_id:int}").
+    # Теперь — в web/me.py, подключён через app.include_router выше.
 
-    # ── Root → редирект на login ────────────────────────────────────────
-    @app.get("/")
-    async def root():
-        return RedirectResponse(url="/login", status_code=302)
+    # ── Root → редирект на login — v4.8.10 перенесён в web/me.py ────────
+    # Раньше тут был inline @app.get("/").
 
     # ── GET /login ──────────────────────────────────────────────────────
     @app.get("/login", response_class=HTMLResponse)
@@ -4551,31 +4545,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             status_code=303,
         )
 
-    @app.get("/api/presets")
-    async def api_presets_list(
-        scope: str = "",
-        _auth: AuthUser = Depends(require_admin),
-    ):
-        """v4.6.0: JSON-API список пресетов (для динамической подгрузки в admin_chats)."""
-        async with async_session() as session:
-            q = select(PermissionPreset).order_by(
-                PermissionPreset.scope, PermissionPreset.name
-            )
-            if scope in ("day", "night", "sanitary"):
-                q = q.where(PermissionPreset.scope == scope)
-            presets = (await session.execute(q)).scalars().all()
-        return JSONResponse({
-            "presets": [
-                {
-                    "id": p.id,
-                    "name": p.name,
-                    "scope": p.scope,
-                    "permissions": json.loads(p.permissions) if p.permissions else {},
-                    "is_system": p.is_system,
-                }
-                for p in presets
-            ]
-        })
+    # v4.8.10: /api/presets перенесён в web/api.py.
+    # Раньше тут был inline @app.get("/api/presets") — JSON-API список пресетов.
+    # Теперь — в web/api.py, подключён через app.include_router выше.
 
     # ════════════════════════════════════════════════════════════════════
     # v4.8.1: Web unban (#3) — список активных банов + API разбана
@@ -4867,46 +4839,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 status_code=500,
             )
 
-    # ── v4.8.4: API для просмотра счётчика автомьютов ───────────────────
-    # GET /api/automute-count?chat_id=X&user_id=Y — возвращает текущий count.
-    # Доступ: все аутентифицированные веб-юзеры (как /admin/bans).
-    @app.get("/api/automute-count")
-    async def api_get_automute_count(
-        request: Request,
-        chat_id: int = 0,
-        user_id: int = 0,
-        _auth: AuthUser = Depends(require_auth),
-    ):
-        """v4.8.4: Возвращает счётчик автомьютов для (chat_id, user_id)."""
-        from sqlalchemy import select as _sel
-        if chat_id == 0 or user_id == 0:
-            return JSONResponse(
-                {"ok": False, "error": "chat_id and user_id are required"},
-                status_code=400,
-            )
-        try:
-            async with async_session() as session:
-                counter = (await session.execute(
-                    _sel(AutomuteCounter).where(
-                        AutomuteCounter.chat_id == chat_id,
-                        AutomuteCounter.user_id == user_id,
-                    )
-                )).scalar_one_or_none()
-                count = counter.count if counter else 0
-            return JSONResponse({
-                "ok": True,
-                "count": count,
-                "chat_id": chat_id,
-                "user_id": user_id,
-            })
-        except Exception as e:
-            _req_logger.error(
-                "api_get_automute_count: error — chat_id=%s user_id=%s: %s",
-                chat_id, user_id, e,
-            )
-            return JSONResponse(
-                {"ok": False, "error": str(e)},
-                status_code=500,
-            )
+    # v4.8.10: /api/automute-count перенесён в web/api.py.
+    # Раньше тут был inline @app.get("/api/automute-count") — счётчик автомьютов.
+    # Теперь — в web/api.py, подключён через app.include_router выше.
 
     return app

@@ -74,7 +74,10 @@
 | **v4.8.6** | Финальная чистка + чистка вкладки Settings + подготовка MINOR bump до v4.9.0 | ✅ релизнут (14 августа 2026) |
 | **v4.8.7** | Stabilization: TG flood control (429/RetryAfter), неблокирующий SQLite в async-роутах, `busy_timeout=30000`, token expiry, `compare_digest` для SU, `secure=True` cookie, `SESSION_SECRET` required env | ✅ релизнут (16 августа 2026) |
 | **v4.8.8** | Security: CSRF-токены на всех 30 POST-роутах веб-панели + 29 формах в шаблонах; X-Forwarded-For только от доверенных прокси (`TRUSTED_PROXIES` env) | ✅ релизнут (16 августа 2026) |
-| **v4.8.9** | Infra: декомпозиция + uv + `pyproject.toml` + Python 3.14 в `Dockerfile`, CI workflow (ruff + pytest на push/PR), полная синхронизация roadmap.md с кодом, Alembic миграции, удаление `sys.modules.setdefault` хака, перенос `alarm_auto_off` в `chat_modes.py` | 🚧 в работе |
+| **v4.8.9** | Infra: декомпозиция + uv + `pyproject.toml` + Python 3.14 в `Dockerfile`, CI workflow (ruff + pytest на push/PR), полная синхронизация roadmap.md с кодом, Alembic миграции, удаление `sys.modules.setdefault` хака, перенос `alarm_auto_off` в `chat_modes.py` | ✅ релизнут (16 августа 2026) |
+| **v4.8.9.1** | Hotfix: auto-stamp для существующих БД без `alembic_version` | ✅ релизнут (16 августа 2026) |
+| **v4.8.9.2** | Hotfix: усиленная диагностика auto-stamp через `print()` в stderr | ✅ релизнут (16 августа 2026) |
+| **v4.8.10** | Декомпозиция `handle_group_command` (11 команд → `mod_commands.py`), частичная декомпозиция `create_app()` (4 роута → `web/`), behavioral-тесты, `!mywarns` (бонус) | 🚧 в работе |
 
 После v4.8.6 → `ROADMAP_v4.9.0.md` становится активным, стартует MINOR-цикл
 v4.9.0 (по запросам модераторов, после совещания).
@@ -1066,6 +1069,23 @@ SQLite в `/app/data/ded_vobzhak.db` (WAL mode). Папка `data/` исключ
 файлы перезаписываются. Бэкап — через `/admin/settings` → кнопка
 «Backup» (с `_wal_checkpoint_async()` перед копированием, чтобы свежие
 записи из WAL попали в бэкап).
+
+### Alembic миграции (v4.8.9+)
+
+v4.8.9 перевела миграции БД с 664-строчного идемпотентного `init_db()`
+на Alembic (`alembic upgrade head`). Однако на проде v4.8.9–v4.8.9.2
+выяснилось, что auto-stamp (автоматическое помечение существующей БД
+как актуальной) не всегда срабатывает — циклический рестарт контейнера.
+
+**Решение (v4.8.10):** `DB_USE_LEGACY_MIGRATIONS=1` — **recommended для
+прод-деплоя** до v5.0.0. Это env var переключает бот на старый
+`init_db()` (идемпотентный, не упадёт на существующей БД). Alembic
+остаётся в коде, но не используется пока env задан.
+
+- **Прод-деплой (Bothost):** `DB_USE_LEGACY_MIGRATIONS=1` в env panel.
+- **Локальная разработка:** можно не задавать — Alembic создаст БД с нуля.
+- **v5.0.0:** планируется полноценная миграция на Alembic с тестированием
+  на staging-инстансе. До тогда — `DB_USE_LEGACY_MIGRATIONS=1` на проде.
 
 ### Тесты
 
