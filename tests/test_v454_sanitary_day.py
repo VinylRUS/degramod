@@ -99,7 +99,7 @@ def _make_message(*, text=None, chat_id=-1001234567890, chat_type="private",
     user.is_bot = False
     msg.from_user = user
     msg.reply = AsyncMock()
-    msg.bot = MagicMock()
+    msg.bot = AsyncMock()
     msg.bot.send_message = AsyncMock()
     msg.bot.set_chat_permissions = AsyncMock()
     msg.bot.get_chat = AsyncMock()

@@ -314,6 +314,9 @@ class TestSmuteHandlerNoDurHotfix(unittest.IsolatedAsyncioTestCase):
             self.bh = _import_bh()
         except ImportError as e:
             self.skipTest(f"aiogram/dependencies not installed: {e}")
+        # Хендлер доходит до запроса в БД, поэтому схема должна существовать.
+        from db import init_db
+        await init_db()
 
     def _make_message(
         self,
@@ -436,6 +439,9 @@ class TestSwarnBareReasonHotfix(unittest.IsolatedAsyncioTestCase):
             self.bh = _import_bh()
         except ImportError as e:
             self.skipTest(f"aiogram/dependencies not installed: {e}")
+        # Хендлер доходит до запроса в БД, поэтому схема должна существовать.
+        from db import init_db
+        await init_db()
 
     def _make_message(
         self,
@@ -482,16 +488,20 @@ class TestSwarnBareReasonHotfix(unittest.IsolatedAsyncioTestCase):
         reply.delete = AsyncMock()
         return reply
 
+    # v4.8.9/v4.8.10: ветки !swarn/!sban уехали в mod_commands.py, а модуль
+    # связывает хелперы при импорте (`from bot_handlers import _count_warns`).
+    # Патч по имени bot_handlers.<...> его копию не подменяет — патчим там,
+    # где хендлер исполняется.
     @patch("bot_handlers._is_admin")
-    @patch("bot_handlers._get_chat_settings")
-    @patch("bot_handlers._save_punishment", new_callable=AsyncMock)
-    @patch("bot_handlers._upsert_user", new_callable=AsyncMock)
-    @patch("bot_handlers._upsert_moderator", new_callable=AsyncMock)
-    @patch("bot_handlers._count_warns", return_value=1)
-    @patch("bot_handlers._send_report", new_callable=AsyncMock)
-    @patch("bot_handlers._send_user_warn_notification", new_callable=AsyncMock)
-    @patch("bot_handlers._send_ephemeral", new_callable=AsyncMock)
-    @patch("bot_handlers._check_warn_threshold", new_callable=AsyncMock)
+    @patch("mod_commands._get_chat_settings")
+    @patch("mod_commands._save_punishment", new_callable=AsyncMock)
+    @patch("mod_commands._upsert_user", new_callable=AsyncMock)
+    @patch("mod_commands._upsert_moderator", new_callable=AsyncMock)
+    @patch("mod_commands._count_warns", return_value=1)
+    @patch("mod_commands._send_report", new_callable=AsyncMock)
+    @patch("mod_commands._send_user_warn_notification", new_callable=AsyncMock)
+    @patch("mod_commands._send_ephemeral", new_callable=AsyncMock)
+    @patch("mod_commands._check_warn_threshold", new_callable=AsyncMock)
     async def test_swarn_bare_reason_dispatches_to_handler_hotfix(
         self,
         mock_threshold,
@@ -609,6 +619,9 @@ class TestSbanBareReasonHotfix(unittest.IsolatedAsyncioTestCase):
             self.bh = _import_bh()
         except ImportError as e:
             self.skipTest(f"aiogram/dependencies not installed: {e}")
+        # Хендлер доходит до запроса в БД, поэтому схема должна существовать.
+        from db import init_db
+        await init_db()
 
     def _make_message(self, text="!sban Реклама", reply_to_message=None):
         msg = MagicMock()
@@ -638,13 +651,17 @@ class TestSbanBareReasonHotfix(unittest.IsolatedAsyncioTestCase):
         )
         reply.text = "Нарушение"
         reply.photo = None
+        # v4.8.9/v4.8.10: ветки !swarn/!sban уехали в mod_commands.py, а модуль
+        # связывает хелперы при импорте (`from bot_handlers import _count_warns`).
+        # Патч по имени bot_handlers.<...> его копию не подменяет — патчим там,
+        # где хендлер исполняется.
         reply.sticker = None
         reply.delete = AsyncMock()
         return reply
 
     @patch("bot_handlers._is_admin")
-    @patch("bot_handlers._get_chat_settings")
-    @patch("bot_handlers._save_punishment", new_callable=AsyncMock)
+    @patch("mod_commands._get_chat_settings")
+    @patch("mod_commands._save_punishment", new_callable=AsyncMock)
     @patch("bot_handlers._upsert_user", new_callable=AsyncMock)
     @patch("bot_handlers._upsert_moderator", new_callable=AsyncMock)
     @patch("bot_handlers._send_report", new_callable=AsyncMock)

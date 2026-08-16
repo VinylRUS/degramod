@@ -8,14 +8,17 @@
 # проходить — раннер требует убрать строку. Список должен только сокращаться;
 # добавлять в него новые файлы — значит скрывать регрессию.
 #
-# Что осталось разобрать (по убыванию частоты):
-#   - MagicMock вместо AsyncMock: методы стали корутинами либо ушли под
-#     tg_safe_call, и мок больше нельзя await'ить;
-#   - грепы по исходнику, ищущие код в bot_handlers.py после того, как он
-#     уехал в mod_commands.py (лечится как в test_v481: искать по обоим);
+# Типовые причины, встречавшиеся при разборе (могут помочь со следующим файлом):
+#   - patch("bot_handlers.X") не действует, если хендлер уехал в mod_commands.py:
+#     модуль связывает имена при импорте, патчить надо там, где исполняется код.
+#     Но только те имена, которые mod_commands действительно импортировал —
+#     _is_admin, например, остался в bot_handlers;
+#   - MagicMock вместо AsyncMock для message.bot: методы Bot API асинхронные;
+#   - грепы по исходнику, ищущие код в bot_handlers.py после его выноса;
 #   - зашитые в ассерты номера версий ('v4.8.10' != 'v4.6.1');
-#   - изменившиеся сигнатуры (_send_public_punishment_notice: duration_s → duration);
-#   - изменившиеся тексты шаблонов и сообщений.
+#   - изменившиеся сигнатуры и тексты сообщений;
+#   - тесты фич, удалённых намеренно — помечаются @unittest.skip с причиной,
+#     а не удаляются: skip виден в отчёте.
 #
 # Прогон: uv run python tools/run_tests.py
 # Разбор одного файла: uv run pytest tests/<файл> -q
@@ -23,7 +26,6 @@
 test_cleanup_test_data.py
 test_v451_audit_fixes.py
 test_v452_features.py
-test_v453_night_mode.py
 test_v454_sanitary_day.py
 test_v456_ephemeral_autodelete.py
 test_v470_admin_discovery.py
@@ -37,9 +39,7 @@ test_v473_background_lifecycle.py
 test_v475_wordfilter_linkallowlist_ui.py
 test_v479_moderator_help.py
 test_v480_major_update.py
-test_v480_web_ui_modchat_keywords.py
 test_v481_command_reform.py
 test_v481_web_unban.py
-test_v4831_swarn_smute_fix.py
 test_v4832_help_rich.py
 test_v487_sanity.py

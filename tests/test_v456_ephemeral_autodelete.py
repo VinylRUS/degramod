@@ -57,7 +57,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
 
     def test_default_schedules_delete_task(self):
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 12345
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -74,7 +74,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
 
     def test_delete_after_zero_skips_scheduling(self):
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -90,7 +90,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
 
     def test_send_failure_no_delete_scheduled(self):
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             bot.send_message = AsyncMock(side_effect=TelegramBadRequest(message="blocked"))
             bot.delete_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 1
@@ -106,7 +106,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
 
     def test_actual_delete_called_after_delay(self):
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 777
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -127,7 +127,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
     def test_already_deleted_graceful(self):
         """If delete_message fails (e.g. message already gone), no exception bubbles."""
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 888
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock(
@@ -150,7 +150,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
     def test_warn_notification_schedules_delete(self):
         async def run():
             from db import ChatSettings
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 99999
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -174,7 +174,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
     def test_warn_notification_zero_no_scheduling(self):
         async def run():
             from db import ChatSettings
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -197,7 +197,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
     def test_warn_notification_actual_delete(self):
         async def run():
             from db import ChatSettings
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 4242
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()
@@ -241,7 +241,7 @@ class TestBackwardCompat(unittest.TestCase):
 
     def test_send_ephemeral_no_kwarg_works(self):
         async def run():
-            bot = MagicMock()
+            bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
             bot.delete_message = AsyncMock()

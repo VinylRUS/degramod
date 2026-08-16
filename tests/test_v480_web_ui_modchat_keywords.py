@@ -187,15 +187,20 @@ class TestWebAppStructure(unittest.TestCase):
                         pass
                 # Проверим defaults — последние N аргументов имеют defaults
                 # Defaults соответствуют последним n позиционным аргам.
+                # v4.8.8: POST-роуты перешли с require_su на require_csrf_su —
+                # та же проверка роли плюс CSRF, то есть строго сильнее.
+                # Подстрокой одно в другом не содержится ("require_" + "csrf_su"),
+                # поэтому принимаем оба имени.
                 for default in node.args.defaults:
                     src_lines = _read(WEB_APP_PY).splitlines()
                     if hasattr(default, "lineno"):
                         line = src_lines[default.lineno - 1]
-                        if "require_su" in line:
+                        if "require_su" in line or "require_csrf_su" in line:
                             deps_found = True
                             break
                 self.assertTrue(deps_found,
-                    f"{node.name} must use require_su (found defaults: {node.args.defaults})")
+                    f"{node.name} must use require_su/require_csrf_su "
+                    f"(found defaults: {node.args.defaults})")
 
     def test_07_keywordwatch_imported(self):
         """KeywordWatch должен быть импортирован из db."""

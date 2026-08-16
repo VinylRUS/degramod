@@ -121,10 +121,11 @@ def _make_message(*, text=None, chat_id=-1001234567890, chat_type="private",
     user.is_bot = False
     msg.from_user = user
     msg.reply = AsyncMock()
-    msg.bot = MagicMock()
-    msg.bot.send_message = AsyncMock()
-    msg.bot.set_chat_permissions = AsyncMock()
-    msg.bot.get_chat = AsyncMock()
+    # AsyncMock, а не MagicMock со списком методов: методы Telegram Bot API все
+    # асинхронные, и перечислять их поимённо — значит ломать тест на каждом
+    # новом вызове. Так и вышло с send_rich_message (v4.8.3): его в списке не
+    # было, и cmd_help падал на `await` от MagicMock.
+    msg.bot = AsyncMock()
     return msg
 
 
@@ -857,6 +858,11 @@ class TestAppVersion(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # Тест 26-29: /help cleanup
 # ═══════════════════════════════════════════════════════════════════════════
+@unittest.skip(
+    "v4.8.3.2: /help перешёл с текстового message.reply на Rich Message "
+    "(bot.send_rich_message с блоками) — проверять текст ответа больше нечем. "
+    "Актуальное покрытие: test_v4832_help_rich.py"
+)
 class TestHelpCleanup(unittest.TestCase):
 
     def _get_help_text(self):
@@ -866,6 +872,9 @@ class TestHelpCleanup(unittest.TestCase):
         msg.from_user = MagicMock()
         msg.from_user.id = 111111111
         msg.reply = AsyncMock()
+        # См. комментарий в _make_message: методы Bot API асинхронные, поэтому
+        # bot — AsyncMock целиком.
+        msg.bot = AsyncMock()
         # Запускаем async функцию через unittest runner.
         import asyncio
         asyncio.run(bot_handlers.cmd_help(msg))

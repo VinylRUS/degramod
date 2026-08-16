@@ -99,7 +99,7 @@ def _make_private_message(from_user_id: int, text: str = "/help") -> Message:
     # reply — async method, captures the text the bot sends back
     msg.reply = AsyncMock()
     msg.answer = AsyncMock()
-    msg.bot = MagicMock()
+    msg.bot = AsyncMock()
     msg.bot.send_message = AsyncMock()
     return msg
 

@@ -13,8 +13,11 @@ conftest импортируется pytest'ом до любого тестово
 """
 from __future__ import annotations
 
+import atexit
+import glob
 import os
 import sys
+import tempfile
 
 from _paths import ROOT
 
@@ -49,10 +52,30 @@ _DEFAULTS = {
     # Alembic на проде выключен (см. CLAUDE.md), сюита идёт тем же путём —
     # через идемпотентный init_db().
     "DB_USE_LEGACY_MIGRATIONS": "1",
+    # Без этого db.py берёт прод-дефолт /app/data/shadow_logs.db: локально он
+    # даёт "unable to open database file", а на машине с боевым каталогом
+    # прогон писал бы в рабочую базу. Файл — свой на каждый процесс, а раннер
+    # запускает файлы по одному, так что тесты не мешают друг другу.
+    "DB_PATH": os.path.join(
+        tempfile.gettempdir(), f"degramod_tests_{os.getpid()}.db"
+    ),
 }
 
 for _k, _v in _DEFAULTS.items():
     os.environ.setdefault(_k, _v)
+
+
+@atexit.register
+def _cleanup_test_db() -> None:
+    """Убирает временную БД процесса вместе с WAL-спутниками."""
+    base = _DEFAULTS["DB_PATH"]
+    if os.environ.get("DB_PATH") != base:
+        return  # файл задал свой путь — не наше дело
+    for path in glob.glob(base + "*"):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 # ── CSRF-шим для легаси-файлов ──────────────────────────────────────────────
@@ -85,15 +108,22 @@ def _install_csrf_shim() -> None:
         if getattr(original, "_csrf_shim", False):
             return original
 
+        # Кука сессии живёт либо в jar клиента (обычный логин через POST /login),
+        # либо передаётся на конкретный запрос параметром cookies= — так делают
+        # тесты, которые кладут заранее выписанный токен. Второй источник
+        # приоритетнее: он и уйдёт на сервер.
+        def _cookies_for(self, kwargs):
+            return kwargs.get("cookies") or self.cookies
+
         if is_async:
             async def post(self, url, *args, **kwargs):
                 if _needs_form(kwargs):
-                    kwargs["data"] = inject(kwargs.get("data"), self.cookies)
+                    kwargs["data"] = inject(kwargs.get("data"), _cookies_for(self, kwargs))
                 return await original(self, url, *args, **kwargs)
         else:
             def post(self, url, *args, **kwargs):
                 if _needs_form(kwargs):
-                    kwargs["data"] = inject(kwargs.get("data"), self.cookies)
+                    kwargs["data"] = inject(kwargs.get("data"), _cookies_for(self, kwargs))
                 return original(self, url, *args, **kwargs)
 
         post._csrf_shim = True
