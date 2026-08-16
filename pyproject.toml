@@ -1,22 +1,14 @@
-# v4.8.9: pyproject.toml для локальной разработки.
-#
-# НЕ используется для деплоя — деплой идёт через requirements.txt + Dockerfile
-# (см. 06_DO_NOT_TOUCH.md §16: requirements.txt = primary source of truth).
-#
-# Этот файл нужен для:
-#   - IDE (PyCharm/VSCode): корректный Python version, deps autocomplete.
-#   - `uv sync` / `uv pip install -e .` локально — если разработчик хочет
-#     поставить пакет в editable-режиме.
-#   - ruff/pytest конфигурации (через [tool.ruff] / [tool.pytest]).
-#
-# Если поменяли зависимости — ОБЯЗАТЕЛЬНО обновите requirements.txt тоже.
-# Эти два файла должны быть синхронизированы вручную.
+# Единственный источник правды по зависимостям. Точные версии всего дерева,
+# включая транзитивные, зафиксированы в uv.lock по хешам — `uv sync --frozen`
+# в Dockerfile ставит ровно их. requirements.txt удалён: два файла с
+# зависимостями приходилось синхронизировать вручную, и они разъезжались
+# (pyproject требовал Python >=3.11, Dockerfile собирал 3.14).
 
 [project]
 name = "ded-vobzhak"
-version = "4.8.9"
+version = "4.8.10"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
-requires-python = ">=3.11"  # v4.8.9: Dockerfile bumped to 3.14; локально можно 3.11+
+requires-python = ">=3.14,<3.15"
 authors = [
     { name = "VinylRUS" },
 ]
@@ -29,51 +21,56 @@ dependencies = [
     "jinja2==3.1.5",
     "python-multipart==0.0.18",
     "aiohttp==3.13.3",
+    # Конвертация WebP-стикеров → PNG для inline-блоков в Rich Messages (v4.8.3).
     "Pillow>=10.0.0",
+    # Конвертация анимированных TGS-стикеров → PNG (v4.8.3).
+    # Если не установится на платформе — fallback на отдельный send_sticker.
     "rlottie-python>=1.0.0",
+    # Шифрование GitHub PAT в БД: Fernet, AES-128-CBC + HMAC-SHA256 (v4.8.5).
+    # Используется в db._encrypt_pat / _decrypt_pat.
     "cryptography>=42.0.0",
-    "alembic>=1.13",  # v4.8.9: миграции БД
-]
-
-[project.optional-dependencies]
-# Dev-зависимости — не входят в production-образ.
-dev = [
-    "httpx>=0.27",
-    "pytest>=8.0",
-    "ruff>=0.6",
+    # v4.8.9: миграции БД. На проде выключены через DB_USE_LEGACY_MIGRATIONS=1,
+    # но db.run_migrations_async() импортирует alembic — без пакета старт упадёт,
+    # если флаг когда-нибудь снимут.
     "alembic>=1.13",
 ]
 
 [tool.uv]
-# uv будет ставить dev-dependencies при `uv sync --extra dev`.
-# Lock-файл (uv.lock) НЕ используется — requirements.txt = primary.
-dev-dependencies = [
-    "httpx>=0.27",
+# Приложение, а не библиотека: модули лежат в корне (bot.py, db.py, ...),
+# устанавливать проект в venv не нужно — только его зависимости.
+package = false
+
+[dependency-groups]
+dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.27",
     "ruff>=0.6",
-    "alembic>=1.13",
 ]
 
 # ── ruff конфигурация ───────────────────────────────────────────────────────
-# v4.8.9: добавлено для CI (см. .github/workflows/ci.yml).
-# ruff = линтер + форматтер. Запускается через `ruff check .` и `ruff format .`.
 
 [tool.ruff]
 line-length = 120
-target-version = "py314"  # v4.8.9: bumped together с Dockerfile
+target-version = "py314"
 # Исключаем генерируемые и внешние файлы.
 extend-exclude = [
     "data/",
-    "scripts/",
-    "uploads/",
     ".venv/",
     "__pycache__/",
     "migrations/versions/",  # v4.8.9: autogenerate-файлы Alembic, не редактируются вручную
+    # scripts/ — сюита, залитая в main 16.08.2026. Под ruff даёт 535 замечаний
+    # (177 unsorted-imports, 126 module-import-not-at-top, 116 unused-import).
+    # Исключена до Task 2, где сюита приводится в рабочий вид; править её в
+    # инфраструктурной ветке не место.
+    "scripts/",
 ]
 
 [tool.ruff.lint]
-# Правила: E/W (pycodestyle), F (pyflakes), I (isort), B (bugbear).
-select = ["E", "W", "F", "I", "B"]
+# E/W (pycodestyle), F (pyflakes), I (isort), B (bugbear), ASYNC (flake8-async),
+# RUF (ruff-специфичные). ASYNC ловит блокирующие вызовы в async-функциях —
+# для проекта, где веб-панель и бот делят один event loop, это ключевое правило.
+select = ["E", "W", "F", "I", "B", "ASYNC", "RUF"]
 ignore = [
     # E501: line too long — line-length=120, но иногда длинные URL/строки оправданы.
     "E501",
@@ -83,37 +80,61 @@ ignore = [
     "E712",
     # E711: comparison to None — SQLAlchemy .is_(None) предпочтим, но == None встречается.
     "E711",
+    # RUF001-003 ругаются на кириллицу, похожую на латиницу. В русскоязычной
+    # кодовой базе это 1296 срабатываний подряд и ноль полезного сигнала.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # ASYNC240 требует trio.Path/anyio.path вместо os.path в async-функциях.
+    # Правило заточено под trio/anyio, у нас голый asyncio. Речь про os.path.exists
+    # и Path.exists — это stat() на локальном диске, микросекунды. Держать 8
+    # исключений ради этого не стоит. ASYNC230 (реальный blocking open) оставлен.
+    "ASYNC240",
 ]
 
 [tool.ruff.lint.per-file-ignores]
 # В db.py много SQLAlchemy моделей с длинными строками.
 # B904 — pre-existing: raise без `from err` в _get_pat_encryption_key.
 "db.py" = ["E501", "B904"]
-# В bot_handlers.py 8728 строк — игнорируем complexity warnings.
+# В bot_handlers.py 8369 строк — игнорируем complexity warnings.
 # B904 — pre-existing raise без `from err` в _parse_duration.
 # E402 — `import re as _san_re` локально в середине модуля (намеренно).
 # B007 — `month_key` не используется в for-loop (намеренно, итерируем по dict).
 # B023 — closure over loop variable в tg_safe_call(lambda: ...) — ложное срабатывание
 #         (lambda вызывается синхронно внутри tg_safe_call, не отложенно).
-"bot_handlers.py" = ["C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "B904", "E402", "B007", "B023"]
-# В web_app.py 4900 строк — аналогично.
-# E402 — `from db import (...)` стоит после `_req_logger = logging.getLogger(...)`
-# (строка 62-64). Это намеренно: logger инициализируется до импорта db, чтобы
-# в случае ошибки импорта db логгер уже был готов.
+# RUF059 — неиспользуемая распакованная переменная `settings` (строка 8205).
+"bot_handlers.py" = [
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "B904", "E402",
+    "B007", "B023", "RUF059",
+]
+# В web_app.py 4846 строк — аналогично.
+# E402 — `from db import (...)` стоит после `_req_logger = logging.getLogger(...)`.
+# Это намеренно: logger инициализируется до импорта db, чтобы в случае ошибки
+# импорта db логгер уже был готов.
 # B904 — pre-existing raise без `from err` в _parse_int_field.
-"web_app.py" = ["C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "E402", "B904"]
-# v4.8.9: bot.py — E402 (module level import not at top) ложится на
-# sys.modules.setdefault("bot", ...) хак в строке 52. Этот хак будет удалён
-# в этапе D1 v4.8.9 (см. 03_TASK_v4.8.9.md §3). После удаления — E402 уйдёт.
-"bot.py" = ["E402"]
+# ASYNC230 — blocking open() в async-роутах (строки 738, 3333). Это долг из
+# той же серии, что чинил v4.8.7 (sqlite/VACUUM/copy2 вынесены в to_thread),
+# но open() тогда пропустили. Снимается в Task 6 плана стабилизации.
+# RUF023/RUF059 — несортированный __slots__ и неиспользуемая распакованная
+# переменная. Косметика, правится при следующей правке этих участков.
+"web_app.py" = [
+    "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "E402", "B904",
+    "ASYNC230", "RUF023", "RUF059",
+]
+# E402 — late import в конце модуля (строка 1143). Остаток от снятого в v4.8.9
+# хака sys.modules.setdefault("bot", ...) — импорт переехал, но вниз файла.
+# RUF034 — бессмысленный if-else в строке 109.
+"bot.py" = ["E402", "RUF034"]
+# RUF019 — лишняя проверка ключа перед обращением к словарю (строка 131).
+"github_client.py" = ["RUF019"]
+# RUF022 — несортированный __all__.
+"web/deps.py" = ["RUF022"]
 
 # ── pytest конфигурация ─────────────────────────────────────────────────────
 [tool.pytest.ini_options]
-# Тесты лежат в /home/z/my-project/scripts/, но запускаются с cwd=v488_work
-# (чтобы import db/web_app находились). pytest находит test_*.py автоматически.
-testpaths = ["scripts"]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 python_files = ["test_*.py"]
-python_functions = ["test_*", "t*"]
 # Фильтры warnings — заглушаем шум от SQLAlchemy/aiohttp.
 filterwarnings = [
     "ignore::DeprecationWarning:aiogram.*",
