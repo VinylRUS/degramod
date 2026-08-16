@@ -640,6 +640,18 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.9.1</strong> — 16 августа 2026 (hotfix: auto-stamp для существующих БД без alembic_version)</p>
+                <ul>
+                    <li><strong>Auto-stamp в init_db_with_fallback()</strong>. v4.8.9 требовала ручного выполнения <code>alembic stamp head</code> на существующей прод-БД перед первым деплоем. Без этого Alembic пытался применить <code>initial migration</code> к уже существующей схеме → <code>table already exists</code> → циклический рестарт контейнера. Теперь: <code>init_db_with_fallback()</code> автоматически определяет существующую БД (есть таблицы, но нет <code>alembic_version</code>) и помечает её как актуальную через <code>alembic stamp head</code>. После этого <code>upgrade head</code> — no-op. <strong>Действий при деплое больше не требуется</strong> — просто залить файлы и обновить Git.</li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в схеме БД, API, обработчиках. Если v4.8.9 уже была задеплоена и упала — просто обновиться на v4.8.9.1, бот поднимется.</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>db.py</code> — добавлен <code>logger</code>, функция <code>_auto_stamp_if_needed(config, alembic_ini)</code>, вызов из <code>run_migrations_async()</code>.</li>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.9.1.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                </ul>
                 <p><strong>v4.8.9</strong> — 16 августа 2026 (infra: декомпозиция + uv + Python 3.14 + Alembic + CI + roadmap sync)</p>
                 <ul>
                     <li><strong>uv drop-in в Dockerfile</strong>. <code>pip install --no-cache-dir -r requirements.txt</code> заменён на <code>pip install --no-cache-dir uv &amp;&amp; uv pip install --system --no-cache -r requirements.txt</code>. uv в 10-100× быстрее pip на cold cache — образ собирается заметно быстрее. <code>requirements.txt</code> остаётся primary source of truth (см. <code>06_DO_NOT_TOUCH.md §16</code>).</li>

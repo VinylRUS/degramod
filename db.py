@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 from datetime import datetime, timezone
@@ -77,6 +78,11 @@ def _set_sqlite_pragma(dbapi_connection, _):
     # writes в WAL. 30 сек синхронизировано с connect_args.timeout выше.
     cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()
+
+
+# v4.8.9.1: logger для Alembic auto-stamp и других db-level операций.
+# Использует тот же shadow_logger, что и bot.py / web_app.py — для консистентности.
+logger = logging.getLogger("shadow_logger")
 
 
 # ── Base ────────────────────────────────────────────────────────────────────
@@ -1451,17 +1457,23 @@ async def run_migrations_async() -> None:
     v4.8.9: вызывается из bot.py lifespan startup ВМЕСТО init_db().
     Использует migrations/env.py + migrations/versions/* (см. alembic.ini).
 
-    На пустой БД: создаёт схему с нуля (initial migration).
-    На существующей БД с alembic_version: применяет только недостающие миграции.
-    На существующей БД БЕЗ alembic_version (созданной init_db() до v4.8.9):
-    нужно сначала `alembic stamp head` вручную (см. CHANGES_v4.8.9.md).
+    v4.8.9.1 hotfix: автоматически делает `alembic stamp head` если БД уже
+    существует (с таблицами), но не имеет alembic_version. Это происходит
+    при первом деплое v4.8.9 на проде — БД была создана init_db() в предыдущих
+    версиях, Alembic её не знает и пытается применить initial migration →
+    "table already exists" → циклический рестарт контейнера. Auto-stamp
+    помечает существующую схему как актуальную, после чего upgrade head — no-op.
+
+    Сценарии:
+      - Пустая БД (нет файла или нет таблиц) → upgrade head создаёт схему.
+      - Существующая БД без alembic_version → auto-stamp head, потом upgrade no-op.
+      - Существующая БД с alembic_version → upgrade head применяет недостающие.
     """
     from pathlib import Path
 
     from alembic import command
     from alembic.config import Config
 
-    # Абсолютный путь к alembic.ini — он лежит рядом с db.py.
     alembic_ini = Path(__file__).resolve().parent / "alembic.ini"
     if not alembic_ini.exists():
         raise RuntimeError(
@@ -1470,22 +1482,88 @@ async def run_migrations_async() -> None:
         )
 
     config = Config(str(alembic_ini))
-    # config уже читает sqlalchemy.url из env.py (переопределён там через db.DATABASE_URL).
-    # Запускаем upgrade в текущем event loop (env.py сам сделает asyncio.run
-    # для online migrations через async_engine_from_config).
-    # ВАЖНО: мы уже в async-context, поэтому используем `command.upgrade`
-    # напрямую — alembic.env сам создаст новый event loop через asyncio.run.
-    # Это работает, потому что asyncio.run создаёт независимый loop.
-    # Альтернатива — переписать env.py на use_asyncio_from_running_loop, но
-    # это усложняет код. Оставляем как есть.
+
+    # v4.8.9.1: auto-stamp для существующих БД без alembic_version.
+    # Без этого Alembic пытается применить initial migration к уже
+    # существующей схеме → "table already exists" → bot падает при старте.
+    _auto_stamp_if_needed(config, alembic_ini)
+
+    # Запускаем upgrade. config уже знает про sqlalchemy.url через env.py.
+    # Мы в async-context (bot.py lifespan), поэтому env.py использует sync
+    # engine fallback (см. migrations/env.py:run_migrations_online_sync).
     command.upgrade(config, "head")
+
+
+def _auto_stamp_if_needed(config, alembic_ini) -> None:
+    """v4.8.9.1: если БД существует с таблицами, но без alembic_version —
+    автоматически stamp head. Безопасно: только помечает, не применяет DDL.
+
+    Это решает проблему циклического рестарта на проде при переходе с
+    v4.8.8 (где БД создавалась init_db()) на v4.8.9 (где БД управляется
+    Alembic). Без auto-stamp пользователю пришлось бы вручную выполнять
+    `alembic stamp head` в контейнере, что неудобно и хрупко.
+    """
+    import sqlite3
+
+    from alembic import command
+
+    db_path = os.getenv("DB_PATH", "/app/data/shadow_logs.db")
+    if not os.path.exists(db_path):
+        # БД не существует — пустая, Alembic создаст схему с нуля.
+        return
+
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            # Есть ли таблицы кроме alembic_version?
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name != 'alembic_version'"
+            )
+            tables = [row[0] for row in cursor.fetchall()]
+            if not tables:
+                # БД пустая — Alembic создаст схему.
+                return
+
+            # Есть ли alembic_version?
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='alembic_version'"
+            )
+            has_alembic = cursor.fetchone() is not None
+            if has_alembic:
+                # Alembic уже знает про эту БД — пусть upgrade сам разрулит.
+                return
+
+            # БД существует, таблицы есть, alembic_version нет → auto-stamp.
+            # Это БД, созданная init_db() до v4.8.9. Помечаем как актуальную.
+            logger.warning(
+                "v4.8.9.1 auto-stamp: existing DB detected at %s "
+                "with %d tables but no alembic_version — stamping head "
+                "(marks schema as up-to-date without applying DDL).",
+                db_path, len(tables),
+            )
+            command.stamp(config, "head")
+            logger.info(
+                "v4.8.9.1 auto-stamp: done. DB marked as revision 'head'. "
+                "Subsequent alembic upgrade head will be no-op."
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.warning(
+            "v4.8.9.1 auto-stamp: failed to inspect DB at %s: %s. "
+            "Falling through to alembic upgrade head (may fail if DB "
+            "already has tables without alembic_version).",
+            db_path, e,
+        )
 
 
 async def init_db_with_fallback() -> None:
     """v4.8.9: запускает миграции через Alembic, с fallback на init_db().
 
     Если env DB_USE_LEGACY_MIGRATIONS=1 — вызывает init_db() (старый путь).
-    Иначе — вызывает run_migrations_async() (Alembic).
+    Иначе — вызывает run_migrations_async() (Alembic, с auto-stamp).
 
     Это точка входа из bot.py lifespan startup.
     """
