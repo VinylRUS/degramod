@@ -409,7 +409,11 @@ class TestCmdSanitary(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await init_db()
         await _clear_all_tables()
-        await _seed_chat_settings()
+        # v4.7.2 закрыла add/remove/toggle гейтом на sanitary_days_enabled:
+        # без него команда отвечает «Функция санитарных дней выключена» и
+        # выходит. Тесты написаны до гейта, поэтому включаем фичу явно —
+        # проверяется работа команд, а не сам гейт (он покрыт отдельно).
+        await _seed_chat_settings(sanitary_days_enabled=True)
 
     async def test_help_when_no_args(self):
         msg = _make_message(text="/sanitary")
@@ -710,7 +714,10 @@ class TestSanitaryDayTick(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await init_db()
         await _clear_all_tables()
-        await _seed_chat_settings()
+        # v4.7.2: _sanitary_day_tick выбирает только чаты с
+        # sanitary_days_enabled=True (bot.py:867). Без флага тик проходит мимо
+        # и set_chat_permissions не вызывается.
+        await _seed_chat_settings(sanitary_days_enabled=True)
 
     async def test_tick_enters_when_today_is_sanitary(self):
         # Configure sanitary_days = today (in chat's tz, not UTC).
@@ -840,9 +847,11 @@ class TestEnterSanitaryDayExitsNightFirst(unittest.IsolatedAsyncioTestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 class TestAppVersion(unittest.TestCase):
 
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     def test_app_version_is_v454(self):
         self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     def test_release_date_set(self):
         self.assertEqual(web_app.APP_RELEASE_DATE, "2026-07-30")
 
@@ -850,6 +859,10 @@ class TestAppVersion(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 # Тест 14: /help содержит раздел "Санитарные дни"
 # ═══════════════════════════════════════════════════════════════════════════
+@unittest.skip(
+    "v4.8.3.2: /help перешёл с текстового message.reply на Rich Message — "
+    "текста ответа больше нет. Покрытие: test_v4832_help_rich.py"
+)
 class TestHelpSanitarySection(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):

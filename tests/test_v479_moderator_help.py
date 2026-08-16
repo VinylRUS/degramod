@@ -155,6 +155,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 2. /help from ADMIN_IDS env → full text ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_02_help_from_admin_ids_env_returns_full_text(self):
         """ADMIN_IDS env (user_id=1) → полный help с /nightmode."""
         msg = _make_private_message(from_user_id=1, text="/help")
@@ -169,6 +170,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 3. /help from WebUser role='su' → full text ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_03_help_from_su_returns_full_text(self):
         """WebUser role='su' (tg_user_id=2004) → полный help."""
         msg = _make_private_message(from_user_id=2004, text="/help")
@@ -180,6 +182,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 4. /help from WebUser role='admin' → full text ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_04_help_from_admin_returns_full_text(self):
         """WebUser role='admin' (tg_user_id=2001) → полный help."""
         msg = _make_private_message(from_user_id=2001, text="/help")
@@ -191,6 +194,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 5. /help from active moderator → shortened text ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_05_help_from_active_moderator_returns_shortened_text(self):
         """WebUser role='moderator', is_active=True (tg_user_id=2002)
         → сокращённый help: !mute есть, !resetwarns упомянут как админ-only."""
@@ -235,6 +239,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 8. Shortened help contains web panel link ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_08_shortened_help_contains_web_panel_link(self):
         """Сокращённый help содержит кликабельную ссылку на веб-панель."""
         msg = _make_private_message(from_user_id=2002, text="/help")
@@ -245,6 +250,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 9. Shortened help does NOT contain admin command syntax ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_09_shortened_help_excludes_admin_command_syntax(self):
         """Сокращённый help НЕ содержит полного синтаксиса команд настройки
         чатов (с аргументами). Имена команд могут упоминаться в секции
@@ -284,6 +290,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 10. Shortened help warns about !resetwarns ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     async def test_10_shortened_help_warns_about_resetwarns(self):
         """Сокращённый help явно говорит, что !resetwarns только для админов."""
         msg = _make_private_message(from_user_id=2002, text="/help")
@@ -307,6 +314,7 @@ class TestV479ModeratorHelp(unittest.IsolatedAsyncioTestCase):
 
     # ──────────── 12. Static check: code has _HELP_FULL_TEXT and _HELP_MODERATOR_TEXT ────────────
 
+    @unittest.skip("v4.8.3.2: /help перешёл с текстового message.reply на Rich Message (bot.send_rich_message с блоками) — текста ответа больше нет, как и констант с ним. Покрытие: test_v4832_help_rich.py")
     def test_12_code_has_separate_help_text_constants(self):
         """В bot_handlers.py есть отдельные константы для полного и
         сокращённого help-текста."""

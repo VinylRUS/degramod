@@ -507,6 +507,7 @@ class TestBaseHtmlNavbarAndChangelog(unittest.TestCase):
 class TestAppVersionBumped(unittest.TestCase):
     """APP_VERSION бампнут до v4.8.1."""
 
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     def test_90_app_version_is_v481(self):
         self.assertIn('APP_VERSION = "v4.8.1"', _WEB_APP_SRC,
                       'APP_VERSION must be "v4.8.1"')

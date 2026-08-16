@@ -820,6 +820,7 @@ class TestEnvExampleWebhookSecret(unittest.TestCase):
 # ═══════════════════════════════════════════════════════════════════════════
 class TestAppVersion(unittest.TestCase):
 
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     def test_app_version_is_452(self):
         """v4.5.6: версия обновлена до v4.5.6 (ephemeral auto-delete)."""
         import web_app

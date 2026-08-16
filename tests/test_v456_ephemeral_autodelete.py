@@ -223,6 +223,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
 
 class TestVersionBumped(unittest.TestCase):
 
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     def test_app_version_is_v456(self):
         self.assertEqual(web_app.APP_VERSION, "v4.6.1")
 

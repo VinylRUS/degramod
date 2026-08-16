@@ -13,10 +13,15 @@
 #     модуль связывает имена при импорте, патчить надо там, где исполняется код.
 #     Но только те имена, которые mod_commands действительно импортировал —
 #     _is_admin, например, остался в bot_handlers;
+#   - гейты, добавленные позже тестов: v4.7.2 закрыла /sanitary add|remove|toggle
+#     и _sanitary_day_tick флагом sanitary_days_enabled. Тест, написанный до
+#     гейта, получает «функция выключена» — надо включать фичу в setUp;
 #   - MagicMock вместо AsyncMock для message.bot: методы Bot API асинхронные;
 #   - грепы по исходнику, ищущие код в bot_handlers.py после его выноса;
-#   - зашитые в ассерты номера версий ('v4.8.10' != 'v4.6.1');
-#   - изменившиеся сигнатуры и тексты сообщений;
+#   - зашитые в ассерты номера версий — помечаются skip, сверять релиз
+#     с константой в тесте нечем (changelog в templates/base.html);
+#   - /help с v4.8.3.2 отвечает Rich Message, а не текстом: всё, что читало
+#     message.reply, проверять больше нечего (покрытие в test_v4832_help_rich);
 #   - тесты фич, удалённых намеренно — помечаются @unittest.skip с причиной,
 #     а не удаляются: skip виден в отчёте.
 #
@@ -28,7 +33,6 @@ test_v451_audit_fixes.py
 test_v452_features.py
 test_v454_sanitary_day.py
 test_v456_ephemeral_autodelete.py
-test_v470_admin_discovery.py
 test_v4714_mute_permissions.py
 test_v4715_delete_violation_message.py
 test_v4716_slowmode.py
@@ -37,9 +41,7 @@ test_v4726_handler_propagation.py
 test_v4730_alarm_audit_fixes.py
 test_v473_background_lifecycle.py
 test_v475_wordfilter_linkallowlist_ui.py
-test_v479_moderator_help.py
 test_v480_major_update.py
 test_v481_command_reform.py
 test_v481_web_unban.py
-test_v4832_help_rich.py
 test_v487_sanity.py

@@ -117,6 +117,7 @@ class TestV470AdminDiscovery(unittest.IsolatedAsyncioTestCase):
         return r
 
     # ── Test 1: APP_VERSION ──────────────────────────────────────────
+    @unittest.skip("проверка сравнивает APP_VERSION с версией, актуальной на момент написания теста; сейчас v4.8.10, и релиз сверять с константой в тесте нечем — changelog ведётся в templates/base.html")
     async def test_app_version_is_v470(self):
         # Принимаем v4.7.0 или v4.7.x (хотфиксы)
         self.assertTrue(web_app.APP_VERSION.startswith("v4.7."),
