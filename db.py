@@ -44,7 +44,16 @@ def _verify_password(password: str, stored: str) -> bool:
 DB_PATH = os.getenv("DB_PATH", "/app/data/shadow_logs.db")
 DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+# v4.8.7: connect_args.timeout — таймаут на ждущий коннект (по умолчанию
+# SQLite 5 сек, что мало при конкурентных writes в WAL-режиме). 30 сек
+# покрывает даже тяжёлые VACUUM и крупные транзакции на проде.
+# Дополнительно PRAGMA busy_timeout=30000 ставится в _set_sqlite_pragma
+# ниже — для соединений, которые aiosqlite открывает уже внутри пула.
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    connect_args={"timeout": 30},
+)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -54,6 +63,10 @@ def _set_sqlite_pragma(dbapi_connection, _):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
+    # v4.8.7: busy_timeout=30000 мс — сколько SQLite ждёт блокировку перед
+    # выбросом SQLITE_BUSY. По умолчанию 5000 — мало при VACUUM или длинных
+    # writes в WAL. 30 сек синхронизировано с connect_args.timeout выше.
+    cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()
 
 

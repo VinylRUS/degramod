@@ -94,7 +94,7 @@ from urllib.parse import urlparse
 
 import aiohttp
 from aiogram import Router, types, F, BaseMiddleware
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, BaseFilter
 from aiogram.types import (
     InputRichMessage,
@@ -188,6 +188,126 @@ router = Router()
 # слота. В Python 3.10+ Semaphore лениво привязывается к event loop при
 # первом acquire(), так что module-level объявление безопасно.
 _EPHEMERAL_DELETE_SEM = asyncio.Semaphore(100)
+
+# ── v4.8.7: Strong refs для fire-and-forget задач ────────────────────────
+# asyncio.create_task() без сохранения ссылки может быть убит GC на середине
+# выполнения (Python docs: «Important: Save a reference to the result of this
+# method, to avoid a task disappearing mid-execution»). Раньше все 5 вызовов
+# ниже были fire-and-forget — эфемерные сообщения «иногда» не удалялись.
+#
+# Решение: _background_tasks хранит strong refs до завершения задачи.
+# task.add_done_callback(_background_tasks.discard) удаляет ссылку по
+# завершении (включая exception — чтобы не копить протухшие задачи).
+# Источник: https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro, *, label: str = "bg") -> asyncio.Task:
+    """Создаёт asyncio.Task с сильной ссылкой в _background_tasks.
+
+    Аналог asyncio.create_task, но GC-безопасный. После завершения задачи
+    (нормально или с исключением) ссылка автоматически удаляется из set.
+
+    Args:
+        coro: корутина для запуска.
+        label: метка для логирования (для отладки «какая задача зависла»).
+
+    Returns:
+        asyncio.Task — можно await'ить или cancel().
+    """
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning(
+                "background task '%s' failed: %s: %s",
+                label, type(exc).__name__, exc,
+            )
+
+    task.add_done_callback(_on_done)
+    return task
+
+
+# ── v4.8.7: TG flood control (429 / RetryAfter) ───────────────────────────
+# Telegram API кидает 429 с retry_after когда бот слишком часто шлёт запросы.
+# aiogram 3.30 поднимает TelegramRetryAfter (подкласс TelegramAPIError) с
+# атрибутом retry_after: int. Раньше во всём проекте этот эксепшн ловился
+# общим `except TelegramAPIError` и тихо логировался — бот просто переставал
+# реагировать на команду (например, !ban срабатывал в БД, но public-сообщение
+# в чат не шло).
+#
+# Решение: обёртка tg_safe_call для КРИТИЧНЫХ Telegram-вызовов (где потеря
+# вызова = нарушенная бизнес-логика). Для best-effort вызовов (ephemeral,
+# audit-в-DM, удаление команды модератора) — НЕ оборачиваем: там 429 не
+# критичен, retry_after может быть 30+ сек и лучше показать ошибку сразу.
+#
+# Важно: передаём CALLABLE, возвращающий корутину (а не саму корутину) —
+# после исключения корутину нельзя «перезапустить», нужно создавать новую.
+# Синтаксис: await tg_safe_call(lambda: bot.send_message(...), label=...)
+#
+# Параметры (env):
+#   TG_FLOOD_MAX_RETRIES — сколько ретраев после 429 (default 3).
+#     После исчерпания — exception пробрасывается наверх (как раньше).
+#   TG_FLOOD_RETRY_CAP — cap на sleep (default 30 сек). Если retry_after=120,
+#     sleep 30 (не блокируем хендлер на 2 минуты), exception пробрасывается.
+_MAX_RETRIES = max(0, int(os.getenv("TG_FLOOD_MAX_RETRIES", "3")))
+_RETRY_CAP = max(1, int(os.getenv("TG_FLOOD_RETRY_CAP", "30")))
+
+
+async def tg_safe_call(factory, *, label: str = "tg_call"):
+    """Вызывает Telegram API с автоматическим retry на 429 / RetryAfter.
+
+    Если Telegram поднимает TelegramRetryAfter — sleep(retry_after) и ретраит.
+    После _MAX_RETRIES попыток (или если retry_after > _RETRY_CAP) — exception
+    пробрасывается наверх (видимо в логах как раньше).
+
+    Использование:
+        # Было: await message.bot.send_message(chat_id=..., text=...)
+        # Стало:
+        await tg_safe_call(
+            lambda: message.bot.send_message(chat_id=..., text=...),
+            label="send_ban_public_notice",
+        )
+
+    Args:
+        factory: callable без аргументов, возвращающий НОВУЮ корутину при
+                 каждом вызове. После exception корутину нельзя использовать
+                 повторно, поэтому нужна фабрика.
+        label: метка для логирования при ретраях.
+
+    Returns:
+        Результат await factory().
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES + 1):  # 1.._MAX_RETRIES+1 попыток
+        try:
+            return await factory()
+        except TelegramRetryAfter as e:
+            last_exc = e
+            sleep_s = min(e.retry_after, _RETRY_CAP)
+            if attempt >= _MAX_RETRIES:
+                logger.warning(
+                    "tg_safe_call('%s'): TelegramRetryAfter retry_after=%ds "
+                    "exceeded max_retries=%d — giving up",
+                    label, e.retry_after, _MAX_RETRIES,
+                )
+                raise
+            logger.warning(
+                "tg_safe_call('%s'): TelegramRetryAfter retry_after=%ds, "
+                "sleeping %ds (attempt %d/%d)",
+                label, e.retry_after, sleep_s, attempt + 1, _MAX_RETRIES,
+            )
+            await asyncio.sleep(sleep_s)
+    # Unreachable — but just in case:
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("tg_safe_call: unreachable state")
+
 
 # ── Конфигурация из окружения ──────────────────────────────────────────────
 _raw_admins = os.getenv("ADMIN_IDS", "")
@@ -3270,7 +3390,8 @@ async def _schedule_ephemeral_delete(
                 e,
             )
 
-    asyncio.create_task(_del_ephemeral())
+    # v4.8.7: strong ref через _spawn_background_task — GC не убьёт задачу до delete.
+    _spawn_background_task(_del_ephemeral(), label="del_ephemeral")
 
 
 async def _send_ephemeral(
@@ -3454,9 +3575,13 @@ async def revoke_user_ban(
     :return: dict с ok=True/False и описанием ошибки при неудаче.
     """
     # 1. Telegram API: unban_chat_member (only_if_banned=True — безопасный).
+    # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter автоматически.
     try:
-        await bot.unban_chat_member(
-            chat_id=chat_id, user_id=user_id, only_if_banned=True,
+        await tg_safe_call(
+            lambda: bot.unban_chat_member(
+                chat_id=chat_id, user_id=user_id, only_if_banned=True,
+            ),
+            label="revoke_user_ban/unban_chat_member",
         )
     except TelegramAPIError as e:
         logger.error(
@@ -3636,7 +3761,11 @@ async def _check_warn_threshold(
                 pass
 
             try:
-                await bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+                # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+                await tg_safe_call(
+                    lambda: bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
+                    label="_check_warn_threshold/autoban",
+                )
                 # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
                 _mark_bot_ban(chat_id, target.id)
                 await _upsert_user(session, target.id, target.username,
@@ -3693,11 +3822,15 @@ async def _check_warn_threshold(
             mute_dur = mute_dur + (auto_count * 60)
             until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
             try:
-                await bot.restrict_chat_member(
-                    chat_id=chat_id,
-                    user_id=target.id,
-                    permissions=_mute_permissions(),
-                    until_date=until_date,
+                # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+                await tg_safe_call(
+                    lambda: bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=target.id,
+                        permissions=_mute_permissions(),
+                        until_date=until_date,
+                    ),
+                    label="_check_warn_threshold/automute",
                 )
                 await _upsert_user(session, target.id, target.username,
                                    target.first_name, target.last_name)
@@ -3970,10 +4103,14 @@ async def handle_group_command(message: types.Message) -> None:
 
         until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
         try:
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id, user_id=target.id,
-                permissions=_mute_permissions(),
-                until_date=until_date,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=target.id,
+                    permissions=_mute_permissions(),
+                    until_date=until_date,
+                ),
+                label="!mute",
             )
         except TelegramAPIError as e:
             logger.error("restrict_chat_member failed: %s", e)
@@ -4080,10 +4217,14 @@ async def handle_group_command(message: types.Message) -> None:
 
         until_date = int(datetime.now(timezone.utc).timestamp()) + duration_seconds
         try:
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id, user_id=target.id,
-                permissions=_mute_permissions(),
-                until_date=until_date,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=target.id,
+                    permissions=_mute_permissions(),
+                    until_date=until_date,
+                ),
+                label="!smute",
             )
         except TelegramAPIError as e:
             logger.error("restrict_chat_member failed (smute): %s", e)
@@ -4269,7 +4410,11 @@ async def handle_group_command(message: types.Message) -> None:
             logger.warning("get_chat_member before ban failed: %s", e)
 
         try:
-            await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
+                label="!ban",
+            )
         except TelegramAPIError as e:
             logger.error("ban_chat_member failed: %s", e)
             try:
@@ -4395,7 +4540,11 @@ async def handle_group_command(message: types.Message) -> None:
             logger.warning("get_chat_member before sban failed: %s", e)
 
         try:
-            await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
+                label="!sban",
+            )
         except TelegramAPIError as e:
             logger.error("ban_chat_member failed (sban): %s", e)
             try:
@@ -4537,9 +4686,13 @@ async def handle_group_command(message: types.Message) -> None:
             return
 
         try:
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id, user_id=target.id,
-                permissions=chat_perms,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=target.id,
+                    permissions=chat_perms,
+                ),
+                label="!unmute",
             )
         except TelegramAPIError as e:
             logger.error("unmute restrict failed: %s", e)
@@ -4724,7 +4877,7 @@ async def handle_group_command(message: types.Message) -> None:
                             pass
                 except asyncio.CancelledError:
                     raise
-            asyncio.create_task(_del_msg())
+            _spawn_background_task(_del_msg(), label="del_msg")
         try:
             await message.delete()
         except TelegramAPIError:
@@ -7959,7 +8112,11 @@ async def private_start_handler(message: types.Message) -> None:
         # циклического импорта с web_app на верхнем уровне.
         try:
             from web_app import _fetch_and_save_avatar
-            asyncio.create_task(_fetch_and_save_avatar(message.bot, tg_uid))
+            # v4.8.7: strong ref — аватарка скачивается в фоне, GC не убьёт.
+            _spawn_background_task(
+                _fetch_and_save_avatar(message.bot, tg_uid),
+                label="fetch_avatar",
+            )
         except ImportError:
             pass
 
@@ -8102,8 +8259,12 @@ async def handle_new_members(message: types.Message) -> None:
             continue
         # Юзер в CAS-базе — банним
         try:
-            await message.bot.ban_chat_member(
-                chat_id=message.chat.id, user_id=member.id,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.ban_chat_member(
+                    chat_id=message.chat.id, user_id=member.id,
+                ),
+                label="CAS_auto_ban",
             )
             # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
             _mark_bot_ban(message.chat.id, member.id)
@@ -8236,10 +8397,14 @@ async def handle_sticker_message(message: types.Message) -> None:
         mute_dur = mute_dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
         try:
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id, user_id=target.id,
-                permissions=_mute_permissions(),
-                until_date=until_date,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=target.id,
+                    permissions=_mute_permissions(),
+                    until_date=until_date,
+                ),
+                label="sticker_auto_mute",
             )
             async with async_session() as session:
                 await _save_punishment(
@@ -8263,7 +8428,11 @@ async def handle_sticker_message(message: types.Message) -> None:
 
     if punishment == "ban":
         try:
-            await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
+                label="sticker_auto_ban",
+            )
             # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
             _mark_bot_ban(chat_id, target.id)
             async with async_session() as session:
@@ -8359,10 +8528,14 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
     dur = dur + (auto_count * 60)
     until_date = int(now.timestamp()) + dur
     try:
-        await message.bot.restrict_chat_member(
-            chat_id=chat_id, user_id=fu.id,
-            permissions=_mute_permissions(),
-            until_date=until_date,
+        # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+        await tg_safe_call(
+            lambda: message.bot.restrict_chat_member(
+                chat_id=chat_id, user_id=fu.id,
+                permissions=_mute_permissions(),
+                until_date=until_date,
+            ),
+            label="via_bot_filter_auto_mute",
         )
         async with async_session() as session:
             await _upsert_user(session, fu.id, fu.username,
@@ -8552,8 +8725,12 @@ async def handle_content_filters(message: types.Message) -> None:
                         phrases_str = ", ".join(f"«{kw.phrase}»" for kw in ban_phrases)
                         reason = f"Keyword-watch (night mode auto-ban): {phrases_str}"
                         try:
-                            await message.bot.ban_chat_member(
-                                chat_id=chat_id, user_id=target.id,
+                            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+                            await tg_safe_call(
+                                lambda: message.bot.ban_chat_member(
+                                    chat_id=chat_id, user_id=target.id,
+                                ),
+                                label="keyword_watch_auto_ban",
                             )
                             # v4.7.27: помечаем бан от бота — для дедупликации.
                             _mark_bot_ban(chat_id, target.id)
@@ -8625,10 +8802,14 @@ async def handle_content_filters(message: types.Message) -> None:
         dur = dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + dur
         try:
-            await message.bot.restrict_chat_member(
-                chat_id=chat_id, user_id=target.id,
-                permissions=_mute_permissions(),
-                until_date=until_date,
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.restrict_chat_member(
+                    chat_id=chat_id, user_id=target.id,
+                    permissions=_mute_permissions(),
+                    until_date=until_date,
+                ),
+                label="content_filter_auto_mute",
             )
             async with async_session() as session:
                 await _save_punishment(
@@ -8650,7 +8831,11 @@ async def handle_content_filters(message: types.Message) -> None:
 
     if action == "ban":
         try:
-            await message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id)
+            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
+            await tg_safe_call(
+                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
+                label="content_filter_auto_ban",
+            )
             # v4.7.27: помечаем бан от бота — для дедупликации в on_chat_member_updated
             _mark_bot_ban(chat_id, target.id)
             async with async_session() as session:
@@ -8689,8 +8874,9 @@ async def stealth_catchall_group(message: types.Message) -> None:
                 _new_chat_id = settings.chat_id
                 _new_chat_title = settings.title or message.chat.title
                 # Уведомляем SU вне сессии (best-effort)
-                asyncio.create_task(
-                    _notify_su_about_chat(message.bot, _new_chat_id, _new_chat_title)
+                _spawn_background_task(
+                    _notify_su_about_chat(message.bot, _new_chat_id, _new_chat_title),
+                    label="notify_su_group",
                 )
                 logger.info(
                     "Auto-detected new chat: id=%s title='%s' — notified SU",
@@ -8725,8 +8911,9 @@ async def on_my_chat_member(event: types.ChatMemberUpdated) -> None:
                 )
                 if created:
                     await session.commit()
-                    asyncio.create_task(
-                        _notify_su_about_chat(event.bot, event.chat.id, event.chat.title)
+                    _spawn_background_task(
+                        _notify_su_about_chat(event.bot, event.chat.id, event.chat.title),
+                        label="notify_su_my_chat_member",
                     )
                     logger.info(
                         "my_chat_member: bot added to chat id=%s title='%s'",

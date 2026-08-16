@@ -27,6 +27,7 @@ v4.3 — Поддержка нескольких админ-аккаунтов:
   - /api/dashboard и /api/user/<id>/punishments отдают JSON для автообновления страниц
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -70,7 +71,21 @@ from db import (
 # ── Конфигурация ────────────────────────────────────────────────────────────
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
 COOKIE_NAME = "sl_session"
-_SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
+
+# v4.8.7: SESSION_SECRET теперь обязательна. Раньше дефолтилась в
+# secrets.token_hex(32) — безопасно (каждый рестарт разлогинивает всех),
+# но сюрприз для пользователя: после деплоя все куки инвалидны без видимой
+# причины. Теперь: если env не задан при create_app() — падаем со стартовой
+# ошибкой. На уровне импорта оставляем дефолт secrets.token_hex(32), чтобы
+# не сломать тесты и AST-анализ — реальная проверка идёт в create_app().
+_SESSION_SECRET = os.getenv("SESSION_SECRET") or secrets.token_hex(32)
+_SESSION_SECRET_EXPLICIT = bool(os.getenv("SESSION_SECRET"))
+
+# v4.8.7: Cookie secure flag — должен быть True при HTTPS-деплое.
+# Bothost по умолчанию обслуживает через HTTPS (https://*.bothost.tech),
+# так что дефолт = True. Если локальная dev-инсталляция на http://localhost,
+# нужно явно выставить WEB_COOKIE_SECURE=0 в env.
+_COOKIE_SECURE = os.getenv("WEB_COOKIE_SECURE", "1") == "1"
 
 # МСК таймзона
 MSK = timezone(timedelta(hours=3))
@@ -99,8 +114,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.6"
-APP_RELEASE_DATE = "2026-08-14"
+APP_VERSION = "v4.8.8"
+APP_RELEASE_DATE = "2026-08-16"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
@@ -131,13 +146,29 @@ def _check_login_rate_limit(ip: str) -> bool:
     return True
 
 
+# v4.8.8: доверяем X-Forwarded-For только от известных прокси.
+# Раньше _client_ip безусловно верил XFF — любой запрос мог подставить
+# произвольный IP и обойти rate-limit на /login (5 попыток с одного IP).
+# Теперь: если peer (прямой соединитель) в списке TRUSTED_PROXIES,
+# берём первый IP из XFF. Иначе — берём сам peer.
+# Это безопасный дефолт: если env не задан, лимит может стать глобальным
+# (всё приходит с 127.0.0.1 за reverse proxy), но это лучше, чем дыра.
+# Для Bothost: TRUSTED_PROXIES=127.0.0.1 (или IP их nginx).
+_TRUSTED_PROXIES = frozenset(
+    ip.strip() for ip in os.getenv("TRUSTED_PROXIES", "").split(",") if ip.strip()
+)
+
+
 def _client_ip(request: Request) -> str:
-    """Достаёт IP клиента из request. Учитывает X-Forwarded-For (за прокси)."""
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        # Берём первый IP из списка
-        return xff.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """IP клиента. X-Forwarded-For учитывается только если прямой peer
+    — доверенный прокси (см. _TRUSTED_PROXIES). Иначе берётся peer соединения."""
+    peer = request.client.host if request.client else "unknown"
+    if peer in _TRUSTED_PROXIES:
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            # Берём первый (самый левый) IP из списка — это исходный клиент.
+            return xff.split(",")[0].strip()
+    return peer
 
 
 def _wal_checkpoint() -> None:
@@ -157,6 +188,23 @@ def _wal_checkpoint() -> None:
             conn.close()
     except sqlite3.Error as e:
         _req_logger.warning("wal_checkpoint failed: %s (continuing)", e)
+
+
+# v4.8.7: async-обёртки для блокирующих SQLite-операций. Раньше в async-роутах
+# (/admin/settings, /admin/settings/backup, /admin/settings/vacuum,
+# /admin/cleanup) вызывались синхронные sqlite3.connect / shutil.copy2 /
+# VACUUM — это блокировало event loop на всё время операции. Пока SU жмёт
+# «Backup» или «Cleanup» с тяжёлым VACUUM, бот не отвечал ни в одном чате
+# (polling приостанавливался). asyncio.to_thread() выносит блокирующий I/O
+# в пул потоков — event loop остаётся живым, бот продолжает работать.
+# Все функции ниже — тонкие обёртки, чтобы вызывать их через await.
+async def _wal_checkpoint_async() -> None:
+    await asyncio.to_thread(_wal_checkpoint)
+
+
+async def _backup_db_async(backup_path: str) -> None:
+    """Синхронный shutil.copy2 в потоке — не блокирует event loop."""
+    await asyncio.to_thread(shutil.copy2, DB_PATH, backup_path)
 
 # ── Публичный URL веб-панели ────────────────────────────────────────────────
 # Дублируется из bot_handlers.py намеренно (web_app.py не должен зависеть от
@@ -189,15 +237,39 @@ def _make_token(username: str, is_su: bool, role: str = "admin") -> str:
     return f"{raw}:{sig}"
 
 
+# v4.8.7: срок годности токена сессии. Раньше поле 't' (issued_ts) писалось
+# в payload, но _verify_token его не проверял — утёкшая кука оставалась
+# валидной бесконечно (пока SU-аккаунт активен). Теперь: токен протухает
+# через _SESSION_TTL_SECONDS (7 дней по умолчанию, как cookie max_age).
+# При истечении — _verify_token возвращает None → require_auth кидает
+# редирект на /login. Cookie max_age и server-side TTL синхронизированы:
+# если браузер почистил куку раньше — пользователь сам разлогинился,
+# если кука утекла — сервер всё равно её отбросит через 7 дней.
+_SESSION_TTL_SECONDS = int(os.getenv("WEB_SESSION_TTL_SECONDS", str(86400 * 7)))
+
+
 def _verify_token(token: str) -> dict | None:
-    """Возвращает payload (dict) или None если токен невалиден."""
+    """Возвращает payload (dict) или None если токен невалиден или протух."""
     try:
         raw, signature = token.rsplit(":", 1)
         expected = _sign(raw)
         if not hmac.compare_digest(signature, expected):
             return None
         payload = json.loads(raw)
-        return payload if {"u", "s", "t"} <= set(payload.keys()) else None
+        if not {"u", "s", "t"} <= set(payload.keys()):
+            return None
+        # v4.8.7: проверка срока годности. Если токен старше
+        # _SESSION_TTL_SECONDS — считаем протухшим (return None).
+        # compare в int — нет float edge cases.
+        issued_at = int(payload["t"])
+        age = int(time.time()) - issued_at
+        if age > _SESSION_TTL_SECONDS:
+            return None
+        # Защита от "future timestamps" (часы убежали вперёд при выдаче) —
+        # токен из будущего считаем невалидным (5 сек tolerance).
+        if age < -5:
+            return None
+        return payload
     except (ValueError, json.JSONDecodeError):
         return None
 
@@ -269,6 +341,84 @@ async def require_admin(request: Request, _: AuthUser = Depends(require_auth)) -
 
     Moderator → redirect на /dashboard.
     """
+    if _.role not in ("su", "admin"):
+        raise HTTPException(status_code=303, headers={"Location": "/dashboard"})
+    return _
+
+
+# ── CSRF (v4.8.8) ───────────────────────────────────────────────────────────
+# SameSite=lax на куке закрывает основной вектор CSRF в современных браузерах,
+# но это одна линия обороны — если куку когда-нибудь переведут на SameSite=none
+# или браузер пользователя не поддерживает SameSite, панель станет уязвимой.
+# Токен привязан к username сессии тем же HMAC-секретом, что и сама кука:
+# отдельного хранилища не нужно, токен безперационно валидируется на сервере.
+# Шаблон получает csrf_token автоматически через context_processor ниже —
+# во все формы достаточно добавить:
+#   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+#
+# Зависимости require_csrf_* совмещают проверку CSRF с проверкой роли:
+#   require_csrf_auth    → auth + CSRF
+#   require_csrf_admin   → auth + admin+ + CSRF
+#   require_csrf_su      → auth + su + CSRF
+# В POST-роутах они заменяют соответствующие require_* (без csrf).
+
+def _csrf_token_for_username(username: str) -> str:
+    """CSRF-токен, привязанный к username. Подписан тем же секретом, что сессия."""
+    return _sign(f"csrf:{username}")
+
+
+def _csrf_token_from_request(request: Request) -> str:
+    """Достаёт CSRF-токен для текущего запроса (по куке сессии).
+    Возвращает пустую строку, если пользователь не залогинен —
+    в этом случае форма всё равно отрендерится, но POST без токена отклонится."""
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return ""
+    payload = _verify_token(token)
+    if not payload:
+        return ""
+    return _csrf_token_for_username(payload["u"])
+
+
+async def _validate_csrf(request: Request, auth: AuthUser) -> None:
+    """Проверяет csrf_token из form data. Raises HTTPException(403) если невалиден."""
+    try:
+        form = await request.form()
+    except Exception:
+        # form() может бросить, если body уже прочитан (например, JSON). Для
+        # JSON-API роутов CSRF не используется — там заголовок X-CSRF-Token.
+        form = None
+    supplied = ""
+    if form is not None:
+        supplied = form.get("csrf_token", "") or ""
+    if not supplied:
+        # Fallback: заголовок X-CSRF-Token (для fetch-вызовов из JS).
+        supplied = request.headers.get("X-CSRF-Token", "") or ""
+    expected = _csrf_token_for_username(auth.username)
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
+
+
+async def require_csrf_auth(request: Request) -> AuthUser:
+    """Auth + CSRF. Используется в POST-роутах вместо require_auth."""
+    auth = await require_auth(request)
+    await _validate_csrf(request, auth)
+    return auth
+
+
+async def require_csrf_su(
+    request: Request, _: AuthUser = Depends(require_csrf_auth)
+) -> AuthUser:
+    """SU + CSRF. Заменяет require_su в POST-роутах."""
+    if _.role != "su":
+        raise HTTPException(status_code=303, headers={"Location": "/dashboard"})
+    return _
+
+
+async def require_csrf_admin(
+    request: Request, _: AuthUser = Depends(require_csrf_auth)
+) -> AuthUser:
+    """Admin+ + CSRF. Заменяет require_admin в POST-роутах."""
     if _.role not in ("su", "admin"):
         raise HTTPException(status_code=303, headers={"Location": "/dashboard"})
     return _
@@ -593,6 +743,19 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 (дёргает bot.get_chat(user_id) для получения профиля из Telegram).
                 Если None — эндпоинт /admin/users/create вернёт 503.
     """
+    # v4.8.7: SESSION_SECRET обязательна при реальном старте приложения.
+    # Если env не задан — падаем с понятным сообщением вместо тихого
+    # разлогинивания всех пользователей при каждом рестарте. Тесты обычно
+    # вызывают create_app(bot=None) — для них делаем исключение через
+    # WEB_ALLOW_NO_SECRET=1 (тесты сами выставляют).
+    if not _SESSION_SECRET_EXPLICIT and os.getenv("WEB_ALLOW_NO_SECRET") != "1":
+        raise RuntimeError(
+            "SESSION_SECRET env var is required. Generate one with:\n"
+            "  python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+            "and set it in Bothost panel env vars. Without it, all session "
+            "cookies would be invalidated on every restart. For local dev "
+            "or tests, set WEB_ALLOW_NO_SECRET=1 to bypass this check."
+        )
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
     # ── Request logging middleware ────────────────────────────────────
@@ -641,6 +804,38 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # v4.5.2: глобальные переменные для всех шаблонов (версия в футере)
     templates.env.globals["app_version"] = APP_VERSION
     templates.env.globals["app_release_date"] = APP_RELEASE_DATE
+
+    # v4.8.8: обёртка над TemplateResponse — автоматически прокидывает csrf_token
+    # в контекст каждого шаблона. Все 14 вызовов templates.TemplateResponse(...)
+    # передают request в context — по нему вычисляется токен. Если пользователь
+    # не залогинен (например, /login) — токен пустой, форма рендерится без поля.
+    # В шаблонах: {{ csrf_token }} — значение, {{ csrf_field() }} — готовый <input>.
+    _orig_template_response = templates.TemplateResponse
+
+    def _template_response_with_csrf(name, context=None, **kwargs):
+        ctx = dict(context or {})
+        req = ctx.get("request")
+        if req is not None and "csrf_token" not in ctx:
+            ctx["csrf_token"] = _csrf_token_from_request(req)
+        return _orig_template_response(name, ctx, **kwargs)
+
+    templates.TemplateResponse = _template_response_with_csrf
+
+    # csrf_field() — хелпер для шаблонов: рендерит <input type="hidden" ...>.
+    # Читает csrf_token из контекста шаблона через @pass_context — иначе Jinja
+    # не передаёт контекстные переменные в глобальные callable.
+    # Возвращает Markup (не str), чтобы Jinja не эскейпил HTML-теги.
+    from jinja2 import pass_context
+    from markupsafe import Markup
+
+    @pass_context
+    def _csrf_field(ctx):
+        token = ctx.get("csrf_token", "")
+        if not token:
+            return ""
+        return Markup(f'<input type="hidden" name="csrf_token" value="{token}">')
+
+    templates.env.globals["csrf_field"] = _csrf_field
 
     # v4.5: создаём папку для аватарок при старте (если ещё нет)
     try:
@@ -704,13 +899,19 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
         # SU login — пароль из env WEB_PASSWORD
         if username == "su":
-            if not WEB_PASSWORD or password != WEB_PASSWORD:
+            # v4.8.7: константное сравнение (hmac.compare_digest) вместо
+            # != — закрывает теоретический timing attack на SU-пароль.
+            # Для обычных админов PBKDF2 с 200k итераций уже даёт
+            # ~60ms на проверку, что шумит timing — там != было ок.
+            # SU пароль хранится в env как plaintext (без хеша), поэтому
+            # сравнение должно быть константным.
+            if not WEB_PASSWORD or not hmac.compare_digest(password, WEB_PASSWORD):
                 return templates.TemplateResponse("login.html", {"request": request, "error": True})
             token = _make_token("su", is_su=True, role="su")
             response = RedirectResponse(url="/dashboard", status_code=303)
             response.set_cookie(
                 key=COOKIE_NAME, value=token, httponly=True,
-                secure=False, samesite="lax", max_age=86400 * 7,
+                secure=_COOKIE_SECURE, samesite="lax", max_age=86400 * 7,
             )
             # Обновляем last_login_at (v4.7.8: обёрнуто в try/except —
             # обновление метрики не должно блокировать логин. Если БД
@@ -748,7 +949,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             response = RedirectResponse(url="/dashboard", status_code=303)
             response.set_cookie(
                 key=COOKIE_NAME, value=token, httponly=True,
-                secure=False, samesite="lax", max_age=86400 * 7,
+                secure=_COOKIE_SECURE, samesite="lax", max_age=86400 * 7,
             )
             return response
 
@@ -1187,7 +1388,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         tg_user_id: str = Form(...),
         role: str = Form("admin"),
         chat_ids: list[str] = Form(None),
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.4.7: создаёт веб-пользователя по Telegram ID с ролью admin/moderator.
 
@@ -1378,7 +1579,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/users/{user_id:int}/toggle")
     async def admin_users_toggle(
         user_id: int,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         async with async_session() as session:
             wu = (await session.execute(
@@ -1397,7 +1598,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         request: Request,
         user_id: int,
         password: str = Form(...),
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         if len(password) < 6:
             return RedirectResponse(url="/admin/users?flash=Password+must+be+at+least+6+chars", status_code=303)
@@ -1415,7 +1616,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_users_change_role(
         user_id: int,
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.4.7: меняет роль пользователя admin↔moderator.
 
@@ -1467,7 +1668,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_users_edit_chats(
         user_id: int,
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.4.7: редактирует список чатов, к которым привязан модератор.
 
@@ -1531,7 +1732,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_users_bind_tg(
         user_id: int,
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.4.7: привязывает/отвязывает TG ID для существующего пользователя.
 
@@ -1626,7 +1827,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/users/{user_id:int}/delete")
     async def admin_users_delete(
         user_id: int,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         async with async_session() as session:
             wu = (await session.execute(
@@ -1772,7 +1973,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         day_preset_id: str = Form(""),
         night_preset_id: str = Form(""),
         sanitary_preset_id: str = Form("__lockdown__"),
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
         try:
@@ -2067,7 +2268,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_chats_toggle(
         chat_id_str: str,
         request: Request,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.4.7: переключает is_enabled / is_report_chat для чата.
         v4.5.2: добавлены toggle для cas, link_filter, night_mode.
@@ -2247,7 +2448,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/chats/{chat_id_str}/delete")
     async def admin_chats_delete(
         chat_id_str: str,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.4.8: полностью удаляет чат. Бот ливает, записи из БД чистятся."""
         try:
@@ -2366,7 +2567,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/chats/{chat_id_str}/sync-admins")
     async def admin_chats_sync_admins(
         chat_id_str: str,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.7.0: sync TG-admins of a chat → WebUser (pending or activate)."""
         try:
@@ -2617,7 +2818,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_chats_sanitary_add(
         chat_id_str: str,
         request: Request,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.6: добавить период санитарных дней."""
         try:
@@ -2684,7 +2885,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_chats_sanitary_delete(
         chat_id_str: str,
         idx_str: str,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.6: удалить период санитарных дней по индексу."""
         try:
@@ -2783,7 +2984,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_keywords_add(
         phrase: str = Form(""),
         ban_in_night_mode: str = Form(""),
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.8.0: добавить фразу в keyword-watch список.
 
@@ -2848,7 +3049,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/keywords/{keyword_id:int}/delete")
     async def admin_keywords_delete(
         keyword_id: int,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.8.0: soft-delete фразу из keyword-watch списка.
 
@@ -2879,7 +3080,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/keywords/{keyword_id:int}/toggle-ban-night")
     async def admin_keywords_toggle_ban_night(
         keyword_id: int,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.8.0: переключить флаг ban_in_night_mode для фразы."""
         async with async_session() as session:
@@ -2943,7 +3144,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         old_password: str = Form(...),
         new_password: str = Form(...),
         confirm: str = Form(...),
-        _auth: AuthUser = Depends(require_auth),
+        _auth: AuthUser = Depends(require_csrf_auth),
     ):
         # SU пароль в env — менять через /me нельзя.
         if _auth.is_su:
@@ -3049,7 +3250,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/me/avatar/refresh")
     async def me_avatar_refresh(
         request: Request,
-        _auth: AuthUser = Depends(require_auth),
+        _auth: AuthUser = Depends(require_csrf_auth),
     ):
         """v4.5: принудительно скачивает аватарку из TG и обновляет timestamp."""
         if not _auth.tg_user_id:
@@ -3094,13 +3295,15 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     #    • Cleanup (preview + apply — встроенный, как было в /admin/cleanup)
     #    • VACUUM (оптимизация файла БД без удаления данных)
     # ──────────────────────────────────────────────────────────────────
-    def _bot_info() -> dict:
+    async def _bot_info() -> dict:
         """Собирает snapshot инфо о боте для страницы Settings.
 
         v4.8.6: переписано без psutil (его нет в requirements.txt, поэтому
         uptime всегда показывал 0s). Uptime считается от _APP_START_TIME
         (время импорта модуля). Memory RSS читается из /proc/self/status
         (Linux only — на Bothost работает, в Windows dev-окружении fallback 0).
+        v4.8.7: blocking SQLite (6 COUNT-запросов) вынесен в asyncio.to_thread
+        — не фризит event loop при рендере страницы Settings.
         """
         info = {
             "version": APP_VERSION,
@@ -3134,30 +3337,38 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                         break
         except (OSError, ValueError):
             pass
-        # Счётчики из БД
-        try:
+        # Счётчики из БД — v4.8.7: blocking SQLite в потоке.
+        def _counts_sync() -> dict:
+            result = {
+                "chats_total": 0, "chats_enabled": 0, "chats_disabled": 0,
+                "moderators_total": 0, "web_users_total": 0, "punishments_total": 0,
+            }
             conn = sqlite3.connect(DB_PATH)
             try:
-                info["chats_total"] = conn.execute(
+                result["chats_total"] = conn.execute(
                     "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0"
                 ).fetchone()[0]
-                info["chats_enabled"] = conn.execute(
+                result["chats_enabled"] = conn.execute(
                     "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0 AND is_enabled=1"
                 ).fetchone()[0]
-                info["chats_disabled"] = conn.execute(
+                result["chats_disabled"] = conn.execute(
                     "SELECT COUNT(*) FROM chat_settings WHERE chat_id != 0 AND is_enabled=0"
                 ).fetchone()[0]
-                info["moderators_total"] = conn.execute(
+                result["moderators_total"] = conn.execute(
                     "SELECT COUNT(*) FROM moderators"
                 ).fetchone()[0]
-                info["web_users_total"] = conn.execute(
+                result["web_users_total"] = conn.execute(
                     "SELECT COUNT(*) FROM web_users"
                 ).fetchone()[0]
-                info["punishments_total"] = conn.execute(
+                result["punishments_total"] = conn.execute(
                     "SELECT COUNT(*) FROM punishments"
                 ).fetchone()[0]
             finally:
                 conn.close()
+            return result
+        try:
+            counts = await asyncio.to_thread(_counts_sync)
+            info.update(counts)
         except sqlite3.Error as e:
             _req_logger.warning("_bot_info: sqlite error: %s", e)
         return info
@@ -3177,11 +3388,14 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 "users_to_delete": 0,
             }
         else:
-            conn = sqlite3.connect(DB_PATH)
-            try:
-                counts = _cleanup_counts(conn)
-            finally:
-                conn.close()
+            # v4.8.7: blocking SQLite — в потоке, чтобы не фризить event loop.
+            def _get_counts_sync():
+                conn = sqlite3.connect(DB_PATH)
+                try:
+                    return _cleanup_counts(conn)
+                finally:
+                    conn.close()
+            counts = await asyncio.to_thread(_get_counts_sync)
 
         # v4.8.5: текущие настройки GitHub (для pre-fill формы).
         github_settings: dict = {}
@@ -3241,7 +3455,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "flash": flash or None,
             "counts": counts,
             "db_path_dir": os.path.dirname(DB_PATH) or ".",
-            "bot_info": _bot_info(),
+            "bot_info": await _bot_info(),
             "github_settings": github_settings,
             "idea_stats": idea_stats,
         })
@@ -3249,7 +3463,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/settings/backup")
     async def admin_settings_backup(
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.5: создаёт резервную копию БД без удаления данных."""
         if not os.path.exists(DB_PATH):
@@ -3262,9 +3476,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         backup_filename = os.path.basename(backup_path)
         # v4.5.1: checkpoint WAL в основной файл перед копированием — иначе
         # свежие записи (последние несколько секунд) в бэкап не попадут.
-        _wal_checkpoint()
+        # v4.8.7: blocking I/O обёрнут в asyncio.to_thread — event loop
+        # остаётся живым, бот продолжает отвечать в чатах.
+        await _wal_checkpoint_async()
         try:
-            shutil.copy2(DB_PATH, backup_path)
+            await _backup_db_async(backup_path)
         except OSError as e:
             _req_logger.error("admin_settings_backup: backup failed: %s", e)
             return RedirectResponse(
@@ -3283,7 +3499,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/settings/vacuum")
     async def admin_settings_vacuum(
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.5: запускает VACUUM на файле БД (оптимизация без удаления данных)."""
         if not os.path.exists(DB_PATH):
@@ -3291,7 +3507,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 url="/admin/settings?flash=Database+file+not+found",
                 status_code=303,
             )
-        try:
+        # v4.8.7: VACUUM — блокирующая синхронная операция. Выносим в
+        # поток через asyncio.to_thread — event loop остаётся живым, бот
+        # продолжает обрабатывать обновления во время VACUUM.
+        def _vacuum_sync() -> tuple[int, int]:
             size_before = os.path.getsize(DB_PATH)
             conn = sqlite3.connect(DB_PATH)
             try:
@@ -3301,6 +3520,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             finally:
                 conn.close()
             size_after = os.path.getsize(DB_PATH)
+            return size_before, size_after
+
+        try:
+            size_before, size_after = await asyncio.to_thread(_vacuum_sync)
         except sqlite3.Error as e:
             _req_logger.error("admin_settings_vacuum: VACUUM failed: %s", e)
             return RedirectResponse(
@@ -3374,7 +3597,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         project_owner_login: str = Form(""),
         project_status_option_name: str = Form(""),
         is_active: str = Form(""),
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.8.5: сохраняет настройки GitHub Projects.
 
@@ -3465,7 +3688,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/settings/github/test")
     async def admin_settings_github_test(
         request: Request,
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.8.5: проверка подключения к GitHub.
 
@@ -3582,7 +3805,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_cleanup_apply(
         request: Request,
         include_chat_admins: str = Form(""),
-        _auth: AuthUser = Depends(require_su),
+        _auth: AuthUser = Depends(require_csrf_su),
     ):
         """v4.5: реальное удаление тестовых данных (логика не изменилась).
 
@@ -3604,12 +3827,15 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
 
         # ── 1. Pre-flight counts ────────────────────────────────────
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            before = _cleanup_counts(conn)
-        finally:
-            conn.close()
+        # v4.8.7: blocking SQLite — в потоке.
+        def _preflight_counts_sync() -> dict:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                return _cleanup_counts(conn)
+            finally:
+                conn.close()
+        before = await asyncio.to_thread(_preflight_counts_sync)
 
         # ── 2. Safety: refuse on empty moderators+web_users ─────────
         if before["moderators"] == 0 and before["web_users"] == 0:
@@ -3628,9 +3854,10 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         backup_path = f"{DB_PATH}.backup-{ts}.db"
         backup_filename = os.path.basename(backup_path)
         # v4.5.1: checkpoint WAL в основной файл перед копированием.
-        _wal_checkpoint()
+        # v4.8.7: blocking I/O — через async-обёртки.
+        await _wal_checkpoint_async()
         try:
-            shutil.copy2(DB_PATH, backup_path)
+            await _backup_db_async(backup_path)
         except OSError as e:
             _req_logger.error("admin_cleanup: backup failed: %s", e)
             return RedirectResponse(
@@ -3644,31 +3871,46 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         )
 
         # ── 4-7. Delete + VACUUM ────────────────────────────────────
+        # v4.8.7: DELETE + VACUUM — всё в одном синхронном блоке внутри
+        # asyncio.to_thread. Транзакция с `with conn:` атомарна для DELETE;
+        # VACUUM выполняется после фиксации транзакции (SQLite требует VACUUM
+        # вне активной транзакции). Возврат: (deleted_p, deleted_u, deleted_ca).
         deleted_punishments = 0
         deleted_users = 0
         deleted_chat_admins: int | None = None
-        try:
+
+        def _delete_and_vacuum_sync() -> tuple[int, int, int | None]:
+            dp = du = 0
+            dca: int | None = None
             conn = sqlite3.connect(DB_PATH)
             conn.execute("PRAGMA foreign_keys=ON")
-            with conn:
-                cur = conn.execute("DELETE FROM punishments")
-                deleted_punishments = cur.rowcount
+            try:
+                with conn:
+                    cur = conn.execute("DELETE FROM punishments")
+                    dp = cur.rowcount
 
-                cur = conn.execute(
-                    "DELETE FROM users WHERE user_id NOT IN "
-                    "(SELECT mod_id FROM moderators)"
-                )
-                deleted_users = cur.rowcount
+                    cur = conn.execute(
+                        "DELETE FROM users WHERE user_id NOT IN "
+                        "(SELECT mod_id FROM moderators)"
+                    )
+                    du = cur.rowcount
 
-                if include_chat_admins:
-                    cur = conn.execute("DELETE FROM chat_admins")
-                    deleted_chat_admins = cur.rowcount
+                    if include_chat_admins:
+                        cur = conn.execute("DELETE FROM chat_admins")
+                        dca = cur.rowcount
 
-            # VACUUM вне транзакции (SQLite требует)
-            conn.isolation_level = None
-            conn.execute("VACUUM")
-            conn.isolation_level = ""
-            conn.close()
+                # VACUUM вне транзакции (SQLite требует)
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+                conn.isolation_level = ""
+            finally:
+                conn.close()
+            return dp, du, dca
+
+        try:
+            deleted_punishments, deleted_users, deleted_chat_admins = (
+                await asyncio.to_thread(_delete_and_vacuum_sync)
+            )
         except sqlite3.Error as e:
             _req_logger.error(
                 "admin_cleanup: deletion failed: %s (backup=%s)",
@@ -3680,11 +3922,13 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
 
         # ── 8. Post-counts ──────────────────────────────────────────
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            after = _cleanup_counts(conn)
-        finally:
-            conn.close()
+        def _post_counts_sync() -> dict:
+            conn = sqlite3.connect(DB_PATH)
+            try:
+                return _cleanup_counts(conn)
+            finally:
+                conn.close()
+        after = await asyncio.to_thread(_post_counts_sync)
 
         _req_logger.info(
             "admin_cleanup: done (by=%s) punishments %d→%d, users %d→%d, "
@@ -3790,7 +4034,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # Empty/blank = None (не менять slow_mode при применении пресета).
         # 0 = выкл. >0 = N сек. Telegram limit: 0..36400.
         slow_mode_delay: str = Form(""),
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.6.0: создать новый пользовательский пресет. v4.7.16: + slow_mode_delay."""
         name = (name or "").strip()
@@ -3909,7 +4153,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         perm_can_invite_users: str = Form(""),
         perm_can_pin_messages: str = Form(""),
         slow_mode_delay: str = Form(""),
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.17: редактировать пресет (name/scope/permissions/slow_mode_delay).
 
@@ -4022,7 +4266,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/{preset_id:int}/delete")
     async def admin_presets_delete(
         preset_id: int,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.6.0: удалить пользовательский пресет. Системные неудаляемы."""
         async with async_session() as session:
@@ -4075,7 +4319,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         pattern: str = Form(...),
         is_regex: str = Form(""),
         action: str = Form("delete"),
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.5: добавить паттерн в word filter через веб-панель.
 
@@ -4162,7 +4406,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/words/{word_id:int}/delete")
     async def admin_presets_words_delete(
         word_id: int,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.5: удалить паттерн из word filter (soft-delete — is_active=False).
 
@@ -4203,7 +4447,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_presets_links_add(
         chat_id: str = Form("0"),
         domain: str = Form(...),
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.5: добавить домен в link allowlist через веб-панель.
 
@@ -4268,7 +4512,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/links/{link_id:int}/delete")
     async def admin_presets_links_delete(
         link_id: int,
-        _auth: AuthUser = Depends(require_admin),
+        _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.5: удалить домен из link allowlist (hard delete).
 

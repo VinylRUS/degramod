@@ -142,6 +142,7 @@
             <td style="padding: 8px 12px; text-align: right;">
                 <form method="post" action="/api/unban" style="display: inline;"
                       onsubmit="return submit_unban({{ ban.id }}, {{ ban.user_id }}, {{ ban.chat_id }}, '{{ (ban.user_first_name or '')|e|replace("'", "\\'") }}');">
+            {{ csrf_field() }}
                     <input type="hidden" name="punishment_id" value="{{ ban.id }}">
                     <input type="hidden" name="user_id" value="{{ ban.user_id }}">
                     <input type="hidden" name="chat_id" value="{{ ban.chat_id }}">

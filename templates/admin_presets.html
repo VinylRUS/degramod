@@ -36,6 +36,7 @@
 <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
     <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Create new preset</summary>
     <form method="post" action="/admin/presets/create" style="margin-top: var(--sp-4);">
+            {{ csrf_field() }}
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-3); margin-bottom: var(--sp-3);">
             <div>
                 <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Name (1-64 chars, unique)</label>
@@ -160,6 +161,7 @@
                     </span>
                     <form method="post" action="/admin/presets/{{ p.id }}/delete" style="display: inline;"
                           onsubmit="return confirm('Delete preset {{ p.name|e }}?\nExisting chats using it will keep their saved copy — not affected.');">
+            {{ csrf_field() }}
                         <button type="submit"
                                 style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
                             Delete
@@ -172,6 +174,7 @@
             </summary>
             {% if not p.is_system %}
             <form method="post" action="/admin/presets/{{ p.id }}/edit" style="padding: var(--sp-3); border-top: 1px solid var(--border);">
+            {{ csrf_field() }}
                 <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); margin-bottom: var(--sp-3);">
                     Edit preset #{{ p.id }} «{{ p.name }}»
                 </div>
@@ -276,6 +279,7 @@
     <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
         <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Добавить слово</summary>
         <form method="post" action="/admin/presets/words/add" style="margin-top: var(--sp-4);">
+            {{ csrf_field() }}
             {# ── Main row: Pattern + Action + Scope (3 columns, simple) ── #}
             <div style="display: grid; grid-template-columns: 2fr 1fr 1.4fr; gap: var(--sp-3); align-items: end;">
                 <div>
@@ -366,6 +370,7 @@
             <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">#{{ w.id }}</span>
             <form method="post" action="/admin/presets/words/{{ w.id }}/delete" style="display: inline;"
                   onsubmit="return confirm('Delete pattern {{ w.pattern|e }}?\n\nThis will soft-delete it (is_active=False). Audit history is preserved.');">
+            {{ csrf_field() }}
                 <button type="submit"
                         style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
                     Delete
@@ -403,6 +408,7 @@
     <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
         <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Добавить домен</summary>
         <form method="post" action="/admin/presets/links/add" style="margin-top: var(--sp-4);">
+            {{ csrf_field() }}
             <div style="display: grid; grid-template-columns: 1fr 2fr; gap: var(--sp-3); align-items: end;">
                 <div>
                     <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Куда применить</label>
@@ -451,6 +457,7 @@
             <code style="color: var(--text); font-size: 12px; word-break: break-all;">{{ l.domain }}</code>
             <form method="post" action="/admin/presets/links/{{ l.id }}/delete" style="display: inline;"
                   onsubmit="return confirm('Remove domain {{ l.domain|e }} from allowlist?\n\nLinks to this domain will be blocked by link-filter if enabled.');">
+            {{ csrf_field() }}
                 <button type="submit"
                         style="padding: 2px 8px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
                     ✕

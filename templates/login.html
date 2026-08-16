@@ -106,6 +106,7 @@
         <div class="error-msg">{% if error_msg %}{{ error_msg }}{% else %}ACCESS DENIED{% endif %}</div>
         {% endif %}
         <form method="post" action="/login">
+            {{ csrf_field() }}
             <div class="field">
                 <label for="username">Username</label>
                 <input type="text" id="username" name="username" placeholder="su" autofocus autocomplete="username">

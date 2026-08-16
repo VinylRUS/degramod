@@ -68,6 +68,7 @@
 <details open style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
     <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Добавить фразу</summary>
     <form method="post" action="/admin/keywords/add" style="margin-top: var(--sp-4);">
+            {{ csrf_field() }}
         <div style="display: grid; grid-template-columns: 3fr 1fr; gap: var(--sp-3); align-items: end;">
             <div>
                 <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Слово или фраза (1..255 символов)</label>
@@ -127,6 +128,7 @@
         </div>
         <form method="post" action="/admin/keywords/{{ kw.id }}/toggle-ban-night" style="display: inline;"
               title="Переключить флаг ban_in_night_mode (ночью → автобан вместо notify)">
+            {{ csrf_field() }}
             <button type="submit"
                     style="padding: 4px 10px; background: transparent; border: 1px solid {% if kw.ban_in_night_mode %}var(--danger){% else %}var(--border){% endif %}; color: {% if kw.ban_in_night_mode %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
                 {% if kw.ban_in_night_mode %}🚫 BAN-NIGHT ●{% else %}🚫 BAN-NIGHT ○{% endif %}
@@ -135,6 +137,7 @@
         <span style="font-size: 10px; color: var(--text-dim); font-family: var(--font-mono);">#{{ kw.id }}</span>
         <form method="post" action="/admin/keywords/{{ kw.id }}/delete" style="display: inline;"
               onsubmit="return confirm('Delete phrase «{{ kw.phrase|e }}»?\n\nThis will soft-delete it (is_active=False). Audit history is preserved.\n\nThe phrase will stop matching in all chats immediately.');">
+            {{ csrf_field() }}
             <button type="submit"
                     style="padding: 4px 10px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
                 Delete

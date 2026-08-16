@@ -618,7 +618,8 @@
         </a>
         {% endif %}
         <a href="/logout" class="nav-link" onclick="event.preventDefault(); document.getElementById('logout-form').submit();">Logout</a>
-        <form id="logout-form" method="post" action="/logout" style="display: none;"></form>
+        <form id="logout-form" method="post" action="/logout" style="display: none;">
+            {{ csrf_field() }}</form>
     </nav>
     {% endblock %}
 
@@ -639,6 +640,57 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.8</strong> — 16 августа 2026 (security: CSRF-токены на всех изменяющих запросах веб-панели, XFF trusted proxy)</p>
+                <ul>
+                    <li><strong>CSRF-токены на всех POST-роутах</strong>. Раньше единственная защита от подделки запроса к веб-панели — <code>SameSite=lax</code> на куке. Это закрывает основной вектор в современных браузерах, но это одна линия обороны — если куку когда-нибудь переведут на <code>SameSite=none</code> или браузер пользователя не поддерживает SameSite, панель станет уязвимой. Теперь: каждый POST-роут (30 штук, кроме <code>/login</code> и <code>/api/*</code>) требует валидный CSRF-токен в form data или заголовке <code>X-CSRF-Token</code>. Токен привязан к username тем же HMAC-секретом, что и сессия — отдельного хранилища не нужно. Сравнение через <code>hmac.compare_digest</code> (timing-safe).</li>
+                    <li><strong>CSRF-токен в шаблонах</strong>. Все 29 POST-форм в 9 шаблонах (<code>login.html</code>, <code>base.html</code>, <code>admin.html</code>, <code>admin_chats.html</code>, <code>admin_keywords.html</code>, <code>admin_presets.html</code>, <code>admin_settings.html</code>, <code>admin_bans.html</code>, <code>profile.html</code>) получили <code>{{ csrf_field() }}</code> — скрытое поле <code>&lt;input type="hidden" name="csrf_token" value="..."&gt;</code>. Хелпер <code>csrf_field()</code> автоматически берёт токен из контекста запроса; для незалогиненных (на <code>/login</code>) возвращает пустую строку — форма рендерится без поля.</li>
+                    <li><strong>X-Forwarded-For только от доверенного прокси</strong>. Раньше <code>_client_ip</code> безусловно верил заголовку <code>X-Forwarded-For</code> — любой запрос мог подставить произвольный IP и обойти rate-limit на <code>/login</code> (5 попыток на 5 минут с одного IP). Теперь: заголовок учитывается только если прямой peer соединения — в списке <code>TRUSTED_PROXIES</code>. Дефолт пустой (безопасный — лимит может стать глобальным за reverse proxy, но это лучше дыры). Для Bothost: <code>TRUSTED_PROXIES=127.0.0.1</code>.</li>
+                    <li><strong>Новый env var</strong>:
+                        <ul>
+                            <li><code>TRUSTED_PROXIES</code> — список CSV IP-адресов доверенных reverse proxy. Пример: <code>TRUSTED_PROXIES=127.0.0.1,10.0.0.1</code>. Дефолт пустой. Если Bothost за Cloudflare/nginx — нужно указать IP их прокси, иначе rate-limit на <code>/login</code> будет глобальным.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в схеме БД, API endpoints, обработчиках команд. После обновления — указать <code>TRUSTED_PROXIES=127.0.0.1</code> в env Bothost (или IP их reverse proxy), иначе rate-limit на <code>/login</code> станет глобальным.</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.8; <code>_TRUSTED_PROXIES</code> frozenset из env; <code>_client_ip</code> переписана (XFF только от доверенного peer); добавлены <code>_csrf_token_for_username()</code>, <code>_csrf_token_from_request()</code>, <code>_validate_csrf()</code>, <code>require_csrf_auth()</code>, <code>require_csrf_su()</code>, <code>require_csrf_admin()</code>; обёртка <code>templates.TemplateResponse</code> для автоматического прокидывания <code>csrf_token</code> в контекст; <code>csrf_field()</code> Jinja global через <code>@pass_context</code>; 30 замен <code>Depends(require_*)</code> → <code>Depends(require_csrf_*)</code> в POST-роутах.</li>
+                            <li><code>templates/*.html</code> — 29 форм в 9 файлах получили <code>{{ csrf_field() }}</code>.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                </ul>
+
+                <p><strong>v4.8.7</strong> — 16 августа 2026 (security + reliability: защита от 429, неблокирующий SQLite, hardening веб-панели)</p>
+                <ul>
+                    <li><strong>TG flood control (429 / RetryAfter)</strong>. Во всём проекте не было обработки <code>TelegramRetryAfter</code> — при 429 от Telegram хендлер падал в лог, команда не выполнялась. Добавлена обёртка <code>tg_safe_call(factory, label=...)</code> — при <code>TelegramRetryAfter</code> sleep(<code>retry_after</code>) и ретрай до <code>TG_FLOOD_MAX_RETRIES</code> (default 3). Покрыты 13 критичных call sites: <code>!ban</code>, <code>!sban</code>, <code>!mute</code>, <code>!smute</code>, <code>!unmute</code>, <code>revoke_user_ban</code>, <code>_check_warn_threshold</code> (autoban + automute), CAS auto-ban, sticker filter auto-mute/ban, via-bot filter auto-mute, keyword-watch night-mode auto-ban, content filter auto-mute/ban. Best-effort вызовы (ephemeral, audit DM, удаление команды) НЕ обернуты — там 429 не критичен.</li>
+                    <li><strong><code>asyncio.create_task</code> без сильной ссылки — фикс GC-убийцы</strong>. 5 мест в <code>bot_handlers.py</code> создавали fire-and-forget таски через <code>asyncio.create_task(coro)</code> без сохранения ссылки — Python docs предупреждают: «GC может убить задачу на середине». Эфемерные сообщения «иногда» не удалялись. Добавлен <code>_background_tasks: set[asyncio.Task]</code> + helper <code>_spawn_background_task(coro, label=...)</code>: сохраняет strong ref, по <code>task.add_done_callback</code> удаляет из set, при exception — логирует warning. Заменены все 5 мест (3273, 4727, 7962, 8692, 8728 в v4.8.6).</li>
+                    <li><strong>Неблокирующий SQLite в async-роутах</strong>. Раньше в <code>web_app.py</code> в async-роутах <code>/admin/settings</code>, <code>/admin/settings/backup</code>, <code>/admin/settings/vacuum</code>, <code>/admin/cleanup</code> вызывались синхронные <code>sqlite3.connect</code> (7 мест), <code>shutil.copy2</code> (2 места), <code>VACUUM</code> (2 места) — это блокировало event loop на всё время операции. Пока SU жмёт «Backup» или «Cleanup» с тяжёлым VACUUM, бот не отвечал ни в одном чате. Фикс: все блокирующие операции обёрнуты в <code>await asyncio.to_thread(...)</code>. Добавлены async-helpers <code>_wal_checkpoint_async()</code> и <code>_backup_db_async(path)</code>. Вложенная <code>_bot_info()</code> стала async.</li>
+                    <li><strong><code>busy_timeout=30000</code> для SQLite</strong>. <code>create_async_engine</code> в <code>db.py:47</code> создавался без <code>connect_args</code> — дефолт SQLite 5 сек. При конкурентных writes в WAL-режиме (а именно так работает бот при активной модерации) получали <code>database is locked</code>. Фикс: <code>connect_args={"timeout": 30}</code> + <code>PRAGMA busy_timeout=30000</code> в <code>_set_sqlite_pragma</code>. 30 сек покрывает даже тяжёлые VACUUM.</li>
+                    <li><strong>Безопасность: срок годности токена сессии</strong>. Поле <code>t</code> (issued_ts) писалось в payload, но <code>_verify_token</code> его не проверял — утёкшая кука валидна бесконечно (пока SU-аккаунт активен). Фикс: в <code>_verify_token</code> добавлена проверка <code>age > _SESSION_TTL_SECONDS</code> (default 7 дней, через <code>WEB_SESSION_TTL_SECONDS</code> env). Cookie max_age и server-side TTL синхронизированы. Дополнительно: защита от future-timestamp (если часы убежали вперёд при выдаче — >5 сек tolerance, отбрасывается).</li>
+                    <li><strong>Безопасность: константное сравнение SU-пароля</strong>. <code>password != WEB_PASSWORD</code> для SU (web_app.py:707) — timing attack теоретический, но реальный (SU пароль в env plaintext, без хеша). Фикс: <code>hmac.compare_digest(password, WEB_PASSWORD)</code>. Для обычных админов PBKDF2 200k итераций уже даёт ~60ms на проверку — там было ок.</li>
+                    <li><strong>Безопасность: <code>secure=True</code> на куке</strong>. <code>secure=False</code> (web_app.py:713, 751) — на HTTPS-домене <code>https://degraban.bothost.tech</code> кука уходила в plaintext при redirect с HTTP. Фикс: <code>_COOKIE_SECURE</code> через env <code>WEB_COOKIE_SECURE</code> (default <code>"1"</code> = True). Для локальной dev-инсталляции на http://localhost — выставить <code>WEB_COOKIE_SECURE=0</code>.</li>
+                    <li><strong>Безопасность: <code>SESSION_SECRET</code> без env → стартовая ошибка</strong>. Раньше дефолтилась в <code>secrets.token_hex(32)</code> — безопасно, но при каждом рестарте без env все куки инвалидировались без видимой причины. Фикс: если env не задан при <code>create_app()</code> — падаем с понятным сообщением «generate one with python -c "import secrets; print(secrets.token_hex(32))" and set in Bothost panel». Для тестов и dev — <code>WEB_ALLOW_NO_SECRET=1</code>.</li>
+                    <li><strong>Новые env vars</strong>:
+                        <ul>
+                            <li><code>SESSION_SECRET</code> — обязательно для прода. 32+ char random hex string.</li>
+                            <li><code>WEB_COOKIE_SECURE</code> — default <code>"1"</code>. <code>"0"</code> для dev на http://.</li>
+                            <li><code>WEB_SESSION_TTL_SECONDS</code> — default <code>604800</code> (7 дней). Срок годности серверного токена.</li>
+                            <li><code>WEB_ALLOW_NO_SECRET=1</code> — обход проверки SESSION_SECRET (только для тестов/dev).</li>
+                            <li><code>TG_FLOOD_MAX_RETRIES</code> — default <code>"3"</code>. Сколько ретраев после 429.</li>
+                            <li><code>TG_FLOOD_RETRY_CAP</code> — default <code>"30"</code>. Cap на sleep при retry_after.</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в схеме БД, API endpoints, обработчиках команд. <code>SESSION_SECRET</code> — единственный новый обязательный env var для прода (для dev — <code>WEB_ALLOW_NO_SECRET=1</code>).</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>db.py</code> — <code>connect_args={"timeout": 30}</code> для <code>create_async_engine</code>, <code>PRAGMA busy_timeout=30000</code> в <code>_set_sqlite_pragma</code>.</li>
+                            <li><code>bot_handlers.py</code> — добавлен <code>_background_tasks</code> set + <code>_spawn_background_task()</code>; 5 замен <code>asyncio.create_task</code> → <code>_spawn_background_task</code>; добавлен <code>tg_safe_call()</code> с env-tunable <code>_MAX_RETRIES</code>/<code>_RETRY_CAP</code>; 13 замен <code>await bot.ban_chat_member(...)</code>/<code>restrict_chat_member</code>/<code>unban_chat_member</code> → <code>await tg_safe_call(lambda: ..., label=...)</code>; <code>import TelegramRetryAfter</code>.</li>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.7; <code>import asyncio</code>; <code>_SESSION_SECRET</code> теперь валидируется в <code>create_app()</code> (с <code>WEB_ALLOW_NO_SECRET</code> escape hatch); <code>_COOKIE_SECURE</code> через env (default True); <code>_SESSION_TTL_SECONDS</code> через env (default 7 дней); <code>_verify_token</code> проверяет срок годности + future-timestamp guard; SU login использует <code>hmac.compare_digest</code>; 2 места <code>secure=False</code> → <code>secure=_COOKIE_SECURE</code>; <code>_wal_checkpoint_async()</code> + <code>_backup_db_async()</code> helpers; <code>_bot_info()</code> стала async; все блокирующие SQLite-операции (7 мест) обёрнуты в <code>await asyncio.to_thread(...)</code>.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                </ul>
+
                 <p><strong>v4.8.6</strong> — 14 августа 2026 (maintenance: чистка Settings, багфиксы, удаление stub-команд)</p>
                 <ul>
                     <li><strong>Settings UI cleanup</strong>. Вкладка <code>/admin/settings</code> переписана: группировка Backup+Cleanup+VACUUM в один блок «Database maintenance» с цветными sub-секциями; color-aware flash (success=зелёный, error=красный — раньше всегда зелёный); статус-бейдж «● Online» в Bot info; новые строки Memory (RSS) и Python version.</li>

@@ -130,6 +130,7 @@
                     </button>
                 {% else %}
                     <form method="post" action="/admin/users/{{ wu.id }}/toggle" style="display: inline;">
+            {{ csrf_field() }}
                         <button type="submit"
                                 style="background: transparent; border: 1px solid var(--border); color: var(--text-dim); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                             {% if wu.is_active %}Disable{% else %}Enable{% endif %}
@@ -142,6 +143,7 @@
                     </button>
                     {% endif %}
                     <form method="post" action="/admin/users/{{ wu.id }}/role" style="display: inline; margin-left: 4px;">
+            {{ csrf_field() }}
                         <input type="hidden" name="role" value="{% if wu.role == 'admin' %}moderator{% else %}admin{% endif %}">
                         <button type="submit"
                                 onclick="return confirm('Change role {{ wu.username }}: {{ wu.role }} → {% if wu.role == 'admin' %}moderator{% else %}admin{% endif %}?');"
@@ -155,6 +157,7 @@
                     </button>
                     <form method="post" action="/admin/users/{{ wu.id }}/delete" style="display: inline; margin-left: 4px;"
                           onsubmit="return confirm('Delete user {{ wu.username }}? This removes their web-panel access.');">
+            {{ csrf_field() }}
                         <button type="submit"
                                 style="background: transparent; border: 1px solid var(--danger); color: var(--danger); padding: 4px 10px; font-size: 10px; font-family: var(--font-mono); cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                             Delete
@@ -167,6 +170,7 @@
         <tr id="bind-{{ wu.id }}" style="display: none; background: var(--bg3);">
             <td colspan="10" style="padding: var(--sp-3) var(--sp-4);">
                 <form method="post" action="/admin/users/{{ wu.id }}/bind-tg" style="display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap;">
+            {{ csrf_field() }}
                     <strong style="color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: var(--sp-2);">Telegram ID:</strong>
                     <input type="text" name="tg_user_id" pattern="[0-9]*" placeholder="{% if wu.tg_user_id %}{{ wu.tg_user_id }} (leave empty to unbind){% else %}123456789{% endif %}"
                            style="flex: 1; min-width: 200px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none;">
@@ -186,6 +190,7 @@
         <tr id="edit-chats-{{ wu.id }}" style="display: none; background: var(--bg3);">
             <td colspan="10" style="padding: var(--sp-3) var(--sp-4);">
                 <form method="post" action="/admin/users/{{ wu.id }}/edit-chats">
+            {{ csrf_field() }}
                     <div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-2);">
                         Select chats where <strong>{{ wu.username }}</strong> can use moderation commands:
                     </div>
@@ -222,6 +227,7 @@
         <tr id="reset-{{ wu.id }}" style="display: none; background: var(--bg3);">
             <td colspan="10" style="padding: var(--sp-3) var(--sp-4);">
                 <form method="post" action="/admin/users/{{ wu.id }}/reset" style="display: flex; gap: var(--sp-2); align-items: center; flex-wrap: wrap;">
+            {{ csrf_field() }}
                     <strong style="color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-right: var(--sp-2);">New password:</strong>
                     <input type="password" name="password" required minlength="6" placeholder="at least 6 chars"
                            style="flex: 1; min-width: 200px; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; outline: none;">

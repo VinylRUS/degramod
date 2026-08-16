@@ -121,6 +121,7 @@
     </div>
     <form method="post" action="/admin/settings/backup"
           onsubmit="return confirm('Create DB backup now?');">
+            {{ csrf_field() }}
         <button type="submit"
                 style="padding: 10px 20px; background: transparent; border: 1px solid var(--accent); border-radius: var(--r-sm); color: var(--accent); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: background .15s, color .15s;">
             ⬇ Backup now
@@ -199,6 +200,7 @@
     <form method="post" action="/admin/cleanup"
           onsubmit="return confirm('Apply cleanup?\n\nThis will:\n  - DELETE all {{ counts.punishments }} rows from punishments\n  - DELETE {{ counts.users_to_delete }} test users (keep moderators)\n  - PRESERVE all moderators, web_users, chat_settings\n  - Create a backup file first\n\nThis cannot be undone (except by restoring the backup).');"
           {% if counts.moderators == 0 and counts.web_users == 0 %}style="opacity: 0.5; pointer-events: none;"{% endif %}>
+            {{ csrf_field() }}
         <label style="display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); cursor: pointer; padding: var(--sp-3); background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);">
             <input type="checkbox" name="include_chat_admins" value="1"
                    style="cursor: pointer; width: 16px; height: 16px;">
@@ -231,6 +233,7 @@
     </div>
     <form method="post" action="/admin/settings/vacuum"
           onsubmit="return confirm('Run VACUUM on the database?\n\nThis rebuilds the DB file to reclaim space.\nNo data is deleted.');">
+            {{ csrf_field() }}
         <button type="submit"
                 style="padding: 10px 20px; background: transparent; border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 2px; font-weight: 700; cursor: pointer; transition: border-color .15s, color .15s;">
             ▶ VACUUM now
@@ -285,6 +288,7 @@
     {# Форма ──────────────────────────────────────────────────────────────── #}
     <form method="post" action="/admin/settings/github" id="github-form"
           style="display: flex; flex-direction: column; gap: var(--sp-4);">
+            {{ csrf_field() }}
 
         <div>
             <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: var(--sp-2);">
