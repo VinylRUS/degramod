@@ -52,9 +52,9 @@ import re
 # Подкладываем test-окружение ДО импорта модулей проекта.
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("BOT_TOKEN", "test:token")
-os.environ.setdefault("WEB_PASSWORD", "test-pwd")
+os.environ["WEB_PASSWORD"] = "test-pwd"
 os.environ.setdefault("SESSION_SECRET", "test-secret-xxxxxxxxxxxxxxxxxxxxx")
-os.environ.setdefault("ADMIN_IDS", "111111111")
+os.environ["ADMIN_IDS"] = "111111111"
 
 sys.path.insert(0, _P())
 

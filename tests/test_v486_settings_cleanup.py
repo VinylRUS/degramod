@@ -16,7 +16,7 @@ import time
 
 # Подкладываем фейковый DB_PATH чтобы импорт web_app не упал
 os.environ.setdefault("BOT_TOKEN", "test:test")
-os.environ.setdefault("ADMIN_IDS", "123")
+os.environ["ADMIN_IDS"] = "123"
 
 sys.path.insert(0, _P())
 

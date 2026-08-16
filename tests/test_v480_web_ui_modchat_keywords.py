@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("BOT_TOKEN", "123:test")
 os.environ.setdefault("BOT_ID", "123")
 os.environ.setdefault("USER_ID", "456")
-os.environ.setdefault("WEB_PASSWORD", "test-password")
+os.environ["WEB_PASSWORD"] = "test-password"
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-1234567890")
 os.environ.setdefault("DB_PATH", ":memory:")
 

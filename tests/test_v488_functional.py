@@ -63,7 +63,12 @@ print(f"   csrf_token: {csrf_token[:16]}... (len={len(csrf_token)})")
 
 # Проверка 2: POST без csrf_token → 403
 print("\n3. POST /admin/settings/vacuum БЕЗ csrf_token → ожидаем 403...")
-r = post_with_cookie("/admin/settings/vacuum")
+# Шим из conftest подставляет токен легаси-файлам сюиты; здесь его отсутствие —
+# и есть предмет проверки, поэтому шим выключается.
+import _csrf
+
+with _csrf.disabled():
+    r = post_with_cookie("/admin/settings/vacuum")
 assert r.status_code == 403, f"ожидался 403, получили {r.status_code}"
 print(f"   OK: {r.status_code} (CSRF защита работает)")
 

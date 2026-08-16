@@ -555,6 +555,7 @@ class TestNoRegressions(unittest.TestCase):
         self.assertIn("return True, perms_source, slow_source", body,
                       "_deactivate_alarm must still return (ok, perms_source, slow_source)")
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     def test_114_word_filter_still_works(self):
         """word_filter остался для обратной совместимости (deprecated)."""
         self.assertIn("class WordFilter", self.db_src,

@@ -21,7 +21,7 @@ import hmac
 import hashlib
 
 os.environ.setdefault("BOT_TOKEN", "test:test")
-os.environ.setdefault("ADMIN_IDS", "123")
+os.environ["ADMIN_IDS"] = "123"
 os.environ["WEB_ALLOW_NO_SECRET"] = "1"
 os.environ["WEB_COOKIE_SECURE"] = "0"  # TestClient uses http://
 

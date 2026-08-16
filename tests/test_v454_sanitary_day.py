@@ -41,9 +41,9 @@ os.environ.setdefault("DB_PATH", ":memory:")
 # Aiogram валидирует формат токена при создании Bot(). Используем валидный
 # формат: <bot_id>:<base64-ish-35+chars>.
 os.environ.setdefault("BOT_TOKEN", "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw")
-os.environ.setdefault("WEB_PASSWORD", "test-pwd")
+os.environ["WEB_PASSWORD"] = "test-pwd"
 os.environ.setdefault("SESSION_SECRET", "test-secret-xxxxxxxxxxxxxxxxxxxxx")
-os.environ.setdefault("ADMIN_IDS", "111111111")
+os.environ["ADMIN_IDS"] = "111111111"
 
 sys.path.insert(0, _P())
 

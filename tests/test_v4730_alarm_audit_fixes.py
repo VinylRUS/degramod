@@ -214,6 +214,7 @@ class TestBug4_FiltersExemptModerators(unittest.TestCase):
         self.assertIn("_is_admin(", body,
                       "handle_content_filters должен вызывать _is_admin")
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     def test_34_handle_content_filters_exempt_before_word_link(self):
         """Проверка exempt идёт ДО word/link фильтров.
 

@@ -9,7 +9,7 @@ import asyncio
 import tempfile
 
 os.environ.setdefault("BOT_TOKEN", "test:test")
-os.environ.setdefault("ADMIN_IDS", "123")
+os.environ["ADMIN_IDS"] = "123"
 
 _TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False, prefix="v486_e2e_")
 _TMP_DB.close()

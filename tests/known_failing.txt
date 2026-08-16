@@ -1,13 +1,21 @@
 # Файлы сюиты, которые пока не проходят.
 #
 # Сюита залита в main 16.08.2026 и писалась под код версий v4.4–v4.8.10 в
-# отдельной песочнице. За это время проект пережил несколько рефакторингов, и
-# часть проверок отстала: переименованные и переехавшие функции, зашитые в
-# ассерты номера версий, изменившиеся тексты шаблонов.
+# отдельной песочнице. За это время проект пережил несколько рефакторингов,
+# и часть проверок отстала.
 #
 # Пока файл здесь, его падение не роняет прогон. Как только он начинает
 # проходить — раннер требует убрать строку. Список должен только сокращаться;
 # добавлять в него новые файлы — значит скрывать регрессию.
+#
+# Что осталось разобрать (по убыванию частоты):
+#   - MagicMock вместо AsyncMock: методы стали корутинами либо ушли под
+#     tg_safe_call, и мок больше нельзя await'ить;
+#   - грепы по исходнику, ищущие код в bot_handlers.py после того, как он
+#     уехал в mod_commands.py (лечится как в test_v481: искать по обоим);
+#   - зашитые в ассерты номера версий ('v4.8.10' != 'v4.6.1');
+#   - изменившиеся сигнатуры (_send_public_punishment_notice: duration_s → duration);
+#   - изменившиеся тексты шаблонов и сообщений.
 #
 # Прогон: uv run python tools/run_tests.py
 # Разбор одного файла: uv run pytest tests/<файл> -q
@@ -18,22 +26,15 @@ test_v452_features.py
 test_v453_night_mode.py
 test_v454_sanitary_day.py
 test_v456_ephemeral_autodelete.py
-test_v45_dashboard.py
-test_v460_granular_perms.py
-test_v461_admin_chats_redesign.py
 test_v470_admin_discovery.py
 test_v4714_mute_permissions.py
 test_v4715_delete_violation_message.py
 test_v4716_slowmode.py
 test_v4720b_alarm_command.py
 test_v4726_handler_propagation.py
-test_v472_toggles.py
 test_v4730_alarm_audit_fixes.py
 test_v473_background_lifecycle.py
-test_v474_update_form_fix.py
 test_v475_wordfilter_linkallowlist_ui.py
-test_v476_sanitary_ui_cleanup.py
-test_v477_formnovalidate_fix.py
 test_v479_moderator_help.py
 test_v480_major_update.py
 test_v480_web_ui_modchat_keywords.py
@@ -41,5 +42,4 @@ test_v481_command_reform.py
 test_v481_web_unban.py
 test_v4831_swarn_smute_fix.py
 test_v4832_help_rich.py
-test_v487_async_routes.py
 test_v487_sanity.py

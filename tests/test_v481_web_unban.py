@@ -21,7 +21,7 @@ if _PROJ_ROOT not in sys.path:
     sys.path.insert(0, _PROJ_ROOT)
 
 os.environ.setdefault("BOT_TOKEN", "123456789:AAEhBP0av28zZc-WSxGyJzkvJm5abc1234")
-os.environ.setdefault("WEB_PASSWORD", "test-su-password")
+os.environ["WEB_PASSWORD"] = "test-su-password"
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-for-unban-tests-v481")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession

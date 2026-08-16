@@ -41,7 +41,7 @@ sys.path.insert(0, str(WORK_DIR))
 # Минимальные env-заглушки для импорта bot_handlers (db.py может требовать).
 os.environ.setdefault("BOT_TOKEN", "0:fake_token_for_tests")
 os.environ.setdefault("DATABASE_URL", "sqlite:///tmp/test_v4832.db")
-os.environ.setdefault("ADMIN_IDS", "123456789")
+os.environ["ADMIN_IDS"] = "123456789"
 
 # Импортируем тестируемые модули
 from aiogram.types import (

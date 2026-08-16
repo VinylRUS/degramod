@@ -56,9 +56,9 @@ import json
 # Подкладываем test-окружение ДО импорта модулей проекта.
 os.environ.setdefault("DB_PATH", ":memory:")
 os.environ.setdefault("BOT_TOKEN", "test:token")
-os.environ.setdefault("WEB_PASSWORD", "test-pwd")
+os.environ["WEB_PASSWORD"] = "test-pwd"
 os.environ.setdefault("SESSION_SECRET", "test-secret-xxxxxxxxxxxxxxxxxxxxx")
-os.environ.setdefault("ADMIN_IDS", "111111111")
+os.environ["ADMIN_IDS"] = "111111111"
 
 sys.path.insert(0, _P())
 
@@ -325,6 +325,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
         await init_db()
         await _clear_all_tables()
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_match_simple_substring(self):
         """Простая подстрока находится case-insensitive."""
         async with async_session() as s:
@@ -336,6 +337,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wf.pattern, "spam")
         self.assertEqual(word, "spam")  # returns original pattern
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_match_regex(self):
         async with async_session() as s:
             s.add(WordFilter(chat_id=0, pattern=r"\bcasino\d+\b", action="warn", is_regex=True))
@@ -345,6 +347,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(wf)
         self.assertEqual(word, "casino777")
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_per_chat_priority_over_global(self):
         """Per-chat фильтр срабатывает раньше global."""
         async with async_session() as s:
@@ -355,6 +358,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
             wf, word = await bot_handlers._word_filter_match(s, -1001, "spam spam")
         self.assertEqual(wf.action, "ban")  # per-chat wins
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_inactive_ignored(self):
         async with async_session() as s:
             s.add(WordFilter(chat_id=0, pattern="spam", action="delete", is_active=False))
@@ -363,6 +367,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
             wf, word = await bot_handlers._word_filter_match(s, -1001, "spam message")
         self.assertIsNone(wf)
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_broken_regex_skipped(self):
         """Битый regex не должен валить весь фильтр."""
         async with async_session() as s:
@@ -374,6 +379,7 @@ class TestWordFilter(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(wf)
         self.assertEqual(wf.pattern, "valid")
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_word_filter_empty_text(self):
         async with async_session() as s:
             s.add(WordFilter(chat_id=0, pattern="spam", action="delete"))
@@ -1109,6 +1115,7 @@ class TestDMCommandsV452(unittest.IsolatedAsyncioTestCase):
             )).scalar_one_or_none()
             self.assertIsNone(pack)
 
+    @unittest.skip("v4.8.6: bot-команда /addword удалена, слова ведутся через веб-панель")
     async def test_cmd_addword_creates_pattern(self):
         msg = await self._make_dm_message("/addword 0 spam delete")
         await bot_handlers.cmd_addword(msg)
@@ -1121,6 +1128,7 @@ class TestDMCommandsV452(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(wf.action, "delete")
             self.assertFalse(wf.is_regex)
 
+    @unittest.skip("v4.8.6: bot-команда /addword удалена, слова ведутся через веб-панель")
     async def test_cmd_addword_regex(self):
         msg = await self._make_dm_message("/addword 0 \\\\bcasino\\\\d+\\\\b warn 1")
         await bot_handlers.cmd_addword(msg)
@@ -1132,6 +1140,7 @@ class TestDMCommandsV452(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(wf)
             self.assertEqual(wf.action, "warn")
 
+    @unittest.skip("v4.8.6: bot-команда /addword удалена, слова ведутся через веб-панель")
     async def test_cmd_addword_invalid_action(self):
         msg = await self._make_dm_message("/addword 0 spam kick")
         await bot_handlers.cmd_addword(msg)
@@ -1139,6 +1148,7 @@ class TestDMCommandsV452(unittest.IsolatedAsyncioTestCase):
         reply_text = msg.reply.call_args[0][0]
         self.assertIn("delete/warn/mute/ban", reply_text)
 
+    @unittest.skip("v4.8.6: bot-команда /delword удалена, слова ведутся через веб-панель")
     async def test_cmd_delword_removes_pattern(self):
         async with async_session() as s:
             s.add(WordFilter(chat_id=0, pattern="spam", action="delete"))
@@ -1155,6 +1165,7 @@ class TestDMCommandsV452(unittest.IsolatedAsyncioTestCase):
             )).scalar_one_or_none()
             self.assertIsNone(wf)
 
+    @unittest.skip("v4.8.6: bot-команда /listwords удалена, слова ведутся через веб-панель")
     async def test_cmd_listwords_shows_patterns(self):
         async with async_session() as s:
             s.add(WordFilter(chat_id=0, pattern="spam", action="delete"))
@@ -1341,6 +1352,7 @@ class TestGroupHandlersV452(unittest.IsolatedAsyncioTestCase):
         await bot_handlers.handle_content_filters(msg)
         msg.delete.assert_not_called()
 
+    @unittest.skip("v4.8.1: word_filter заменён на KeywordWatch, функции больше нет")
     async def test_handle_content_filters_word_filter_match_deletes(self):
         """Word filter match → удаляет сообщение."""
         async with async_session() as s:
