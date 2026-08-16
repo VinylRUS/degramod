@@ -6,7 +6,7 @@ What's tested:
   2. delete_after=0 disables auto-delete (no task scheduled).
   3. If bot.send_message fails (TelegramBadRequest), no delete task is scheduled
      and no delete_message call is made — the function returns cleanly.
-  4. If bot.delete_message fails (message already gone), the error is swallowed
+  4. If bot.delete_ephemeral_message fails (message already gone), the error is swallowed
      gracefully (logged at info level, no exception bubbles up).
   5. _send_user_warn_notification also supports delete_after and schedules delete.
   6. delete_message receives the same chat_id and the message_id returned by
@@ -60,7 +60,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 12345
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 999
 
             with _CreateTaskCapture() as cap:
@@ -77,7 +77,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 1
 
             with _CreateTaskCapture() as cap:
@@ -92,7 +92,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
         async def run():
             bot = AsyncMock()
             bot.send_message = AsyncMock(side_effect=TelegramBadRequest(message="blocked"))
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 1
 
             with _CreateTaskCapture() as cap:
@@ -100,7 +100,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
                     bot=bot, chat_id=1, recipient=recipient, text="x",
                     delete_after=30,
                 )
-            self.assertFalse(bot.delete_message.called)
+            self.assertFalse(bot.delete_ephemeral_message.called)
             self.assertEqual(len(cap.calls), 0)
         asyncio.run(run())
 
@@ -109,7 +109,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 777
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 1
 
             await bot_handlers._send_ephemeral(
@@ -118,8 +118,8 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
             )
             await asyncio.sleep(0.15)
 
-            self.assertTrue(bot.delete_message.called)
-            call = bot.delete_message.call_args
+            self.assertTrue(bot.delete_ephemeral_message.called)
+            call = bot.delete_ephemeral_message.call_args
             self.assertEqual(call.kwargs.get("chat_id"), 42)
             self.assertEqual(call.kwargs.get("message_id"), 777)
         asyncio.run(run())
@@ -130,7 +130,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 888
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock(
+            bot.delete_ephemeral_message = AsyncMock(
                 side_effect=TelegramBadRequest(message="message to delete not found")
             )
             recipient = MagicMock(); recipient.id = 1
@@ -141,7 +141,7 @@ class TestSendEphemeralAutoDelete(unittest.TestCase):
                 delete_after=0.05,
             )
             await asyncio.sleep(0.15)
-            self.assertTrue(bot.delete_message.called)
+            self.assertTrue(bot.delete_ephemeral_message.called)
         asyncio.run(run())
 
 
@@ -153,7 +153,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 99999
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             target = MagicMock(); target.id = 555
             target.username = "loser"; target.first_name = "L"
 
@@ -177,7 +177,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             target = MagicMock(); target.id = 1
             target.username = "x"; target.first_name = "X"
 
@@ -200,7 +200,7 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 4242
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             target = MagicMock(); target.id = 555
             target.username = "u"; target.first_name = "U"
 
@@ -214,8 +214,8 @@ class TestSendUserWarnNotificationAutoDelete(unittest.TestCase):
                 delete_after=0.05,
             )
             await asyncio.sleep(0.15)
-            self.assertTrue(bot.delete_message.called)
-            call = bot.delete_message.call_args
+            self.assertTrue(bot.delete_ephemeral_message.called)
+            call = bot.delete_ephemeral_message.call_args
             self.assertEqual(call.kwargs.get("chat_id"), 42)
             self.assertEqual(call.kwargs.get("message_id"), 4242)
         asyncio.run(run())
@@ -245,7 +245,7 @@ class TestBackwardCompat(unittest.TestCase):
             bot = AsyncMock()
             sent = MagicMock(); sent.message_id = 1
             bot.send_message = AsyncMock(return_value=sent)
-            bot.delete_message = AsyncMock()
+            bot.delete_ephemeral_message = AsyncMock()
             recipient = MagicMock(); recipient.id = 1
 
             # No delete_after kwarg — should default to 30.0 and schedule a task.

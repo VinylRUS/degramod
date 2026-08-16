@@ -347,7 +347,7 @@ class TestLifespanShutdownBehavior(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(bot_module, "_night_mode_loop", fake_night_loop), \
              patch.object(bot_module, "_start_polling", AsyncMock()), \
-             patch.object(bot_module, "init_db", AsyncMock()), \
+             patch.object(bot_module, "init_db_with_fallback", AsyncMock()), \
              patch.object(bot_module, "_startup_recovery", AsyncMock()), \
              patch.object(bot_module, "bot") as mock_bot:
             mock_bot.delete_my_commands = AsyncMock()
@@ -446,9 +446,16 @@ class TestSourceCodePatterns(unittest.TestCase):
 
     # ── Test 17: bot_handlers имеет async with _EPHEMERAL_DELETE_SEM ─
     def test_bot_handlers_uses_semaphore_in_auto_delete(self):
-        with open("bot_handlers.py", "r", encoding="utf-8") as f:
-            src = f.read()
-        # Должно быть хотя бы 2 использования (в _send_ephemeral и _send_user_warn_notification)
+        # Второе использование (_send_user_warn_notification) уехало в
+        # mod_commands.py при декомпозиции v4.8.9/v4.8.10 — семафор туда
+        # импортируется из bot_handlers, то есть он общий и лимит в 100
+        # параллельных удалений соблюдается на оба модуля.
+        import os as _os
+        src = ""
+        for _name in ("bot_handlers.py", "mod_commands.py"):
+            if _os.path.exists(_name):
+                with open(_name, "r", encoding="utf-8") as f:
+                    src += f.read() + "\n"
         count = src.count("async with _EPHEMERAL_DELETE_SEM")
         self.assertGreaterEqual(count, 2,
                                 f"bot_handlers must use _EPHEMERAL_DELETE_SEM in at least 2 places, "

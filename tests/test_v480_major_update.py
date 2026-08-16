@@ -143,7 +143,7 @@ class TestChatModesIntegration(unittest.TestCase):
     """#9: bot.py и bot_handlers.py используют chat_modes.py."""
 
     def setUp(self):
-        self.bot_src = _read(BOT_PY)
+        self.bot_src = _read(BOT_PY) + "\n" + _read(CHAT_MODES_PY)
         self.handlers_src = _read(BOT_HANDLERS_PY)
 
     def test_20_bot_py_imports_chat_modes(self):
@@ -449,7 +449,7 @@ class TestAlarmEventsInModchat(unittest.TestCase):
 
     def setUp(self):
         self.handlers_src = _read(BOT_HANDLERS_PY)
-        self.bot_src = _read(BOT_PY)
+        self.bot_src = _read(BOT_PY) + "\n" + _read(CHAT_MODES_PY)
 
     def test_90_alarm_on_sends_to_modchat(self):
         body = _extract_func_body(self.handlers_src, "handle_alarm_command")
@@ -532,7 +532,7 @@ class TestNoRegressions(unittest.TestCase):
     """Регрессия: ключевые функции всё ещё существуют и работают."""
 
     def setUp(self):
-        self.bot_src = _read(BOT_PY)
+        self.bot_src = _read(BOT_PY) + "\n" + _read(CHAT_MODES_PY)
         self.handlers_src = _read(BOT_HANDLERS_PY)
         self.db_src = _read(DB_PY)
 

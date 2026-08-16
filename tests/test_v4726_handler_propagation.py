@@ -208,11 +208,28 @@ class TestV4726HandlerPropagation(unittest.TestCase):
         for dec in func.decorator_list:
             if isinstance(dec, ast.Call):
                 all_args.extend(dec.args)
-        # Should have 3 args: chat type + F.reply_to_message + _ModerationCommandFilter
+        # Раньше фильтров было три: тип чата + F.reply_to_message +
+        # _ModerationCommandFilter. В v4.8.3 требование reply убрали из
+        # декоратора — цель команды можно указать через @username или TGID
+        # (см. docstring handle_group_command). Осталось два, и это верно.
+        #
+        # Проверяем то, ради чего тест написан (v4.7.26): фильтр команд стоит
+        # именно в декораторе, иначе handler перехватывает чужие сообщения и
+        # обрывает propagation до handle_content_filters.
+        import ast as _ast
+        names = {
+            d.func.id for d in all_args
+            if isinstance(d, _ast.Call) and isinstance(d.func, _ast.Name)
+        }
+        self.assertIn(
+            "_ModerationCommandFilter", names,
+            f"handle_group_command must filter by _ModerationCommandFilter "
+            f"in the decorator, got args: {names}",
+        )
         self.assertGreaterEqual(
-            len(all_args), 3,
-            f"handle_group_command should have >=3 filter args (chat type + "
-            F"reply + _ModerationCommandFilter), got {len(all_args)}",
+            len(all_args), 2,
+            f"handle_group_command should keep the chat-type filter too, "
+            f"got {len(all_args)}",
         )
 
     # ── 10. Changelog contains v4.7.26 ─────────────────────────────────────

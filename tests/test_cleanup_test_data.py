@@ -22,7 +22,10 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).resolve().parent / "cleanup_test_data.py"
+# cleanup_test_data.py — утилита обслуживания БД, а не тест. При заливке
+# сюиты в main её не приложили (остался только этот тест к ней),
+# поэтому она восстановлена из истории в tools/.
+SCRIPT = Path(__file__).resolve().parent.parent / "tools" / "cleanup_test_data.py"
 SCHEMA_SQL = """
 CREATE TABLE users (
     user_id INTEGER PRIMARY KEY,

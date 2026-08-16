@@ -557,7 +557,15 @@ class TestCmdSanitary(unittest.IsolatedAsyncioTestCase):
         проверяем что reply содержит текст про ручное включение.
         """
         # Patch _enter_sanitary_day to avoid real bot API calls.
-        with patch.object(bot, "_enter_sanitary_day", new=AsyncMock()) as mock_enter:
+        #
+        # v4.8.9: cmd_sanitary больше не делает late import `from bot import
+        # _enter_sanitary_day` — функция берётся из реестра app_state
+        # (bot_handlers.py:6777). Патч атрибута модуля bot до неё не достаёт,
+        # поэтому подменяем то, что реально вызывается.
+        import app_state
+        with patch.object(app_state, "get_enter_sanitary_day") as mock_getter:
+            mock_enter = AsyncMock()
+            mock_getter.return_value = mock_enter
             msg = _make_message(text="/sanitary -1001234567890 toggle")
             await bot_handlers.cmd_sanitary(msg)
             mock_enter.assert_awaited_once()
@@ -778,11 +786,19 @@ class TestSanitaryDayTick(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.bot, "set_chat_permissions", new=AsyncMock()) as mock_set:
             await bot._sanitary_day_tick()
             mock_set.assert_awaited_once()
-            # Verify restore: perms should be True (from snapshot).
+            # v4.7.12+: выход из санитарного дня восстанавливает ДНЕВНЫЕ права
+            # (_restore_day_state: day-пресет чата → системный «Day default» →
+            # хардкод), а не снимок один-в-один. При этом _resolve_day_perms
+            # документированно «никогда не возвращает all_true — admin-права
+            # всегда False», поэтому прежнее ожидание «все 13 полей True»
+            # противоречит инварианту.
             call_kwargs = mock_set.call_args.kwargs
             perms = call_kwargs["permissions"]
-            for f in bot._PERM_FIELDS:
-                self.assertTrue(getattr(perms, f, False), f"perm {f} should be True")
+            self.assertTrue(getattr(perms, "can_send_messages", False),
+                            "после выхода из санитарного дня чат должен писать")
+            for f in ("can_change_info", "can_invite_users", "can_pin_messages"):
+                self.assertFalse(getattr(perms, f, False),
+                                 f"admin-право {f} не должно включаться при restore")
 
         async with async_session() as s:
             cs = (await s.execute(

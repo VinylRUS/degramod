@@ -39,7 +39,14 @@ def _read_handlers() -> str:
 
 
 def _read_bot() -> str:
-    return BOT_PATH.read_text(encoding="utf-8")
+    # v4.8.9: _alarm_auto_off_tick перенесена из bot.py в chat_modes.py — это
+    # её домен (bot.py:198). Проверки ниже ищут определения и вызовы, поэтому
+    # склеиваем оба модуля: важно наличие логики, а не файл, где она лежит.
+    src = BOT_PATH.read_text(encoding="utf-8")
+    _chat_modes = BOT_PATH.parent / "chat_modes.py"
+    if _chat_modes.exists():
+        src += "\n" + _chat_modes.read_text(encoding="utf-8")
+    return src
 
 
 def _read_db() -> str:
@@ -344,7 +351,10 @@ class TestV4720bBotIntegration(unittest.TestCase):
         src = _read_bot()
         # Сначала ищем новую _alarm_auto_off_tick
         m_alarm = re.search(
-            r"async\s+def\s+_alarm_auto_off_tick\s*\([^)]*\)\s*:\s*(.*?)(?=\nasync\s+def\s+|\nclass\s+|\Z)",
+            # `[^)]*\)\s*:` не переживает аннотацию возврата: сигнатура стала
+            # `async def _alarm_auto_off_tick(bot: "Bot") -> None:`.
+            r"async\s+def\s+_alarm_auto_off_tick\s*\([^)]*\)\s*(?:->[^:]+)?:\s*(.*?)"
+            r"(?=\nasync\s+def\s+|\nclass\s+|\Z)",
             src, re.DOTALL,
         )
         if m_alarm:
@@ -628,6 +638,9 @@ class TestV4720bSlowModeApiFix(unittest.TestCase):
         self.assertIn("SetChatSlowModeDelay", fn_body,
                       "_restore_day_state должен вызывать SetChatSlowModeDelay")
 
+    @unittest.skip(
+        "v4.8.9: хак sys.modules.setdefault('bot', ...) удалён — вместо late import из bot.py введён service locator app_state.py (bot.py:12, app_state.py). Тест сторожил обходной путь, от которого осознанно избавились"
+    )
     def test_59_bot_has_safety_net_for_late_imports(self):
         """v4.7.22: bot.py содержит safety net — sys.modules.setdefault('bot', ...).
 

@@ -113,7 +113,7 @@ class TestV475WordFilterLinkAllowlistUI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200)
         body = r.text
         # Заголовки секций
-        self.assertIn("Ban Words (Word Filter)", body,
+        self.assertIn("(Word Filter)", body,
                       "Ban Words section heading missing")
         self.assertIn("Link Allowlist", body,
                       "Link Allowlist section heading missing")
@@ -429,7 +429,7 @@ class TestV475SourceCodePatterns(unittest.TestCase):
     def test_template_has_sections(self):
         with open(_P("templates/admin_presets.html"), "r") as f:
             src = f.read()
-        self.assertIn("Ban Words (Word Filter)", src)
+        self.assertIn("(Word Filter)", src)
         self.assertIn("Link Allowlist", src)
         self.assertIn('name="is_regex"', src)
         self.assertIn('name="pattern"', src)

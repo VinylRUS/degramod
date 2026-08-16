@@ -101,7 +101,14 @@ class TestV4714MutePermissions(unittest.TestCase):
     """v4.7.14: _mute_permissions() без админских полей + харденинг !unmute."""
 
     def setUp(self):
+        # v4.8.9/v4.8.10: ветки команд уехали в mod_commands.py, а текст берётся
+        # из ctx.text вместо локальной text. Склеиваем оба модуля и нормализуем
+        # обращение — проверки смотрят на состав кода, а не на его расположение.
         self.bot_handlers_py = _read(BOT_HANDLERS_PY)
+        _mod_commands = os.path.join(os.path.dirname(BOT_HANDLERS_PY), "mod_commands.py")
+        if os.path.exists(_mod_commands):
+            self.bot_handlers_py += "\n" + _read(_mod_commands).replace(
+                ".match(ctx.text)", ".match(text)")
         self.base_html = _read(BASE_HTML)
         self.mute_perms = bh._mute_permissions()
 
@@ -248,11 +255,25 @@ class TestV4714MutePermissions(unittest.TestCase):
 
     # ─── 10. !unmute содержит пересборку ChatPermissions ───────────────
 
+    def _unmute_section_start(self) -> int:
+        """Начало обработки !unmute.
+
+        Раньше это была ветка внутри handle_group_command с маркером
+        `_CMD_UNMUTE.match(text)`. После декомпозиции v4.8.9/v4.8.10 диспетч
+        стал таблицей `_cmd_regex_map`, а логика уехала в
+        mod_commands.cmd_unmute — на неё и ориентируемся.
+        """
+        for marker in ("async def cmd_unmute(", "_CMD_UNMUTE.match(text)"):
+            idx = self.bot_handlers_py.find(marker)
+            if idx >= 0:
+                return idx
+        return -1
+
     def test_10_unmute_rebuilds_permissions(self):
         """В коде !unmute есть пересборка ChatPermissions
         из 10 контентных полей (без админских)."""
         # Находим секцию _CMD_UNMUTE
-        idx = self.bot_handlers_py.find("_CMD_UNMUTE.match(text)")
+        idx = self._unmute_section_start()
         self.assertGreater(idx, 0, "!unmute section not found")
         # Берём следующие 2000 символов
         section = self.bot_handlers_py[idx:idx + 3000]
@@ -262,14 +283,17 @@ class TestV4714MutePermissions(unittest.TestCase):
         # Должно быть can_send_messages= в пересборке
         self.assertIn("can_send_messages=getattr", section,
                       "!unmute rebuild should include can_send_messages")
-        # Должен быть комментарий про v4.7.14
-        self.assertIn("v4.7.14", section,
-                      "!unmute rebuild should have v4.7.14 comment")
+        # Комментарий «v4.7.14» не переехал вместе с кодом при декомпозиции
+        # в mod_commands.py — сама пересборка прав сохранена полностью.
+        # Проверяем суть фикса: права берутся из текущих настроек чата через
+        # getattr с безопасным дефолтом, а не выставляются в True вслепую.
+        self.assertIn('getattr(chat_perms, "can_send_messages", False)', section,
+                      "!unmute must rebuild perms from chat defaults, not hardcode True")
 
     def test_10a_unmute_does_not_pass_admin_perms(self):
         """В пересборке ChatPermissions для !unmute не должно быть
         админских полей в True."""
-        idx = self.bot_handlers_py.find("_CMD_UNMUTE.match(text)")
+        idx = self._unmute_section_start()
         section = self.bot_handlers_py[idx:idx + 3000]
         # Находим пересборку (до закрывающей скобки на отдельной строке)
         m = re.search(
@@ -294,7 +318,7 @@ class TestV4714MutePermissions(unittest.TestCase):
 
     def test_11_unmute_passes_all_content_fields(self):
         """В пересборке для !unmute передаются все 10 контентных полей."""
-        idx = self.bot_handlers_py.find("_CMD_UNMUTE.match(text)")
+        idx = self._unmute_section_start()
         section = self.bot_handlers_py[idx:idx + 3000]
         # Берём ПЕРВУЮ пересборку ChatPermissions в секции !unmute.
         # Используем жадный поиск до закрывающей скобки на отдельной строке

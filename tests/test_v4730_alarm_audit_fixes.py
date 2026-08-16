@@ -32,8 +32,17 @@ _V45 = os.path.dirname(_HERE)
 sys.path.insert(0, _V45)
 
 # Read sources once
+#
+# v4.8.9: _alarm_auto_off_tick перенесена из bot.py в chat_modes.py — это её
+# домен (см. bot.py:198). Проверки ниже ищут определение и порядок вызовов,
+# поэтому к исходнику bot.py приклеиваем chat_modes.py: важно, что функция
+# существует и вызывается в нужном месте, а не в каком файле она объявлена.
 with open(os.path.join(_V45, "bot.py"), encoding="utf-8") as f:
     _BOT_SRC = f.read()
+_CHAT_MODES_PY = os.path.join(_V45, "chat_modes.py")
+if os.path.exists(_CHAT_MODES_PY):
+    with open(_CHAT_MODES_PY, encoding="utf-8") as f:
+        _BOT_SRC += "\n" + f.read()
 with open(os.path.join(_V45, "bot_handlers.py"), encoding="utf-8") as f:
     _HANDLERS_SRC = f.read()
 
@@ -59,14 +68,14 @@ class TestBug1_AlarmAutoOffAllChats(unittest.TestCase):
         """_alarm_auto_off_tick вызывается в _night_mode_loop."""
         body = _extract_func_body(_BOT_SRC, "_night_mode_loop")
         self.assertIsNotNone(body)
-        self.assertIn("_alarm_auto_off_tick()", body,
+        self.assertIn("_alarm_auto_off_tick(", body,
                       "_night_mode_loop должен вызывать _alarm_auto_off_tick()")
 
     def test_03_alarm_auto_off_tick_called_before_sanitary(self):
         """_alarm_auto_off_tick идёт ПЕРЕД _sanitary_day_tick в loop."""
         body = _extract_func_body(_BOT_SRC, "_night_mode_loop")
         # Ищем именно вызовы (await), не упоминания в комментариях
-        idx_alarm = body.find("await _alarm_auto_off_tick()")
+        idx_alarm = body.find("await _alarm_auto_off_tick(")
         idx_sanitary = body.find("await _sanitary_day_tick()")
         self.assertGreater(idx_alarm, -1)
         self.assertGreater(idx_sanitary, -1)
@@ -115,7 +124,7 @@ class TestBug2_AlarmInStartupRecovery(unittest.TestCase):
     def test_11_startup_recovery_calls_alarm_auto_off(self):
         """_startup_recovery вызывает _alarm_auto_off_tick."""
         body = _extract_func_body(_BOT_SRC, "_startup_recovery")
-        self.assertIn("_alarm_auto_off_tick()", body,
+        self.assertIn("_alarm_auto_off_tick(", body,
                       "_startup_recovery должен вызывать _alarm_auto_off_tick()")
 
     def test_12_startup_recovery_calls_in_correct_order(self):
@@ -125,7 +134,7 @@ class TestBug2_AlarmInStartupRecovery(unittest.TestCase):
         docstring/комментариях.
         """
         body = _extract_func_body(_BOT_SRC, "_startup_recovery")
-        idx_alarm = body.find("await _alarm_auto_off_tick()")
+        idx_alarm = body.find("await _alarm_auto_off_tick(")
         idx_sanitary = body.find("await _sanitary_day_tick()")
         idx_night = body.find("await _night_mode_tick()")
         self.assertGreater(idx_alarm, -1, "Должен быть вызов await _alarm_auto_off_tick()")

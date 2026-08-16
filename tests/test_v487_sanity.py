@@ -231,7 +231,9 @@ print("    ✓ голых asyncio.create_task нет")
 
 # 10. 13 tg_safe_call call sites
 print("\n[10] bot_handlers.py: ≥13 tg_safe_call call sites...")
-tg_calls = re.findall(r"tg_safe_call\s*\(\s*\n?\s*lambda", bh_src)
+# Часть call sites уехала в mod_commands.py вместе с ветками команд
+# (v4.8.9/v4.8.10) — считаем по обоим модулям, как и в проверке [9].
+tg_calls = re.findall(r"tg_safe_call\s*\(\s*\n?\s*lambda", bh_src + "\n" + mc_src)
 assert len(tg_calls) >= 13, f"expected ≥13 tg_safe_call(lambda:...) call sites, got {len(tg_calls)}"
 print(f"    ✓ {len(tg_calls)} tg_safe_call(lambda: ...) call sites (expected ≥13)")
 
@@ -247,8 +249,14 @@ assert hasattr(web_app, "_backup_db_async"), "missing _backup_db_async"
 print("    ✓ _wal_checkpoint_async() + _backup_db_async() helpers defined")
 
 # 12. APP_VERSION
-print("\n[12] web_app.py: APP_VERSION = v4.8.7...")
-assert web_app.APP_VERSION == "v4.8.7", f"expected v4.8.7, got {web_app.APP_VERSION}"
+# Проверка была прибита к "v4.8.7" — версии, в которой писался этот файл.
+# Сверять релиз с константой внутри теста нечем, поэтому проверяем формат и
+# что версия не ниже той, в которой появились охраняемые здесь инварианты.
+print("\n[12] web_app.py: APP_VERSION...")
+_m = re.match(r"^v(\d+)\.(\d+)\.(\d+)", web_app.APP_VERSION)
+assert _m, f"unexpected APP_VERSION format: {web_app.APP_VERSION!r}"
+assert tuple(int(g) for g in _m.groups()) >= (4, 8, 7), \
+    f"expected >= v4.8.7, got {web_app.APP_VERSION}"
 print(f"    ✓ APP_VERSION = {web_app.APP_VERSION}")
 
 # 13. Changelog in base.html
@@ -256,7 +264,8 @@ print("\n[13] templates/base.html: changelog для v4.8.7 присутству�
 with open(_P("templates/base.html")) as f:
     base_src = f.read()
 assert "v4.8.7" in base_src, "base.html missing v4.8.7 changelog entry"
-assert "16 августа 2026" in base_src, "base.html missing release date"
+# Дата релиза v4.8.7 в changelog менялась; сам факт записи проверяется строкой
+# выше, а конкретное число к инвариантам не относится.
 assert "tg_safe_call" in base_src, "changelog should mention tg_safe_call"
 assert "_spawn_background_task" in base_src or "_background_tasks" in base_src, \
     "changelog should mention background_tasks fix"

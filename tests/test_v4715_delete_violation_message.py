@@ -83,7 +83,13 @@ def _find_cmd_section(source: str, cmd_marker: str) -> tuple[int, int]:
     Возвращает (start, end) — индексы начала и конца секции.
     Конец = следующая секция команды (маркер '# ── !') ИЛИ конец функции.
     """
-    start = source.find(cmd_marker)
+    markers = cmd_marker if isinstance(cmd_marker, (list, tuple)) else [cmd_marker]
+    start = -1
+    for _m in markers:
+        start = source.find(_m)
+        if start >= 0:
+            cmd_marker = _m
+            break
     if start < 0:
         return (-1, -1)
     # Ищем следующий "# ── !" маркер после start
@@ -93,16 +99,22 @@ def _find_cmd_section(source: str, cmd_marker: str) -> tuple[int, int]:
     return (start, next_cmd)
 
 
-# Маркеры для каждой команды (уникальные в исходнике)
+# Маркеры для каждой команды.
+#
+# v4.8.9/v4.8.10: handle_group_command разобрали, ветки команд уехали в
+# mod_commands.py, и текст сообщения там берётся из контекста (ctx.text)
+# вместо локальной переменной text. Поэтому для каждой команды держим оба
+# написания и ищем по обоим модулям — тест проверяет наличие и порядок
+# операций, а не то, в каком файле они лежат.
 MARKERS = {
-    "mute":      "m = _CMD_MUTE.match(text)",
-    "warn":      "m = _CMD_WARN.match(text)",
-    "ban":       "m = _CMD_BAN.match(text)",
-    "unmute":    "if _CMD_UNMUTE.match(text):",
-    "unban":     "if _CMD_UNBAN.match(text):",
-    "unwarn":    "m = _CMD_UNWARN.match(text)",
-    "warns":     "if _CMD_WARNS.match(text):",
-    "resetwarns": "if _CMD_RESETWARNS.match(text):",
+    "mute":      ["m = _CMD_MUTE.match(ctx.text)", "m = _CMD_MUTE.match(text)"],
+    "warn":      ["m = _CMD_WARN.match(ctx.text)", "m = _CMD_WARN.match(text)"],
+    "ban":       ["m = _CMD_BAN.match(ctx.text)", "m = _CMD_BAN.match(text)"],
+    "unmute":    ["if _CMD_UNMUTE.match(ctx.text):", "if _CMD_UNMUTE.match(text):"],
+    "unban":     ["if _CMD_UNBAN.match(ctx.text):", "if _CMD_UNBAN.match(text):"],
+    "unwarn":    ["m = _CMD_UNWARN.match(ctx.text)", "m = _CMD_UNWARN.match(text)"],
+    "warns":     ["if _CMD_WARNS.match(ctx.text):", "if _CMD_WARNS.match(text):"],
+    "resetwarns": ["if _CMD_RESETWARNS.match(ctx.text):", "if _CMD_RESETWARNS.match(text):"],
 }
 
 
@@ -113,7 +125,11 @@ class TestV4715DeleteViolationMessage(unittest.TestCase):
     """v4.7.15: !mute/!ban удаляют сообщение нарушителя, !warn реорганизован."""
 
     def setUp(self):
+        # Логика команд распределена между двумя модулями — склеиваем.
+        _mod_commands = os.path.join(os.path.dirname(BOT_HANDLERS_PY), "mod_commands.py")
         self.source = _read(BOT_HANDLERS_PY)
+        if os.path.exists(_mod_commands):
+            self.source += "\n" + _read(_mod_commands)
         self.base_html = _read(BASE_HTML)
 
     # ─── 1. Version ────────────────────────────────────────────────────

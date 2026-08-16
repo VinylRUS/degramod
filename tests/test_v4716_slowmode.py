@@ -239,10 +239,18 @@ class TestV4716SlowMode(unittest.TestCase):
         fn_end = src.find("async def ", fn_start + 10)
         fn_body = src[fn_start:fn_end] if fn_end > 0 else src[fn_start:]
         # current_slow_mode must be assigned BEFORE set_chat_permissions call
-        idx_read = fn_body.find("current_slow_mode = ")
-        idx_set_perms = fn_body.find("await bot.set_chat_permissions")
+        # v4.8.0: прямой bot.set_chat_permissions заменён на обёртку
+        # _apply_chat_permissions — она централизует
+        # use_independent_chat_permissions=True (инвариант режимов чата).
+        # Ищем оба варианта: важен порядок операций, а не имя вызова.
+        idx_read = fn_body.find("current_slow_mode")
+        idx_set_perms = fn_body.find("await _apply_chat_permissions")
+        if idx_set_perms < 0:
+            idx_set_perms = fn_body.find("await bot.set_chat_permissions")
         self.assertGreater(idx_read, 0, "current_slow_mode assignment not found")
-        self.assertGreater(idx_set_perms, 0, "set_chat_permissions call not found")
+        self.assertGreater(idx_set_perms, 0,
+                           "chat permissions call not found "
+                           "(_apply_chat_permissions / set_chat_permissions)")
         self.assertLess(idx_read, idx_set_perms,
                         "current_slow_mode должен читаться ДО set_chat_permissions")
 

@@ -1399,6 +1399,7 @@ class TestGroupHandlersV452(unittest.IsolatedAsyncioTestCase):
         await bot_handlers.handle_content_filters(msg)
         msg.delete.assert_not_called()
 
+    @unittest.skip("v4.8.1/v4.8.6: word filter удалён из handle_content_filters (замена — KeywordWatch и веб-панель), поэтому запрещённые слова больше не приводят к удалению сообщения этим путём")
     async def test_handle_content_filters_word_filter_ban_action(self):
         """Word filter с action=ban → банит юзера."""
         async with async_session() as s:
