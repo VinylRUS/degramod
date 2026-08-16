@@ -84,61 +84,18 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import os
 import re
-import logging
 import secrets
 import time
-from datetime import datetime, timezone, timedelta, date
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import aiohttp
-from aiogram import Router, types, F, BaseMiddleware
+from aiogram import BaseMiddleware, F, Router, types
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
-from aiogram.filters import Command, BaseFilter
-from aiogram.types import (
-    InputRichMessage,
-    InputRichBlockSectionHeading,
-    InputRichBlockParagraph,
-    InputRichBlockBlockQuotation,
-    InputRichBlockDetails,
-    InputRichBlockFooter,
-    InputRichBlockPhoto,
-    InputRichBlockVideo,
-    InputRichBlockAnimation,
-    InputRichBlockAudio,
-    InputRichBlockVoiceNote,
-    InputRichBlockList,
-    InputRichBlockListItem,
-    InputRichBlockDivider,
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaAnimation,
-    InputMediaAudio,
-    InputMediaVoiceNote,
-    RichTextUrl,
-    RichTextBold,
-    RichTextCode,
-    RichTextSpoiler,
-    BufferedInputFile,
-)
-from sqlalchemy import select, desc, func
-
-from db import (
-    async_session, User, Moderator, Punishment, ChatAdmin, ChatSettings, WebUser,
-    LinkAllowlist, BannedStickerPack, AutomuteCounter,
-    IdeaLog, GithubSettings, _encrypt_pat, _decrypt_pat,
-    _hash_password,
-)
-
-# v4.8.3: модуль для скачивания стикеров/фото в BytesIO и конвертации
-# WebP/TGS → PNG, WebM — как есть. Используется в _build_media_block и
-# _send_report для inline-блоков в Rich Messages.
-from sticker_cache import (
-    download_sticker_for_rich_message,
-    download_photo_bytes,
-    _HAVE_RLOTTIE,
-)
+from aiogram.filters import BaseFilter, Command
 
 # v4.7.22: aiogram 3.30 не имеет обёртки для setChatSlowModeDelay (появилась
 # в более поздних версиях). Создаём минимальный TelegramMethod-класс — он
@@ -157,6 +114,58 @@ from sticker_cache import (
 # 3. Все потребители (handle_alarm_command, _deactivate_alarm в bot_handlers.py;
 #    _enter_night_mode, _restore_day_state в bot.py) получают класс без late import.
 from aiogram.methods.base import TelegramMethod
+from aiogram.types import (
+    BufferedInputFile,
+    InputMediaAnimation,
+    InputMediaAudio,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaVoiceNote,
+    InputRichBlockAnimation,
+    InputRichBlockAudio,
+    InputRichBlockBlockQuotation,
+    InputRichBlockDetails,
+    InputRichBlockDivider,
+    InputRichBlockFooter,
+    InputRichBlockList,
+    InputRichBlockListItem,
+    InputRichBlockParagraph,
+    InputRichBlockPhoto,
+    InputRichBlockSectionHeading,
+    InputRichBlockVideo,
+    InputRichBlockVoiceNote,
+    InputRichMessage,
+    RichTextBold,
+    RichTextCode,
+    RichTextSpoiler,
+    RichTextUrl,
+)
+from sqlalchemy import desc, func, select
+
+from db import (
+    AutomuteCounter,
+    BannedStickerPack,
+    ChatAdmin,
+    ChatSettings,
+    GithubSettings,
+    IdeaLog,
+    LinkAllowlist,
+    Moderator,
+    Punishment,
+    User,
+    WebUser,
+    _decrypt_pat,
+    _hash_password,
+    async_session,
+)
+
+# v4.8.3: модуль для скачивания стикеров/фото в BytesIO и конвертации
+# WebP/TGS → PNG, WebM — как есть. Используется в _build_media_block и
+# _send_report для inline-блоков в Rich Messages.
+from sticker_cache import (
+    download_photo_bytes,
+    download_sticker_for_rich_message,
+)
 
 
 class SetChatSlowModeDelay(TelegramMethod[bool]):
@@ -927,7 +936,7 @@ async def _deactivate_alarm(
 
     # Шаг 1: определяем права для восстановления.
     # v4.8.0: используем унифицированную функцию из chat_modes.py.
-    from chat_modes import _resolve_restore_perms_sync, _apply_chat_permissions
+    from chat_modes import _apply_chat_permissions, _resolve_restore_perms_sync
     perms_to_restore, perms_source = _resolve_restore_perms_sync(
         cs=cs,
         saved_permissions_field=cs.alarm_saved_permissions,
@@ -1310,7 +1319,7 @@ async def _resolve_punishment_target(
             return None, f"❌ Некорректный TGID: <code>{target_str}</code>"
 
         if user_id <= 0:
-            return None, f"❌ TGID должен быть положительным числом."
+            return None, "❌ TGID должен быть положительным числом."
 
         # Проверяем что юзер есть в чате (иначе банить некого).
         try:
@@ -1959,6 +1968,7 @@ def _build_custom_night_permissions(
 # Регэксп для парсинга даты "YYYY-MM-DD". Валидацию диапазона (день 1-31,
 # месяц 1-12) делаем в _parse_sanitary_date; regex ловит только формат.
 import re as _san_re
+
 _SAN_DATE_RE = _san_re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
 _SAN_TIME_RE = _san_re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 # v4.7.11: 'YYYY-MM-DD' или 'YYYY-MM-DD HH:MM' — одна часть диапазона с
@@ -4398,130 +4408,20 @@ async def handle_group_command(message: types.Message) -> None:
     # Убрано: ephemeral подтверждение модератору (техническое ephemeral про
     # автодобавление стикерпака — ОСТАЁТСЯ, это не дубликат публичного бана).
     # Добавлено: публичное сообщение в чат.
-    m = _CMD_BAN.match(text)
-    if m:
-        reason = m.group("reason")
-
-        perm_snapshot = None
-        try:
-            member = await message.bot.get_chat_member(chat_id=chat_id, user_id=target.id)
-            perm_snapshot = _snapshot_permissions(member)
-        except TelegramAPIError as e:
-            logger.warning("get_chat_member before ban failed: %s", e)
-
-        try:
-            # v4.8.7: tg_safe_call — ретраит при 429/RetryAfter.
-            await tg_safe_call(
-                lambda: message.bot.ban_chat_member(chat_id=chat_id, user_id=target.id),
-                label="!ban",
-            )
-        except TelegramAPIError as e:
-            logger.error("ban_chat_member failed: %s", e)
-            try:
-                await message.bot.send_message(
-                    chat_id=mod.id,
-                    text=f"❌ Бан не удался: {e}",
-                )
-            except TelegramAPIError:
-                pass
-            return
-
-        # v4.7.27: помечаем что бан выполнил сам бот — чтобы ChatMemberUpdated
-        # handler не отправил второй отчёт о «ручном бане» (дедупликация).
-        _mark_bot_ban(chat_id, target.id)
-
-        # ── v4.5.2: если забанили за стикер — автоматически добавляем пак ──
-        # в BannedStickerPack (per-chat, punishment=ban — чтобы следующий
-        # юзер с этим же паком тоже был забанен автоматически). Это избавляет
-        # модератора от необходимости отдельно выполнять !bansticker.
-        # v4.5.3: используем getattr для безопасности (mock objects в тестах
-        # могут не иметь атрибута 'sticker' — это нормально, просто пропустим).
-        # v4.7.15: читаем sticker ДО удаления сообщения — для надёжности
-        # (хотя Python-объект остаётся в памяти после delete, мы явно
-        # сохраняем ссылку заранее).
-        # v4.8.1: ephemeral про автодобавление стикерпака ОСТАЁТСЯ для !ban
-        # и !sban — это техническое уведомление, не дубликат публичного бана.
-        # v4.8.3: отслеживаем был ли стикерпак newly_added — для sticker_pack_info
-        # в _send_report (пункт «📦 Использованный стикерпак забанен» в List).
-        sticker = getattr(message.reply_to_message, "sticker", None) if message.reply_to_message else None
-        sticker_pack_info: tuple[str, bool] | None = None
-        if sticker and sticker.set_name:
-            try:
-                # v4.8.3: проверяем — был ли стикерпак уже в бан-листе ДО добавления.
-                async with async_session() as session:
-                    existing_pack = (
-                        await session.execute(
-                            select(BannedStickerPack).where(
-                                BannedStickerPack.chat_id == chat_id,
-                                BannedStickerPack.pack_name == sticker.set_name,
-                                BannedStickerPack.is_active.is_(True),
-                            )
-                        )
-                    ).scalar_one_or_none()
-                was_newly_added = (existing_pack is None)
-
-                async with async_session() as session:
-                    await _add_banned_sticker_pack(
-                        session,
-                        chat_id=chat_id,
-                        pack_name=sticker.set_name,
-                        punishment="ban",
-                        reason=f"Auto-added via !ban by mod {mod.id}: {reason}",
-                        added_by_mod_id=mod.id,
-                        added_via="auto_ban",
-                    )
-                logger.info(
-                    "v4.5.2 auto-banned sticker pack '%s' in chat %s (via !ban by mod %s)",
-                    sticker.set_name, chat_id, mod.id,
-                )
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        f"🎭 Стикерпак <code>{sticker.set_name}</code> "
-                        f"автодобавлен в бан-лист (punishment=ban)."
-                    ),
-                )
-                # v4.8.3: передаём в _send_report инфу о стикерпаке.
-                sticker_pack_info = (sticker.set_name, was_newly_added)
-            except Exception as e:
-                logger.warning(
-                    "auto-add sticker pack '%s' failed: %s", sticker.set_name, e
-                )
-
-        await _send_report(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action_type="ban", reason=reason, mod=mod,
-            reply_to_message=message.reply_to_message,
-            sticker_pack_info=sticker_pack_info,
-            moderator_screenshot=message if message.photo else None,
+    #
+    # v4.8.9: блок !ban вынесен в mod_commands.cmd_ban (декомпозиция
+    # handle_group_command, см. 03_TASK_v4.8.9.md §1). Остальные 11 команд
+    # пока обрабатываются inline ниже — TODO v4.9.0.
+    if _CMD_BAN.match(text):
+        from mod_commands import ModContext, cmd_ban
+        ctx = ModContext(
+            chat_id=chat_id,
+            mod=mod,
+            target=target,
+            target_content=target_content,
+            text=text,
         )
-
-        async with async_session() as session:
-            await _upsert_user(session, target.id, target.username,
-                               target.first_name, target.last_name)
-            await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-            await _save_punishment(
-                session, target.id, mod.id, chat_id,
-                "ban", None, reason, target_content,
-                permissions_snapshot=perm_snapshot,
-            )
-
-        # ── v4.8.1: публичное сообщение в чат (вместо ephemeral) ─────
-        # Громкая команда !ban — чат видит, кто и за что забанен.
-        await _send_public_punishment_notice(
-            bot=message.bot, chat_id=chat_id, target=target,
-            action="ban", reason=reason,
-        )
-
-        # v4.7.15: удаляем сообщение нарушителя ПОСЛЕ всех операций.
-        # v4.8.3: если reply нет (бан по @username/TGID) — пропускам.
-        if message.reply_to_message is not None:
-            try:
-                await message.reply_to_message.delete()
-            except TelegramAPIError as e:
-                logger.warning("Не удалось удалить сообщение нарушителя %s в чате %s: %s",
-                               target.id, chat_id, e)
-
+        await cmd_ban(message, ctx)
         return
 
     # ── !sban (v4.8.1: тихий бан, stealth) ─────────────────────────────
@@ -5151,8 +5051,8 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    f"⚠️ Alarm не удалось снять — ошибка при восстановлении прав. "
-                    f"Проверьте логи и при необходимости восстановите права вручную."
+                    "⚠️ Alarm не удалось снять — ошибка при восстановлении прав. "
+                    "Проверьте логи и при необходимости восстановите права вручную."
                 ),
             )
         return
@@ -5183,10 +5083,10 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    f"🌙 Сейчас активен ночной режим — !alarm включить нельзя.\n"
-                    f"Ночной режим уже ограничивает права чата (медиа отключены, "
-                    f"slow_mode активен). Alarm будет избыточен.\n"
-                    f"Дождитесь окончания ночного режима или отключите его."
+                    "🌙 Сейчас активен ночной режим — !alarm включить нельзя.\n"
+                    "Ночной режим уже ограничивает права чата (медиа отключены, "
+                    "slow_mode активен). Alarm будет избыточен.\n"
+                    "Дождитесь окончания ночного режима или отключите его."
                 ),
             )
             return
@@ -5200,9 +5100,9 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    f"🚫 Сейчас активен санитарный день — !alarm включить нельзя.\n"
-                    f"Санитарный день уже ограничивает права чата (полный локдаун). "
-                    f"Alarm будет избыточен."
+                    "🚫 Сейчас активен санитарный день — !alarm включить нельзя.\n"
+                    "Санитарный день уже ограничивает права чата (полный локдаун). "
+                    "Alarm будет избыточен."
                 ),
             )
             return
@@ -5300,8 +5200,8 @@ async def handle_alarm_command(message: types.Message) -> None:
         # сейчас», а не «то что должно быть днём по пресету». Это правильно,
         # потому что alarm — это экстренный режим поверх любого состояния.
         # При restore (через _deactivate_alarm) приоритет будет у preset'а.
-        from chat_modes import _snapshot_chat_permissions as _v480_snapshot
         from chat_modes import _apply_chat_permissions as _v480_apply
+        from chat_modes import _snapshot_chat_permissions as _v480_snapshot
         snapshot_perms: str | None = None
         snapshot_slow: int = 0
         try:
@@ -5329,8 +5229,8 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    f"❌ Не удалось применить ограничения alarm.\n"
-                    f"У бота нет прав администратора в чате?"
+                    "❌ Не удалось применить ограничения alarm.\n"
+                    "У бота нет прав администратора в чате?"
                 ),
             )
             return
@@ -6541,9 +6441,10 @@ async def _process_idea_submission(
 
     try:
         from github_client import (
-            create_issue, add_issue_to_project, get_issue_node_id,
-            set_item_status_by_name,
             GithubApiError,
+            add_issue_to_project,
+            create_issue,
+            set_item_status_by_name,
         )
         # 1. REST: создаём Issue (title = idea_text, без body).
         issue_ref = await create_issue(
@@ -6861,7 +6762,10 @@ async def cmd_nightmode(message: types.Message) -> None:
             # восстанавливаем права из snapshot. Иначе чат зависнет в night-правах.
             if settings.night_mode_currently_active:
                 try:
-                    from bot import _exit_night_mode
+                    # v4.8.9: late import через app_state вместо `from bot import`
+                    # (см. 03_TASK_v4.8.9.md §3 — удаление sys.modules хака).
+                    from app_state import get_exit_night_mode
+                    _exit_night_mode = get_exit_night_mode()
                     # Re-fetch из сессии чтобы _exit_night_mode работал
                     await _exit_night_mode(settings)
                     await session.refresh(settings)
@@ -7444,7 +7348,9 @@ async def cmd_sanitary(message: types.Message) -> None:
             # Если сейчас активен — выходим из sanitary day.
             if settings.sanitary_days_currently_active:
                 try:
-                    from bot import _exit_sanitary_day
+                    # v4.8.9: app_state вместо `from bot import`
+                    from app_state import get_exit_sanitary_day
+                    _exit_sanitary_day = get_exit_sanitary_day()
                     await _exit_sanitary_day(settings)
                 except Exception as e:
                     logger.warning("sanitary off: exit failed for chat %s: %s", chat_id, e)
@@ -7480,9 +7386,9 @@ async def cmd_sanitary(message: types.Message) -> None:
         # ── TOGGLE (manual enter/exit for testing) ─────────────────────
         if sub == "toggle":
             if not settings.sanitary_days_currently_active:
-                # Импортируем _enter_sanitary_day из bot.py (avoid circular).
-                # Поскольку bot.py импортирует bot_handlers, делаем lazy import.
-                from bot import _enter_sanitary_day, _exit_sanitary_day
+                # v4.8.9: app_state вместо `from bot import`
+                from app_state import get_enter_sanitary_day
+                _enter_sanitary_day = get_enter_sanitary_day()
                 await _enter_sanitary_day(settings)
                 await message.reply(
                     f"🔒 Чат {chat_id}: <b>санитарный день включён вручную</b>\n"
@@ -7490,7 +7396,8 @@ async def cmd_sanitary(message: types.Message) -> None:
                     parse_mode="HTML",
                 )
             else:
-                from bot import _enter_sanitary_day, _exit_sanitary_day
+                from app_state import get_exit_sanitary_day
+                _exit_sanitary_day = get_exit_sanitary_day()
                 await _exit_sanitary_day(settings)
                 await message.reply(
                     f"🔓 Чат {chat_id}: <b>санитарный день снят вручную</b>\n"
@@ -8503,7 +8410,7 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
         _via_bot_rate_limit[key] = now
         logger.debug(
             "Via-bot filter: allowed @%s in chat %s (user %s, last=%s, gap=%ss)",
-            bot_username, chat_id, fu.id, last, 
+            bot_username, chat_id, fu.id, last,
             int((now - last).total_seconds()) if last else -1,
         )
         return False
@@ -8684,12 +8591,16 @@ async def handle_content_filters(message: types.Message) -> None:
     # Night mode: если ban_in_night_mode=True — автобан + notify.
     #             Иначе — notify.
     try:
+        from db import async_session as _kw_session
         from modchat import (
-            _keyword_watch_match as _kw_match,
-            _send_keyword_notify_to_modchat as _kw_notify,
             _check_keyword_rate_limit as _kw_rl,
         )
-        from db import async_session as _kw_session
+        from modchat import (
+            _keyword_watch_match as _kw_match,
+        )
+        from modchat import (
+            _send_keyword_notify_to_modchat as _kw_notify,
+        )
         async with _kw_session() as kw_session:
             kw_matches = await _kw_match(kw_session, text)
             # Проверяем night mode (для автобана).

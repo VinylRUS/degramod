@@ -14,3 +14,6 @@ rlottie-python>=1.0.0
 # v4.8.5: шифрование GitHub PAT в БД (Fernet — AES-128-CBC + HMAC-SHA256).
 # Используется в db._encrypt_pat / _decrypt_pat для хранения PAT из веб-панели.
 cryptography>=42.0.0
+# v4.8.9: миграции БД через Alembic (вместо 664-строчного идемпотентного init_db()).
+# См. db.run_migrations_async() + migrations/env.py + migrations/versions/.
+alembic>=1.13

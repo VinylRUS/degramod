@@ -640,6 +640,46 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.9</strong> — 16 августа 2026 (infra: декомпозиция + uv + Python 3.14 + Alembic + CI + roadmap sync)</p>
+                <ul>
+                    <li><strong>uv drop-in в Dockerfile</strong>. <code>pip install --no-cache-dir -r requirements.txt</code> заменён на <code>pip install --no-cache-dir uv &amp;&amp; uv pip install --system --no-cache -r requirements.txt</code>. uv в 10-100× быстрее pip на cold cache — образ собирается заметно быстрее. <code>requirements.txt</code> остаётся primary source of truth (см. <code>06_DO_NOT_TOUCH.md §16</code>).</li>
+                    <li><strong>Python 3.14 bump</strong>. <code>FROM python:3.11-slim</code> → <code>FROM python:3.14-slim</code>. Проверено локально: все зависимости (aiogram, fastapi, sqlalchemy, aiohttp, Pillow, rlottie-python, cryptography) ставятся и regression 46/46 проходит на Python 3.14.7.</li>
+                    <li><strong>pyproject.toml для локалки</strong>. Метаданные проекта + ruff/pytest конфигурация. Не используется для деплоя (deploys через requirements.txt + Dockerfile).</li>
+                    <li><strong>CI workflow (.github/workflows/ci.yml)</strong>. На push/PR: <code>ruff check</code> + regression-тесты на Python 3.11 и 3.14. На tag <code>v*</code>: авто-сборка zip + upload как GitHub Release artifact.</li>
+                    <li><strong>Alembic миграции</strong>. 664-строчный идемпотентный <code>init_db()</code> заменён на <code>init_db_with_fallback()</code> → <code>alembic upgrade head</code>. Создан <code>migrations/versions/</code> с initial migration (создаёт схему с нуля). Escape hatch: <code>DB_USE_LEGACY_MIGRATIONS=1</code> — fallback на старый <code>init_db()</code>.</li>
+                    <li><strong>Удалён sys.modules.setdefault("bot", ...) хак</strong>. Создан <code>app_state.py</code> (service locator pattern): <code>bot.py</code> при старте регистрирует свои функции, <code>bot_handlers.py</code>/<code>web_app.py</code> достают их через <code>from app_state import get_*()</code>. 5 late imports обновлены.</li>
+                    <li><strong>alarm_auto_off перенесён в chat_modes.py</strong>. Функция <code>_alarm_auto_off_tick(bot)</code> перенесена из <code>bot.py</code> в <code>chat_modes.py</code> (это её домен). 2 call sites в <code>bot.py</code> обновлены.</li>
+                    <li><strong>Декомпозиция handle_group_command (частично)</strong>. Создан <code>mod_commands.py</code> с <code>ModContext</code> dataclass + dispatcher <code>COMMANDS</code>. <code>cmd_ban</code> вынесена как proof-of-concept (~130 строк). Остальные 11 команд — TODO v4.9.0.</li>
+                    <li><strong>Декомпозиция create_app() (частично)</strong>. Создан <code>web/</code> package (<code>web/deps.py</code>, <code>web/health.py</code>, <code>web/auth.py</code>). <code>/health</code> и <code>/logout</code> вынесены как proof-of-concept. Остальные 52 роута — TODO v4.9.0.</li>
+                    <li><strong>ROADMAP_v4.8.x.md sync</strong>. 3 неточности исправлены: (1) WordFilter — описан как активный (управляется через /admin/presets), а не удалённый; (2) ссылки на утерянные тест-скрипты v4.8.1–v4.8.6 помечены как исторические; (3) §12 «Деплой» переписан под Git-flow (push → Bothost auto-redeploy).</li>
+                    <li><strong>Новые env vars</strong>:
+                        <ul>
+                            <li><code>DB_USE_LEGACY_MIGRATIONS</code> — <code>=1</code> fallback на старый <code>init_db()</code> если Alembic сломается. Дефолт: не задан (используется Alembic).</li>
+                        </ul>
+                    </li>
+                    <li><strong>Совместимость</strong>: 100%. Никаких изменений в схеме БД (Alembic initial migration = текущая схема), API endpoints, обработчиках команд. <strong>Важно при деплое</strong>: на существующей прод-БД (созданной <code>init_db()</code> до v4.8.9) нужно один раз выполнить <code>alembic stamp head</code> — чтобы Alembic пометил БД как актуальную и не пытался применить миграции повторно. См. <code>CHANGES_v4.8.9.md</code>.</li>
+                    <li><strong>Регрессия</strong>: 46/46 проверок v4.8.7 + v4.8.8 проходят на Python 3.12 и 3.14. <code>ruff check</code> чистый.</li>
+                    <li><strong>Затронутые файлы</strong>:
+                        <ul>
+                            <li><code>Dockerfile</code> — uv drop-in + Python 3.14-slim.</li>
+                            <li><code>requirements.txt</code> — добавлен <code>alembic&gt;=1.13</code>.</li>
+                            <li><code>pyproject.toml</code> — новый файл (метаданные + ruff/pytest config).</li>
+                            <li><code>.github/workflows/ci.yml</code> — новый файл (CI workflow).</li>
+                            <li><code>alembic.ini</code> + <code>migrations/</code> — новые файлы (Alembic config + env.py + initial migration).</li>
+                            <li><code>app_state.py</code> — новый файл (service locator для bot.py функций).</li>
+                            <li><code>mod_commands.py</code> — новый файл (декомпозиция handle_group_command).</li>
+                            <li><code>web/</code> — новый package (deps.py, health.py, auth.py).</li>
+                            <li><code>db.py</code> — добавлены <code>Index()</code> declarations в <code>KeywordWatch</code> и <code>IdeaLog</code>; добавлены <code>run_migrations_async()</code>, <code>init_db_with_fallback()</code>; убран raw SQL для индексов (теперь через <code>Base.metadata.create_all</code>).</li>
+                            <li><code>bot.py</code> — удалён <code>sys.modules.setdefault</code> хак; добавлена регистрация функций в <code>app_state</code>; <code>init_db()</code> → <code>init_db_with_fallback()</code>; <code>_alarm_auto_off_tick</code> импортируется из <code>chat_modes</code>.</li>
+                            <li><code>chat_modes.py</code> — перенесён <code>_alarm_auto_off_tick(bot)</code> из <code>bot.py</code>.</li>
+                            <li><code>bot_handlers.py</code> — 3 late imports <code>from bot import</code> → <code>from app_state import get_*()</code>; блок <code>!ban</code> вынесен в <code>mod_commands.cmd_ban</code>.</li>
+                            <li><code>web_app.py</code> — APP_VERSION → v4.8.9; 2 late imports обновлены; <code>/health</code> и <code>/logout</code> вынесены в <code>web/</code> routers.</li>
+                            <li><code>modchat.py</code> — убран unused <code>now_ts = time.time()</code> (ruff F841).</li>
+                            <li><code>roadmaps/ROADMAP_v4.8.x.md</code> — 3 неточности исправлены.</li>
+                            <li><code>templates/base.html</code> — этот changelog.</li>
+                        </ul>
+                    </li>
+                </ul>
                 <p><strong>v4.8.8</strong> — 16 августа 2026 (security: CSRF-токены на всех изменяющих запросах веб-панели, XFF trusted proxy)</p>
                 <ul>
                     <li><strong>CSRF-токены на всех POST-роутах</strong>. Раньше единственная защита от подделки запроса к веб-панели — <code>SameSite=lax</code> на куке. Это закрывает основной вектор в современных браузерах, но это одна линия обороны — если куку когда-нибудь переведут на <code>SameSite=none</code> или браузер пользователя не поддерживает SameSite, панель станет уязвимой. Теперь: каждый POST-роут (30 штук, кроме <code>/login</code> и <code>/api/*</code>) требует валидный CSRF-токен в form data или заголовке <code>X-CSRF-Token</code>. Токен привязан к username тем же HMAC-секретом, что и сессия — отдельного хранилища не нужно. Сравнение через <code>hmac.compare_digest</code> (timing-safe).</li>

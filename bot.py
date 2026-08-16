@@ -8,91 +8,45 @@ FastAPI запускается всегда — для веб-панели (ко
 """
 
 import asyncio
+
+# v4.8.9: хак `sys.modules.setdefault("bot", _self_module)` удалён.
+# Вместо него используется чистый паттерн "service locator": bot.py при
+# старте регистрирует свои функции в app_state.py, а bot_handlers.py /
+# web_app.py достают их через `from app_state import get_*()`.
+# См. 03_TASK_v4.8.9.md §3 и 10_KEY_DECISIONS.md §7.
+#
+# Раньше (до v4.8.9): бот запускался как `python bot.py` (т.е. __main__,
+# а не bot), поэтому `from bot import X` приводил к повторному import bot.py
+# со side-effectами (dp.include_router, startup tasks, etc.) →
+# RuntimeError: Router is already attached. Хак решал это, но путал IDE
+# и ломал тесты. v4.8.9 — чистое решение через app_state.py.
+import json
 import logging
 import os
 import secrets
 import socket
-import sys
 import time
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 
+import fastapi
 import uvicorn
 from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
-import fastapi
-
-# v4.7.22: SAFETY NET — регистрируем текущий модуль в sys.modules под именем
-# "bot", чтобы late import `from bot import X` из bot_handlers.py (или любого
-# другого модуля) находил уже загруженный модуль и НЕ вызывал повторный import
-# bot.py со side-effectами (dp.include_router, startup tasks, etc.).
-#
-# Контекст: Docker CMD = `python bot.py`, поэтому Python загружает bot.py как
-# __main__, а sys.modules['bot'] остаётся пустым. Любой late import
-# `from bot import X` (внутри функций) приводил к повторному import bot.py как
-# отдельного модуля "bot" → dp = Dispatcher() создавал НОВЫЙ Dispatcher →
-# dp.include_router(mod_router) пытался прицепить тот же mod_router к новому
-# Dispatcher → RuntimeError: Router is already attached.
-#
-# Эта строка решает проблему для ВСЕХ существующих и будущих late imports:
-# `_exit_night_mode`, `_exit_sanitary_day`, `_enter_sanitary_day` (L4730, L5313,
-# L5351, L5359 в bot_handlers.py) и любых других. После неё late import
-# `from bot import X` просто находит X в уже загруженном __main__ модуле.
-#
-# В test-окружении (importlib.util.spec_from_file_location) __name__ может
-# быть 'bot_module' и модуля ещё нет в sys.modules — в этом случае safety net
-# пропускается (тесты не вызывают функции с late imports, только AST-анализ).
-#
-# Альтернатива (более чистая архитектурно) — перенести ВСЕ общие символы в
-# bot_handlers.py (как сделано для SetChatSlowModeDelay в v4.7.22). Но это
-# требует большого рефакторинга (_exit_night_mode и др. — крупные функции,
-# использующие bot.py-специфичные объекты). Safety net — минимальный фикс.
-_self_module = sys.modules.get(__name__)
-if _self_module is not None:
-    sys.modules.setdefault("bot", _self_module)
-
-from bot_handlers import router as mod_router
-from db import init_db, async_session, ChatSettings
-from web_app import create_app
-
-# v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
-# Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
-# См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
-from chat_modes import (
-    _snapshot_chat_permissions,
-    _resolve_restore_perms_async,
-    _apply_chat_permissions,
-    _restore_permissions_from_json,
-    _hardcoded_day_default,
-    _mode_priority,
-    _active_modes,
-    _PERM_FIELDS as _CHAT_MODES_PERM_FIELDS,
-)
 
 # v4.5.2: helpers для night mode background task (defined in bot_handlers)
 # v4.5.3: добавлен _night_mode_in_window для поддержки per-chat tz + weekend.
 # v4.5.4: добавлены helpers для санитарных дней (chat-level ChatPermissions lockdown).
 from bot_handlers import (
-    _time_str_in_range, _parse_night_mode_permissions, _snapshot_permissions,
-    _PERM_FIELDS, _night_mode_in_window,
-    parse_sanitary_days_json, is_sanitary_day_today,
-    # v4.7.18: night mode / day mode notifications go to report chat, not
-    # to the public chat. Reuse the existing resolver — it honours per-chat
-    # override (ChatSettings.report_chat_id), is_report_chat flag, and the
-    # global default (chat_id=0).
-    _get_report_chat_id,
-    # v4.7.20: !alarm integration — _deactivate_alarm используется в
-    # _night_mode_tick для (1) auto-off при истечении alarm_active_until,
-    # (2) auto-deactivate при входе в night mode (alarm избыточен когда
-    # night mode уже ограничивает права).
-    _deactivate_alarm,
     # v4.7.20: env-chats cleanup при старте — если чат из CHAT_HASHTAGS
     # не отвечает (бот кикнут / чат удалён), помечаем is_enabled=False.
     # Раньше бот при каждом апдейте пересоздавал chat_settings для мёртвых
     # чатов из env (CHAT_HASHTAGS=-1003972381175:Test), и SU не мог их
     # удалить из веб-панели — они "воскресали" при следующем сообщении.
     _CHAT_HASHTAGS,
+    _PERM_FIELDS,
     # v4.7.22: SetChatSlowModeDelay — обёртка над setChatSlowModeDelay Telegram
     # Bot API method (aiogram 3.30 не имеет её). Раньше класс был определён в
     # bot.py, но late import `from bot import SetChatSlowModeDelay` из
@@ -102,10 +56,36 @@ from bot_handlers import (
     # already attached. Теперь класс живёт в bot_handlers.py — bot.py
     # импортирует его как обычный symbol.
     SetChatSlowModeDelay,
+    # v4.7.20: !alarm integration — _deactivate_alarm используется в
+    # _night_mode_tick для (1) auto-off при истечении alarm_active_until,
+    # (2) auto-deactivate при входе в night mode (alarm избыточен когда
+    # night mode уже ограничивает права).
+    _deactivate_alarm,
+    # v4.7.18: night mode / day mode notifications go to report chat, not
+    # to the public chat. Reuse the existing resolver — it honours per-chat
+    # override (ChatSettings.report_chat_id), is_report_chat flag, and the
+    # global default (chat_id=0).
+    _get_report_chat_id,
+    _night_mode_in_window,
+    _parse_night_mode_permissions,
+    is_sanitary_day_today,
+    parse_sanitary_days_json,
 )
-from datetime import datetime, timezone, timedelta, date
-import json
-from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
+from bot_handlers import router as mod_router
+
+# v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
+# Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
+# См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
+from chat_modes import (
+    _alarm_auto_off_tick,  # v4.8.9: перенесено из bot.py
+    _apply_chat_permissions,
+    _mode_priority,
+    _resolve_restore_perms_async,
+    _snapshot_chat_permissions,
+)
+from db import ChatSettings, async_session, init_db_with_fallback
+from web_app import create_app
+
 # v4.7.19: TelegramAPIError — базовый класс для ВСЕХ Telegram-ошибок
 # (TelegramNotFound, TelegramForbiddenError, TelegramConflictError, ...).
 # Раньше ловили только TelegramBadRequest, но TelegramNotFound ("Not Found"
@@ -206,7 +186,7 @@ async def _night_mode_loop():
             # v4.7.30: alarm auto-off ПЕРВЫМ — снимает зависшие alarm'ы
             # с истёкшим alarm_active_until. Должно идти ДО sanitary/night,
             # чтобы alarm снялся до любых других манипуляций с правами чата.
-            await _alarm_auto_off_tick()
+            await _alarm_auto_off_tick(bot)
             # v4.5.4: sanitary day tick ВТОРЫМ — он может снять night mode.
             await _sanitary_day_tick()
             await _night_mode_tick()
@@ -215,82 +195,8 @@ async def _night_mode_loop():
         await asyncio.sleep(60)
 
 
-async def _alarm_auto_off_tick():
-    """v4.7.30: проверяет ВСЕ чаты с активным alarm и истёкшим alarm_active_until.
-
-    Вынесено из _night_mode_tick в отдельную функцию — Баг #1 аудита v4.7.30:
-    раньше auto-off работал только для чатов с night_mode_enabled=True
-    (т.к. был встроен в query _night_mode_tick). Чаты без night_mode вообще
-    не проверялись, alarm зависал навсегда даже при указанной длительности.
-
-    Теперь: отдельный query по всем чатам с alarm_currently_active=True и
-    alarm_active_until IS NOT NULL. Если now >= alarm_active_until —
-    вызываем _deactivate_alarm(reason="auto_off_timeout").
-
-    Вызывается из _night_mode_loop ПЕРЕД _sanitary_day_tick и _night_mode_tick
-    — чтобы alarm снялся до любых других манипуляций с правами чата.
-    """
-    now = datetime.now(timezone.utc)
-    try:
-        async with async_session() as session:
-            stmt = select(ChatSettings).where(
-                ChatSettings.alarm_currently_active.is_(True),
-                ChatSettings.alarm_active_until.is_not(None),
-                ChatSettings.chat_id != 0,  # пропускаем global default
-                ChatSettings.is_enabled.is_(True),  # чат активен
-            )
-            chats = (await session.execute(stmt)).scalars().all()
-    except Exception as e:
-        logger.warning("Alarm auto-off tick: DB error loading chats: %s", e)
-        return
-
-    for cs in chats:
-        if cs.alarm_active_until is None or now < cs.alarm_active_until:
-            continue  # не вышло время (двойная проверка на случай race)
-        logger.info(
-            "Alarm auto-off: chat %s alarm_active_until=%s (now=%s)",
-            cs.chat_id, cs.alarm_active_until.isoformat(), now.isoformat(),
-        )
-        try:
-            async with async_session() as alarm_session:
-                alarm_cs = (await alarm_session.execute(
-                    select(ChatSettings).where(
-                        ChatSettings.chat_id == cs.chat_id
-                    )
-                )).scalar_one_or_none()
-                if alarm_cs and alarm_cs.alarm_currently_active:
-                    # Сохраняем started_by ДО деактивации — для modchat-события.
-                    started_by = alarm_cs.alarm_started_by
-                    # Используем _deactivate_alarm из bot_handlers.
-                    # Восстанавливает права из snapshot/preset.
-                    await _deactivate_alarm(
-                        alarm_session, alarm_cs, bot,
-                        cs.chat_id, reason="auto_off_timeout",
-                    )
-                    # Синхронизируем cs в памяти (на случай если кто-то
-                    # дальше в этом тике будет читать — defensive).
-                    cs.alarm_currently_active = False
-                    cs.alarm_saved_permissions = None
-                    cs.alarm_saved_slow_mode_delay = None
-                    cs.alarm_active_until = None
-                    # v4.8.0: отправляем событие в modchat.
-                    try:
-                        from modchat import _send_alarm_event_to_modchat
-                        await _send_alarm_event_to_modchat(
-                            bot=bot, chat_id=cs.chat_id, event_type="auto_off",
-                            mod_id=started_by,
-                            reason="истёк таймаут",
-                        )
-                    except Exception as modchat_e:
-                        logger.debug(
-                            "Modchat alarm auto-off event failed for chat %s: %s",
-                            cs.chat_id, modchat_e,
-                        )
-        except Exception as e:
-            logger.error(
-                "Alarm auto-off failed for chat %s: %s",
-                cs.chat_id, e,
-            )
+# v4.8.9: _alarm_auto_off_tick перенесена в chat_modes.py (это её домен).
+# Импортируется в начале файла через `from chat_modes import _alarm_auto_off_tick`.
 
 
 async def _night_mode_tick():
@@ -1153,7 +1059,8 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
     default» нет — используется hardcoded-фолбэк с admin-правами OFF.
     """
     # v4.6.0: проставляем last_sanitary_month и чистим старые месяцы.
-    from datetime import datetime as _dt, timezone as _tz
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
     tz_name = cs.night_mode_tz or "Europe/Moscow"
     try:
         from zoneinfo import ZoneInfo
@@ -1228,6 +1135,20 @@ async def _exit_sanitary_day(cs: ChatSettings) -> None:
 _SHUTDOWN_TIMEOUT_SECONDS: float = 5.0
 
 
+# ── v4.8.9: регистрация функций в app_state ────────────────────────────────
+# После определения _exit_night_mode / _enter_sanitary_day / _exit_sanitary_day
+# регистрируем их в app_state.py. Это заменяет хак sys.modules.setdefault("bot",
+# _self_module) — теперь bot_handlers.py и web_app.py достают эти функции через
+# `from app_state import get_exit_night_mode` (см. app_state.py).
+from app_state import register as _app_state_register
+
+_app_state_register(
+    exit_night_mode=_exit_night_mode,
+    enter_sanitary_day=_enter_sanitary_day,
+    exit_sanitary_day=_exit_sanitary_day,
+)
+
+
 # ── v4.7.3: Startup recovery ──────────────────────────────────────────────
 # При жёстком SIGTERM в предыдущем запуске чат мог остаться с
 # night_mode_currently_active=True или sanitary_days_currently_active=True,
@@ -1285,7 +1206,7 @@ async def _startup_recovery() -> None:
         # 2. sanitary day tick — снимет sanitary если окно вышло
         # 3. night mode tick — снимет night если окно вышло
         try:
-            await _alarm_auto_off_tick()
+            await _alarm_auto_off_tick(bot)
             await _sanitary_day_tick()
             await _night_mode_tick()
             logger.info("Startup recovery: tick completed, state reconciled")
@@ -1384,8 +1305,12 @@ async def lifespan(app):
     global _webhook_set
 
     # ── Startup ─────────────────────────────────────────────────
-    await init_db()
-    logger.info("DB initialized (WAL mode)")
+    # v4.8.9: миграции через Alembic (init_db_with_fallback).
+    # По умолчанию — alembic upgrade head. Если env DB_USE_LEGACY_MIGRATIONS=1
+    # — fallback на старый init_db() (664 строки идемпотентных ALTER'ов).
+    # См. db.run_migrations_async() и 03_TASK_v4.8.9.md §4.
+    await init_db_with_fallback()
+    logger.info("DB initialized (Alembic migrations applied)")
 
     # v4.7.3: recovery для чатов с зависшими active-флагами после жёсткого
     # SIGTERM в предыдущем запуске. Должен идти ДО запуска background loop,

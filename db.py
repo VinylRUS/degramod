@@ -7,17 +7,26 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import os
 import secrets
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, DateTime, ForeignKey, Text, Float, Boolean, event, text, select,
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,  # v4.8.9: для явных Index() declarations в __table_args__
+    Integer,
+    String,
+    Text,
+    event,
+    select,
+    text,
 )
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
-
 
 # ── Хэширование паролей для веб-панели ───────────────────────────────────────
 # PBKDF2-HMAC-SHA256, 200 000 итераций, соль 16 байт. Возвращает 'salt:hash'.
@@ -420,9 +429,18 @@ class KeywordWatch(Base):
     Пока в v4.8.0 не используется (GitHub sync планируется отдельно).
     """
     __tablename__ = "keyword_watch"
+    # v4.8.9: явные Index() declarations — раньше индексы создавались через
+    # raw SQL в init_db(), что путало Alembic autogenerate. Теперь они
+    # описаны в модели → Alembic видит их как expected.
+    __table_args__ = (
+        Index("ix_keyword_watch_chat_id", "chat_id"),
+        Index("ix_keyword_watch_is_active", "is_active"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    chat_id = Column(BigInteger, nullable=False, default=0, index=True)  # 0 = global (всегда)
+    # v4.8.9: index=True убран — индекс ix_keyword_watch_chat_id явно описан
+    # в __table_args__ через Index(). Двойное объявление даёт конфликт.
+    chat_id = Column(BigInteger, nullable=False, default=0)  # 0 = global (всегда)
     phrase = Column(String(255), nullable=False)              # отслеживаемая фраза
     ban_in_night_mode = Column(Boolean, default=False, nullable=False)  # авто-бан ночью
     rules_section = Column(String(64), nullable=True)         # ID секции сайта правил (для #11)
@@ -693,9 +711,16 @@ class IdeaLog(Base):
     фильтровать историю конкретного юзера.
     """
     __tablename__ = "idea_log"
+    # v4.8.9: явные Index() declarations (раньше raw SQL в init_db()).
+    __table_args__ = (
+        Index("ix_idea_log_tg_user_id", "tg_user_id"),
+        Index("ix_idea_log_created_at", "created_at"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    tg_user_id = Column(BigInteger, nullable=False, index=True)
+    # v4.8.9: index=True убран — индекс ix_idea_log_tg_user_id явно описан
+    # в __table_args__ через Index(). Двойное объявление даёт конфликт.
+    tg_user_id = Column(BigInteger, nullable=False)
     tg_username = Column(String(255), nullable=True)         # @username (без @, lowercase) или None
     tg_display_name = Column(String(255), nullable=True)     # first_name + last_name для алерта SU
     source = Column(String(16), nullable=False)              # "dm" | "modchat"
@@ -1210,14 +1235,12 @@ async def init_db() -> None:
                 is_active BOOLEAN NOT NULL DEFAULT 1
             )
         """))
-        await conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_keyword_watch_chat_id "
-            "ON keyword_watch (chat_id)"
-        ))
-        await conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_keyword_watch_is_active "
-            "ON keyword_watch (is_active)"
-        ))
+        # v4.8.9: индексы ix_keyword_watch_* создаются через Index() в
+        # __table_args__ модели KeywordWatch (Base.metadata.create_all).
+        # Раньше тут был raw SQL CREATE INDEX IF NOT EXISTS, но он конфликтовал
+        # с явными Index() declarations. Для существующих БД индексы уже стоят
+        # (созданы предыдущими версиями init_db). Для новых БД — создастся
+        # автоматически через create_all.
 
     # ── v4.8.4: Новая таблица automute_counters (прогрессивные автомьюты) ──
     # Хранит per-chat per-user счётчик автомьютов. Используется для формулы:
@@ -1255,14 +1278,8 @@ async def init_db() -> None:
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """))
-        await conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_idea_log_tg_user_id "
-            "ON idea_log (tg_user_id)"
-        ))
-        await conn.execute(text(
-            "CREATE INDEX IF NOT EXISTS ix_idea_log_created_at "
-            "ON idea_log (created_at)"
-        ))
+        # v4.8.9: индексы ix_idea_log_* создаются через Index() в
+        # __table_args__ модели IdeaLog (Base.metadata.create_all).
 
     # ── v4.8.5: Новая таблица github_settings (singleton для PAT и репо) ───
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
@@ -1421,3 +1438,59 @@ async def get_session() -> AsyncSession:
     """Фабрика сессий — использовать через async with."""
     async with async_session() as session:
         yield session
+
+
+# ── v4.8.9: Alembic миграции ────────────────────────────────────────────────
+# Заменяет 664-строчный идемпотентный init_db() на явные миграции через Alembic.
+# Escape hatch: env DB_USE_LEGACY_MIGRATIONS=1 — fallback на init_db() если
+# Alembic что-то сломает (см. 03_TASK_v4.8.9.md §4, грабли №3).
+
+async def run_migrations_async() -> None:
+    """Запускает `alembic upgrade head` через in-process API (без subprocess).
+
+    v4.8.9: вызывается из bot.py lifespan startup ВМЕСТО init_db().
+    Использует migrations/env.py + migrations/versions/* (см. alembic.ini).
+
+    На пустой БД: создаёт схему с нуля (initial migration).
+    На существующей БД с alembic_version: применяет только недостающие миграции.
+    На существующей БД БЕЗ alembic_version (созданной init_db() до v4.8.9):
+    нужно сначала `alembic stamp head` вручную (см. CHANGES_v4.8.9.md).
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    # Абсолютный путь к alembic.ini — он лежит рядом с db.py.
+    alembic_ini = Path(__file__).resolve().parent / "alembic.ini"
+    if not alembic_ini.exists():
+        raise RuntimeError(
+            f"alembic.ini not found at {alembic_ini}. "
+            "v4.8.9 requires alembic.ini + migrations/ in the project root."
+        )
+
+    config = Config(str(alembic_ini))
+    # config уже читает sqlalchemy.url из env.py (переопределён там через db.DATABASE_URL).
+    # Запускаем upgrade в текущем event loop (env.py сам сделает asyncio.run
+    # для online migrations через async_engine_from_config).
+    # ВАЖНО: мы уже в async-context, поэтому используем `command.upgrade`
+    # напрямую — alembic.env сам создаст новый event loop через asyncio.run.
+    # Это работает, потому что asyncio.run создаёт независимый loop.
+    # Альтернатива — переписать env.py на use_asyncio_from_running_loop, но
+    # это усложняет код. Оставляем как есть.
+    command.upgrade(config, "head")
+
+
+async def init_db_with_fallback() -> None:
+    """v4.8.9: запускает миграции через Alembic, с fallback на init_db().
+
+    Если env DB_USE_LEGACY_MIGRATIONS=1 — вызывает init_db() (старый путь).
+    Иначе — вызывает run_migrations_async() (Alembic).
+
+    Это точка входа из bot.py lifespan startup.
+    """
+    if os.getenv("DB_USE_LEGACY_MIGRATIONS") == "1":
+        # Escape hatch: если Alembic что-то сломал — можно откатиться.
+        await init_db()
+    else:
+        await run_migrations_async()

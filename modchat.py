@@ -36,7 +36,7 @@ from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 if TYPE_CHECKING:
-    from db import ChatSettings, KeywordWatch
+    from db import KeywordWatch
 
 logger = logging.getLogger("shadow_logger")
 
@@ -248,7 +248,8 @@ async def _enqueue_alarm_extend(
     Если очередь пуста — создаём запись и планируем отправку через 60 сек.
     Если уже есть — добавляем в extends и обновляем last_until.
     """
-    now_ts = time.time()
+    # v4.8.9: ruff поймал unused `now_ts = time.time()` — убрали. В коде
+    # ниже используется `datetime.now(timezone.utc)` для форматирования.
     mod_mention = "неизвестно"
     if mod_user is not None:
         mod_mention = _user_mention_html(mod_user)

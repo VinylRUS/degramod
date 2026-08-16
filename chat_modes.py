@@ -39,13 +39,17 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from aiogram import types
 from aiogram.exceptions import TelegramAPIError
+from sqlalchemy import select
+
+from db import ChatSettings, async_session
 
 if TYPE_CHECKING:
-    from db import ChatSettings
+    from aiogram import Bot
 
 logger = logging.getLogger("shadow_logger")
 
@@ -283,8 +287,9 @@ async def _resolve_restore_perms_async(
 
     # 2. Системный пресет «Day default».
     try:
-        from db import PermissionPreset
         from sqlalchemy import select
+
+        from db import PermissionPreset
         preset = (await session.execute(
             select(PermissionPreset).where(
                 PermissionPreset.name == "Day default",
@@ -402,3 +407,98 @@ def _active_modes(cs: "ChatSettings") -> list[str]:
     if cs.alarm_currently_active:
         modes.append("alarm")
     return modes
+
+
+# ── Alarm auto-off (перенесено из bot.py в v4.8.9) ─────────────────────────
+# v4.8.9: функция перенесена сюда из bot.py — это её домен (см. план v4.8.9 §5).
+# Раньше лежала в bot.py:218 как часть _night_mode_loop, что создавало
+# путаницу: night/sanitary/alarm — всё в chat_modes.py, а alarm auto-off
+# почему-то отдельно. Теперь все tick'и alarm'а — в одном модуле.
+
+
+async def _alarm_auto_off_tick(bot: "Bot") -> None:
+    """v4.7.30: проверяет ВСЕ чаты с активным alarm и истёкшим alarm_active_until.
+
+    v4.8.9: перенесена из bot.py в chat_modes.py — это её домен.
+
+    Вынесено из _night_mode_tick в отдельную функцию — Баг #1 аудита v4.7.30:
+    раньше auto-off работал только для чатов с night_mode_enabled=True
+    (т.к. был встроен в query _night_mode_tick). Чаты без night_mode вообще
+    не проверялись, alarm зависал навсегда даже при указанной длительности.
+
+    Теперь: отдельный query по всем чатам с alarm_currently_active=True и
+    alarm_active_until IS NOT NULL. Если now >= alarm_active_until —
+    вызываем _deactivate_alarm(reason="auto_off_timeout").
+
+    Вызывается из _night_mode_loop (bot.py) ПЕРЕД _sanitary_day_tick и
+    _night_mode_tick — чтобы alarm снялся до любых других манипуляций
+    с правами чата.
+
+    Args:
+        bot: экземпляр aiogram.Bot — нужен для _deactivate_alarm (восстанавливает
+            права через bot.set_chat_permissions) и для отправки modchat-события.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with async_session() as session:
+            stmt = select(ChatSettings).where(
+                ChatSettings.alarm_currently_active.is_(True),
+                ChatSettings.alarm_active_until.is_not(None),
+                ChatSettings.chat_id != 0,  # пропускаем global default
+                ChatSettings.is_enabled.is_(True),  # чат активен
+            )
+            chats = (await session.execute(stmt)).scalars().all()
+    except Exception as e:
+        logger.warning("Alarm auto-off tick: DB error loading chats: %s", e)
+        return
+
+    for cs in chats:
+        if cs.alarm_active_until is None or now < cs.alarm_active_until:
+            continue  # не вышло время (двойная проверка на случай race)
+        logger.info(
+            "Alarm auto-off: chat %s alarm_active_until=%s (now=%s)",
+            cs.chat_id, cs.alarm_active_until.isoformat(), now.isoformat(),
+        )
+        try:
+            async with async_session() as alarm_session:
+                alarm_cs = (await alarm_session.execute(
+                    select(ChatSettings).where(
+                        ChatSettings.chat_id == cs.chat_id
+                    )
+                )).scalar_one_or_none()
+                if alarm_cs and alarm_cs.alarm_currently_active:
+                    # Сохраняем started_by ДО деактивации — для modchat-события.
+                    started_by = alarm_cs.alarm_started_by
+                    # Используем _deactivate_alarm из bot_handlers.
+                    # Восстанавливает права из snapshot/preset.
+                    # Lazy import — чтобы избежать циклической зависимости
+                    # (bot_handlers импортирует из chat_modes).
+                    from bot_handlers import _deactivate_alarm
+                    await _deactivate_alarm(
+                        alarm_session, alarm_cs, bot,
+                        cs.chat_id, reason="auto_off_timeout",
+                    )
+                    # Синхронизируем cs в памяти (на случай если кто-то
+                    # дальше в этом тике будет читать — defensive).
+                    cs.alarm_currently_active = False
+                    cs.alarm_saved_permissions = None
+                    cs.alarm_saved_slow_mode_delay = None
+                    cs.alarm_active_until = None
+                    # v4.8.0: отправляем событие в modchat.
+                    try:
+                        from modchat import _send_alarm_event_to_modchat
+                        await _send_alarm_event_to_modchat(
+                            bot=bot, chat_id=cs.chat_id, event_type="auto_off",
+                            mod_id=started_by,
+                            reason="истёк таймаут",
+                        )
+                    except Exception as modchat_e:
+                        logger.debug(
+                            "Modchat alarm auto-off event failed for chat %s: %s",
+                            cs.chat_id, modchat_e,
+                        )
+        except Exception as e:
+            logger.error(
+                "Alarm auto-off failed for chat %s: %s",
+                cs.chat_id, e,
+            )

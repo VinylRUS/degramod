@@ -38,34 +38,48 @@ import shutil
 import sqlite3
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, Request, Depends, HTTPException, Form
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, FileResponse
-from fastapi.templating import Jinja2Templates
-from sqlalchemy import select, func, desc, or_
+from aiogram.exceptions import TelegramBadRequest
 
 # Rich Messages (Bot API 10.2 / aiogram 3.30) — для приветствия новому админу.
 # Импортируем лениво внутри функции, чтобы не тащить зависимость на aiogram.types
 # при статическом импорте модуля (на случай если бот запускается без aiogram).
 from aiogram.types import (
-    InputRichMessage,
-    InputRichBlockSectionHeading,
-    InputRichBlockParagraph,
     InputRichBlockFooter,
-    RichTextUrl,
+    InputRichBlockParagraph,
+    InputRichBlockSectionHeading,
+    InputRichMessage,
     RichTextBold,
     RichTextSpoiler,
+    RichTextUrl,
 )
-from aiogram.exceptions import TelegramBadRequest
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import desc, func, select
 
 _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
-    async_session, User, Moderator, Punishment, ChatSettings, ChatAdmin, WebUser,
-    PermissionPreset, WordFilter, LinkAllowlist, KeywordWatch, AutomuteCounter,
-    IdeaLog, GithubSettings, _encrypt_pat, _decrypt_pat,
-    _hash_password, _verify_password, DB_PATH,
+    DB_PATH,
+    AutomuteCounter,
+    ChatAdmin,
+    ChatSettings,
+    GithubSettings,
+    KeywordWatch,
+    LinkAllowlist,
+    Moderator,
+    PermissionPreset,
+    Punishment,
+    User,
+    WebUser,
+    WordFilter,
+    _decrypt_pat,
+    _encrypt_pat,
+    _hash_password,
+    _verify_password,
+    async_session,
 )
 
 # ── Конфигурация ────────────────────────────────────────────────────────────
@@ -114,7 +128,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.8"
+APP_VERSION = "v4.8.9"
 APP_RELEASE_DATE = "2026-08-16"
 
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
@@ -794,6 +808,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     try:
         from bot_handlers import (
             format_sanitary_period_human as _fmt_san_period,
+        )
+        from bot_handlers import (
             get_sanitary_periods_flat as _san_flat,
         )
         templates.env.filters["format_sanitary_period"] = _fmt_san_period
@@ -843,15 +859,14 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     except OSError as e:
         _req_logger.warning("create_app: cannot create AVATARS_DIR %s: %s", AVATARS_DIR, e)
 
-    # ── Health check ─────────────────────────────────────────────────
-    @app.get("/health")
-    async def health():
-        return {
-            "status": "ok",
-            "service": "dedushka-vobzhak",
-            "version": APP_VERSION,
-            "time": datetime.now(timezone.utc).isoformat(),
-        }
+    # ── v4.8.9: Routers из web/ package ──────────────────────────────────
+    # Декомпозиция create_app() — см. 03_TASK_v4.8.9.md §2 и web/__init__.py.
+    # Пока перенесены 2 роута (/health и /logout) как proof-of-concept.
+    # Остальные 52 роута — inline ниже, TODO v4.9.0.
+    from web.auth import router as auth_router
+    from web.health import router as health_router
+    app.include_router(health_router)
+    app.include_router(auth_router)
 
     # ── v4.5: Endpoint для отдачи аватарок ────────────────────────────
     # Возвращает файл <AVATARS_DIR>/<tg_user_id>.jpg. Если файла нет —
@@ -953,23 +968,11 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
             return response
 
-    # ── POST /logout (v4.5.1: было GET, изменили на POST) ──────────────
-    # GET /logout был CSRF-уязвим: любой сайт с <img src=".../logout">
-    # разлогинивал юзера. POST + SameSite=lax cookie полностью закрывают
-    # этот вектор (для POST-запроса с другого origin браузер не шлёт cookie).
-    # Шаблон base.html использует <form method="post" action="/logout">.
-    @app.post("/logout")
-    async def logout():
-        response = RedirectResponse(url="/login", status_code=303)
-        response.delete_cookie(COOKIE_NAME)
-        return response
-
-    # GET /logout — редирект на /login (для старых закладок). Не вылогинивает,
-    # просто редиректит — чтобы случайно зашедший по старой ссылке не потерял
-    # сессию без действия.
-    @app.get("/logout")
-    async def logout_legacy():
-        return RedirectResponse(url="/login", status_code=303)
+    # ── POST /logout и GET /logout — v4.8.9 перенесены в web/auth.py ────
+    # Раньше тут были inline @app.post("/logout") и @app.get("/logout").
+    # Теперь они в web/auth.py, подключены через app.include_router выше.
+    # v4.5.1: GET /logout был CSRF-уязвим (<img src="/logout"> разлогинивал).
+    # POST + SameSite=lax cookie закрывают вектор.
 
     # ── GET /dashboard ──────────────────────────────────────────────────
     # v4.5: урезанный дашборд. Только:
@@ -1057,7 +1060,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             # 3. no_bot_rights — приоритет 20
             # 4. other (e.g. chat disabled) — приоритет 30
             warnings = []
-            from datetime import datetime as _dt, timezone as _tz
+            from datetime import datetime as _dt
+            from datetime import timezone as _tz
             from zoneinfo import ZoneInfo as _ZI
             try:
                 now_msk = _dt.now(_ZI("Europe/Moscow"))
@@ -2032,12 +2036,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         nm_end = (night_mode_end or "").strip()
         if not _hhmm_re.match(nm_start):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+night_mode_start+(use+HH:MM)",
+                url="/admin/chats?flash=Invalid+night_mode_start+(use+HH:MM)",
                 status_code=303,
             )
         if not _hhmm_re.match(nm_end):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+night_mode_end+(use+HH:MM)",
+                url="/admin/chats?flash=Invalid+night_mode_end+(use+HH:MM)",
                 status_code=303,
             )
 
@@ -2048,7 +2052,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             ZoneInfo(nm_tz)
         except (ValueError, KeyError):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+night_mode_tz+(use+IANA+name+like+Europe/Moscow)",
+                url="/admin/chats?flash=Invalid+night_mode_tz+(use+IANA+name+like+Europe/Moscow)",
                 status_code=303,
             )
 
@@ -2058,17 +2062,17 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         nm_wknd_end = (night_mode_weekend_end or "").strip()
         if (nm_wknd_start or nm_wknd_end) and not (nm_wknd_start and nm_wknd_end):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Weekend+schedule+requires+both+start+and+end",
+                url="/admin/chats?flash=Weekend+schedule+requires+both+start+and+end",
                 status_code=303,
             )
         if nm_wknd_start and not _hhmm_re.match(nm_wknd_start):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+night_mode_weekend_start+(use+HH:MM)",
+                url="/admin/chats?flash=Invalid+night_mode_weekend_start+(use+HH:MM)",
                 status_code=303,
             )
         if nm_wknd_end and not _hhmm_re.match(nm_wknd_end):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+night_mode_weekend_end+(use+HH:MM)",
+                url="/admin/chats?flash=Invalid+night_mode_weekend_end+(use+HH:MM)",
                 status_code=303,
             )
 
@@ -2093,11 +2097,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # (textarea). Парсинг остаётся тем же.
         try:
             from bot_handlers import (
-                parse_sanitary_days_textarea, serialize_sanitary_days_monthly,
+                parse_sanitary_days_textarea,
+                serialize_sanitary_days_monthly,
             )
         except ImportError:
             return RedirectResponse(
-                url=f"/admin/chats?flash=Server+error+(bot_handlers+import+failed)",
+                url="/admin/chats?flash=Server+error+(bot_handlers+import+failed)",
                 status_code=303,
             )
 
@@ -2283,7 +2288,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             chat_id = int(chat_id_str)
         except (ValueError, TypeError):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+chat_id",
+                url="/admin/chats?flash=Invalid+chat_id",
                 status_code=303,
             )
         form = await request.form()
@@ -2291,7 +2296,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days", "via_bot_filter", "mod_chat"}
         if field not in valid_fields:
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+toggle+field",
+                url="/admin/chats?flash=Invalid+toggle+field",
                 status_code=303,
             )
 
@@ -2327,8 +2332,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     # Лучше: дёрнуть _exit_night_mode если бот доступен.
                     if cs.night_mode_currently_active and bot is not None:
                         try:
-                            # Импортируем тут чтобы избежать circular import.
-                            from bot import _exit_night_mode
+                            # v4.8.9: app_state вместо `from bot import`
+                            from app_state import get_exit_night_mode
+                            _exit_night_mode = get_exit_night_mode()
                             await _exit_night_mode(cs)
                             # Re-fetch т.к. _exit_night_mode коммитил.
                             await session.refresh(cs)
@@ -2348,7 +2354,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     # Выходим из sanitary day если он сейчас активен.
                     if bot is not None:
                         try:
-                            from bot import _exit_sanitary_day
+                            # v4.8.9: app_state вместо `from bot import`
+                            from app_state import get_exit_sanitary_day
+                            _exit_sanitary_day = get_exit_sanitary_day()
                             await _exit_sanitary_day(cs)
                             await session.refresh(cs)
                         except Exception as e:
@@ -2455,7 +2463,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             chat_id = int(chat_id_str)
         except (ValueError, TypeError):
             return RedirectResponse(
-                url=f"/admin/chats?flash=Invalid+chat_id",
+                url="/admin/chats?flash=Invalid+chat_id",
                 status_code=303,
             )
 
@@ -2599,7 +2607,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 )
             if cs.is_report_chat:
                 return RedirectResponse(
-                    url=f"/admin/chats?flash=Report+chat+ignored+(no+admins+to+sync)",
+                    url="/admin/chats?flash=Report+chat+ignored+(no+admins+to+sync)",
                     status_code=303,
                 )
 
@@ -2838,7 +2846,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             from bot_handlers import add_sanitary_period
         except ImportError:
             return RedirectResponse(
-                url=f"/admin/chats?flash=Server+error+(bot_handlers+import)",
+                url="/admin/chats?flash=Server+error+(bot_handlers+import)",
                 status_code=303,
             )
 
@@ -2900,7 +2908,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             from bot_handlers import delete_sanitary_period
         except ImportError:
             return RedirectResponse(
-                url=f"/admin/chats?flash=Server+error+(bot_handlers+import)",
+                url="/admin/chats?flash=Server+error+(bot_handlers+import)",
                 status_code=303,
             )
 
@@ -3328,7 +3336,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         # Memory RSS: читаем из /proc/self/status (Linux only).
         # VmRSS line: "VmRSS:\t    12345 kB\n"
         try:
-            with open(f"/proc/self/status", "r") as f:
+            with open("/proc/self/status", "r") as f:
                 for line in f:
                     if line.startswith("VmRSS:"):
                         parts = line.split()
@@ -3728,7 +3736,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
         # Вызываем test_connection.
         try:
-            from github_client import test_connection, get_project_node_id, GithubApiError
+            from github_client import GithubApiError, get_project_node_id, test_connection
             # Если project_node_id пустой, но project_owner_login + project_number
             # заданы — резолвим node_id автоматически.
             project_node_id = gs.project_node_id
@@ -4624,7 +4632,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             if q_lower:
                 # Простая подстрока. user_id — числовое поле, проверяем если
                 # q — число. Иначе — ILIKE по username/first_name.
-                from db import User as _U, Moderator as _M
+                from db import Moderator as _M
+                from db import User as _U
                 user_cond = []
                 try:
                     q_int = int(q_lower)
@@ -4634,7 +4643,6 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 user_cond.append(_U.username.ilike(f"%{q_lower}%"))
                 user_cond.append(_U.first_name.ilike(f"%{q_lower}%"))
                 from sqlalchemy import or_ as _or
-                from sqlalchemy import case as _case
 
                 main_q = (
                     select(
@@ -4656,7 +4664,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                     .limit(limit_int)
                 )
             else:
-                from db import User as _U, Moderator as _M
+                from db import Moderator as _M
+                from db import User as _U
                 main_q = (
                     select(
                         Punishment,
@@ -4833,7 +4842,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
                 else:
                     old_count = counter.count
                     counter.count = 0
-                    from datetime import datetime, timezone as _tz
+                    from datetime import datetime
+                    from datetime import timezone as _tz
                     counter.updated_at = datetime.now(_tz.utc)
                     await session.commit()
             _req_logger.info(
