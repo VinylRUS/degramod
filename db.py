@@ -1455,19 +1455,9 @@ async def run_migrations_async() -> None:
     """Запускает `alembic upgrade head` через in-process API (без subprocess).
 
     v4.8.9: вызывается из bot.py lifespan startup ВМЕСТО init_db().
-    Использует migrations/env.py + migrations/versions/* (см. alembic.ini).
-
-    v4.8.9.1 hotfix: автоматически делает `alembic stamp head` если БД уже
-    существует (с таблицами), но не имеет alembic_version. Это происходит
-    при первом деплое v4.8.9 на проде — БД была создана init_db() в предыдущих
-    версиях, Alembic её не знает и пытается применить initial migration →
-    "table already exists" → циклический рестарт контейнера. Auto-stamp
-    помечает существующую схему как актуальную, после чего upgrade head — no-op.
-
-    Сценарии:
-      - Пустая БД (нет файла или нет таблиц) → upgrade head создаёт схему.
-      - Существующая БД без alembic_version → auto-stamp head, потом upgrade no-op.
-      - Существующая БД с alembic_version → upgrade head применяет недостающие.
+    v4.8.9.1: добавлен auto-stamp для существующих БД без alembic_version.
+    v4.8.9.2: усилена диагностика — print() в stderr (точно видно в Bothost
+              даже если logger фильтруется).
     """
     from pathlib import Path
 
@@ -1483,80 +1473,84 @@ async def run_migrations_async() -> None:
 
     config = Config(str(alembic_ini))
 
+    db_path_env = os.getenv("DB_PATH", "/app/data/shadow_logs.db")
+    print(f"[v4.8.9.2] run_migrations_async: starting, DB_PATH={db_path_env}", flush=True)
+
     # v4.8.9.1: auto-stamp для существующих БД без alembic_version.
-    # Без этого Alembic пытается применить initial migration к уже
-    # существующей схеме → "table already exists" → bot падает при старте.
     _auto_stamp_if_needed(config, alembic_ini)
 
-    # Запускаем upgrade. config уже знает про sqlalchemy.url через env.py.
-    # Мы в async-context (bot.py lifespan), поэтому env.py использует sync
-    # engine fallback (см. migrations/env.py:run_migrations_online_sync).
+    print("[v4.8.9.2] run_migrations_async: calling alembic upgrade head", flush=True)
     command.upgrade(config, "head")
+    print("[v4.8.9.2] run_migrations_async: alembic upgrade head done", flush=True)
 
 
 def _auto_stamp_if_needed(config, alembic_ini) -> None:
     """v4.8.9.1: если БД существует с таблицами, но без alembic_version —
-    автоматически stamp head. Безопасно: только помечает, не применяет DDL.
+    автоматически stamp head.
 
-    Это решает проблему циклического рестарта на проде при переходе с
-    v4.8.8 (где БД создавалась init_db()) на v4.8.9 (где БД управляется
-    Alembic). Без auto-stamp пользователю пришлось бы вручную выполнять
-    `alembic stamp head` в контейнере, что неудобно и хрупко.
+    v4.8.9.2: усилена диагностика через print() в stderr — Bothost logs
+    показывают stdout/stderr без фильтрации по уровню logging.
     """
     import sqlite3
+    import sys
 
     from alembic import command
 
     db_path = os.getenv("DB_PATH", "/app/data/shadow_logs.db")
+    print(f"[v4.8.9.2] auto-stamp: checking DB at {db_path}", flush=True)
+
     if not os.path.exists(db_path):
-        # БД не существует — пустая, Alembic создаст схему с нуля.
+        print("[v4.8.9.2] auto-stamp: DB file does not exist — empty DB, will create schema from scratch", flush=True)
         return
+
+    file_size = os.path.getsize(db_path)
+    print(f"[v4.8.9.2] auto-stamp: DB file exists, size={file_size} bytes", flush=True)
 
     try:
         conn = sqlite3.connect(db_path)
         try:
-            # Есть ли таблицы кроме alembic_version?
+            # Все таблицы
             cursor = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name != 'alembic_version'"
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
             )
-            tables = [row[0] for row in cursor.fetchall()]
-            if not tables:
-                # БД пустая — Alembic создаст схему.
+            all_tables = [row[0] for row in cursor.fetchall()]
+            print(f"[v4.8.9.2] auto-stamp: tables found: {all_tables}", flush=True)
+
+            if not all_tables:
+                print("[v4.8.9.2] auto-stamp: no tables — empty DB, will create schema", flush=True)
                 return
 
-            # Есть ли alembic_version?
-            cursor = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='alembic_version'"
-            )
-            has_alembic = cursor.fetchone() is not None
+            has_alembic = "alembic_version" in all_tables
             if has_alembic:
-                # Alembic уже знает про эту БД — пусть upgrade сам разрулит.
+                # Проверим какая версия стоит
+                try:
+                    version_row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+                    print(f"[v4.8.9.2] auto-stamp: alembic_version present, version={version_row[0] if version_row else 'NULL'}", flush=True)
+                except sqlite3.Error as e:
+                    print(f"[v4.8.9.2] auto-stamp: alembic_version present but error reading version: {e}", flush=True)
                 return
 
             # БД существует, таблицы есть, alembic_version нет → auto-stamp.
-            # Это БД, созданная init_db() до v4.8.9. Помечаем как актуальную.
-            logger.warning(
-                "v4.8.9.1 auto-stamp: existing DB detected at %s "
-                "with %d tables but no alembic_version — stamping head "
-                "(marks schema as up-to-date without applying DDL).",
-                db_path, len(tables),
-            )
+            non_alembic_tables = [t for t in all_tables if t != "alembic_version"]
+            print(f"[v4.8.9.2] auto-stamp: {len(non_alembic_tables)} tables exist but no alembic_version — stamping head", flush=True)
+            print("[v4.8.9.2] auto-stamp: this is a legacy DB (created by init_db() before v4.8.9)", flush=True)
+
             command.stamp(config, "head")
-            logger.info(
-                "v4.8.9.1 auto-stamp: done. DB marked as revision 'head'. "
-                "Subsequent alembic upgrade head will be no-op."
-            )
+            print("[v4.8.9.2] auto-stamp: stamp head done — DB marked as up-to-date", flush=True)
+
+            # Verify stamp succeeded
+            cursor = conn.execute("SELECT version_num FROM alembic_version")
+            version_row = cursor.fetchone()
+            print(f"[v4.8.9.2] auto-stamp: verification — alembic_version={version_row[0] if version_row else 'NULL'}", flush=True)
         finally:
             conn.close()
     except sqlite3.Error as e:
-        logger.warning(
-            "v4.8.9.1 auto-stamp: failed to inspect DB at %s: %s. "
-            "Falling through to alembic upgrade head (may fail if DB "
-            "already has tables without alembic_version).",
-            db_path, e,
-        )
+        print(f"[v4.8.9.2] auto-stamp: ERROR inspecting DB: {type(e).__name__}: {e}", flush=True)
+        print("[v4.8.9.2] auto-stamp: falling through to alembic upgrade head (may fail)", flush=True)
+    except Exception as e:
+        print(f"[v4.8.9.2] auto-stamp: UNEXPECTED ERROR: {type(e).__name__}: {e}", flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
 
 
 async def init_db_with_fallback() -> None:
