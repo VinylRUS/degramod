@@ -131,6 +131,12 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 APP_VERSION = "v4.8.11"
 APP_RELEASE_DATE = "2026-08-17"
 
+# v4.8.11: служебный mod_id для действий встроенного su из веб-панели.
+# У su нет привязанного Telegram-аккаунта (создаётся сидом init_db, логин по
+# WEB_PASSWORD), поэтому настоящего mod_id у него не существует. Все остальные
+# учётки обязаны иметь tg_user_id — см. api_unban.
+_SU_WEB_MOD_ID = -1
+
 # ── v4.5: Папка для аватарок ───────────────────────────────────────────────
 # Хранится в <data_dir>/avatars/ (рядом с БД — переживает пересоздание контейнера
 # если data_dir смонтирован как volume). Создаётся при старте.
@@ -4722,8 +4728,40 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             )
 
         # mod_id: для БД нужен ID модератора. У веб-юзера это tg_user_id
-        # (привязанный Telegram-аккаунт). Если нет — fallback на -1 (web).
-        mod_id = _auth.tg_user_id or -1
+        # привязанного Telegram-аккаунта.
+        #
+        # v4.8.11: раньше здесь стоял `_auth.tg_user_id or -1`. Учётки
+        # веб-панели заводятся только через привязку в боте (sync-admins →
+        # /start → пароль), поэтому обычный юзер без tg_user_id — нарушение
+        # инварианта, а не штатный случай. Fallback на -1 его заминал: разбан
+        # проходил, _upsert_moderator заводил несуществующего модератора -1,
+        # и на него вешались все такие записи. Теперь такой запрос отклоняется.
+        #
+        # Исключение — встроенный su: он создаётся сидом init_db (db.py:1372)
+        # и логинится по WEB_PASSWORD, TG ID у него нет по построению.
+        mod_id = _auth.tg_user_id
+        reason_author: str | None = None
+        if mod_id is None:
+            if _auth.role != "su":
+                _req_logger.warning(
+                    "api_unban: refused — web user %r has no linked tg_user_id "
+                    "(punishment_id=%s user_id=%s chat_id=%s)",
+                    _auth.username, punishment_id, user_id, chat_id,
+                )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": (
+                            "Учётка не привязана к Telegram. Привяжите аккаунт "
+                            "через бота, иначе разбан некому записать."
+                        ),
+                    },
+                    status_code=400,
+                )
+            # su без привязки: mod_id остаётся служебным, поэтому автора
+            # сохраняем в тексте причины — иначе он теряется совсем.
+            mod_id = _SU_WEB_MOD_ID
+            reason_author = _auth.username
 
         # Импортируем revoke_user_ban (lazy — чтобы не подтягивать весь модуль
         # при импорте web_app).
@@ -4738,6 +4776,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
         # Нормализуем reason — пустая строка → None.
         reason_clean = (reason or "").strip() or None
+        if reason_author:
+            mark = f"через веб-панель: {reason_author}"
+            reason_clean = f"{reason_clean} ({mark})" if reason_clean else mark
 
         # Логируем попытку (до вызова — для аудита даже при падении).
         _req_logger.info(
