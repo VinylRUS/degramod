@@ -122,11 +122,45 @@ class _BaseWebUnbanTest(unittest.TestCase):
                     role="moderator", is_active=True,
                     tg_user_id=None,
                 ))
+                # Встроенный SU: создаётся сидом init_db без tg_user_id,
+                # логинится по WEB_PASSWORD, а не через привязку в боте.
+                s.add(WebUser(
+                    username="su",
+                    password_hash=None,
+                    role="su", is_su=True, is_active=True,
+                    tg_user_id=None,
+                ))
                 await s.commit()
         asyncio.run(_seed())
 
     def tearDown(self):
         asyncio.run(self.engine.dispose())
+
+    @staticmethod
+    def _unban_error(response) -> str:
+        """Текст ошибки: из JSON-поля error либо из flash в Location."""
+        if response.headers.get("content-type", "").startswith("application/json"):
+            try:
+                return str(response.json().get("error", ""))
+            except ValueError:
+                return ""
+        from urllib.parse import unquote
+        return unquote(response.headers.get("location", ""))
+
+    @staticmethod
+    def _unban_ok(response) -> bool:
+        if response.status_code == 303:
+            # Роут редиректит на /admin/bans и при успехе, и при ошибке —
+            # различает их только flash: неудача помечена «❌ Ошибка разбана».
+            from urllib.parse import unquote
+            loc = unquote(response.headers.get("location", ""))
+            return "/admin/bans" in loc and "Ошибка разбана" not in loc
+        if response.headers.get("content-type", "").startswith("application/json"):
+            try:
+                return bool(response.json().get("ok"))
+            except ValueError:
+                return False
+        return False
 
     def _make_token(self, username: str, role: str = "moderator") -> str:
         return self._web_app._make_token(username, is_su=False, role=role)
@@ -245,32 +279,6 @@ class TestApiUnban(_BaseWebUnbanTest):
     # теперь при успехе делает 303 на /admin/bans?flash=..., а ошибки
     # по-прежнему отдаёт JSON. Тесты написаны под старый контракт, поэтому
     # результат разбирается здесь в одном месте.
-    @staticmethod
-    def _unban_error(response) -> str:
-        """Текст ошибки: из JSON-поля error либо из flash в Location."""
-        if response.headers.get("content-type", "").startswith("application/json"):
-            try:
-                return str(response.json().get("error", ""))
-            except ValueError:
-                return ""
-        from urllib.parse import unquote
-        return unquote(response.headers.get("location", ""))
-
-    @staticmethod
-    def _unban_ok(response) -> bool:
-        if response.status_code == 303:
-            # Роут редиректит на /admin/bans и при успехе, и при ошибке —
-            # различает их только flash: неудача помечена «❌ Ошибка разбана».
-            from urllib.parse import unquote
-            loc = unquote(response.headers.get("location", ""))
-            return "/admin/bans" in loc and "Ошибка разбана" not in loc
-        if response.headers.get("content-type", "").startswith("application/json"):
-            try:
-                return bool(response.json().get("ok"))
-            except ValueError:
-                return False
-        return False
-
     def _post_authed(self, data: dict, username: str = "moderator1", role: str = "moderator"):
         client = TestClient(self._app)
         token = self._make_token(username, role=role)
@@ -341,31 +349,87 @@ class TestApiUnban(_BaseWebUnbanTest):
 
 
 class TestApiUnbanRequiresTgUserId(_BaseWebUnbanTest):
-    """Разбан от веб-юзера без tg_user_id → 400."""
+    """Разбан требует привязанного TG ID — кроме встроенного su.
 
-    @unittest.skip(
-        "ПОВЕДЕНИЕ ИЗМЕНИЛОСЬ, НЕ ТЕСТ: раньше веб-юзер без привязанного tg_user_id получал отказ 400. Сейчас api_unban подставляет mod_id = _auth.tg_user_id or -1 (web_app.py) и разбан проходит, записываясь на mod_id=-1. Нужно решение владельца: вернуть запрет или признать sentinel намеренным"
-    )
-    def test_30_unban_without_tg_user_id_returns_400(self):
-        """Веб-юзер без tg_user_id не может разбанивать."""
+    Учётки веб-панели заводятся только через привязку в боте: sync-admins
+    создаёт WebUser с tg_user_id, юзер жмёт /start, получает пароль. Значит
+    обычный пользователь без tg_user_id — это нарушение инварианта, а не
+    штатный случай, и разбан от него принимать нельзя.
+
+    Единственное исключение — встроенный su: он создаётся сидом init_db и
+    логинится по WEB_PASSWORD, TG ID у него нет по построению.
+    """
+
+    def _unban_as(self, username: str, role: str):
         client = TestClient(self._app)
-        token = self._make_token("moderator_no_tg", role="moderator")
-        r = client.post("/api/unban",
-                        cookies={self._web_app.COOKIE_NAME: token},
-                        data={"punishment_id": "1", "user_id": "999001",
-                              "chat_id": "-1001234", "reason": ""},
-                        follow_redirects=False)
-        # Раньше роут отвечал 400 с JSON-ошибкой. Обязательные Form-поля
-        # user_id/chat_id появились позже, поэтому запрос без них теперь
-        # отсекается валидацией FastAPI (422) ещё до обработчика. Передаём их
-        # и проверяем то, ради чего тест написан: веб-юзер без tg_user_id
-        # разбанить не может.
-        self.assertNotEqual(r.status_code, 303,
-                            "web user without tg_user_id must not unban")
-        if r.headers.get("content-type", "").startswith("application/json"):
-            body = r.json()
-            self.assertFalse(body["ok"])
-            self.assertIn("TG user ID", body["error"])
+        token = self._make_token(username, role=role)
+        return client.post(
+            "/api/unban",
+            cookies={self._web_app.COOKIE_NAME: token},
+            data={"punishment_id": "1", "user_id": "999001",
+                  "chat_id": "-1001234", "reason": ""},
+            follow_redirects=False,
+        )
+
+    def _active_bans(self) -> int:
+        async def _q():
+            async with self.AsyncSessionLocal() as s:
+                return (await s.execute(sql_text(
+                    "SELECT COUNT(*) FROM punishments "
+                    "WHERE action_type='ban' AND is_revoked=0"
+                ))).scalar()
+        return asyncio.run(_q())
+
+    def test_30_user_without_tg_user_id_cannot_unban(self):
+        """Обычный юзер без tg_user_id разбанить не может."""
+        before = self._active_bans()
+        r = self._unban_as("moderator_no_tg", "moderator")
+        self.assertFalse(self._unban_ok(r),
+                         f"разбан не должен пройти, получили {r.status_code}")
+        self.assertEqual(self._active_bans(), before,
+                         "бан не должен быть снят")
+
+    def test_31_no_phantom_moderator_created(self):
+        """Отказ не оставляет фантомного модератора с id -1.
+
+        Раньше mod_id = tg_user_id or -1, и _upsert_moderator заводил
+        несуществующего модератора, на которого вешались все такие разбаны.
+        """
+        self._unban_as("moderator_no_tg", "moderator")
+
+        async def _q():
+            async with self.AsyncSessionLocal() as s:
+                return (await s.execute(sql_text(
+                    "SELECT COUNT(*) FROM moderators WHERE mod_id = -1"
+                ))).scalar()
+        self.assertEqual(asyncio.run(_q()), 0,
+                         "фантомный модератор -1 создаваться не должен")
+
+    def test_32_builtin_su_can_still_unban(self):
+        """Встроенный su разбанивает, несмотря на отсутствие tg_user_id."""
+        before = self._active_bans()
+        r = self._unban_as("su", "su")
+        self.assertTrue(self._unban_ok(r),
+                        f"su должен разбанивать, получили {r.status_code}")
+        self.assertEqual(self._active_bans(), before - 1)
+
+    def test_33_su_unban_records_author_in_reason(self):
+        """Разбан от su подписан в причине — иначе автор теряется.
+
+        У su нет TG ID, поэтому mod_id ничего не говорит о том, кто нажал
+        кнопку. Имя учётки сохраняется в тексте причины.
+        """
+        self._unban_as("su", "su")
+
+        async def _q():
+            async with self.AsyncSessionLocal() as s:
+                return (await s.execute(sql_text(
+                    "SELECT reason FROM punishments "
+                    "WHERE action_type='unban' ORDER BY id DESC LIMIT 1"
+                ))).scalar()
+        reason = asyncio.run(_q()) or ""
+        self.assertIn("su", reason.lower(),
+                      f"причина должна называть автора, получили {reason!r}")
 
 
 if __name__ == "__main__":
