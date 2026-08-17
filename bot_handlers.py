@@ -3943,6 +3943,38 @@ _CMD_MYWARNS = re.compile(r"^!mywarns\s*$", re.IGNORECASE)
 _MYWARNS_TIMEOUT_SECONDS = 300  # 5 минут
 _mywarns_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
 
+# v4.8.11: strftime("%b") зависит от локали, а она в проекте нигде не задаётся.
+# В slim-образе локали нет, поэтому юзер видел «12 Aug 2026» вместо «12 авг 2026».
+_RU_MONTHS_SHORT = (
+    "янв", "фев", "мар", "апр", "мая", "июн",
+    "июл", "авг", "сен", "окт", "ноя", "дек",
+)
+
+
+def _format_msk_date_ru(dt: datetime) -> str:
+    """Дата в МСК с русским месяцем: «12 авг 2026, 15:30»."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    msk_dt = dt.astimezone(MSK)
+    month = _RU_MONTHS_SHORT[msk_dt.month - 1]
+    return f"{msk_dt.day:02d} {month} {msk_dt.year}, {msk_dt:%H:%M}"
+
+
+def _mywarns_prune_stale(now: float) -> None:
+    """v4.8.11: чистит протухшие записи реестра таймаутов.
+
+    Ключ — (user_id, chat_id), и записи не удалялись никогда: каждый юзер в
+    каждом чате оставлял запись навсегда. Бот работает месяцами без рестарта,
+    так что словарь рос всё это время. Записи старше таймаута уже не влияют
+    на решение, поэтому их можно выбрасывать.
+    """
+    stale = [
+        key for key, ts in _mywarns_last_call.items()
+        if now - ts >= _MYWARNS_TIMEOUT_SECONDS
+    ]
+    for key in stale:
+        del _mywarns_last_call[key]
+
 
 async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> str | None:
     """Форматирует сводку варнов юзера для конкретного чата.
@@ -3971,9 +4003,8 @@ async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> st
 
     lines = [f"• Варнов: {total}"]
     if last_warn and last_warn.created_at:
-        # Конвертируем UTC → МСК для отображения
-        msk_dt = last_warn.created_at.astimezone(MSK) if last_warn.created_at.tzinfo else last_warn.created_at.replace(tzinfo=timezone.utc).astimezone(MSK)
-        lines.append(f"• Последний: {msk_dt.strftime('%d %b %Y, %H:%M')}")
+        # v4.8.11: русский месяц вместо strftime("%b") — см. _format_msk_date_ru.
+        lines.append(f"• Последний: {_format_msk_date_ru(last_warn.created_at)}")
 
     return "\n".join(lines)
 
@@ -4026,24 +4057,31 @@ async def handle_mywarns_group(message: types.Message) -> None:
 
     user_id = message.from_user.id
     chat_id = message.chat.id
-
-    # Timeout: per-user per-chat, 5 минут, silent
     now = time.time()
-    key = (user_id, chat_id)
-    last = _mywarns_last_call.get(key, 0)
-    if now - last < _MYWARNS_TIMEOUT_SECONDS:
-        # Silent — молча игнорируем, не отвечаем и не удаляем команду
-        # (чтобы юзер не понял что произошёл таймаут).
-        logger.debug("mywarns timeout for user %s in chat %s (%.0f sec left)",
-                     user_id, chat_id, _MYWARNS_TIMEOUT_SECONDS - (now - last))
-        return
-    _mywarns_last_call[key] = now
 
-    # Удаляем команду (privacy — не показываем другим что юзер проверяет варны)
+    # v4.8.11: удаляем команду ДО проверки таймаута.
+    #
+    # Приватность — единственная причина, по которой команда вообще удаляется:
+    # никто не должен видеть, что юзер проверяет свои варны. Раньше выход по
+    # таймауту происходил раньше удаления, и при повторном вызове «!mywarns»
+    # оставался висеть в чате — то есть защита отваливалась ровно в том случае,
+    # ради которого она существует.
     try:
         await message.delete()
     except TelegramAPIError as e:
         logger.warning("mywarns: cannot delete command message in chat %s: %s", chat_id, e)
+
+    # Timeout: per-user per-chat, 5 минут, silent
+    key = (user_id, chat_id)
+    last = _mywarns_last_call.get(key, 0)
+    if now - last < _MYWARNS_TIMEOUT_SECONDS:
+        # Silent — молча игнорируем, ответ не отправляем
+        # (чтобы юзер не понял что произошёл таймаут).
+        logger.debug("mywarns timeout for user %s in chat %s (%.0f sec left)",
+                     user_id, chat_id, _MYWARNS_TIMEOUT_SECONDS - (now - last))
+        return
+    _mywarns_prune_stale(now)
+    _mywarns_last_call[key] = now
 
     # Получаем варны для этого чата
     async with async_session() as session:
@@ -4055,8 +4093,14 @@ async def handle_mywarns_group(message: types.Message) -> None:
         text = f"📊 Ваши варны в этом чате:\n{warn_info}"
 
     # Отправляем DM. Если невозможно — молча игнорируем.
+    # v4.8.11: через tg_safe_call — при flood control (429) сообщение уходит
+    # после ретрая. Без обёртки оно терялось, а таймаут уже был записан, так
+    # что повторить запрос юзер смог бы только через 5 минут.
     try:
-        await message.bot.send_message(chat_id=user_id, text=text)
+        await tg_safe_call(
+            lambda: message.bot.send_message(chat_id=user_id, text=text),
+            label="mywarns_group_dm",
+        )
     except TelegramAPIError as e:
         logger.debug("mywarns: cannot send DM to user %s: %s", user_id, e)
 
@@ -4083,13 +4127,19 @@ async def handle_mywarns_dm(message: types.Message) -> None:
         logger.debug("mywarns DM timeout for user %s (%.0f sec left)",
                      user_id, _MYWARNS_TIMEOUT_SECONDS - (now - last))
         return
+    _mywarns_prune_stale(now)
     _mywarns_last_call[key] = now
 
     # Сводка по всем чатам
     async with async_session() as session:
         text = await _format_user_warns_summary(session, user_id)
 
-    await message.reply(text)
+    # v4.8.11: через tg_safe_call и с обработкой ошибки — раньше ответ шёл
+    # голым await, и TelegramRetryAfter улетал наверх, роняя хендлер.
+    try:
+        await tg_safe_call(lambda: message.reply(text), label="mywarns_dm_reply")
+    except TelegramAPIError as e:
+        logger.debug("mywarns: cannot reply in DM to user %s: %s", user_id, e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

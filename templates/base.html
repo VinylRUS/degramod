@@ -640,6 +640,14 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v4.8.11</strong> — 17 августа 2026 (починки !mywarns + тесты на неё)</p>
+                <ul>
+                    <li><strong>Приватность !mywarns больше не отваливается при таймауте</strong>. Команда удалялась из чата только при успешном вызове: если юзер повторял <code>!mywarns</code> в течение 5 минут, обработчик выходил ДО удаления, и сообщение оставалось висеть в чате у всех на виду. То есть защита пропадала ровно в том случае, ради которого существует. Теперь команда удаляется всегда, до проверки таймаута.</li>
+                    <li><strong>Реестр таймаутов больше не растёт бесконечно</strong>. Словарь <code>_mywarns_last_call</code> с ключом (user_id, chat_id) не чистился никогда — каждый юзер в каждом чате оставлял запись навсегда, а бот работает месяцами без рестарта. Протухшие записи удаляются при следующем вызове.</li>
+                    <li><strong>Отправка переживает flood control</strong>. Оба вызова Telegram обёрнуты в <code>tg_safe_call</code>. Ответ в личке вообще шёл голым <code>await</code> без try — <code>TelegramRetryAfter</code> улетал наверх и ронял хендлер. При этом таймаут уже был записан, так что повторить запрос юзер смог бы только через 5 минут.</li>
+                    <li><strong>Дата варна печатается по-русски</strong>. <code>strftime("%b")</code> зависит от локали, а она в проекте нигде не задаётся — в slim-образе юзеры видели «12 Aug 2026» вместо «12 авг 2026». Месяц берётся из явной таблицы.</li>
+                    <li><strong>13 тестов на !mywarns</strong> (<code>tests/test_v4811_mywarns.py</code>). Команда выехала в v4.8.10 без единого теста; теперь покрыты формат сводки, приватность, таймаут, чистка реестра и поведение при 429.</li>
+                </ul>
                 <p><strong>v4.8.10</strong> — 16 августа 2026 (завершение декомпозиции + behavioral-тесты + !mywarns бонус)</p>
                 <ul>
                     <li><strong>Декомпозиция handle_group_command завершена</strong>. Все 11 оставшихся команд (!sban, !mute, !smute, !warn, !swarn, !unmute, !unban, !unwarn, !warns, !resetwarns, !resetmc) перенесены из 1011-строчного монолита в <code>mod_commands.py</code>. <code>handle_group_command</code> теперь ~65-строчный dispatcher. Все 12 команд в одном файле.</li>
