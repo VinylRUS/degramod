@@ -128,7 +128,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.8.11"
+APP_VERSION = "v4.8.12"
 APP_RELEASE_DATE = "2026-08-17"
 
 # v4.8.11: служебный mod_id для действий встроенного su из веб-панели.
@@ -233,6 +233,20 @@ async def _backup_db_async(backup_path: str) -> None:
 # на другой домен.
 WEB_PUBLIC_URL = (os.getenv("WEB_PUBLIC_URL") or "https://degraban.bothost.tech").rstrip("/")
 
+
+# v4.8.12: текстовые поля форм объявлены как `Form("")`, а не `Form(...)`.
+#
+# После обновления FastAPI 0.115.6 → 0.141.1 (Starlette 0.41 → 1.6) пустое
+# значение формы приравнено к отсутствующему: `Form(...)` отбивает его
+# валидацией и отдаёт машинный 422 JSON ещё до хендлера. Раньше хендлер
+# получал "" и сам возвращал редирект с понятным flash-сообщением.
+#
+# Все затронутые роуты проверяют пустоту сами (`if not name.strip()`,
+# `len(password) < 6` и т.п.), поэтому обязательность на уровне схемы только
+# мешала. Числовые поля (`punishment_id`, `user_id`, `chat_id`) остались
+# `Form(...)`: они приходят из сгенерированных форм, руками не набираются,
+# и 422 для них — корректная реакция. Контракт закреплён в
+# tests/test_v4812_empty_form_fields.py.
 
 # ── Токены сессий ───────────────────────────────────────────────────────────
 # Токен = base64url(JSON{u:<username>, s:<is_su 0/1>, r:<role>, t:<issued_ts>, n:<nonce>}) : <hmac>
@@ -839,7 +853,12 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
         req = ctx.get("request")
         if req is not None and "csrf_token" not in ctx:
             ctx["csrf_token"] = _csrf_token_from_request(req)
-        return _orig_template_response(name, ctx, **kwargs)
+        # v4.8.12: Starlette 1.0 убрал старую сигнатуру TemplateResponse(name,
+        # context) — request стал обязательным первым аргументом. Со старым
+        # порядком `name` получал контекст-словарь, и Jinja падал на
+        # «cannot use 'tuple' as a dict key» при построении ключа кеша шаблона.
+        # Все 14 вызовов кладут request в контекст, поэтому берём его оттуда.
+        return _orig_template_response(req, name, ctx, **kwargs)
 
     templates.TemplateResponse = _template_response_with_csrf
 
@@ -1389,7 +1408,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/users/create")
     async def admin_users_create(
         request: Request,
-        tg_user_id: str = Form(...),
+        tg_user_id: str = Form(""),
         role: str = Form("admin"),
         chat_ids: list[str] = Form(None),
         _auth: AuthUser = Depends(require_csrf_su),
@@ -1601,7 +1620,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     async def admin_users_reset(
         request: Request,
         user_id: int,
-        password: str = Form(...),
+        password: str = Form(""),
         _auth: AuthUser = Depends(require_csrf_su),
     ):
         if len(password) < 6:
@@ -3149,9 +3168,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/me/password")
     async def me_change_password(
         request: Request,
-        old_password: str = Form(...),
-        new_password: str = Form(...),
-        confirm: str = Form(...),
+        old_password: str = Form(""),
+        new_password: str = Form(""),
+        confirm: str = Form(""),
         _auth: AuthUser = Depends(require_csrf_auth),
     ):
         # SU пароль в env — менять через /me нельзя.
@@ -4023,8 +4042,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
 
     @app.post("/admin/presets/create")
     async def admin_presets_create(
-        name: str = Form(...),
-        scope: str = Form(...),
+        name: str = Form(""),
+        scope: str = Form(""),
         perm_can_send_messages: str = Form(""),
         perm_can_send_audios: str = Form(""),
         perm_can_send_documents: str = Form(""),
@@ -4145,8 +4164,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/{preset_id:int}/edit")
     async def admin_presets_edit(
         preset_id: int,
-        name: str = Form(...),
-        scope: str = Form(...),
+        name: str = Form(""),
+        scope: str = Form(""),
         perm_can_send_messages: str = Form(""),
         perm_can_send_audios: str = Form(""),
         perm_can_send_documents: str = Form(""),
@@ -4324,7 +4343,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/words/add")
     async def admin_presets_words_add(
         chat_id: str = Form("0"),
-        pattern: str = Form(...),
+        pattern: str = Form(""),
         is_regex: str = Form(""),
         action: str = Form("delete"),
         _auth: AuthUser = Depends(require_csrf_admin),
@@ -4454,7 +4473,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     @app.post("/admin/presets/links/add")
     async def admin_presets_links_add(
         chat_id: str = Form("0"),
-        domain: str = Form(...),
+        domain: str = Form(""),
         _auth: AuthUser = Depends(require_csrf_admin),
     ):
         """v4.7.5: добавить домен в link allowlist через веб-панель.

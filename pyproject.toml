@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "4.8.11"  # держать в синхроне с APP_VERSION в web_app.py
+version = "4.8.12"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [
@@ -16,7 +16,7 @@ dependencies = [
     "aiogram==3.30.0",
     "aiosqlite==0.20.0",
     "sqlalchemy[asyncio]==2.0.36",
-    "fastapi==0.115.6",
+    "fastapi==0.141.1",
     "uvicorn[standard]==0.34.0",
     "jinja2==3.1.5",
     "python-multipart==0.0.18",

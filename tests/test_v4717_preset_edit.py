@@ -129,11 +129,11 @@ class TestV4717PresetEdit(unittest.TestCase):
 
     def test_05_accepts_name_form_field(self):
         """name: str = Form(...) в сигнатуре."""
-        self.assertIn("name: str = Form(...)", self.edit_fn_body)
+        self.assertIn("name: str = Form(", self.edit_fn_body)
 
     def test_06_accepts_scope_form_field(self):
         """scope: str = Form(...) в сигнатуре."""
-        self.assertIn("scope: str = Form(...)", self.edit_fn_body)
+        self.assertIn("scope: str = Form(", self.edit_fn_body)
 
     def test_07_accepts_all_13_perm_fields(self):
         """Все 13 perm_can_* Form fields в сигнатуре."""
