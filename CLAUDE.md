@@ -35,11 +35,31 @@ docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
 Базовый уровень на момент перехода — **78 замечаний** по легаси, из них 47
 автоисправимы.
 
-Тестов в репозитории **нет**. Каталог `scripts/` с ~30 тест-файлами был удалён из
-git (коммит `351b6d8`), хотя changelog в `templates/base.html` на них ссылается.
-Не верь упоминаниям «14/14 тестов проходят» — проверить это нечем. Линтера,
-`pyproject.toml` и CI для кода тоже нет; единственный workflow
-(`.github/workflows/auto-label-idea.yml`) вешает label `idea` на новые Issues.
+### Тесты
+
+```bash
+uv run python tools/run_tests.py          # вся сюита, 64 файла
+uv run python tools/run_tests.py -k alarm # подмножество по имени файла
+uv run pytest tests/test_v487_sanity.py -q  # один файл
+```
+
+**Запускать только через раннер, не `pytest tests` напрямую.** Сюита писалась
+как набор самостоятельных скриптов: каждый файл поднимает своё окружение при
+импорте, и в одном процессе они конфликтуют — повторный `dp.include_router`
+даёт `Router is already attached`, а `web_app`/`db` замораживают `WEB_PASSWORD`
+и `DB_PATH` на первом импортировавшем файле. Раннер даёт каждому файлу свой
+процесс. `pytest tests` напрямую покажет 3 ошибки сбора — это ожидаемо.
+
+`tests/known_failing.txt` — список временно отложенных файлов. Сейчас **пуст**:
+все 64 файла зелёные. Пока файл в списке, его падение не роняет сборку, но как
+только он начинает проходить, раннер требует убрать строку.
+
+Около 40 тестов помечены `@unittest.skip` — это проверки удалённых фич
+(`/addword`, word filter) и текстового `/help` до перехода на Rich Message.
+Причина всегда в тексте skip'а.
+
+CI (`.github/workflows/ci.yml`) на каждый push и PR гоняет ruff, сюиту и
+`docker build`.
 
 ## Переменные окружения
 
@@ -55,6 +75,13 @@ git (коммит `351b6d8`), хотя changelog в `templates/base.html` на �
 | `CHAT_HASHTAGS` | нет | `-100123:Тег,-100456:Тег2` — принудительно создаёт `chat_settings` для этих чатов |
 | `WEB_PUBLIC_URL` | нет | база для ссылок в отчётах; дефолт захардкожен на прод-домен |
 | `PORT` | нет | дефолт 3000 |
+| `TRUSTED_PROXIES` | нет | прокси, которым можно верить в `X-Forwarded-For`; пусто = не верить никому (v4.8.8) |
+| `DB_USE_LEGACY_MIGRATIONS` | **на проде да** | `1` → миграции через `init_db()` вместо Alembic |
+| `WEB_SESSION_TTL_SECONDS` | нет | срок жизни сессии, дефолт 604800 (7 дней) |
+| `WEB_COOKIE_SECURE` | нет | дефолт `1`; `0` для локальной разработки по http |
+| `WEB_ALLOW_NO_SECRET` | нет | `1` разрешает старт без `SESSION_SECRET` (тесты) |
+
+Пример со всеми переменными и пояснениями — `.env.example`.
 
 Есть и не-env секрет: ключ шифрования GitHub PAT (`db.py:_load_or_create_enc_key`)
 берётся из env или файла рядом с БД, при отсутствии генерируется с правами 0600.
@@ -63,30 +90,46 @@ git (коммит `351b6d8`), хотя changelog в `templates/base.html` на �
 
 ### Точка входа и цикл импортов
 
-`bot.py` запускается как `__main__`, но `bot_handlers.py` делает late import
-`from bot import X` внутри функций. Без обхода Python грузил бы `bot.py` второй раз
-как модуль `bot` и повторно выполнял `dp.include_router(...)` →
-`RuntimeError: Router is already attached`. Обход — `bot.py:53`:
+`bot.py` запускается как `__main__`, а другим модулям нужны его функции. Раньше
+это решалось хаком `sys.modules.setdefault("bot", _self_module)` — иначе Python
+грузил `bot.py` второй раз как модуль `bot`, повторно выполнял
+`dp.include_router(...)` и падал с `RuntimeError: Router is already attached`.
+
+**v4.8.9 хак убран.** Вместо него — service locator `app_state.py`: `bot.py` при
+старте регистрирует свои функции, потребители достают их геттерами.
 
 ```python
-sys.modules.setdefault("bot", _self_module)
+# в bot.py при старте
+register(exit_night_mode=_exit_night_mode, ...)
+
+# в bot_handlers.py / web_app.py вместо `from bot import _exit_night_mode`
+from app_state import get_exit_night_mode
+_exit_night_mode = get_exit_night_mode()
 ```
 
-**Это костыль.** Любой новый `from bot import ...` работает только благодаря ему.
-Правильное решение — вынести общие символы в `bot_handlers.py` (так уже сделали для
-`SetChatSlowModeDelay`) или в третий модуль. Не добавляй новые late imports из `bot`.
+Не возвращай `from bot import ...`. И учти при тестах: патчить надо
+`app_state.get_*`, а не атрибут модуля `bot` — до реального вызова он не достаёт.
 
 ### Карта модулей
 
-- `bot.py` (1.6k) — точка входа, `lifespan`, фоновые тики режимов, webhook-роут.
-- `bot_handlers.py` (8.9k) — все хендлеры и вся бизнес-логика модерации.
-- `web_app.py` (4.7k) — веб-панель. Все ~50 роутов вложены внутрь одной функции
-  `create_app()` (строка 588, ~4000 строк) через замыкание на `bot`.
-- `db.py` (1.4k) — модели SQLAlchemy + `init_db()`.
-- `chat_modes.py` — единая логика snapshot/restore/apply прав чата (v4.8.0).
+- `bot.py` (1.5k) — точка входа, `lifespan`, фоновые тики режимов, webhook-роут.
+- `bot_handlers.py` (8.4k) — хендлеры и бизнес-логика модерации.
+- `mod_commands.py` (1.1k) — 12 мод-команд, вынесенных из `handle_group_command`
+  в v4.8.9/v4.8.10. Модуль импортирует хелперы из `bot_handlers` по именам,
+  поэтому в тестах патчить надо `mod_commands.X`, а не `bot_handlers.X`.
+- `web_app.py` (4.9k) — веб-панель. Большинство роутов по-прежнему внутри
+  `create_app()` через замыкание на `bot`; 6 вынесено в `web/`.
+- `web/` — `deps.py`, `auth.py`, `me.py`, `api.py`, `health.py`: начало
+  декомпозиции `create_app()` (v4.8.9/v4.8.10).
+- `app_state.py` — service locator, заменивший хак с `sys.modules`.
+- `db.py` (1.6k) — модели SQLAlchemy + `init_db()`.
+- `chat_modes.py` — snapshot/restore/apply прав чата (v4.8.0) и
+  `_alarm_auto_off_tick` (переехал сюда из `bot.py` в v4.8.9).
 - `modchat.py` — отправка в модчат, keyword-watch, rate-limit алармов.
 - `github_client.py` — GitHub REST + GraphQL (Issues + Projects v2).
 - `sticker_cache.py` — конвертация стикеров (webp/tgs/webm) в PNG через BytesIO.
+- `tools/` — `run_tests.py` (раннер сюиты), `cleanup_test_data.py` (очистка
+  тестовых данных из БД), `legacy/` (одноразовые кодмоды v4.8.8, не запускать).
 
 ### Режимы чата — главный инвариант проекта
 
@@ -169,21 +212,25 @@ ORM подставляет в SELECT все колонки модели и па�
 
 ## Известные ловушки
 
-- **Нет обработки `TelegramRetryAfter`** нигде в проекте. При flood control хендлер
-  просто падает в лог.
-- **`asyncio.create_task` без сохранения ссылки** — `bot_handlers.py:3273, 4727,
-  7962, 8692, 8728`. Задачу может собрать GC на середине. В `bot.py` фоновые задачи
-  уже переведены на `TaskGroup`, в хендлерах — нет.
-- **Блокирующий синхронный SQLite в async-роутах** — `web_app.py:3139, 3607, 3651,
-  3683`, плюс `shutil.copy2` и `VACUUM`. На время бэкапа/вакуума встаёт весь бот,
-  включая обработку сообщений. Движок создан без `busy_timeout`.
-- **Сессия не истекает**: `_verify_token` (`web_app.py:192`) кладёт в payload время
-  выдачи `t`, но никогда его не проверяет.
-- **`_client_ip` доверяет `X-Forwarded-For` безусловно** (`web_app.py:134`) —
-  rate-limit логина обходится подстановкой заголовка.
-- **CSRF-защиты нет** ни на одном из 34 POST-роутов; держится на `SameSite=lax`.
+- **Flood control обрабатывается только там, где вызов обёрнут.** Есть
+  `tg_safe_call(factory, label=...)` — retry на `TelegramRetryAfter`. Но покрыты
+  им не все вызовы: в `bot_handlers.py` +`mod_commands.py` около 20 call sites
+  при сотнях `message.answer`/`reply`. Новый критичный вызов оборачивай.
+  `factory` — callable, возвращающий **новую** корутину: после исключения
+  корутину переиспользовать нельзя.
+- **`asyncio.create_task` только через `_spawn_background_task`**
+  (`bot_handlers.py:214`). Голый `create_task` без сохранения ссылки GC может
+  собрать на середине. Инвариант сторожит `tests/test_v487_sanity.py` [9].
+- **Блокирующий `open()` в async-роутах** — `web_app.py:738, 3333`. Остальное
+  (`sqlite3`, `VACUUM`, `shutil.copy2`) вынесено в `asyncio.to_thread` в v4.8.7,
+  но `open()` тогда пропустили. Ruff видит это как `ASYNC230`, замечания
+  вынесены в `per-file-ignores` с пометкой.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
   `bot_handlers.py` и `modchat.py` — правь обе копии.
+- **Alembic есть, но выключен.** `migrations/` и `alembic.ini` в репозитории,
+  однако прод работает через `DB_USE_LEGACY_MIGRATIONS=1` → старый `init_db()`.
+  Попытка включить Alembic в v4.8.9 дважды уронила прод (auto-stamp на
+  существующей БД). Не включай без проверки на staging.
 - **FastAPI 0.115.6 использует `asyncio.iscoroutinefunction`** (`fastapi/routing.py:233`),
   который удалят в Python 3.16. Сейчас это только `DeprecationWarning` и приложение
   работает, но обновиться придётся. Актуальная версия 0.141.1 тянет Starlette 1.6.0,
