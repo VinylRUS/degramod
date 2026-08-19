@@ -136,6 +136,10 @@ ignore = [
 # (тело перенесено дословно из web_app.py, где это же было в общем
 # RUF059-игноре модуля; Task 4, v4.9.0).
 "web/admin_cleanup.py" = ["RUF059"]
+# ASYNC230 — blocking open("/proc/self/status") в _bot_info. Долг из той же
+# серии, что чинил v4.8.7; переехал сюда вместе с хелпером в v4.9.0.
+# Снимается в Task 6 плана стабилизации.
+"web/admin_settings.py" = ["ASYNC230"]
 
 # ── pytest конфигурация ─────────────────────────────────────────────────────
 [tool.pytest.ini_options]
