@@ -296,6 +296,30 @@ from web_app import _fetch_and_save_avatar
 патчить надо `mod_commands.X`». Здесь выбирается противоположная стратегия,
 чтобы существующие патчи продолжали работать без правки тестов.
 
+### 5.1a. Тесты, грепающие исходник — единственное исключение из «чини код»
+
+Три файла сюиты читают `web_app.py` как **текст** и ищут в нём подстроки.
+При переносе кода такие проверки краснеют законно: строка не исчезла, она
+переехала в другой файл.
+
+| Файл | Что ищет | Ломается на домене |
+|---|---|---|
+| `test_v478_login_500_fix.py` (`test_07`) | `login: failed to update su.last_login_at`, `login: failed to update %s.last_login_at` | `auth` |
+| `test_v487_sanity.py` [4] | `hmac.compare_digest(password, WEB_PASSWORD)` | `auth` |
+| `test_v487_sanity.py` [11] | `asyncio.to_thread` ≥ 7 вхождений | `admin_cleanup`, `admin_settings` |
+| `test_v475_wordfilter_linkallowlist_ui.py` | `/admin/presets/words/*`, `/links/*`, `WordFilter`, `LinkAllowlist` | `admin_presets` |
+| `test_v476_sanitary_ui_cleanup.py` | `/sanitary/add`, `admin_chats_sanitary_add`, … | `admin_chats` |
+
+**Правило.** Общее «краснеет тест — чинится код, а не тест» (§7) здесь не
+работает: код исправен, устарел адрес. Такой тест правится так, чтобы искать
+в новом файле, — и только так. Ослаблять проверку, снимать assert или
+заменять на `assertTrue(True)` нельзя: она ловит реальные регрессии
+(try/except вокруг `last_login_at` из v4.7.8, `compare_digest` из v4.8.7).
+
+Всего `web_app.py` упоминают 33 тестовых файла, но большинство — в
+докстроках и комментариях. Реально читают исходник и делают по нему assert
+пять проверок в трёх файлах, перечисленных выше.
+
 ### 5.2. Module-level хелперы остаются в `web_app.py`
 
 `_avatar_path` (682), `_fetch_and_save_avatar` (711), `_wal_checkpoint` (194),
@@ -329,6 +353,14 @@ from web_app import _fetch_and_save_avatar
 `from app_state import get_*` (2 места в `admin_chats`) остаются внутри
 функций. Первый — защита от цикла `bot.py` → `web_app.py`; второй — уже
 принятый в проекте service locator.
+
+**Импорты самих роутеров тоже обязаны оставаться late.** Сейчас
+`create_app()` импортирует `web.api`, `web.auth`, `web.health`, `web.me`
+внутри тела функции (`web_app.py:892-895`), а не в шапке модуля. Это не
+стилистика: `web/deps.py` импортирует из `web_app`, поэтому top-level импорт
+даёт цикл `web_app → web.X → web.deps → web_app`. Проверено экспериментально
+19.08.2026 — падает с `ImportError: cannot import name 'APP_VERSION' from
+'web_app'`.
 
 `CLAUDE.md` требует не возвращать `from bot import ...` в пользу `app_state`.
 Три места с `_invalidate_day_default_cache` формально под это правило
@@ -443,6 +475,8 @@ assert len(pairs) == 54
 | Двойная CSRF-обёртка | `TemplateResponse` вызывается дважды | обёртка остаётся в `create_app`, §5.4 |
 | Циклический импорт | падение на старте | late imports сохраняются, §5.5 |
 | Ruff краснеет на новых файлах | падает CI | §5.7, игноры едут за кодом |
+| Grep-тест ищет строку в старом файле | краснеет 5 проверок в 3 файлах | §5.1a, переадресация на новый путь |
+| Top-level импорт роутера | `ImportError` на старте | импорты `web.*` только внутри `create_app()`, см. ниже |
 | Расхождение с прод-поведением | незаметно до деплоя | тела роутов копируются дословно, без «улучшений» |
 
 **Главное правило:** тела роутов переносятся дословно. Любая замеченная по
