@@ -38,7 +38,7 @@ docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
 ### Тесты
 
 ```bash
-uv run python tools/run_tests.py          # вся сюита, 64 файла
+uv run python tools/run_tests.py          # вся сюита, 65 файлов
 uv run python tools/run_tests.py -k alarm # подмножество по имени файла
 uv run pytest tests/test_v487_sanity.py -q  # один файл
 ```
@@ -51,7 +51,7 @@ uv run pytest tests/test_v487_sanity.py -q  # один файл
 процесс. `pytest tests` напрямую покажет 3 ошибки сбора — это ожидаемо.
 
 `tests/known_failing.txt` — список временно отложенных файлов. Сейчас **пуст**:
-все 64 файла зелёные. Пока файл в списке, его падение не роняет сборку, но как
+все 65 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
 только он начинает проходить, раннер требует убрать строку.
 
 Около 40 тестов помечены `@unittest.skip` — это проверки удалённых фич
