@@ -316,9 +316,45 @@ from web_app import _fetch_and_save_avatar
 заменять на `assertTrue(True)` нельзя: она ловит реальные регрессии
 (try/except вокруг `last_login_at` из v4.7.8, `compare_digest` из v4.8.7).
 
-Всего `web_app.py` упоминают 33 тестовых файла, но большинство — в
-докстроках и комментариях. Реально читают исходник и делают по нему assert
-пять проверок в трёх файлах, перечисленных выше.
+**Список выше неполон — уточнено 19.08.2026 по факту Task 3.** Первичный
+анализ искал только форму `with open(_P("web_app.py")) as f: content = f.read()`
+и пропускал обёртки вроде `_read_file(_WEB_APP_PATH)`. Фактически исходник
+`web_app.py` читают и доводят до assert **девять** файлов:
+
+```
+test_v4711_sanitary_roundtrip.py   test_v475_wordfilter_linkallowlist_ui.py
+test_v4724_via_bot_filter.py       test_v476_sanitary_ui_cleanup.py
+test_v4727_manual_ban_report.py    test_v481_command_reform.py
+test_v4728_bot_own_ban_ignore.py   test_v487_sanity.py
+test_v4729_ux_simplifications.py
+```
+
+(`test_v486_settings_render.py` читает исходник, но результат уходит в `print`,
+а не в assert — не ломается.)
+
+Практический вывод: предсказывать поимённо, какой тест сломается на каком
+домене, не нужно и ненадёжно. Достаточно правила — прогнать сюиту после
+переноса и переадресовать то, что покраснело, по прецеденту.
+
+### 5.1b. `async_session` патчится в каждом модуле-импортёре
+
+Вторая ловушка того же класса, обнаружена в Task 3. Тесты, поднимающие
+тестовую БД и бьющие по роутам HTTP-запросами, патчат `async_session`
+отдельно в каждом модуле, который импортировал его себе. Новый модуль
+`web/<домен>.py` делает `from db import async_session` — это свой символ,
+и патч `web_app.async_session` до него не достаёт.
+
+Симптом коварный: роут отвечает 200, но читает боевую БД вместо тестовой,
+и тест падает на несовпадении данных, а не на импорте.
+
+Лечится добавлением патча в тест:
+
+```python
+import web.<домен> as _<домен>
+patcher = patch.object(_<домен>, "async_session", self.AsyncSessionLocal)
+```
+
+Это не костыль, а практика проекта — она записана в `tests/known_failing.txt`.
 
 ### 5.2. Module-level хелперы остаются в `web_app.py`
 
