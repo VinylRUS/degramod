@@ -5,8 +5,7 @@ web/me.py — v4.8.10: роуты пользователя (вынесены и�
 не используют templates и bot.
 
 v4.8.10: перенесены / (root) и /avatar/{tg_user_id}.
-Остальные /me/*, /dashboard, /user/* — TODO v4.9.0 (используют templates
-и вложенные helpers из create_app).
+Остальные /me/*, /dashboard, /user/* — TODO v4.9.0 (используют templates и вложенные helpers из create_app).
 """
 from __future__ import annotations
 
