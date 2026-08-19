@@ -50,6 +50,7 @@ import os
 import re
 import sys
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -116,8 +117,8 @@ class TestV4717PresetEdit(unittest.TestCase):
     def test_01_app_version(self):
         # v4.7.18+: APP_VERSION bumped. Loosen to >=.
         # v4.10.0: FIX сравнение строк ломалось на двузначном minor
-        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
-        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.17".lstrip("v").split(".")),
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.17"),
             f"APP_VERSION={APP_VERSION} should be >= v4.7.17")
 
     def test_02_app_release_date(self):

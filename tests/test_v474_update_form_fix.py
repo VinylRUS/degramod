@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 from unittest.mock import MagicMock, AsyncMock, patch
 
 sys.path.insert(0, _P())
@@ -98,8 +99,8 @@ class TestV474UpdateFormFix(unittest.IsolatedAsyncioTestCase):
     # ── Test 1: APP_VERSION bumped ──────────────────────────────────
     async def test_app_version_is_v474(self):
         # v4.10.0: FIX сравнение строк ломалось на двузначном minor
-        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
-        self.assertGreaterEqual(tuple(int(p) for p in web_app.APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.4".lstrip("v").split(".")),
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(web_app.APP_VERSION), ver("v4.7.4"),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.4")
 
     # ── Test 2: POST /admin/chats/{id}/update сохраняет hashtag ─────

@@ -49,6 +49,7 @@ import os
 import re
 import sys
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 import asyncio
 import tempfile
 
@@ -132,8 +133,8 @@ class TestV4716SlowMode(unittest.TestCase):
 
     def test_01_app_version(self):
         # v4.10.0: FIX сравнение строк ломалось на двузначном minor
-        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
-        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.16".lstrip("v").split(".")),
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.16"),
             f"APP_VERSION={APP_VERSION} should be >= v4.7.16")
 
     def test_02_app_release_date(self):

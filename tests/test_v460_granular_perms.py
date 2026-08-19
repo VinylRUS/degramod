@@ -46,6 +46,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 from datetime import datetime, timezone, date
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -899,8 +900,8 @@ class TestVersionBumpedV460(unittest.TestCase):
     def test_app_version_is_v460(self):
         # v4.7.0+: APP_VERSION bumped. Loosen to >=.
         # v4.10.0: FIX сравнение строк ломалось на двузначном minor
-        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
-        self.assertGreaterEqual(tuple(int(p) for p in web_app.APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.6.1".lstrip("v").split(".")),
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(web_app.APP_VERSION), ver("v4.6.1"),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.6.1")
 
     def test_app_release_date_set(self):

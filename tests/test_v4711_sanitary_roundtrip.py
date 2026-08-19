@@ -51,6 +51,7 @@ import sys
 import re
 import json
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 
 sys.path.insert(0, _P())
 sys.path.insert(0, _P("tests"))
@@ -93,8 +94,8 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
         # v4.7.13: ослаблен с == "v4.7.11" на >= v4.7.11 — чтобы не падать
         # на каждом следующем релизе.
         # v4.10.0: FIX сравнение строк ломалось на двузначном minor
-        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
-        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.11".lstrip("v").split(".")),
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.11"),
                                 f"APP_VERSION should be >= v4.7.11, got {APP_VERSION}")
 
     # ─── 2. Воспроизведение исходного бага ─────────────────────────────

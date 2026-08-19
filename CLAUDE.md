@@ -38,7 +38,7 @@ docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
 ### Тесты
 
 ```bash
-uv run python tools/run_tests.py          # вся сюита, 65 файлов
+uv run python tools/run_tests.py          # вся сюита, 67 файлов
 uv run python tools/run_tests.py -k alarm # подмножество по имени файла
 uv run pytest tests/test_v487_sanity.py -q  # один файл
 ```
@@ -51,7 +51,7 @@ uv run pytest tests/test_v487_sanity.py -q  # один файл
 процесс. `pytest tests` напрямую покажет 3 ошибки сбора — это ожидаемо.
 
 `tests/known_failing.txt` — список временно отложенных файлов. Сейчас **пуст**:
-все 65 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
+все 67 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
 только он начинает проходить, раннер требует убрать строку.
 
 Около 40 тестов помечены `@unittest.skip` — это проверки удалённых фич
@@ -119,7 +119,9 @@ _exit_night_mode = get_exit_night_mode()
   поэтому в тестах патчить надо `mod_commands.X`, а не `bot_handlers.X`.
 - `web_app.py` (999 строк) — конфигурация, авторизация, module-level
   хелперы и `create_app()` как сборщик (~243 строки, 0 роутов внутри).
-  Все 47 роутов веб-панели — в `web/`.
+  В `web/` всего 54 роута: 7 вынесены раньше (v4.8.9/v4.8.10 — `/health`,
+  `/logout`, `/`, `/avatar/{id}`, `/api/presets`, `/api/automute-count`),
+  ещё 47 — в этот раунд (Task 1–11).
 - `web/` — 11 модулей с роутами по предметным областям: `auth`, `me`,
   `api`, `health`, `admin_bans`, `admin_chats`, `admin_cleanup`,
   `admin_keywords`, `admin_presets`, `admin_settings`, `admin_users`,
