@@ -884,6 +884,16 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     except OSError as e:
         _req_logger.warning("create_app: cannot create AVATARS_DIR %s: %s", AVATARS_DIR, e)
 
+    # ── v4.9.0 (Task 10): зависимости для роутеров из web/ ──────────────
+    # Роутеры не могут замкнуться на локальные переменные create_app, поэтому
+    # templates и bot кладутся в состояние приложения, а web/deps.py отдаёт
+    # их провайдерами get_templates/get_bot.
+    # Именно app.state, а не модульные синглтоны: сюита зовёт create_app()
+    # многократно в одном процессе (test_v460_granular_perms.py — 15 раз),
+    # и глобальное состояние текло бы между экземплярами.
+    app.state.templates = templates
+    app.state.bot = bot
+
     # ── v4.8.9: Routers из web/ package ──────────────────────────────────
     # Декомпозиция create_app() — см. 03_TASK_v4.8.9.md §2 и web/__init__.py.
     # v4.8.9: /health и /logout перенесены.
