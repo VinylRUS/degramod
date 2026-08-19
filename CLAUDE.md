@@ -228,8 +228,8 @@ ORM подставляет в SELECT все колонки модели и па�
 - **`asyncio.create_task` только через `_spawn_background_task`**
   (`bot_handlers.py:214`). Голый `create_task` без сохранения ссылки GC может
   собрать на середине. Инвариант сторожит `tests/test_v487_sanity.py` [9].
-- **Блокирующий `open()` в async-роутах** — `web_app.py:743` и
-  `web/admin_settings.py:86`. Остальное (`sqlite3`, `VACUUM`, `shutil.copy2`)
+- **Блокирующий `open()` в async-функциях** — `_fetch_and_save_avatar`
+  (`web_app.py`) и `_bot_info` (`web/admin_settings.py`). Остальное (`sqlite3`, `VACUUM`, `shutil.copy2`)
   вынесено в `asyncio.to_thread` в v4.8.7, но `open()` тогда пропустили. Ruff
   видит это как `ASYNC230`, замечания вынесены в `per-file-ignores` с пометкой.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в

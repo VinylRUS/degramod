@@ -110,12 +110,12 @@ ignore = [
     "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "B904", "E402",
     "B007", "B023", "RUF059",
 ]
-# В web_app.py 999 строк (после декомпозиции создания роутов в web/, v4.10.0).
+# В web_app.py ~1000 строк (после выноса роутов в web/, v4.10.0).
 # E402 — `from db import (...)` стоит после `_req_logger = logging.getLogger(...)`.
 # Это намеренно: logger инициализируется до импорта db, чтобы в случае ошибки
 # импорта db логгер уже был готов.
 # B904 — pre-existing raise без `from err` в _parse_int_field.
-# ASYNC230 — blocking open() в async-роутах (строка 743). Это долг из
+# ASYNC230 — blocking open() в _fetch_and_save_avatar. Это долг из
 # той же серии, что чинил v4.8.7 (sqlite/VACUUM/copy2 вынесены в to_thread),
 # но open() тогда пропустили. Снимается в Task 6 плана стабилизации.
 # RUF023/RUF059 — несортированный __slots__ и неиспользуемая распакованная
