@@ -340,19 +340,23 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
     # ─── 19. Regression: web_app.py больше не делает `for s, e in` ────
 
     def test_19_web_app_no_unpacking_bug(self):
-        """В web_app.py больше не должно быть `for s, e in san_pairs`."""
-        with open(_P("web_app.py"), "r",
+        """В web/admin_chats.py больше не должно быть `for s, e in san_pairs`.
+
+        v4.9.0 (Task 11): admin_chats_update вынесен из web_app.py в
+        web/admin_chats.py — проверка переехала вместе с кодом.
+        """
+        with open(_P("web/admin_chats.py"), "r",
                    encoding="utf-8") as f:
             src = f.read()
         # Ищем паттерн `for s, e in san_pairs` — это баг.
         bad = re.search(r'for\s+s\s*,\s*e\s+in\s+san_pairs', src)
         self.assertIsNone(
             bad,
-            f"web_app.py still has buggy `for s, e in san_pairs` at pos {bad.start() if bad else -1}"
+            f"web/admin_chats.py still has buggy `for s, e in san_pairs` at pos {bad.start() if bad else -1}"
         )
         # Должно быть `for entry in san_pairs`
         good = re.search(r'for\s+entry\s+in\s+san_pairs', src)
-        self.assertIsNotNone(good, "web_app.py should have `for entry in san_pairs`")
+        self.assertIsNotNone(good, "web/admin_chats.py should have `for entry in san_pairs`")
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────

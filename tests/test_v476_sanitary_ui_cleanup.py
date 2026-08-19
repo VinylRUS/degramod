@@ -441,8 +441,12 @@ class TestV476SourceCodePatterns(unittest.TestCase):
     """Проверка исходников на наличие/отсутствие нужных паттернов."""
 
     def test_21_sanitary_handlers_in_web_app(self):
-        """В web_app.py есть handlers /sanitary/add и /sanitary/{idx}/delete."""
-        with open(_P("web_app.py")) as f:
+        """В web/admin_chats.py есть handlers /sanitary/add и /sanitary/{idx}/delete.
+
+        v4.9.0 (Task 11): admin_chats_sanitary_add/admin_chats_sanitary_delete
+        переехали из web_app.py в web/admin_chats.py.
+        """
+        with open(_P("web/admin_chats.py")) as f:
             src = f.read()
         self.assertIn("/sanitary/add", src)
         self.assertIn("/sanitary/{idx_str}/delete", src)
@@ -450,8 +454,12 @@ class TestV476SourceCodePatterns(unittest.TestCase):
         self.assertIn("admin_chats_sanitary_delete", src)
 
     def test_22_valid_fields_no_private(self):
-        """В web_app.py valid_fields не содержит 'private'."""
-        with open(_P("web_app.py")) as f:
+        """В web/admin_chats.py valid_fields не содержит 'private'.
+
+        v4.9.0 (Task 11): admin_chats_toggle (где определён valid_fields)
+        переехал из web_app.py в web/admin_chats.py.
+        """
+        with open(_P("web/admin_chats.py")) as f:
             src = f.read()
         # Find the valid_fields line
         import re

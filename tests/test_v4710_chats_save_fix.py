@@ -285,15 +285,16 @@ class TestV4710ChatsSaveFix(unittest.TestCase):
         """Handler /admin/chats/{id}/update не должен принимать start_date/end_date."""
         import inspect
         # Find admin_chats_update function
-        from web_app import create_app  # may also be inner function
-        # The handler is defined inside create_app, so we inspect the source.
-        src = inspect.getsource(web_app)
+        # v4.9.0 (Task 11): роут вынесен из create_app() в web/admin_chats.py —
+        # источник для грепа теперь там, а не в web_app.py.
+        import web.admin_chats as admin_chats_module
+        src = inspect.getsource(admin_chats_module)
         # Find the function body
         m = re.search(
             r'async def admin_chats_update\s*\(([\s\S]*?)\)\s*:',
             src,
         )
-        self.assertIsNotNone(m, "admin_chats_update function not found in web_app.py source")
+        self.assertIsNotNone(m, "admin_chats_update function not found in web/admin_chats.py source")
         sig = m.group(1)
         # Make sure start_date is NOT in the form params
         # (it's OK if it appears as part of "sanitary_days_text" or in comments)

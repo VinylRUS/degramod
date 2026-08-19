@@ -41,6 +41,9 @@ ADMIN_USERS_PY = ROOT / "web" / "admin_users.py"
 # v4.9.0 (Task 10): /admin/presets* переехали из web_app.py в
 # web/admin_presets.py.
 ADMIN_PRESETS_PY = ROOT / "web" / "admin_presets.py"
+# v4.9.0 (Task 11): /admin/chats* (включая admin_chats_toggle) переехали
+# из web_app.py в web/admin_chats.py.
+ADMIN_CHATS_PY = ROOT / "web" / "admin_chats.py"
 ADMIN_CHATS_HTML = ROOT / "templates" / "admin_chats.html"
 ADMIN_KEYWORDS_HTML = ROOT / "templates" / "admin_keywords.html"
 BASE_HTML = ROOT / "templates" / "base.html"
@@ -56,16 +59,20 @@ def _read(p: Path) -> str:
 # ============================================================================
 
 class TestWebAppStructure(unittest.TestCase):
-    """Проверка, что в web_app.py есть новые маршруты и toggle field."""
+    """Проверка, что в web/admin_chats.py есть новые маршруты и toggle field.
+
+    v4.9.0 (Task 11): admin_chats_toggle переехал из web_app.py в
+    web/admin_chats.py — источник для тестов 01-04 переадресован туда.
+    """
 
     def setUp(self):
-        self.src = _read(WEB_APP_PY)
+        self.src = _read(ADMIN_CHATS_PY)
 
     def test_01_mod_chat_in_valid_fields(self):
         """'mod_chat' должен быть в valid_fields set у toggle endpoint."""
         # Найдём valid_fields set literal
         m = re.search(r'valid_fields\s*=\s*\{([^}]+)\}', self.src)
-        self.assertIsNotNone(m, "valid_fields set not found in web_app.py")
+        self.assertIsNotNone(m, "valid_fields set not found in web/admin_chats.py")
         contents = m.group(1)
         self.assertIn("mod_chat", contents,
                       "'mod_chat' must be in valid_fields set for toggle endpoint")
@@ -81,7 +88,7 @@ class TestWebAppStructure(unittest.TestCase):
         try:
             tree = ast.parse(self.src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_chats.py has syntax error: {e}")
 
         toggle_body = None
         for node in ast.walk(tree):
@@ -96,8 +103,11 @@ class TestWebAppStructure(unittest.TestCase):
         self.assertIsNotNone(toggle_body, "admin_chats_toggle not found")
         # Проверим, что в теле есть упоминание is_report_chat в контексте mod_chat
         # Ищем фрагмент между `if field == "mod_chat":` и концом блока.
+        # v4.9.0 (Task 11): функция больше не вложена в create_app (была на
+        # 12 пробелах отступа), теперь она модульная (8 пробелов) — регекс
+        # подстроен под новый уровень отступа, смысл проверки тот же.
         m = re.search(
-            r'if field == "mod_chat":(.*?)(?=\n            cs\.updated_at|\n            await session\.commit)',
+            r'if field == "mod_chat":(.*?)(?=\n        cs\.updated_at|\n        await session\.commit)',
             toggle_body,
             re.DOTALL,
         )
@@ -113,7 +123,7 @@ class TestWebAppStructure(unittest.TestCase):
         try:
             tree = ast.parse(self.src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_chats.py has syntax error: {e}")
 
         toggle_body = None
         for node in ast.walk(tree):
@@ -127,8 +137,10 @@ class TestWebAppStructure(unittest.TestCase):
 
         self.assertIsNotNone(toggle_body, "admin_chats_toggle not found")
         # Найдём ветку report_chat
+        # v4.9.0 (Task 11): отступ подстроен под модульную функцию (8 пробелов
+        # вместо 12 у вложенной в create_app), смысл проверки тот же.
         m = re.search(
-            r'elif field == "report_chat":(.*?)(?=\n            # v4\.8\.0|\n            if field == "mod_chat"|\n            cs\.updated_at)',
+            r'elif field == "report_chat":(.*?)(?=\n        # v4\.8\.0|\n        if field == "mod_chat"|\n        cs\.updated_at)',
             toggle_body,
             re.DOTALL,
         )
@@ -855,8 +867,10 @@ class TestModChatToggleBehavior(unittest.TestCase):
     def setUpClass(cls):
         import web_app
         import db
+        import web.admin_chats
         cls._web_app = web_app
         cls._db = db
+        cls._admin_chats = web.admin_chats
         cls._app = web_app.create_app()
 
     def setUp(self):
@@ -875,6 +889,16 @@ class TestModChatToggleBehavior(unittest.TestCase):
         web_app_patcher = patch.object(self._web_app, "async_session", self.AsyncSessionLocal)
         web_app_patcher.start()
         self.addCleanup(web_app_patcher.stop)
+
+        # v4.9.0 (Task 11): /admin/chats/{id}/toggle переехал в
+        # web/admin_chats.py, у которого async_session — свой импортированный
+        # символ, отдельный от web_app.async_session. Без этого патча роут
+        # читал бы боевую БД мимо тестовой in-memory.
+        admin_chats_patcher = patch.object(
+            self._admin_chats, "async_session", self.AsyncSessionLocal
+        )
+        admin_chats_patcher.start()
+        self.addCleanup(admin_chats_patcher.stop)
 
         async def _init():
             async with self.engine.begin() as conn:
@@ -1090,8 +1114,12 @@ class TestNoRegression(unittest.TestCase):
     """Существующие поля toggle не сломаны после добавления mod_chat."""
 
     def test_80_existing_toggle_fields_preserved(self):
-        """Все 7 существующих полей toggle должны остаться в valid_fields."""
-        src = _read(WEB_APP_PY)
+        """Все 7 существующих полей toggle должны остаться в valid_fields.
+
+        v4.9.0 (Task 11): admin_chats_toggle переехал из web_app.py в
+        web/admin_chats.py — источник переадресован туда.
+        """
+        src = _read(ADMIN_CHATS_PY)
         m = re.search(r'valid_fields\s*=\s*\{([^}]+)\}', src)
         self.assertIsNotNone(m)
         contents = m.group(1)
@@ -1107,11 +1135,12 @@ class TestNoRegression(unittest.TestCase):
         web/admin_users.py (декоратор @router.get/@router.post вместо
         @app.get/@app.post). v4.9.0 (Task 10): /admin/presets и
         /admin/presets/create переехали в web/admin_presets.py той же
-        схемой. Собираем маршруты из всех файлов — смысл проверки прежний,
-        изменился только источник для переехавших путей.
+        схемой. v4.9.0 (Task 11): все /admin/chats* переехали в
+        web/admin_chats.py. Собираем маршруты из всех файлов — смысл
+        проверки прежний, изменился только источник для переехавших путей.
         """
         route_paths = set()
-        for path in (WEB_APP_PY, ADMIN_USERS_PY, ADMIN_PRESETS_PY):
+        for path in (WEB_APP_PY, ADMIN_USERS_PY, ADMIN_PRESETS_PY, ADMIN_CHATS_PY):
             try:
                 tree = ast.parse(_read(path))
             except SyntaxError as e:

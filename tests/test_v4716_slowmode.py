@@ -97,6 +97,9 @@ WEB_APP_PY = os.path.join(PROJECT_DIR, "web_app.py")
 # v4.9.0 (Task 10): admin_presets_create переехал из web_app.py в
 # web/admin_presets.py.
 ADMIN_PRESETS_PY = os.path.join(PROJECT_DIR, "web", "admin_presets.py")
+# v4.9.0 (Task 11): admin_chats_update (и вложенный хелпер _resolve_perms)
+# переехал из web_app.py в web/admin_chats.py.
+ADMIN_CHATS_PY = os.path.join(PROJECT_DIR, "web", "admin_chats.py")
 DB_PY = os.path.join(PROJECT_DIR, "db.py")
 BASE_HTML = os.path.join(PROJECT_DIR, "templates", "base.html")
 ADMIN_PRESETS_HTML = os.path.join(PROJECT_DIR, "templates", "admin_presets.html")
@@ -119,6 +122,7 @@ class TestV4716SlowMode(unittest.TestCase):
         self.bot_handlers_py = _read(BOT_HANDLERS_PY)
         self.web_app_py = _read(WEB_APP_PY)
         self.admin_presets_py = _read(ADMIN_PRESETS_PY)
+        self.admin_chats_py = _read(ADMIN_CHATS_PY)
         self.db_py = _read(DB_PY)
         self.base_html = _read(BASE_HTML)
         self.admin_presets_html = _read(ADMIN_PRESETS_HTML)
@@ -369,10 +373,14 @@ class TestV4716SlowMode(unittest.TestCase):
     # ─── 21-22. admin_chats_update ────────────────────────────────────
 
     def test_21_resolve_perms_returns_tuple_with_slow_mode(self):
-        """_resolve_perms должен возвращать (permissions_json, slow_mode_delay)."""
-        idx = self.web_app_py.find("def _resolve_perms(")
+        """_resolve_perms должен возвращать (permissions_json, slow_mode_delay).
+
+        v4.9.0 (Task 11): _resolve_perms живёт внутри admin_chats_update,
+        которая переехала из web_app.py в web/admin_chats.py.
+        """
+        idx = self.admin_chats_py.find("def _resolve_perms(")
         self.assertGreater(idx, 0, "_resolve_perms not found")
-        chunk = self.web_app_py[idx:idx+1500]
+        chunk = self.admin_chats_py[idx:idx+1500]
         # Return type annotation or return statements
         self.assertIn("slow_mode_delay", chunk,
                       "_resolve_perms должен возвращать slow_mode_delay")
@@ -383,11 +391,14 @@ class TestV4716SlowMode(unittest.TestCase):
         )
 
     def test_22_admin_chats_update_copies_slow_mode_to_chat_settings(self):
-        """admin_chats_update должен копировать slow_mode из пресета в ChatSettings."""
+        """admin_chats_update должен копировать slow_mode из пресета в ChatSettings.
+
+        v4.9.0 (Task 11): роут переехал из web_app.py в web/admin_chats.py.
+        """
         # Find the save block
-        idx = self.web_app_py.find("cs.day_slow_mode_delay = ")
+        idx = self.admin_chats_py.find("cs.day_slow_mode_delay = ")
         self.assertGreater(idx, 0, "cs.day_slow_mode_delay assignment not found")
-        idx2 = self.web_app_py.find("cs.night_mode_slow_mode_delay = ")
+        idx2 = self.admin_chats_py.find("cs.night_mode_slow_mode_delay = ")
         self.assertGreater(idx2, 0, "cs.night_mode_slow_mode_delay assignment not found")
 
     # ─── 23-25. Templates ─────────────────────────────────────────────
