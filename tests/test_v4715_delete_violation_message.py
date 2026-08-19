@@ -135,7 +135,9 @@ class TestV4715DeleteViolationMessage(unittest.TestCase):
     # ─── 1. Version ────────────────────────────────────────────────────
 
     def test_01_app_version_bumped(self):
-        self.assertGreaterEqual(APP_VERSION, "v4.7.15",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.15".lstrip("v").split(".")),
                          f"APP_VERSION should be >= v4.7.15, got {APP_VERSION}")
 
     # ─── 2-4. Все карательные команды удаляют сообщение ────────────────

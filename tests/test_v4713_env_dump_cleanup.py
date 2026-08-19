@@ -88,7 +88,9 @@ class TestV4713EnvDumpCleanup(unittest.TestCase):
         """APP_VERSION должен быть >= v4.7.13 (тест ослаблен в v4.7.14)."""
         # v4.7.14: ослаблен с == "v4.7.13" на >= v4.7.13 — чтобы не падать
         # на каждом следующем релизе.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.13",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.13".lstrip("v").split(".")),
                                 f"APP_VERSION should be >= v4.7.13, got {APP_VERSION}")
 
     def test_02_release_date_updated(self):

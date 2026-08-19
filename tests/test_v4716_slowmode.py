@@ -131,7 +131,9 @@ class TestV4716SlowMode(unittest.TestCase):
     # ─── 1-2. Version ──────────────────────────────────────────────────
 
     def test_01_app_version(self):
-        self.assertGreaterEqual(APP_VERSION, "v4.7.16",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.16".lstrip("v").split(".")),
             f"APP_VERSION={APP_VERSION} should be >= v4.7.16")
 
     def test_02_app_release_date(self):

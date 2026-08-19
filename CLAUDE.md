@@ -117,10 +117,15 @@ _exit_night_mode = get_exit_night_mode()
 - `mod_commands.py` (1.1k) — 12 мод-команд, вынесенных из `handle_group_command`
   в v4.8.9/v4.8.10. Модуль импортирует хелперы из `bot_handlers` по именам,
   поэтому в тестах патчить надо `mod_commands.X`, а не `bot_handlers.X`.
-- `web_app.py` (4.9k) — веб-панель. Большинство роутов по-прежнему внутри
-  `create_app()` через замыкание на `bot`; 6 вынесено в `web/`.
-- `web/` — `deps.py`, `auth.py`, `me.py`, `api.py`, `health.py`: начало
-  декомпозиции `create_app()` (v4.8.9/v4.8.10).
+- `web_app.py` (999 строк) — конфигурация, авторизация, module-level
+  хелперы и `create_app()` как сборщик (~243 строки, 0 роутов внутри).
+  Все 47 роутов веб-панели — в `web/`.
+- `web/` — 11 модулей с роутами по предметным областям: `auth`, `me`,
+  `api`, `health`, `admin_bans`, `admin_chats`, `admin_cleanup`,
+  `admin_keywords`, `admin_presets`, `admin_settings`, `admin_users`,
+  плюс `deps.py` с общими зависимостями (`require_auth`, `get_bot`,
+  `get_templates` и др.). `bot` и `templates` приходят через `app.state`
+  + `Depends`, не через замыкание. Декомпозиция завершена в v4.10.0.
 - `app_state.py` — service locator, заменивший хак с `sys.modules`.
 - `db.py` (1.6k) — модели SQLAlchemy + `init_db()`.
 - `chat_modes.py` — snapshot/restore/apply прав чата (v4.8.0) и
@@ -235,6 +240,13 @@ ORM подставляет в SELECT все колонки модели и па�
   который удалят в Python 3.16. Сейчас это только `DeprecationWarning` и приложение
   работает, но обновиться придётся. Актуальная версия 0.141.1 тянет Starlette 1.6.0,
   то есть смену мажорной — делать под тестами, см. Task 17 плана.
+- **Роутеры `web/` импортируются только внутри `create_app()`.** Top-level
+  импорт `web.X` в `web_app.py` даёт цикл: `web_app → web.X → web.deps →
+  web_app` (модули `web/` сами обращаются к `web_app` за хелперами).
+- **Модули `web/` зовут хелперы `web_app` через модуль** (`web_app._helper(...)`),
+  а не `from web_app import _helper`. Тесты патчат хелперы как атрибуты
+  модуля `web_app`; именной импорт фиксирует значение на момент импорта, и
+  патч в тестах перестаёт действовать.
 
 ## Стиль
 

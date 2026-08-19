@@ -113,7 +113,9 @@ class TestV4718NightNotifyToReport(unittest.TestCase):
 
     def test_01_app_version(self):
         """APP_VERSION должен быть v4.7.18 или выше."""
-        self.assertGreaterEqual(APP_VERSION, "v4.7.18")
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.18".lstrip("v").split(".")))
 
     def test_02_app_release_date(self):
         self.assertGreaterEqual(APP_RELEASE_DATE, "2026-08-04")

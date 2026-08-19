@@ -898,7 +898,9 @@ class TestVersionBumpedV460(unittest.TestCase):
 
     def test_app_version_is_v460(self):
         # v4.7.0+: APP_VERSION bumped. Loosen to >=.
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.6.1",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in web_app.APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.6.1".lstrip("v").split(".")),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.6.1")
 
     def test_app_release_date_set(self):

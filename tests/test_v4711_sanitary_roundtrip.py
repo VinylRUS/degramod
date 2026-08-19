@@ -92,7 +92,9 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
         """APP_VERSION должен быть >= v4.7.11 (тест ослаблен в v4.7.13)."""
         # v4.7.13: ослаблен с == "v4.7.11" на >= v4.7.11 — чтобы не падать
         # на каждом следующем релизе.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.11",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.11".lstrip("v").split(".")),
                                 f"APP_VERSION should be >= v4.7.11, got {APP_VERSION}")
 
     # ─── 2. Воспроизведение исходного бага ─────────────────────────────

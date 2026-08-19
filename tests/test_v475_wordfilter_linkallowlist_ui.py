@@ -104,7 +104,9 @@ class TestV475WordFilterLinkAllowlistUI(unittest.IsolatedAsyncioTestCase):
 
     # ── Test 1: APP_VERSION ──────────────────────────────────────────
     async def test_app_version_is_v475(self):
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.7.5",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in web_app.APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.5".lstrip("v").split(".")),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.5")
 
     # ── Test 2: GET /admin/presets рендерит секции ───────────────────

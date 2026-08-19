@@ -118,7 +118,9 @@ class TestV4714MutePermissions(unittest.TestCase):
         """APP_VERSION должен быть >= v4.7.14 (тест ослаблен в v4.7.15)."""
         # v4.7.15: ослаблен с == "v4.7.14" на >= v4.7.14 — чтобы не падать
         # на каждом следующем релизе.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.14",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.14".lstrip("v").split(".")),
                                 f"APP_VERSION should be >= v4.7.14, got {APP_VERSION}")
 
     def test_02_release_date(self):

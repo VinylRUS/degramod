@@ -20,7 +20,7 @@ snapshot/restore прав описан в chat_modes.py), синхронизац
 и тесты, поднимающие тестовую БД, патчат его именно на этом модуле
 (`web.admin_chats.async_session`).
 
-`admin_chats_update` содержит late-импорты `from app_state import
+`admin_chats_toggle` содержит late-импорты `from app_state import
 get_exit_night_mode` и `get_exit_sanitary_day` внутри тела функции —
 service locator, введённый в v4.8.9 взамен хака с `sys.modules` (см.
 `app_state.py`). Перенесены дословно, наверх модуля не подняты.

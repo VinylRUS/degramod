@@ -273,7 +273,9 @@ class TestV476E2EWebApp(unittest.IsolatedAsyncioTestCase):
 
     def test_11_app_version(self):
         """APP_VERSION = 'v4.7.6'."""
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.7.6",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in web_app.APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.6".lstrip("v").split(".")),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.6")
 
     def test_12_chats_page_has_datetime_picker(self):

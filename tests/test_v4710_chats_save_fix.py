@@ -112,7 +112,9 @@ class TestV4710ChatsSaveFix(unittest.TestCase):
         # v4.7.13: ослаблен с == "v4.7.10" на >= v4.7.10 — чтобы не падать
         # на каждом следующем релизе. Изначальная проверка была валидна
         # только в момент выхода v4.7.10.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.10",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем как кортеж чисел.
+        self.assertGreaterEqual(tuple(int(p) for p in APP_VERSION.lstrip("v").split(".")), tuple(int(p) for p in "v4.7.10".lstrip("v").split(".")),
                                 f"APP_VERSION should be >= v4.7.10, got {APP_VERSION}")
 
     # ─── 2-3. Required removed from start_date / end_date ────────────────
