@@ -238,8 +238,14 @@ print(f"    ✓ {len(tg_calls)} tg_safe_call(lambda: ...) call sites (expected �
 
 # 11. Blocking SQLite wrapped in asyncio.to_thread
 print("\n[11] web_app.py: blocking SQLite wrapped in asyncio.to_thread...")
-# Count asyncio.to_thread calls
-to_thread_count = len(re.findall(r"asyncio\.to_thread\s*\(", wa_src))
+# Count asyncio.to_thread calls.
+# v4.9.0 (Task 4): вызовы разъехались по web/ вместе с роутами
+# (/admin/cleanup → web/admin_cleanup.py, дальше — по мере декомпозиции).
+_to_thread_sources = [_P("web_app.py"), _P("web/admin_cleanup.py"), _P("web/admin_settings.py")]
+to_thread_count = sum(
+    len(re.findall(r"asyncio\.to_thread\s*\(", open(_src).read()))
+    for _src in _to_thread_sources if os.path.exists(_src)
+)
 assert to_thread_count >= 7, f"expected ≥7 asyncio.to_thread calls (7 blocking sites), got {to_thread_count}"
 print(f"    ✓ {to_thread_count} asyncio.to_thread() calls (expected ≥7)")
 # Verify _wal_checkpoint_async and _backup_db_async exist

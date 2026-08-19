@@ -132,6 +132,10 @@ ignore = [
 "github_client.py" = ["RUF019"]
 # RUF022 — несортированный __all__.
 "web/deps.py" = ["RUF022"]
+# RUF059 — неиспользуемая распакованная переменная `deleted_chat_admins`
+# (тело перенесено дословно из web_app.py, где это же было в общем
+# RUF059-игноре модуля; Task 4, v4.9.0).
+"web/admin_cleanup.py" = ["RUF059"]
 
 # ── pytest конфигурация ─────────────────────────────────────────────────────
 [tool.pytest.ini_options]
