@@ -364,15 +364,24 @@ patcher = patch.object(_<домен>, "async_session", self.AsyncSessionLocal)
 
 ### 5.3. Вложенные хелперы переезжают вместе с профильными роутами
 
-| Хелпер | Строка | Куда | Кто ещё зовёт |
-|---|---:|---|---|
-| `_bot_info` | 3325 | `web/admin_settings.py` | `web/me.py` (`/me/avatar/refresh`) |
-| `_cleanup_counts` | 3148 | `web/admin_cleanup.py` | `admin_settings.py`, `admin_keywords.py` |
-| `_load_github_settings_row` | 3575 | `web/admin_settings.py` | только там |
+| Хелпер | Куда | Кто зовёт (проверено точным методом) |
+|---|---|---|
+| `_bot_info` | `web/admin_settings.py` | только `admin_settings_page` |
+| `_cleanup_counts` | `web/admin_cleanup.py` | `admin_settings_page` + свои роуты |
+| `_load_github_settings_row` | `web/admin_settings.py` | три github-роута |
 
-Перекрёстные вызовы — обычным импортом между модулями `web/`
-(`from web.admin_cleanup import _cleanup_counts`). Циклов не возникает:
-`admin_cleanup` не зависит ни от `admin_settings`, ни от `admin_keywords`.
+Единственный перекрёстный вызов — `_cleanup_counts` из `admin_settings`:
+`from web.admin_cleanup import _cleanup_counts`. Цикла не возникает,
+`admin_cleanup` ни от кого из `web/` не зависит.
+
+**Таблица исправлена 19.08.2026 после Task 4.** Первая редакция содержала три
+ложные зависимости: `_cleanup_counts` приписывался `admin_keywords`,
+`_bot_info` — роуту `/me/avatar/refresh`, `_load_github_settings_row` —
+роуту `vacuum`. Причина одна: скрипт определял границу роута как «от
+декоратора до следующего декоратора», а вложенные хелперы объявлены МЕЖДУ
+роутами — определение попадало в диапазон предыдущего и выглядело вызовом.
+Ошибка вскрылась на ревью Task 4. Колонки `templates` и `bot` перепроверены
+тем же методом и верны.
 
 ### 5.4. CSRF-обёртка не трогается
 

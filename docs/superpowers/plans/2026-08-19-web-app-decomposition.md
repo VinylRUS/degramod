@@ -633,10 +633,13 @@ assert to_thread_count >= 7, f"expected ≥7 asyncio.to_thread calls, got {to_th
 | GET | `/admin/keywords` | `admin_keywords_page` | 2971–3009 (39) | `templates` |
 | POST | `/admin/keywords/add` | `admin_keywords_add` | 3010–3075 (66) | — |
 | POST | `/admin/keywords/{keyword_id:int}/delete` | `admin_keywords_delete` | 3076–3106 (31) | — |
-| POST | `/admin/keywords/{keyword_id:int}/toggle-ban-night` | `admin_keywords_toggle_ban_night` | 3107–3147 (61) | `_cleanup_counts` |
+| POST | `/admin/keywords/{keyword_id:int}/toggle-ban-night` | `admin_keywords_toggle_ban_night` | 3107–3147 (61) | — |
 
-Первый межмодульный импорт: `from web.admin_cleanup import _cleanup_counts`.
-Цикла не возникает — `admin_cleanup` ни от кого из `web/` не зависит.
+**Исправлено после Task 4:** ранее здесь значился `_cleanup_counts` — ложная
+запись. Скрипт, собиравший таблицу, брал границу роута до следующего
+декоратора, и определение хелпера, стоящее между роутами, попадало в диапазон
+предыдущего. Проверено точным методом: `admin_keywords_toggle_ban_night` не
+вызывает `_cleanup_counts` вовсе. Межмодульного импорта в этой задаче нет.
 
 ### Task 6: `web/api.py` (+4 роута)
 
@@ -663,17 +666,18 @@ assert to_thread_count >= 7, f"expected ≥7 asyncio.to_thread calls, got {to_th
 | GET | `/user/{user_id:int}` | `user_page` | 1150–1216 (67) | `templates` |
 | POST | `/me/password` | `me_change_password` | 3168–3237 (70) | — |
 | GET | `/me` | `me_profile` | 3238–3276 (39) | `templates` |
-| POST | `/me/avatar/refresh` | `me_avatar_refresh` | 3277–3324 (126) | `bot`, `_bot_info`, `_fetch_and_save_avatar` |
+| POST | `/me/avatar/refresh` | `me_avatar_refresh` | 3277–3324 (126) | `bot`, `_fetch_and_save_avatar` |
 
 **Главный риск задачи.** `tests/test_v45_dashboard.py:547,563` патчат
 `web_app._fetch_and_save_avatar` и дёргают `/me/avatar/refresh`. Вызов
 обязан быть `web_app._fetch_and_save_avatar(...)` — при `from web_app import`
 патч промахнётся, тест полезет в настоящий Telegram и упадёт.
 
-`_bot_info` к этому моменту живёт в `web/admin_settings.py` (Task 8), поэтому
-**Task 7 выполняется после Task 8** либо `_bot_info` временно вызывается из
-`web_app`. Проще: поменять эти две задачи местами. Порядок в плане оставлен
-как в спеке; при исполнении — сначала Task 8, затем Task 7.
+**Исправлено после Task 4: зависимости от `_bot_info` здесь нет.** Ранее план
+утверждал, что `me_avatar_refresh` зовёт `_bot_info`, и требовал из-за этого
+менять порядок задач 7 и 8. Проверка точным методом показала ноль упоминаний
+`_bot_info` в теле роута — запись была артефактом той же ошибки границ, что и
+в Task 5. Задачи 7 и 8 независимы, порядок между ними произволен.
 
 ### Task 8: `web/admin_settings.py`
 
@@ -685,14 +689,19 @@ assert to_thread_count >= 7, f"expected ≥7 asyncio.to_thread calls, got {to_th
 |---|---|---|---|---|
 | GET | `/admin/settings` | `admin_settings_page` | 3403–3489 (87) | `templates`, `_bot_info`, `_cleanup_counts` |
 | POST | `/admin/settings/backup` | `admin_settings_backup` | 3490–3525 (36) | `_wal_checkpoint` |
-| POST | `/admin/settings/vacuum` | `admin_settings_vacuum` | 3526–3588 (63) | `_load_github_settings_row` |
+| POST | `/admin/settings/vacuum` | `admin_settings_vacuum` | 3526–3588 (63) | — |
 | GET | `/admin/settings/github` | `admin_settings_github_get` | 3589–3615 (27) | `_load_github_settings_row` |
 | POST | `/admin/settings/github` | `admin_settings_github_post` | 3616–3714 (99) | `_load_github_settings_row` |
 | POST | `/admin/settings/github/test` | `admin_settings_github_test` | 3715–3816 (102) | `_load_github_settings_row` |
 
 Два вложенных хелпера переезжают сюда: `_bot_info` (78 строк) и
 `_load_github_settings_row` (14 строк). `_cleanup_counts` импортируется из
-`web/admin_cleanup.py`.
+`web/admin_cleanup.py` — это единственный межмодульный импорт во всём Task 10.
+
+**Исправлено после Task 4:** `admin_settings_vacuum` не зовёт
+`_load_github_settings_row` (ложная запись, ошибка границ роутов). Хелпер
+нужен только трём github-роутам. `_bot_info` зовёт только
+`admin_settings_page`.
 
 **Ruff:** внутри `_bot_info` — блокирующий `open("/proc/self/status")`
 (`web_app.py:3358`). Ruff увидит `ASYNC230` в новом файле. Добавить в
