@@ -30,6 +30,7 @@ os.environ["WEB_PASSWORD"] = "test-su-password-12345"
 os.environ["WEB_COOKIE_SECURE"] = "0"
 os.environ["TRUSTED_PROXIES"] = ""
 
+import _csrf  # noqa: E402
 import db  # noqa: E402
 import web_app  # noqa: E402
 from db import WebUser, async_session, init_db  # noqa: E402
@@ -42,13 +43,15 @@ _fail_count = 0
 
 
 def check(name: str, condition: bool, detail: str = "") -> None:
+    """Проверка с настоящим падением: под pytest функция test_0N_... должна
+    упасть, если условие не выполнено, а не просто напечатать ✗."""
     global _pass_count, _fail_count
     if condition:
         print(f"  ✓ {name}")
         _pass_count += 1
     else:
-        print(f"  ✗ {name} — {detail}")
         _fail_count += 1
+        raise AssertionError(f"{name} — {detail}")
 
 
 def make_app_with_db() -> TestClient:
@@ -128,7 +131,7 @@ def _walk(routes):
             yield from _walk(r.original_router.routes)
 
 
-def t01_all_routes_registered() -> None:
+def test_01_all_routes_registered() -> None:
     """1. Все ожидаемые роуты зарегистрированы в app.routes."""
     client = make_app_with_db()
     actual_routes = {r.path for r in _walk(client.app.routes)}
@@ -145,7 +148,7 @@ def t01_all_routes_registered() -> None:
 # ── 2. Роуты с require_auth → 303 redirect без cookie ──────────────────────
 
 
-def t02_protected_routes_redirect_without_cookie() -> None:
+def test_02_protected_routes_redirect_without_cookie() -> None:
     """2. Защищённые роуты → 303 /login без cookie."""
     client = make_app_with_db()
     protected_get = [
@@ -166,7 +169,7 @@ def t02_protected_routes_redirect_without_cookie() -> None:
 # ── 3. Admin pages рендерятся с SU cookie ───────────────────────────────────
 
 
-def t03_admin_pages_render_with_su() -> None:
+def test_03_admin_pages_render_with_su() -> None:
     """3. /admin/* страницы рендерятся (200) с SU cookie."""
     client = make_app_with_db()
     login_as_su(client)
@@ -195,7 +198,7 @@ def t03_admin_pages_render_with_su() -> None:
 # ── 4. POST роуты с require_csrf_* → 403 без CSRF ───────────────────────────
 
 
-def t04_post_routes_403_without_csrf() -> None:
+def test_04_post_routes_403_without_csrf() -> None:
     """4. POST роуты с require_csrf_* → 403 без CSRF токена."""
     client = make_app_with_db()
     login_as_su(client)
@@ -207,10 +210,15 @@ def t04_post_routes_403_without_csrf() -> None:
         "/admin/presets/create",
     ]
     failed = []
-    for path in post_routes:
-        r = client.post(path, follow_redirects=False)
-        if r.status_code != 403:
-            failed.append(f"{path}→{r.status_code}")
+    # conftest.py ставит на httpx.Client.post глобальный шим, который сам
+    # подставляет валидный csrf_token в форму (нужен 13 легаси-файлам старше
+    # v4.8.8). Здесь отсутствие токена — суть проверки, поэтому шим отключаем
+    # (см. docstring tests/_csrf.py).
+    with _csrf.disabled():
+        for path in post_routes:
+            r = client.post(path, follow_redirects=False)
+            if r.status_code != 403:
+                failed.append(f"{path}→{r.status_code}")
     check("4. POST роуты → 403 без CSRF токена",
           len(failed) == 0,
           f"failed: {failed}")
@@ -219,7 +227,7 @@ def t04_post_routes_403_without_csrf() -> None:
 # ── 5. Перенесённые в web/ роуты работают ───────────────────────────────────
 
 
-def t05_migrated_routes_work() -> None:
+def test_05_migrated_routes_work() -> None:
     """5. Роуты перенесённые в web/ package работают корректно."""
     client = make_app_with_db()
     # /health — без auth
@@ -256,7 +264,7 @@ def t05_migrated_routes_work() -> None:
 # ── 6. /admin/bans рендерится с фильтрами ───────────────────────────────────
 
 
-def t06_admin_bans_with_filters() -> None:
+def test_06_admin_bans_with_filters() -> None:
     """6. /admin/bans принимает query params (chat_id, q, limit, flash)."""
     client = make_app_with_db()
     login_as_su(client)
@@ -269,7 +277,7 @@ def t06_admin_bans_with_filters() -> None:
 # ── 7. /admin/keywords рендерится ───────────────────────────────────────────
 
 
-def t07_admin_keywords_renders() -> None:
+def test_07_admin_keywords_renders() -> None:
     """7. /admin/keywords рендерится с SU cookie."""
     client = make_app_with_db()
     login_as_su(client)
@@ -282,7 +290,7 @@ def t07_admin_keywords_renders() -> None:
 # ── 8. /api/unban без CSRF не блокируется (excluded) ─────────────────────────
 
 
-def t08_api_unban_without_csrf_not_blocked() -> None:
+def test_08_api_unban_without_csrf_not_blocked() -> None:
     """8. /api/unban без CSRF → не 403 (excluded из CSRF, см. CHANGES_v4.8.8)."""
     client = make_app_with_db()
     login_as_su(client)
@@ -304,14 +312,14 @@ def main() -> int:
     print()
 
     tests = [
-        t01_all_routes_registered,
-        t02_protected_routes_redirect_without_cookie,
-        t03_admin_pages_render_with_su,
-        t04_post_routes_403_without_csrf,
-        t05_migrated_routes_work,
-        t06_admin_bans_with_filters,
-        t07_admin_keywords_renders,
-        t08_api_unban_without_csrf_not_blocked,
+        test_01_all_routes_registered,
+        test_02_protected_routes_redirect_without_cookie,
+        test_03_admin_pages_render_with_su,
+        test_04_post_routes_403_without_csrf,
+        test_05_migrated_routes_work,
+        test_06_admin_bans_with_filters,
+        test_07_admin_keywords_renders,
+        test_08_api_unban_without_csrf_not_blocked,
     ]
     for fn in tests:
         try:

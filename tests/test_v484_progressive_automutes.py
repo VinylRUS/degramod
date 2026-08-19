@@ -6,7 +6,7 @@ test_v484_progressive_automutes.py — тесты v4.8.4 (прогрессивн
   T1:  Модель AutomuteCounter существует в db.py
   T2:  Миграция CREATE TABLE IF NOT EXISTS в init_db
   T3:  Импорт AutomuteCounter в bot_handlers.py
-  T4:  Импорт AutomuteCounter в web_app.py
+  T4:  Импорт AutomuteCounter в web/api.py
   T5:  Хелпер _get_automute_count существует и работает (in-memory DB)
   T6:  Хелпер _increment_automute_count — 0→1→2→3
   T7:  Хелпер _reset_automute_count — сброс в 0, возврат старого значения
@@ -112,15 +112,17 @@ def test_static():
     except Exception as e:
         _fail("T3: Импорты и хелперы в bot_handlers.py", str(e))
 
-    # T4: Импорт в web_app.py
+    # T4: Импорт в web/api.py
+    # v4.9.0 (Task 6): /api/reset-automute-count и /api/automute-count
+    # переехали из web_app.py в web/api.py вместе с импортом AutomuteCounter.
     try:
-        wa_src = (WORK_DIR / "web_app.py").read_text()
-        assert "AutomuteCounter" in wa_src, "AutomuteCounter не импортирован в web_app.py"
+        wa_src = (WORK_DIR / "web" / "api.py").read_text()
+        assert "AutomuteCounter" in wa_src, "AutomuteCounter не импортирован в web/api.py"
         assert "/api/reset-automute-count" in wa_src, "endpoint /api/reset-automute-count не найден"
         assert "/api/automute-count" in wa_src, "endpoint /api/automute-count не найден"
-        _ok("T4: Импорты и API в web_app.py")
+        _ok("T4: Импорты и API в web/api.py")
     except Exception as e:
-        _fail("T4: Импорты и API в web_app.py", str(e))
+        _fail("T4: Импорты и API в web/api.py", str(e))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -14,7 +14,7 @@ test_v485_idea.py — тесты v4.8.5 (идеи через !idea → GitHub Is
   T9:  bot_handlers.py — стелс: _resolve_sender_web_user возвращает None для постороннего
   T10: bot_handlers.py — /help (full и moderator) содержит !idea
   T11: web_app.py — APP_VERSION начинается с v4.8.5
-  T12: web_app.py — endpoints /admin/settings/github (GET/POST) + /admin/settings/github/test
+  T12: web/admin_settings.py — endpoints /admin/settings/github (GET/POST) + /admin/settings/github/test
   T13: admin_settings.html — раздел GitHub Projects присутствует
   T14: base.html — changelog v4.8.5
   T15: requirements.txt — cryptography
@@ -361,23 +361,25 @@ def test_web_app():
         _fail("T11: APP_VERSION v4.8.5+", str(e))
 
     # T12: Endpoints
+    # v4.9.0 (Task 8): /admin/settings/github* переехал из web_app.py в
+    # web/admin_settings.py, декоратор @app. стал @router.
     try:
-        wa_src = (WORK_DIR / "web_app.py").read_text()
+        wa_src = (WORK_DIR / "web" / "admin_settings.py").read_text()
         assert '"/admin/settings/github"' in wa_src, \
             "endpoint /admin/settings/github не найден"
         assert '"/admin/settings/github/test"' in wa_src, \
             "endpoint /admin/settings/github/test не найден"
         # GET и POST методы для основного endpoint.
-        assert "@app.get(\"/admin/settings/github\")" in wa_src, \
+        assert "@router.get(\"/admin/settings/github\")" in wa_src, \
             "GET /admin/settings/github не зарегистрирован"
-        assert "@app.post(\"/admin/settings/github\")" in wa_src, \
+        assert "@router.post(\"/admin/settings/github\")" in wa_src, \
             "POST /admin/settings/github не зарегистрирован"
         # POST для test endpoint.
-        assert "@app.post(\"/admin/settings/github/test\")" in wa_src, \
+        assert "@router.post(\"/admin/settings/github/test\")" in wa_src, \
             "POST /admin/settings/github/test не зарегистрирован"
         # Импорты из db.
-        assert "IdeaLog" in wa_src, "IdeaLog не импортирован в web_app.py"
-        assert "GithubSettings" in wa_src, "GithubSettings не импортирован в web_app.py"
+        assert "IdeaLog" in wa_src, "IdeaLog не импортирован в web/admin_settings.py"
+        assert "GithubSettings" in wa_src, "GithubSettings не импортирован в web/admin_settings.py"
         assert "_encrypt_pat" in wa_src, "_encrypt_pat не импортирован"
         assert "_decrypt_pat" in wa_src, "_decrypt_pat не импортирован"
         _ok("T12: Endpoints /admin/settings/github (GET/POST) + /test")

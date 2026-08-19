@@ -1,5 +1,9 @@
 """
-web_app.py — FastAPI: маршруты, авторизация по кукам (HMAC), Jinja2-шаблоны.
+web_app.py — сборка FastAPI-приложения: конфигурация, авторизация по кукам
+(HMAC), CSRF, Jinja2-шаблоны и module-level хелперы, которые переиспользуют
+роутеры из web/. Собственных роутов не содержит — все 47 маршрутов веб-панели
+вынесены в web/*.py и подключаются в create_app() через include_router
+(v4.9.0/v4.10.0).
 
 v4.5 — Редизайн дашборда + Profile + Settings:
   - Дашборд сокращён: Search + 4 stat-карточки (Total/Mutes/Warns/Bans) + Recent sanctions
@@ -883,7 +887,8 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # Декомпозиция create_app() — см. 03_TASK_v4.8.9.md §2 и web/__init__.py.
     # v4.8.9: /health и /logout перенесены.
     # v4.8.10: / (root), /avatar/*, /api/presets, /api/automute-count перенесены.
-    # Остальные 47 роутов — inline ниже, TODO v4.9.0.
+    # v4.9.0/v4.10.0: декомпозиция завершена — все остальные роуты переехали
+    # в web/*.py, в create_app() их не осталось (см. докстроку модуля).
     from web.admin_bans import router as admin_bans_router
     from web.admin_chats import router as admin_chats_router
     from web.admin_cleanup import router as admin_cleanup_router

@@ -14,7 +14,7 @@ test_v4853_status_field.py — тесты для v4.8.5.3 (auto-set Status='Пр
   9. db.py — колонка project_status_option_name в GithubSettings.
   10. db.py — миграция для project_status_option_name.
   11. web_app.py — APP_VERSION = v4.8.5.3.
-  12. web_app.py — GET/POST /admin/settings/github принимают project_status_option_name.
+  12. web/admin_settings.py — GET/POST /admin/settings/github принимают project_status_option_name.
   13. admin_settings.html — поле Status option name присутствует.
   14. base.html — changelog v4.8.5.3.
   15. Синтаксис всех 5 изменённых файлов.
@@ -277,9 +277,11 @@ def t12_app_version():
     check(f"T12: APP_VERSION = v4.8.5+ (ok={ok})", ok)
 
 
-# ── T13: web_app.py — project_status_option_name в GET/POST ─────────────
+# ── T13: web/admin_settings.py — project_status_option_name в GET/POST ──
+# v4.9.0 (Task 8): /admin/settings/github* переехал из web_app.py в
+# web/admin_settings.py вместе с этим полем.
 def t13_web_app_endpoints():
-    src = (V485_DIR / "web_app.py").read_text(encoding="utf-8")
+    src = (V485_DIR / "web" / "admin_settings.py").read_text(encoding="utf-8")
     # GET endpoint должен возвращать это поле.
     ok1 = '"project_status_option_name"' in src
     # POST endpoint должен принимать Form.

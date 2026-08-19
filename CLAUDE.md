@@ -228,20 +228,25 @@ ORM подставляет в SELECT все колонки модели и па�
 - **`asyncio.create_task` только через `_spawn_background_task`**
   (`bot_handlers.py:214`). Голый `create_task` без сохранения ссылки GC может
   собрать на середине. Инвариант сторожит `tests/test_v487_sanity.py` [9].
-- **Блокирующий `open()` в async-роутах** — `web_app.py:738, 3333`. Остальное
-  (`sqlite3`, `VACUUM`, `shutil.copy2`) вынесено в `asyncio.to_thread` в v4.8.7,
-  но `open()` тогда пропустили. Ruff видит это как `ASYNC230`, замечания
-  вынесены в `per-file-ignores` с пометкой.
+- **Блокирующий `open()` в async-роутах** — `web_app.py:743` и
+  `web/admin_settings.py:86`. Остальное (`sqlite3`, `VACUUM`, `shutil.copy2`)
+  вынесено в `asyncio.to_thread` в v4.8.7, но `open()` тогда пропустили. Ruff
+  видит это как `ASYNC230`, замечания вынесены в `per-file-ignores` с пометкой.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
   `bot_handlers.py` и `modchat.py` — правь обе копии.
 - **Alembic есть, но выключен.** `migrations/` и `alembic.ini` в репозитории,
   однако прод работает через `DB_USE_LEGACY_MIGRATIONS=1` → старый `init_db()`.
   Попытка включить Alembic в v4.8.9 дважды уронила прод (auto-stamp на
   существующей БД). Не включай без проверки на staging.
-- **FastAPI 0.115.6 использует `asyncio.iscoroutinefunction`** (`fastapi/routing.py:233`),
-  который удалят в Python 3.16. Сейчас это только `DeprecationWarning` и приложение
-  работает, но обновиться придётся. Актуальная версия 0.141.1 тянет Starlette 1.6.0,
-  то есть смену мажорной — делать под тестами, см. Task 17 плана.
+- **`Form(...)` не принимает пустую строку.** После обновления стека (FastAPI
+  0.115.6 → 0.141.1, Starlette 0.41 → 1.6, Task 17) пустое текстовое поле
+  формы валидация считает отсутствующим значением и отсекает запрос ещё до
+  хендлера сырым 422 (`{"detail":[{"type":"missing",...}]}`) — раньше `""`
+  доходила до обработчика, и тот сам отвечал понятной ошибкой. Поэтому
+  текстовые поля, которые пользователь заполняет руками, объявляются как
+  `Form("")`, а не `Form(...)`; числовых (`punishment_id`, `user_id`,
+  `chat_id`) это не касается — они приходят из сгенерированных форм. Контракт
+  закреплён в `tests/test_v4812_empty_form_fields.py`.
 - **Роутеры `web/` импортируются только внутри `create_app()`.** Top-level
   импорт `web.X` в `web_app.py` даёт цикл: `web_app → web.X → web.deps →
   web_app` (модули `web/` сами обращаются к `web_app` за хелперами).
