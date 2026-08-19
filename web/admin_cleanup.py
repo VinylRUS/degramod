@@ -3,8 +3,8 @@ web/admin_cleanup.py — очистка тестовых данных БД (#4).
 
 v4.9.0 (Task 4): вынесены GET и POST /admin/cleanup из create_app(), вместе
 с хелпером `_cleanup_counts` — раньше он был вложен в create_app(), теперь
-это модульная функция: её используют web/admin_settings.py (роут
-/admin/settings) и web/admin_keywords.py (toggle-ban-night), задачи 8 и 5.
+это модульная функция: её используют роуты самого этого модуля и
+admin_settings_page (роут /admin/settings, пока inline в web_app.py).
 
 Хелперы web_app (`_req_logger`, `_wal_checkpoint_async`, `_backup_db_async`)
 берутся через модуль (`web_app._helper(...)`), а не импортом имён: тесты

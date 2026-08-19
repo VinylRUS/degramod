@@ -55,7 +55,7 @@ from aiogram.types import (
     RichTextUrl,
 )
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 
@@ -63,7 +63,6 @@ _req_logger = logging.getLogger("shadow_logger.requests")
 
 from db import (
     DB_PATH,
-    AutomuteCounter,
     ChatAdmin,
     ChatSettings,
     GithubSettings,
@@ -1151,107 +1150,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
             "auth_user": _auth,
         })
 
-    # ── GET /api/dashboard — JSON для автообновления таблицы логов ───────
-    @app.get("/api/dashboard")
-    async def api_dashboard(
-        request: Request,
-        page: int = 1,
-        action: str = "",
-        rev: str = "",
-        sort: str = "new",
-        last: int = 0,    # id последней показанной записи — вернём только свежее
-        _auth: AuthUser = Depends(require_auth),
-    ):
-        offset = (page - 1) * PAGE_SIZE
-        async with async_session() as session:
-            base = (
-                select(Punishment, User, Moderator)
-                .join(User, Punishment.user_id == User.user_id)
-                .join(Moderator, Punishment.mod_id == Moderator.mod_id)
-            )
-            if action in ("mute", "warn", "ban", "unmute", "unwarn", "unban"):
-                base = base.where(Punishment.action_type == action)
-            if rev == "active":
-                base = base.where(Punishment.is_revoked.is_(False))
-            elif rev == "revoked":
-                base = base.where(Punishment.is_revoked.is_(True))
-            if sort == "old":
-                base = base.order_by(Punishment.created_at.asc())
-            elif sort == "type":
-                base = base.order_by(Punishment.action_type.asc(),
-                                     Punishment.created_at.desc())
-            elif sort == "user":
-                base = base.order_by(User.username.asc().nullslast(),
-                                     Punishment.created_at.desc())
-            else:
-                base = base.order_by(Punishment.created_at.desc())
-            rows = (await session.execute(base.offset(offset).limit(PAGE_SIZE))).all()
-
-            # Count active totals
-            total_stmt = (
-                select(Punishment.action_type, func.count(Punishment.id))
-                .where(Punishment.is_revoked.is_(False))
-                .group_by(Punishment.action_type)
-            )
-            total_stats = {
-                row[0]: row[1]
-                for row in (await session.execute(total_stmt)).all()
-            }
-
-        return JSONResponse({
-            "stats": {
-                "total": sum(total_stats.values()),
-                "mute": total_stats.get("mute", 0),
-                "warn": total_stats.get("warn", 0),
-                "ban": total_stats.get("ban", 0),
-                "unmute": total_stats.get("unmute", 0),
-                "unwarn": total_stats.get("unwarn", 0),
-                "unban": total_stats.get("unban", 0),
-            },
-            "rows": [
-                {
-                    "id": p.id,
-                    "time": _msk_time(p.created_at),
-                    "ts": int(p.created_at.replace(tzinfo=timezone.utc).timestamp())
-                          if p.created_at.tzinfo is None
-                          else int(p.created_at.timestamp()),
-                    "action": p.action_type,
-                    "is_revoked": bool(p.is_revoked),
-                    "user_id": u.user_id,
-                    "user_name": u.username or u.first_name or str(u.user_id),
-                    "user_username": u.username,
-                    "mod_name": m.username or m.first_name or str(m.mod_id),
-                    "duration": p.duration_seconds,
-                    "duration_fmt": _duration_fmt(p.duration_seconds) if p.action_type != "warn" else f"{p.duration_seconds or 0} pts",
-                    "reason": p.reason,
-                    "message_text": p.message_text,
-                }
-                for p, u, m in rows
-            ],
-        })
-
-    # ── GET /api/search?q=<query> ──────────────────────────────────────
-    @app.get("/api/search")
-    async def api_search(request: Request, q: str = "", _auth: AuthUser = Depends(require_auth)):
-        if not q or len(q) < 1:
-            return JSONResponse([])
-        async with async_session() as session:
-            stmt = select(User)
-            if q.isdigit():
-                stmt = stmt.where(User.user_id == int(q))
-            else:
-                stmt = stmt.where(User.username.ilike(f"%{q}%"))
-            stmt = stmt.limit(20)
-            users = (await session.execute(stmt)).scalars().all()
-        return JSONResponse([
-            {
-                "user_id": u.user_id,
-                "username": u.username,
-                "first_name": u.first_name,
-                "last_name": u.last_name,
-            }
-            for u in users
-        ])
+    # ── GET /api/dashboard, GET /api/search — v4.9.0 перенесены в web/api.py ──
+    # Раньше тут были inline @app.get("/api/dashboard") и @app.get("/api/search").
+    # Теперь — в web/api.py, подключены через app.include_router выше.
 
     # ──────────────────────────────────────────────────────────────────
     #  /admin/users — управление всеми пользователями (v4.4.7)
@@ -4165,192 +4066,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # Раньше тут был inline @app.get("/admin/bans").
     # Теперь — в web/admin_bans.py, подключён через app.include_router выше.
 
-    @app.post("/api/unban")
-    async def api_unban(
-        request: Request,
-        punishment_id: int = Form(...),
-        user_id: int = Form(...),
-        chat_id: int = Form(...),
-        reason: str = Form(""),
-        _auth: AuthUser = Depends(require_auth),
-    ):
-        """v4.8.1: API для разбана юзера (вызывается из /admin/bans).
-
-        Делегирует в bot_handlers.revoke_user_ban — ту же функцию использует
-        и TG-команда !unban. Это гарантирует паритет:
-          • unban_chat_member (Telegram API) с only_if_banned=True.
-          • _revoke_last_action (помечает последний активный бан как снятый).
-          • _save_punishment с action_type='unban' (видно в веб-панели).
-
-        Возвращает JSON с {ok: True} или {ok: False, error: ...}.
-        """
-        # v4.8.1: создаём ephemeral aiogram.Bot если основной недоступен.
-        # На самом деле, нам нужен экземпляр Bot для вызова unban_chat_member.
-        # create_app получает bot как параметр — используем его.
-        # Если bot is None — отказ (нельзя разбанить без Bot API токена).
-        if bot is None:
-            _req_logger.error(
-                "api_unban: bot is None — create_app called without bot? "
-                "user_id=%s chat_id=%s by=%s",
-                user_id, chat_id, _auth.username,
-            )
-            return JSONResponse(
-                {"ok": False, "error": "Bot instance not available — cannot call unban_chat_member"},
-                status_code=503,
-            )
-
-        # mod_id: для БД нужен ID модератора. У веб-юзера это tg_user_id
-        # привязанного Telegram-аккаунта.
-        #
-        # v4.8.11: раньше здесь стоял `_auth.tg_user_id or -1`. Учётки
-        # веб-панели заводятся только через привязку в боте (sync-admins →
-        # /start → пароль), поэтому обычный юзер без tg_user_id — нарушение
-        # инварианта, а не штатный случай. Fallback на -1 его заминал: разбан
-        # проходил, _upsert_moderator заводил несуществующего модератора -1,
-        # и на него вешались все такие записи. Теперь такой запрос отклоняется.
-        #
-        # Исключение — встроенный su: он создаётся сидом init_db (db.py:1372)
-        # и логинится по WEB_PASSWORD, TG ID у него нет по построению.
-        mod_id = _auth.tg_user_id
-        reason_author: str | None = None
-        if mod_id is None:
-            if _auth.role != "su":
-                _req_logger.warning(
-                    "api_unban: refused — web user %r has no linked tg_user_id "
-                    "(punishment_id=%s user_id=%s chat_id=%s)",
-                    _auth.username, punishment_id, user_id, chat_id,
-                )
-                return JSONResponse(
-                    {
-                        "ok": False,
-                        "error": (
-                            "Учётка не привязана к Telegram. Привяжите аккаунт "
-                            "через бота, иначе разбан некому записать."
-                        ),
-                    },
-                    status_code=400,
-                )
-            # su без привязки: mod_id остаётся служебным, поэтому автора
-            # сохраняем в тексте причины — иначе он теряется совсем.
-            mod_id = _SU_WEB_MOD_ID
-            reason_author = _auth.username
-
-        # Импортируем revoke_user_ban (lazy — чтобы не подтягивать весь модуль
-        # при импорте web_app).
-        try:
-            from bot_handlers import revoke_user_ban
-        except ImportError as e:
-            _req_logger.error("api_unban: cannot import revoke_user_ban: %s", e)
-            return JSONResponse(
-                {"ok": False, "error": f"Internal error: {e}"},
-                status_code=500,
-            )
-
-        # Нормализуем reason — пустая строка → None.
-        reason_clean = (reason or "").strip() or None
-        if reason_author:
-            mark = f"через веб-панель: {reason_author}"
-            reason_clean = f"{reason_clean} ({mark})" if reason_clean else mark
-
-        # Логируем попытку (до вызова — для аудита даже при падении).
-        _req_logger.info(
-            "api_unban: attempt — punishment_id=%s user_id=%s chat_id=%s mod_id=%s (by=%s) reason=%r",
-            punishment_id, user_id, chat_id, mod_id, _auth.username, reason_clean,
-        )
-
-        result = await revoke_user_ban(
-            bot=bot,
-            chat_id=chat_id,
-            user_id=user_id,
-            mod_id=mod_id,
-            reason=reason_clean,
-            target_user=None,  # веб-юзер не имеет types.User объекта
-        )
-
-        if result.get("ok"):
-            _req_logger.info(
-                "api_unban: success — punishment_id=%s user_id=%s chat_id=%s by=%s",
-                punishment_id, user_id, chat_id, _auth.username,
-            )
-            # Redirect обратно на /admin/bans с flash-сообщением.
-            flash_msg = f"Разбан выполнен: user_id={user_id}, chat_id={chat_id}"
-            if reason_clean:
-                flash_msg += f", причина: {reason_clean}"
-            return RedirectResponse(
-                url=f"/admin/bans?flash={flash_msg}&chat_id={chat_id}",
-                status_code=303,
-            )
-        else:
-            _req_logger.warning(
-                "api_unban: failed — punishment_id=%s user_id=%s chat_id=%s error=%s",
-                punishment_id, user_id, chat_id, result.get("error"),
-            )
-            flash_msg = f"❌ Ошибка разбана: {result.get('error', 'unknown')}"
-            return RedirectResponse(
-                url=f"/admin/bans?flash={flash_msg}&chat_id={chat_id}",
-                status_code=303,
-            )
-
-    # ── v4.8.4: API для сброса счётчика автомьютов ──────────────────────
-    # POST /api/reset-automute-count — обнуляет automute_counters для
-    # (chat_id, user_id). Доступ: SU/Admin только.
-    # Параметры: chat_id (int), user_id (int).
-    # Возвращает JSON {ok: true, old_count: N} или {ok: false, error: ...}.
-    @app.post("/api/reset-automute-count")
-    async def api_reset_automute_count(
-        request: Request,
-        chat_id: int = Form(...),
-        user_id: int = Form(...),
-        _auth: AuthUser = Depends(require_admin),
-    ):
-        """v4.8.4: Сброс счётчика автомьютов (прогрессивные муты).
-
-        Обнуляет count в automute_counters для (chat_id, user_id).
-        Формула: mute_duration = base + (count * 60). После сброса
-        следующий автомьют будет = base duration (без штрафа).
-        """
-        from sqlalchemy import select as _sel
-        _req_logger.info(
-            "api_reset_automute_count: attempt — chat_id=%s user_id=%s by=%s",
-            chat_id, user_id, _auth.username,
-        )
-        try:
-            async with async_session() as session:
-                counter = (await session.execute(
-                    _sel(AutomuteCounter).where(
-                        AutomuteCounter.chat_id == chat_id,
-                        AutomuteCounter.user_id == user_id,
-                    )
-                )).scalar_one_or_none()
-                if counter is None:
-                    old_count = 0
-                else:
-                    old_count = counter.count
-                    counter.count = 0
-                    from datetime import datetime
-                    from datetime import timezone as _tz
-                    counter.updated_at = datetime.now(_tz.utc)
-                    await session.commit()
-            _req_logger.info(
-                "api_reset_automute_count: success — chat_id=%s user_id=%s "
-                "old_count=%d by=%s",
-                chat_id, user_id, old_count, _auth.username,
-            )
-            return JSONResponse({
-                "ok": True,
-                "old_count": old_count,
-                "chat_id": chat_id,
-                "user_id": user_id,
-            })
-        except Exception as e:
-            _req_logger.error(
-                "api_reset_automute_count: error — chat_id=%s user_id=%s: %s",
-                chat_id, user_id, e,
-            )
-            return JSONResponse(
-                {"ok": False, "error": str(e)},
-                status_code=500,
-            )
+    # ── POST /api/unban, POST /api/reset-automute-count — v4.9.0 перенесены в web/api.py ──
+    # Раньше тут были inline @app.post("/api/unban") и @app.post("/api/reset-automute-count").
+    # Теперь — в web/api.py, подключены через app.include_router выше.
 
     # v4.8.10: /api/automute-count перенесён в web/api.py.
     # Раньше тут был inline @app.get("/api/automute-count") — счётчик автомьютов.

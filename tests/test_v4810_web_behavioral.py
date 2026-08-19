@@ -34,6 +34,7 @@ import db  # noqa: E402
 import web_app  # noqa: E402
 from db import WebUser, async_session, init_db  # noqa: E402
 from sqlalchemy import select  # noqa: E402
+from starlette.routing import Route  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 _pass_count = 0
@@ -111,10 +112,26 @@ EXPECTED_ROUTES = {
 }
 
 
+def _walk(routes):
+    """Разворачивает вложенные роутеры.
+
+    FastAPI 0.141 кладёт в app.routes объект _IncludedRouter, а сами роуты
+    прячет в его original_router.routes. У _IncludedRouter атрибут path
+    существует и равен None, поэтому фильтр hasattr(r, "path") его не
+    отсеивает и кладёт None в множество путей — без обхода вынесенные в
+    web/ роуты не видны.
+    """
+    for r in routes:
+        if isinstance(r, Route):
+            yield r
+        elif hasattr(r, "original_router"):
+            yield from _walk(r.original_router.routes)
+
+
 def t01_all_routes_registered() -> None:
     """1. Все ожидаемые роуты зарегистрированы в app.routes."""
     client = make_app_with_db()
-    actual_routes = {r.path for r in client.app.routes if hasattr(r, "path")}
+    actual_routes = {r.path for r in _walk(client.app.routes)}
     missing = EXPECTED_ROUTES - actual_routes
     extra = actual_routes - EXPECTED_ROUTES - {"/openapi.json", "/docs", "/redoc"}
     check("1. Все ожидаемые роуты зарегистрированы",
