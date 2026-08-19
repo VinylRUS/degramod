@@ -413,7 +413,8 @@ class TestV475SourceCodePatterns(unittest.TestCase):
     """Static source inspection — без запуска приложения."""
 
     def test_web_app_has_wordfilter_handlers(self):
-        with open(_P("web_app.py"), "r") as f:
+        """v4.9.0 (Task 10): роуты переехали в web/admin_presets.py."""
+        with open(_P("web/admin_presets.py"), "r") as f:
             src = f.read()
         self.assertIn("/admin/presets/words/add", src)
         self.assertIn("/admin/presets/words/{word_id:int}/delete", src)
@@ -421,7 +422,8 @@ class TestV475SourceCodePatterns(unittest.TestCase):
         self.assertIn("/admin/presets/links/{link_id:int}/delete", src)
 
     def test_web_app_imports_wordfilter_linkallowlist(self):
-        with open(_P("web_app.py"), "r") as f:
+        """v4.9.0 (Task 10): импорт моделей переехал в web/admin_presets.py."""
+        with open(_P("web/admin_presets.py"), "r") as f:
             src = f.read()
         self.assertIn("WordFilter", src)
         self.assertIn("LinkAllowlist", src)

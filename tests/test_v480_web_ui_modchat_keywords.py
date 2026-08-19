@@ -38,6 +38,9 @@ WEB_APP_PY = ROOT / "web_app.py"
 ADMIN_KEYWORDS_PY = ROOT / "web" / "admin_keywords.py"
 # v4.9.0 (Task 9): /admin/users* переехали из web_app.py в web/admin_users.py.
 ADMIN_USERS_PY = ROOT / "web" / "admin_users.py"
+# v4.9.0 (Task 10): /admin/presets* переехали из web_app.py в
+# web/admin_presets.py.
+ADMIN_PRESETS_PY = ROOT / "web" / "admin_presets.py"
 ADMIN_CHATS_HTML = ROOT / "templates" / "admin_chats.html"
 ADMIN_KEYWORDS_HTML = ROOT / "templates" / "admin_keywords.html"
 BASE_HTML = ROOT / "templates" / "base.html"
@@ -1102,11 +1105,13 @@ class TestNoRegression(unittest.TestCase):
 
         v4.9.0 (Task 9): /admin/users и /admin/users/create переехали в
         web/admin_users.py (декоратор @router.get/@router.post вместо
-        @app.get/@app.post). Собираем маршруты из обоих файлов — смысл
-        проверки прежний, изменился только источник для двух путей.
+        @app.get/@app.post). v4.9.0 (Task 10): /admin/presets и
+        /admin/presets/create переехали в web/admin_presets.py той же
+        схемой. Собираем маршруты из всех файлов — смысл проверки прежний,
+        изменился только источник для переехавших путей.
         """
         route_paths = set()
-        for path in (WEB_APP_PY, ADMIN_USERS_PY):
+        for path in (WEB_APP_PY, ADMIN_USERS_PY, ADMIN_PRESETS_PY):
             try:
                 tree = ast.parse(_read(path))
             except SyntaxError as e:

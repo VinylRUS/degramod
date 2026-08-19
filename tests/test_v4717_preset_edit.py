@@ -69,6 +69,9 @@ APP_VERSION = web_app.APP_VERSION
 APP_RELEASE_DATE = web_app.APP_RELEASE_DATE
 
 WEB_APP_PY = os.path.join(PROJECT_DIR, "web_app.py")
+# v4.9.0 (Task 10): admin_presets_edit переехал из web_app.py в
+# web/admin_presets.py.
+ADMIN_PRESETS_PY = os.path.join(PROJECT_DIR, "web", "admin_presets.py")
 BASE_HTML = os.path.join(PROJECT_DIR, "templates", "base.html")
 ADMIN_PRESETS_HTML = os.path.join(PROJECT_DIR, "templates", "admin_presets.html")
 
@@ -79,14 +82,18 @@ def _read(path: str) -> str:
 
 
 def _find_fn_body(src: str, fn_name: str) -> str:
-    """Найти тело функции async def fn_name (или def fn_name)."""
+    """Найти тело функции async def fn_name (или def fn_name).
+
+    v4.9.0 (Task 10): граница — следующий декоратор `@...`, независимо от
+    отступа. Раньше искали только `\n    @` (4 пробела): подходило, пока
+    роут был вложен в create_app(). После переноса в web/admin_presets.py
+    декоратор `@router...` стоит на верхнем уровне (0 отступа).
+    """
     for prefix in ("async def ", "def "):
         idx = src.find(f"{prefix}{fn_name}(")
         if idx > 0:
-            # Find next def at same indent (4 spaces)
-            next_idx = src.find("\n    @", idx + 10)
-            if next_idx < 0:
-                next_idx = len(src)
+            m = re.search(r"\n\s*@", src[idx + 10:])
+            next_idx = (idx + 10 + m.start()) if m else len(src)
             return src[idx:next_idx]
     return ""
 
@@ -99,9 +106,10 @@ class TestV4717PresetEdit(unittest.TestCase):
 
     def setUp(self):
         self.web_app_py = _read(WEB_APP_PY)
+        self.admin_presets_py = _read(ADMIN_PRESETS_PY)
         self.base_html = _read(BASE_HTML)
         self.admin_presets_html = _read(ADMIN_PRESETS_HTML)
-        self.edit_fn_body = _find_fn_body(self.web_app_py, "admin_presets_edit")
+        self.edit_fn_body = _find_fn_body(self.admin_presets_py, "admin_presets_edit")
 
     # ─── 1-2. Version ──────────────────────────────────────────────────
 
@@ -116,10 +124,14 @@ class TestV4717PresetEdit(unittest.TestCase):
     # ─── 3-8. Endpoint exists + signature ──────────────────────────────
 
     def test_03_endpoint_exists(self):
-        """POST /admin/presets/{preset_id:int}/edit должен существовать."""
+        """POST /admin/presets/{preset_id:int}/edit должен существовать.
+
+        v4.9.0 (Task 10): роут переехал в web/admin_presets.py, декоратор —
+        @router.post (не @app.post). Смысл проверки прежний.
+        """
         self.assertIn(
-            '@app.post("/admin/presets/{preset_id:int}/edit")',
-            self.web_app_py,
+            '@router.post("/admin/presets/{preset_id:int}/edit")',
+            self.admin_presets_py,
             "Endpoint /admin/presets/{preset_id:int}/edit не найден",
         )
 

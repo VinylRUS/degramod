@@ -94,6 +94,9 @@ spec_bot.loader.exec_module(bot_module)
 BOT_PY = os.path.join(PROJECT_DIR, "bot.py")
 BOT_HANDLERS_PY = os.path.join(PROJECT_DIR, "bot_handlers.py")
 WEB_APP_PY = os.path.join(PROJECT_DIR, "web_app.py")
+# v4.9.0 (Task 10): admin_presets_create переехал из web_app.py в
+# web/admin_presets.py.
+ADMIN_PRESETS_PY = os.path.join(PROJECT_DIR, "web", "admin_presets.py")
 DB_PY = os.path.join(PROJECT_DIR, "db.py")
 BASE_HTML = os.path.join(PROJECT_DIR, "templates", "base.html")
 ADMIN_PRESETS_HTML = os.path.join(PROJECT_DIR, "templates", "admin_presets.html")
@@ -115,6 +118,7 @@ class TestV4716SlowMode(unittest.TestCase):
         self.bot_py = _read(BOT_PY)
         self.bot_handlers_py = _read(BOT_HANDLERS_PY)
         self.web_app_py = _read(WEB_APP_PY)
+        self.admin_presets_py = _read(ADMIN_PRESETS_PY)
         self.db_py = _read(DB_PY)
         self.base_html = _read(BASE_HTML)
         self.admin_presets_html = _read(ADMIN_PRESETS_HTML)
@@ -328,30 +332,36 @@ class TestV4716SlowMode(unittest.TestCase):
 
     # ─── 18-20. admin_presets_create ──────────────────────────────────
 
+    # v4.9.0 (Task 10): admin_presets_create переехал из web_app.py в
+    # web/admin_presets.py — тесты 18-20 читают новый файл. Функция теперь
+    # объявлена на верхнем уровне модуля (не внутри create_app()), поэтому
+    # закрывающая скобка сигнатуры — "):" без отступа (была "    ):" при
+    # 4-пробельном отступе вложенной функции).
+
     def test_18_admin_presets_create_accepts_slow_mode_delay(self):
         """admin_presets_create должен принимать Form field slow_mode_delay."""
         # Find the function
-        idx = self.web_app_py.find("async def admin_presets_create(")
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
         self.assertGreater(idx, 0, "admin_presets_create not found")
         # Find the end of the function signature (next def or return)
-        fn_end = self.web_app_py.find("    ):",
-        idx) + len("    ):")
-        fn_sig = self.web_app_py[idx:fn_end]
+        fn_end = self.admin_presets_py.find("):",
+        idx) + len("):")
+        fn_sig = self.admin_presets_py[idx:fn_end]
         self.assertIn("slow_mode_delay", fn_sig,
                       "slow_mode_delay Form field missing in admin_presets_create signature")
 
     def test_19_admin_presets_create_validates_int_and_range(self):
         """Валидация: int + 0..36400."""
-        idx = self.web_app_py.find("async def admin_presets_create(")
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
         # Get a chunk of the function body
-        chunk = self.web_app_py[idx:idx+5000]
+        chunk = self.admin_presets_py[idx:idx+5000]
         self.assertIn("int(slow_mode_raw)", chunk, "int parsing missing")
         self.assertIn("36400", chunk, "range check 36400 missing")
 
     def test_20_admin_presets_create_saves_slow_mode_delay(self):
         """admin_presets_create должен сохранять slow_mode_delay в PermissionPreset."""
-        idx = self.web_app_py.find("async def admin_presets_create(")
-        chunk = self.web_app_py[idx:idx+6000]
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
+        chunk = self.admin_presets_py[idx:idx+6000]
         # Look for PermissionPreset(...) constructor with slow_mode_delay
         self.assertIn("slow_mode_delay=slow_mode_value", chunk,
                       "slow_mode_delay не передаётся в PermissionPreset constructor")
