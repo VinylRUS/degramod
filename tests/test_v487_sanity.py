@@ -77,18 +77,17 @@ print("    ✓ WEB_COOKIE_SECURE=0 → _COOKIE_SECURE=False (dev mode)")
 importlib.reload(web_app)
 
 # 4. SU password uses hmac.compare_digest
-print("\n[4] web_app.py: SU password compare_digest...")
-# Find "hmac.compare_digest(password, WEB_PASSWORD)" in source
-assert re.search(r"hmac\.compare_digest\s*\(\s*password\s*,\s*WEB_PASSWORD\s*\)", wa_src), \
-    "SU login should use hmac.compare_digest(password, WEB_PASSWORD)"
-# Also check there's no remaining `password != WEB_PASSWORD`
-# Allow it in comments, but not in actual code path
-# Quick heuristic: no `password != WEB_PASSWORD` outside of strings/comments
-src_lines = wa_src.split("\n")
+print("\n[4] web/auth.py: SU password compare_digest...")
+# v4.9.0 (Task 10): роут /login переехал из web_app.py в web/auth.py.
+with open(_P("web/auth.py")) as f:
+    auth_src = f.read()
+assert re.search(r"hmac\.compare_digest\s*\(\s*password\s*,\s*web_app\.WEB_PASSWORD\s*\)", auth_src), \
+    "SU login should use hmac.compare_digest(password, web_app.WEB_PASSWORD)"
+src_lines = auth_src.split("\n")
 violations = []
 for i, line in enumerate(src_lines, 1):
-    stripped = line.split("#", 1)[0].strip()  # strip comments
-    if "password != WEB_PASSWORD" in stripped:
+    stripped = line.split("#", 1)[0].strip()
+    if "password != web_app.WEB_PASSWORD" in stripped:
         violations.append((i, line))
 assert not violations, f"found `password != WEB_PASSWORD` at lines: {violations}"
 print("    ✓ SU login uses hmac.compare_digest (no != comparison)")
