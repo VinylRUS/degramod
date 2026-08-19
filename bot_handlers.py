@@ -3438,11 +3438,21 @@ async def _send_ephemeral(
     для ephemeral НЕ работает (см. BUG#2 в аудите v4.7.20).
     """
     try:
-        sent = await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            receiver_user_id=recipient.id,
-            parse_mode="HTML",
+        # v4.9.0: FIX отправка через tg_safe_call — при flood control (429)
+        # сообщение уходит после ретрая, а не теряется. Обёртки здесь не было:
+        # !mywarns держал её у себя (v4.8.11), но при переезде на ephemeral
+        # снаружи её не навесить — хелпер глотает TelegramAPIError сам, и
+        # tg_safe_call никогда не увидел бы 429. Заодно ретрай получили
+        # модераторские подтверждения в mod_commands.py — там потеря
+        # подтверждения означает, что модератор не знает, прошла ли команда.
+        sent = await tg_safe_call(
+            lambda: bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                receiver_user_id=recipient.id,
+                parse_mode="HTML",
+            ),
+            label="ephemeral_send",
         )
     except TelegramAPIError as e:
         # v4.7.20: TelegramAPIError (базовый класс) ловит все подклассы —
@@ -3929,9 +3939,15 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 # Доступна ВСЕМ юзерам (не только модераторам). Запрос @Gleb (11 авг 2026).
 #
 # Поведение:
-#   - В группе: бот удаляет команду → отправляет DM юзеру с инфо по текущему чату.
-#     Если DM невозможен (юзер не запускал /start) — молча игнорирует.
+#   - В группе: бот удаляет команду → отвечает ephemeral-сообщением в тот же
+#     чат, видимым только автору команды. Если ephemeral не прошёл — молчит.
 #   - В DM: бот отвечает напрямую, сводка по всем чатам с активными варнами.
+#
+# v4.9.0: FIX в группе ответ шёл в DM, а DM требует, чтобы юзер сам запустил
+# бота. /start открыт только модераторам (и это осознанное решение, менять его
+# не надо), поэтому обычный участник — тот, ради кого фича делалась, — не
+# получал ничего и не понимал почему. Ephemeral доставляется без /start и при
+# этом не показывает варны остальному чату.
 #
 # Содержимое (per-chat):
 #   - Количество активных варнов
@@ -4046,9 +4062,10 @@ async def _format_user_warns_summary(session, user_id: int) -> str:
 
 @router.message(F.chat.type.in_(["group", "supergroup"]), F.text.regexp(r"^!mywarns\s*$"))
 async def handle_mywarns_group(message: types.Message) -> None:
-    """!mywarns в группе — удаляет команду, отправляет DM с варнами в этом чате.
+    """!mywarns в группе — удаляет команду, отвечает ephemeral с варнами в этом чате.
 
     v4.8.10 (бонус): доступна всем юзерам. Per-user per-chat timeout 5 мин, silent.
+    v4.9.0: ответ ephemeral'ом вместо DM — см. комментарий в шапке блока.
     """
     if not message.from_user or not message.text:
         return
@@ -4092,17 +4109,18 @@ async def handle_mywarns_group(message: types.Message) -> None:
     else:
         text = f"📊 Ваши варны в этом чате:\n{warn_info}"
 
-    # Отправляем DM. Если невозможно — молча игнорируем.
-    # v4.8.11: через tg_safe_call — при flood control (429) сообщение уходит
-    # после ретрая. Без обёртки оно терялось, а таймаут уже был записан, так
-    # что повторить запрос юзер смог бы только через 5 минут.
-    try:
-        await tg_safe_call(
-            lambda: message.bot.send_message(chat_id=user_id, text=text),
-            label="mywarns_group_dm",
-        )
-    except TelegramAPIError as e:
-        logger.debug("mywarns: cannot send DM to user %s: %s", user_id, e)
+    # v4.9.0: ephemeral в тот же чат вместо DM.
+    #
+    # _send_ephemeral сам логирует и глушит ошибки отправки: если юзер
+    # ограничил ephemeral-сообщения, показать ему всё равно нечего — молчим
+    # ровно так же, как молчали при недоступном DM. Ретрай на flood control
+    # живёт внутри хелпера (v4.9.0), снаружи его навесить нельзя.
+    await _send_ephemeral(
+        bot=message.bot,
+        chat_id=chat_id,
+        recipient=message.from_user,
+        text=text,
+    )
 
 
 @router.message(F.chat.type == "private", F.text.regexp(r"^!mywarns\s*$"))
