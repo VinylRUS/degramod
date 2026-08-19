@@ -36,6 +36,8 @@ WEB_APP_PY = ROOT / "web_app.py"
 # web/admin_keywords.py. Структурные проверки, читавшие их из web_app.py,
 # переадресованы на новый файл — смысл проверок сохранён дословно.
 ADMIN_KEYWORDS_PY = ROOT / "web" / "admin_keywords.py"
+# v4.9.0 (Task 9): /admin/users* переехали из web_app.py в web/admin_users.py.
+ADMIN_USERS_PY = ROOT / "web" / "admin_users.py"
 ADMIN_CHATS_HTML = ROOT / "templates" / "admin_chats.html"
 ADMIN_KEYWORDS_HTML = ROOT / "templates" / "admin_keywords.html"
 BASE_HTML = ROOT / "templates" / "base.html"
@@ -1096,23 +1098,30 @@ class TestNoRegression(unittest.TestCase):
                           f"Existing field '{field}' must still be in valid_fields")
 
     def test_81_all_old_routes_still_exist(self):
-        """Все старые /admin/* маршруты на месте."""
-        try:
-            tree = ast.parse(_read(WEB_APP_PY))
-        except SyntaxError as e:
-            self.fail(f"Syntax error: {e}")
+        """Все старые /admin/* маршруты на месте.
 
+        v4.9.0 (Task 9): /admin/users и /admin/users/create переехали в
+        web/admin_users.py (декоратор @router.get/@router.post вместо
+        @app.get/@app.post). Собираем маршруты из обоих файлов — смысл
+        проверки прежний, изменился только источник для двух путей.
+        """
         route_paths = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef):
-                for dec in node.decorator_list:
-                    if isinstance(dec, ast.Call):
-                        if isinstance(dec.func, ast.Attribute):
-                            attr = dec.func.attr
-                            if attr in ("get", "post") and dec.args:
-                                first_arg = dec.args[0]
-                                if isinstance(first_arg, ast.Constant):
-                                    route_paths.add(first_arg.value)
+        for path in (WEB_APP_PY, ADMIN_USERS_PY):
+            try:
+                tree = ast.parse(_read(path))
+            except SyntaxError as e:
+                self.fail(f"Syntax error in {path}: {e}")
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AsyncFunctionDef):
+                    for dec in node.decorator_list:
+                        if isinstance(dec, ast.Call):
+                            if isinstance(dec.func, ast.Attribute):
+                                attr = dec.func.attr
+                                if attr in ("get", "post") and dec.args:
+                                    first_arg = dec.args[0]
+                                    if isinstance(first_arg, ast.Constant):
+                                        route_paths.add(first_arg.value)
 
         expected_routes = [
             "/admin/users",
