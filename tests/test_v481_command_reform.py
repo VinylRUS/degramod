@@ -50,6 +50,10 @@ _WEB_APP_SRC = _read_file(_WEB_APP_PATH)
 _MOD_COMMANDS_PATH = os.path.join(_PROJ_ROOT, "mod_commands.py")
 _MOD_COMMANDS_SRC = _read_file(_MOD_COMMANDS_PATH) if os.path.exists(_MOD_COMMANDS_PATH) else ""
 
+# v4.9.0 (Task 3): GET /admin/bans переехал из web_app.py в web/admin_bans.py.
+_ADMIN_BANS_PATH = os.path.join(_PROJ_ROOT, "web", "admin_bans.py")
+_ADMIN_BANS_SRC = _read_file(_ADMIN_BANS_PATH) if os.path.exists(_ADMIN_BANS_PATH) else ""
+
 
 def _dispatch_src() -> str:
     """Тело handle_group_command вместе с модулем, куда вынесли его ветви."""
@@ -425,10 +429,14 @@ class TestWebAppRoutes(unittest.TestCase):
     """Проверка новых маршрутов /admin/bans и /api/unban в web_app.py."""
 
     def test_70_admin_bans_route_exists(self):
-        """Маршрут GET /admin/bans зарегистрирован."""
-        self.assertIn('@app.get("/admin/bans"', _WEB_APP_SRC,
+        """Маршрут GET /admin/bans зарегистрирован.
+
+        v4.9.0 (Task 3): роут переехал из web_app.py в web/admin_bans.py,
+        декоратор — @router.get (не @app.get). Смысл проверки прежний.
+        """
+        self.assertIn('@router.get("/admin/bans"', _ADMIN_BANS_SRC,
                       "/admin/bans GET route must be registered")
-        self.assertIn("async def admin_bans_page", _WEB_APP_SRC,
+        self.assertIn("async def admin_bans_page", _ADMIN_BANS_SRC,
                       "admin_bans_page handler must exist")
 
     def test_71_api_unban_route_exists(self):
@@ -439,9 +447,12 @@ class TestWebAppRoutes(unittest.TestCase):
                        "api_unban handler must exist")
 
     def test_72_admin_bans_uses_require_auth(self):
-        """Доступ к /admin/bans — require_auth (все веб-юзеры)."""
+        """Доступ к /admin/bans — require_auth (все веб-юзеры).
+
+        v4.9.0 (Task 3): функция теперь в web/admin_bans.py.
+        """
         # Найдём функцию admin_bans_page и проверим что в ней есть require_auth
-        body = _extract_func_body(_WEB_APP_SRC, "admin_bans_page")
+        body = _extract_func_body(_ADMIN_BANS_SRC, "admin_bans_page")
         self.assertIsNotNone(body)
         self.assertIn("require_auth", body,
                       "admin_bans_page must use require_auth (not require_su)")

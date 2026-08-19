@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 from db import Base, User, Moderator, Punishment, ChatSettings, WebUser, _hash_password
 import web_app
 import db as _db
+import web.admin_bans as _admin_bans
 
 
 class _BaseWebUnbanTest(unittest.TestCase):
@@ -69,6 +70,14 @@ class _BaseWebUnbanTest(unittest.TestCase):
         web_app_patcher = patch.object(self._web_app, "async_session", self.AsyncSessionLocal)
         web_app_patcher.start()
         self.addCleanup(web_app_patcher.stop)
+
+        # v4.9.0 (Task 3): GET /admin/bans переехал в web/admin_bans.py, у
+        # которого async_session — свой импортированный символ, отдельный
+        # от web_app.async_session. Без этого патча роут читал бы боевую
+        # БД мимо тестовой in-memory.
+        admin_bans_patcher = patch.object(_admin_bans, "async_session", self.AsyncSessionLocal)
+        admin_bans_patcher.start()
+        self.addCleanup(admin_bans_patcher.stop)
 
         # Сам разбан выполняет bot_handlers.revoke_user_ban — туда async_session
         # тоже импортирован отдельным именем, и без этого патча запись шла бы

@@ -899,6 +899,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # v4.8.9: /health и /logout перенесены.
     # v4.8.10: / (root), /avatar/*, /api/presets, /api/automute-count перенесены.
     # Остальные 47 роутов — inline ниже, TODO v4.9.0.
+    from web.admin_bans import router as admin_bans_router
     from web.api import router as api_router
     from web.auth import router as auth_router
     from web.health import router as health_router
@@ -907,6 +908,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     app.include_router(auth_router)
     app.include_router(me_router)
     app.include_router(api_router)
+    app.include_router(admin_bans_router)
 
     # ── v4.5: Endpoint для отдачи аватарок — v4.8.10 перенесён в web/me.py ─
     # Раньше тут был inline @app.get("/avatar/{tg_user_id:int}").
@@ -4506,143 +4508,9 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # Раньше тут был inline @app.get("/api/presets") — JSON-API список пресетов.
     # Теперь — в web/api.py, подключён через app.include_router выше.
 
-    # ════════════════════════════════════════════════════════════════════
-    # v4.8.1: Web unban (#3) — список активных банов + API разбана
-    # ════════════════════════════════════════════════════════════════════
-
-    @app.get("/admin/bans", response_class=HTMLResponse)
-    async def admin_bans_page(
-        request: Request,
-        chat_id: str = "",
-        q: str = "",
-        limit: int = 200,
-        flash: str = "",
-        _auth: AuthUser = Depends(require_auth),
-    ):
-        """v4.8.1: страница активных банов (#3).
-
-        Показывает все активные баны (action_type='ban', is_revoked=False)
-        по всем чатам, с фильтрами по chat_id и поиску по юзеру.
-
-        Доступ: все аутентифицированные веб-юзеры (admin + SU + moderator).
-        Кнопка разбана через POST /api/unban.
-        """
-        # Нормализуем параметры.
-        try:
-            limit_int = max(1, min(int(limit), 500))
-        except (TypeError, ValueError):
-            limit_int = 200
-        chat_id_int: int | None = None
-        if chat_id:
-            try:
-                chat_id_int = int(chat_id)
-            except ValueError:
-                pass  # игнорим некорректный — показываем без фильтра
-        q_lower = (q or "").strip().lower()
-
-        bans = []
-        total_count = 0
-        async with async_session() as session:
-            # Базовый запрос: только активные баны (is_revoked=False).
-            # JOIN с User и Moderator для подстановки имён/юзернеймов.
-            from sqlalchemy import func as _f
-            base_filter = [
-                Punishment.action_type == "ban",
-                Punishment.is_revoked.is_(False),
-            ]
-            if chat_id_int is not None:
-                base_filter.append(Punishment.chat_id == chat_id_int)
-
-            # Считаем total_count (без LIMIT).
-            count_q = select(_f.count(Punishment.id)).where(*base_filter)
-            total_count = (await session.execute(count_q)).scalar_one()
-
-            # Поиск по юзеру (user_id, username, first_name) — добавляем к фильтру.
-            if q_lower:
-                # Простая подстрока. user_id — числовое поле, проверяем если
-                # q — число. Иначе — ILIKE по username/first_name.
-                from db import Moderator as _M
-                from db import User as _U
-                user_cond = []
-                try:
-                    q_int = int(q_lower)
-                    user_cond.append(_U.user_id == q_int)
-                except ValueError:
-                    pass
-                user_cond.append(_U.username.ilike(f"%{q_lower}%"))
-                user_cond.append(_U.first_name.ilike(f"%{q_lower}%"))
-                from sqlalchemy import or_ as _or
-
-                main_q = (
-                    select(
-                        Punishment,
-                        _U.user_id.label("u_user_id"),
-                        _U.username.label("u_username"),
-                        _U.first_name.label("u_first_name"),
-                        _U.last_name.label("u_last_name"),
-                        _M.mod_id.label("m_mod_id"),
-                        _M.username.label("m_username"),
-                        _M.first_name.label("m_first_name"),
-                    )
-                    .select_from(Punishment)
-                    .outerjoin(_U, Punishment.user_id == _U.user_id)
-                    .outerjoin(_M, Punishment.mod_id == _M.mod_id)
-                    .where(*base_filter)
-                    .where(_or(*user_cond))
-                    .order_by(Punishment.created_at.desc())
-                    .limit(limit_int)
-                )
-            else:
-                from db import Moderator as _M
-                from db import User as _U
-                main_q = (
-                    select(
-                        Punishment,
-                        _U.user_id.label("u_user_id"),
-                        _U.username.label("u_username"),
-                        _U.first_name.label("u_first_name"),
-                        _U.last_name.label("u_last_name"),
-                        _M.mod_id.label("m_mod_id"),
-                        _M.username.label("m_username"),
-                        _M.first_name.label("m_first_name"),
-                    )
-                    .select_from(Punishment)
-                    .outerjoin(_U, Punishment.user_id == _U.user_id)
-                    .outerjoin(_M, Punishment.mod_id == _M.mod_id)
-                    .where(*base_filter)
-                    .order_by(Punishment.created_at.desc())
-                    .limit(limit_int)
-                )
-            rows = (await session.execute(main_q)).all()
-            for row in rows:
-                p = row[0]
-                bans.append({
-                    "id": p.id,
-                    "user_id": p.user_id,
-                    "chat_id": p.chat_id,
-                    "mod_id": p.mod_id,
-                    "reason": p.reason,
-                    "created_at": p.created_at,
-                    "user_username": row.u_username,
-                    "user_first_name": row.u_first_name,
-                    "user_last_name": row.u_last_name,
-                    "mod_username": row.m_username,
-                    "mod_first_name": row.m_first_name,
-                })
-
-        return templates.TemplateResponse("admin_bans.html", {
-            "request": request,
-            "auth_user": _auth,
-            "app_version": APP_VERSION,
-            "flash": flash or None,
-            "bans": bans,
-            "total_count": total_count,
-            "filters": {
-                "chat_id": chat_id,
-                "q": q,
-                "limit": limit_int,
-            },
-        })
+    # ── GET /admin/bans — v4.9.0 перенесён в web/admin_bans.py ───────────
+    # Раньше тут был inline @app.get("/admin/bans").
+    # Теперь — в web/admin_bans.py, подключён через app.include_router выше.
 
     @app.post("/api/unban")
     async def api_unban(
