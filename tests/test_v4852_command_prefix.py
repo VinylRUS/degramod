@@ -22,6 +22,14 @@ checks = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
+    """Проверка с настоящим падением.
+
+    v4.10.1 (Task 18): раньше провал только увеличивал счётчик, а выход с
+    ошибкой стоял в main() под `if __name__`. Под pytest main() не
+    вызывается, поэтому файл был зелёным независимо от результата проверок.
+    Теперь провал бросает AssertionError — падает и в pytest, и при прямом
+    запуске.
+    """
     global passed, failed
     if ok:
         passed += 1
@@ -29,6 +37,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     else:
         failed += 1
         checks.append(f"  ✗ {name}  {detail}")
+        raise AssertionError(f"{name} — {detail}" if detail else name)
 
 
 # ── Парсим bot_handlers.py через AST, ищем декораторы cmd_idea_* ────────
@@ -59,7 +68,7 @@ def find_command_call_in_decorator(dec: ast.Call) -> ast.Call | None:
 
 
 # ── T1: cmd_idea_dm использует Command("idea", prefix="!/") ─────────────
-def t1_idea_dm_prefix():
+def test_01_idea_dm_prefix():
     decs = get_decorator_calls("cmd_idea_dm")
     if not decs:
         check("T1: cmd_idea_dm has decorator", False, "no decorator found")
@@ -105,7 +114,7 @@ def t1_idea_dm_prefix():
 
 
 # ── T2: cmd_idea_modchat использует Command("idea", prefix="!/") ────────
-def t2_idea_modchat_prefix():
+def test_02_idea_modchat_prefix():
     decs = get_decorator_calls("cmd_idea_modchat")
     if not decs:
         check("T2: cmd_idea_modchat has decorator", False, "no decorator found")
@@ -144,7 +153,7 @@ def t2_idea_modchat_prefix():
 
 
 # ── T3: APP_VERSION = v4.8.5+ в web_app.py ──────────────────────────────
-def t3_app_version():
+def test_03_app_version():
     import re as _re
     src = (V485_DIR / "web_app.py").read_text(encoding="utf-8")
     # v4.8.6: принимаем v4.8.5+ (включая v4.8.6, v4.9.0 и т.д.)
@@ -160,7 +169,7 @@ def t3_app_version():
 
 
 # ── T4: changelog v4.8.5.2 в base.html ──────────────────────────────────
-def t4_changelog():
+def test_04_changelog():
     src = (V485_DIR / "templates" / "base.html").read_text(encoding="utf-8")
     ok1 = "v4.8.5.2" in src
     ok2 = "Command" in src and "prefix" in src
@@ -171,7 +180,7 @@ def t4_changelog():
 
 
 # ── T5: только 2 вхождения Command("idea", prefix="!/") ────────────────
-def t5_only_two_handlers():
+def test_05_only_two_handlers():
     """Должно быть ровно 2 вхождения — для DM и для modchat."""
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
     # Считаем с regex с допуском пробелов.
@@ -182,7 +191,7 @@ def t5_only_two_handlers():
 
 
 # ── T6: НЕ осталось Command("idea") без prefix= ────────────────────────
-def t6_no_bare_command_idea():
+def test_06_no_bare_command_idea():
     """Проверяем, что не осталось bare Command('idea') без prefix=."""
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
     # Ищем Command("idea") или Command('idea') БЕЗ prefix=.
@@ -197,7 +206,7 @@ def t6_no_bare_command_idea():
 
 
 # ── T7: проверяем, что в aiogram Command default prefix — это "/" ──────
-def t7_aiogram_default_prefix_is_slash():
+def test_07_aiogram_default_prefix_is_slash():
     """Smoke-тест: убеждаемся, что наше понимание aiogram верно.
     Если aiogram вдруг поменяет default prefix — этот тест провалится, и
     мы поймём, что фикс нужно пересмотреть.
@@ -228,7 +237,7 @@ def t7_aiogram_default_prefix_is_slash():
 
 
 # ── T8: /help (full + moderator) по-прежнему содержит !idea ────────────
-def t8_help_still_contains_idea():
+def test_08_help_still_contains_idea():
     """Регрессия: !idea должна остаться в /help."""
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
     # В _build_help_full_rich и _build_help_moderator_rich.
@@ -237,7 +246,7 @@ def t8_help_still_contains_idea():
 
 
 # ── T9: синтаксис всех 3 изменённых файлов ─────────────────────────────
-def t9_syntax():
+def test_09_syntax():
     for fname in ("bot_handlers.py", "web_app.py"):
         try:
             ast.parse((V485_DIR / fname).read_text(encoding="utf-8"))
@@ -247,7 +256,7 @@ def t9_syntax():
 
 
 # ── T10: проверка, что !idea через regex тоже ловит ────────────────────
-def t10_idea_command_pattern_in_help():
+def test_10_idea_command_pattern_in_help():
     """В help тексте (Rich Message builders) !idea должна быть задокументирована
     как 'idea' (через ! или / — оба валидны, но help показывает !)."""
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
@@ -266,16 +275,16 @@ def main():
     print("=" * 70)
     print()
 
-    t1_idea_dm_prefix()
-    t2_idea_modchat_prefix()
-    t3_app_version()
-    t4_changelog()
-    t5_only_two_handlers()
-    t6_no_bare_command_idea()
-    t7_aiogram_default_prefix_is_slash()
-    t8_help_still_contains_idea()
-    t9_syntax()
-    t10_idea_command_pattern_in_help()
+    test_01_idea_dm_prefix()
+    test_02_idea_modchat_prefix()
+    test_03_app_version()
+    test_04_changelog()
+    test_05_only_two_handlers()
+    test_06_no_bare_command_idea()
+    test_07_aiogram_default_prefix_is_slash()
+    test_08_help_still_contains_idea()
+    test_09_syntax()
+    test_10_idea_command_pattern_in_help()
 
     print()
     for c in checks:

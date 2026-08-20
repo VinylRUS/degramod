@@ -33,6 +33,14 @@ checks = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
+    """Проверка с настоящим падением.
+
+    v4.10.1 (Task 18): раньше провал только увеличивал счётчик, а реальный
+    выход с ошибкой стоял в main() под `if __name__`. Под pytest main() не
+    вызывается, поэтому файл был зелёным независимо от результата проверок.
+    Теперь провал бросает AssertionError — тест падает и в pytest, и при
+    прямом запуске.
+    """
     global passed, failed
     if ok:
         passed += 1
@@ -40,6 +48,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     else:
         failed += 1
         checks.append(f"  ✗ {name}  {detail}")
+        raise AssertionError(f"{name} — {detail}" if detail else name)
 
 
 # ── Загружаем github_client ─────────────────────────────────────────────
@@ -81,7 +90,7 @@ def make_gc_with_mock(mock_responses):
 
 
 # ── T1: User-аккаунт с валидным Project ─────────────────────────────────
-async def t1_user_ok():
+async def test_01_user_ok():
     """Login — это user, Project существует. Должен вернуть PVT_xxx."""
     make_gc_with_mock([
         # Шаг 1: user query — успешно
@@ -103,7 +112,7 @@ async def t1_user_ok():
 
 
 # ── T2: Organization с валидным Project ─────────────────────────────────
-async def t2_org_ok():
+async def test_02_org_ok():
     """Login — это organization, Project существует."""
     make_gc_with_mock([
         # Шаг 1: user query — падает "Could not resolve to a User"
@@ -130,7 +139,7 @@ async def t2_org_ok():
 
 
 # ── T3: Login не существует ни как user, ни как org ─────────────────────
-async def t3_neither_exists():
+async def test_03_neither_exists():
     """Login вообще не существует — должна быть понятная ошибка."""
     make_gc_with_mock([
         # Шаг 1: user query — "Could not resolve to a User"
@@ -156,7 +165,7 @@ async def t3_neither_exists():
 
 
 # ── T4: User существует, но Project не найден ───────────────────────────
-async def t4_user_no_project():
+async def test_04_user_no_project():
     """User есть, но Project с таким номером не существует."""
     make_gc_with_mock([
         # Шаг 1: user есть, но projectV2 = null
@@ -175,7 +184,7 @@ async def t4_user_no_project():
 
 
 # ── T5: Organization существует, но Project не найден ───────────────────
-async def t5_org_no_project():
+async def test_05_org_no_project():
     """Organization есть, но Project не найден."""
     make_gc_with_mock([
         # Шаг 1: user query — не user
@@ -199,7 +208,7 @@ async def t5_org_no_project():
 
 
 # ── T6: GraphQL error, не связанная с типом owner ──────────────────────
-async def t6_unrelated_graphql_error():
+async def test_06_unrelated_graphql_error():
     """PAT без scope project → GraphQL error пробрасывается как есть."""
     make_gc_with_mock([
         # Шаг 1: user query падает с ошибкой про права
@@ -220,7 +229,7 @@ async def t6_unrelated_graphql_error():
 
 
 # ── T7: APP_VERSION = v4.8.5+ в web_app.py ──────────────────────────────
-def t7_app_version():
+def test_07_app_version():
     import re as _re
     src = (V485_DIR / "web_app.py").read_text(encoding="utf-8")
     # v4.8.6: принимаем v4.8.5+ (включая v4.8.6, v4.9.0 и т.д.)
@@ -236,7 +245,7 @@ def t7_app_version():
 
 
 # ── T8: Changelog v4.8.5.1 в base.html ──────────────────────────────────
-def t8_changelog():
+def test_08_changelog():
     src = (V485_DIR / "templates" / "base.html").read_text(encoding="utf-8")
     ok1 = "v4.8.5.1" in src
     ok2 = "hotfix" in src.lower()
@@ -247,7 +256,7 @@ def t8_changelog():
 
 
 # ── T9: Синтаксис всех 3 изменённых файлов ─────────────────────────────
-def t9_syntax():
+def test_09_syntax():
     for fname in ("github_client.py", "web_app.py"):
         try:
             ast.parse((V485_DIR / fname).read_text(encoding="utf-8"))
@@ -257,7 +266,7 @@ def t9_syntax():
 
 
 # ── T10: get_project_node_id — корректный сигнатурный API ──────────────
-async def t10_api_signature():
+async def test_10_api_signature():
     """API функции не изменился — принимает (pat, owner_login, project_number)."""
     import inspect
     sig = inspect.signature(gc.get_project_node_id)
@@ -267,7 +276,7 @@ async def t10_api_signature():
 
 
 # ── T11: User с projectV2=null (не None) → переходит к org? ─────────────
-async def t11_user_null_branch():
+async def test_11_user_null_branch():
     """Если user существует, но projectV2=None — НЕ переходим к org.
 
     Логин не может быть одновременно user и org — нет смысла пробовать.
@@ -289,7 +298,7 @@ async def t11_user_null_branch():
 
 
 # ── T12: Реальный кейс пользователя — VinylRUS / org path ───────────────
-async def t12_vinylrus_case():
+async def test_12_vinylrus_case():
     """Воспроизводит кейс из баг-репорта:
     VinylRUS — это organization (или user, не важно), но ошибка была
     'Could not resolve to an Organization'. Это значит, что в старом коде
@@ -321,7 +330,7 @@ async def t12_vinylrus_case():
 
 
 # ── T13: Реальный кейс — VinylRUS это user ──────────────────────────────
-async def t13_vinylrus_user_case():
+async def test_13_vinylrus_user_case():
     """Альтернатива: VinylRUS — это user (не org). Тогда шаг 1 должен
     сразу вернуть PVT_xxx без шага 2.
     """
@@ -350,19 +359,19 @@ async def main():
     print("test_v4851_project_node_id.py — hotfix v4.8.5.1 tests")
     print("=" * 70)
 
-    await t1_user_ok()
-    await t2_org_ok()
-    await t3_neither_exists()
-    await t4_user_no_project()
-    await t5_org_no_project()
-    await t6_unrelated_graphql_error()
-    t7_app_version()
-    t8_changelog()
-    t9_syntax()
-    await t10_api_signature()
-    await t11_user_null_branch()
-    await t12_vinylrus_case()
-    await t13_vinylrus_user_case()
+    await test_01_user_ok()
+    await test_02_org_ok()
+    await test_03_neither_exists()
+    await test_04_user_no_project()
+    await test_05_org_no_project()
+    await test_06_unrelated_graphql_error()
+    test_07_app_version()
+    test_08_changelog()
+    test_09_syntax()
+    await test_10_api_signature()
+    await test_11_user_null_branch()
+    await test_12_vinylrus_case()
+    await test_13_vinylrus_user_case()
 
     print()
     for c in checks:

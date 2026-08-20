@@ -37,6 +37,14 @@ checks = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
+    """Проверка с настоящим падением.
+
+    v4.10.1 (Task 18): раньше провал только увеличивал счётчик, а выход с
+    ошибкой стоял в main() под `if __name__`. Под pytest main() не
+    вызывается, поэтому файл был зелёным независимо от результата проверок.
+    Теперь провал бросает AssertionError — падает и в pytest, и при прямом
+    запуске.
+    """
     global passed, failed
     if ok:
         passed += 1
@@ -44,6 +52,7 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     else:
         failed += 1
         checks.append(f"  ✗ {name}  {detail}")
+        raise AssertionError(f"{name} — {detail}" if detail else name)
 
 
 # ── Загружаем github_client ─────────────────────────────────────────────
@@ -77,7 +86,7 @@ def make_gc_with_mock(mock_responses):
 
 
 # ── T1: find_status_field — happy path ──────────────────────────────────
-async def t1_find_status_field_ok():
+async def test_01_find_status_field_ok():
     make_gc_with_mock([
         {"return": {
             "node": {
@@ -104,7 +113,7 @@ async def t1_find_status_field_ok():
 
 
 # ── T2: find_status_field — Status not found (renamed/deleted) ──────────
-async def t2_find_status_field_not_found():
+async def test_02_find_status_field_not_found():
     make_gc_with_mock([
         {"return": {
             "node": {
@@ -122,7 +131,7 @@ async def t2_find_status_field_not_found():
 
 
 # ── T3: find_status_field — node is None (invalid project_node_id) ──────
-async def t3_find_status_field_node_none():
+async def test_03_find_status_field_node_none():
     make_gc_with_mock([
         {"return": {"node": None}},
     ])
@@ -132,7 +141,7 @@ async def t3_find_status_field_node_none():
 
 
 # ── T4: set_item_status_by_name — happy path → True ─────────────────────
-async def t4_set_by_name_ok():
+async def test_04_set_by_name_ok():
     """find_status_field находит Status с option 'Предложено' → set_item_status → True."""
     make_gc_with_mock([
         # Шаг 1: find_status_field
@@ -165,7 +174,7 @@ async def t4_set_by_name_ok():
 
 
 # ── T5: set_item_status_by_name — Status field missing → False ──────────
-async def t5_status_field_missing():
+async def test_05_status_field_missing():
     make_gc_with_mock([
         {"return": {
             "node": {"fields": {"nodes": [
@@ -182,7 +191,7 @@ async def t5_status_field_missing():
 
 
 # ── T6: set_item_status_by_name — option not found → False ──────────────
-async def t6_option_not_found():
+async def test_06_option_not_found():
     make_gc_with_mock([
         {"return": {
             "node": {"fields": {"nodes": [
@@ -200,7 +209,7 @@ async def t6_option_not_found():
 
 
 # ── T7: set_item_status_by_name — GraphQL error → False ─────────────────
-async def t7_graphql_error_returns_false():
+async def test_07_graphql_error_returns_false():
     """find_status_field падает с GraphQL error — должна вернуть False, не кидать."""
     make_gc_with_mock([
         {"raise": gc.GithubApiError(
@@ -219,7 +228,7 @@ async def t7_graphql_error_returns_false():
 
 
 # ── T8: set_item_status_by_name — default status_name = 'Предложено' ────
-async def t8_default_status_name():
+async def test_08_default_status_name():
     """Если status_name не задан — default 'Предложено'."""
     import inspect
     sig = inspect.signature(gc.set_item_status_by_name)
@@ -229,7 +238,7 @@ async def t8_default_status_name():
 
 
 # ── T9: bot_handlers.py — set_item_status_by_name вызывается после add ──
-def t9_bot_handlers_calls_set_status():
+def test_09_bot_handlers_calls_set_status():
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
     ok1 = "set_item_status_by_name" in src
     ok2 = "from github_client import" in src and "set_item_status_by_name" in src
@@ -247,14 +256,14 @@ def t9_bot_handlers_calls_set_status():
 
 
 # ── T10: db.py — поле project_status_option_name в GithubSettings ───────
-def t10_db_field_present():
+def test_10_db_field_present():
     src = (V485_DIR / "db.py").read_text(encoding="utf-8")
     ok = "project_status_option_name = Column(String(128)" in src
     check("T10: db.py has project_status_option_name column", ok)
 
 
 # ── T11: db.py — миграция для project_status_option_name ────────────────
-def t11_db_migration_present():
+def test_11_db_migration_present():
     src = (V485_DIR / "db.py").read_text(encoding="utf-8")
     ok1 = 'ALTER TABLE github_settings ADD COLUMN' in src
     ok2 = 'project_status_option_name VARCHAR(128) NULL' in src
@@ -265,7 +274,7 @@ def t11_db_migration_present():
 
 
 # ── T12: web_app.py — APP_VERSION = v4.8.5+ (>= v4.8.5.3) ────────────────
-def t12_app_version():
+def test_12_app_version():
     src = (V485_DIR / "web_app.py").read_text(encoding="utf-8")
     # v4.8.6: принимаем v4.8.5+ (включая v4.8.5.x hotfixes, v4.8.6, v4.9.0 и т.д.)
     m = re.search(r'APP_VERSION\s*=\s*"v(\d+)\.(\d+)\.(\d+)', src)
@@ -280,7 +289,7 @@ def t12_app_version():
 # ── T13: web/admin_settings.py — project_status_option_name в GET/POST ──
 # v4.9.0 (Task 8): /admin/settings/github* переехал из web_app.py в
 # web/admin_settings.py вместе с этим полем.
-def t13_web_app_endpoints():
+def test_13_web_app_endpoints():
     src = (V485_DIR / "web" / "admin_settings.py").read_text(encoding="utf-8")
     # GET endpoint должен возвращать это поле.
     ok1 = '"project_status_option_name"' in src
@@ -294,7 +303,7 @@ def t13_web_app_endpoints():
 
 
 # ── T14: admin_settings.html — поле Status option name ──────────────────
-def t14_admin_settings_field():
+def test_14_admin_settings_field():
     src = (V485_DIR / "templates" / "admin_settings.html").read_text(encoding="utf-8")
     ok1 = 'name="project_status_option_name"' in src
     ok2 = "Status option name" in src
@@ -305,7 +314,7 @@ def t14_admin_settings_field():
 
 
 # ── T15: base.html — changelog v4.8.5.3 ─────────────────────────────────
-def t15_changelog():
+def test_15_changelog():
     src = (V485_DIR / "templates" / "base.html").read_text(encoding="utf-8")
     ok1 = "v4.8.5.3" in src
     ok2 = "Предложено" in src
@@ -318,7 +327,7 @@ def t15_changelog():
 
 
 # ── T16: синтаксис всех изменённых файлов ───────────────────────────────
-def t16_syntax():
+def test_16_syntax():
     files = [
         "github_client.py", "web_app.py", "bot_handlers.py", "db.py",
     ]
@@ -331,7 +340,7 @@ def t16_syntax():
 
 
 # ── T17: find_status_field — case-sensitive name matching ──────────────
-async def t17_case_sensitive():
+async def test_17_case_sensitive():
     """Имя поля Status case-sensitive. 'status' (lowercase) не должна
     матчится."""
     make_gc_with_mock([
@@ -348,7 +357,7 @@ async def t17_case_sensitive():
 
 
 # ── T18: set_item_status — mutation payload ─────────────────────────────
-async def t18_set_item_status_payload():
+async def test_18_set_item_status_payload():
     """Проверяем, что set_item_status отправляет correct GraphQL variables."""
     captured = []
 
@@ -382,7 +391,7 @@ async def t18_set_item_status_payload():
 
 
 # ── T19: set_item_status_by_name — best-effort exception suppression ───
-async def t19_set_by_name_suppresses_exceptions():
+async def test_19_set_by_name_suppresses_exceptions():
     """Даже если set_item_status кидает неожиданное исключение,
     set_item_status_by_name должен его поймать и вернуть False."""
     # Мокаем find_status_field чтобы вернуть валидный field_info,
@@ -419,7 +428,7 @@ async def t19_set_by_name_suppresses_exceptions():
 
 
 # ── T20: db.py — default в seed для нового singleton'а ──────────────────
-def t20_db_seed_default():
+def test_20_db_seed_default():
     """При создании singleton github_settings (новая БД) project_status_option_name
     должен быть 'Предложено'."""
     src = (V485_DIR / "db.py").read_text(encoding="utf-8")
@@ -440,26 +449,26 @@ async def main():
     print("=" * 70)
     print()
 
-    await t1_find_status_field_ok()
-    await t2_find_status_field_not_found()
-    await t3_find_status_field_node_none()
-    await t4_set_by_name_ok()
-    await t5_status_field_missing()
-    await t6_option_not_found()
-    await t7_graphql_error_returns_false()
-    await t8_default_status_name()
-    t9_bot_handlers_calls_set_status()
-    t10_db_field_present()
-    t11_db_migration_present()
-    t12_app_version()
-    t13_web_app_endpoints()
-    t14_admin_settings_field()
-    t15_changelog()
-    t16_syntax()
-    await t17_case_sensitive()
-    await t18_set_item_status_payload()
-    await t19_set_by_name_suppresses_exceptions()
-    t20_db_seed_default()
+    await test_01_find_status_field_ok()
+    await test_02_find_status_field_not_found()
+    await test_03_find_status_field_node_none()
+    await test_04_set_by_name_ok()
+    await test_05_status_field_missing()
+    await test_06_option_not_found()
+    await test_07_graphql_error_returns_false()
+    await test_08_default_status_name()
+    test_09_bot_handlers_calls_set_status()
+    test_10_db_field_present()
+    test_11_db_migration_present()
+    test_12_app_version()
+    test_13_web_app_endpoints()
+    test_14_admin_settings_field()
+    test_15_changelog()
+    test_16_syntax()
+    await test_17_case_sensitive()
+    await test_18_set_item_status_payload()
+    await test_19_set_by_name_suppresses_exceptions()
+    test_20_db_seed_default()
 
     print()
     for c in checks:
