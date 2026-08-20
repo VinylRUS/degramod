@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""v4.8.8 smoke test: проверить что web_app.py импортируется и create_app()
-работает. Без этой проверки любой синтаксис/импорт-лаž в web_app.py не будет
-обнаружен, пока не деплойнут в прод.
+"""v4.8.8 smoke test: web_app.py импортируется и create_app() работает.
+
+Без этой проверки любая синтаксическая или импортная ошибка в web_app.py
+доживёт до прода.
+
+v4.10.1 (Task 18): шаги 1-3 работали и раньше — они падают при импорте, и
+pytest это видит. А шаги 4-7 только печатали и после декомпозиции стали
+врать: считали POST-роуты наивным обходом app.routes (не видит вынесенные —
+в Starlette 1.6 там _IncludedRouter) и грепали CSRF-зависимости в web_app.py,
+откуда роуты уехали в web/. Заменены на настоящие assert'ы; проверку
+CSRF-инварианта ведёт tests/test_v488_verify_csrf.py, дублировать её здесь
+нечего.
 """
 from _paths import _P  # noqa: E402  (корень вычисляется от __file__)
 import os
@@ -35,30 +44,40 @@ print("   OK")
 
 print("3. create_app(bot=None)...")
 app = web_app.create_app(bot=None)
-print(f"   OK, роутов: {len(app.routes)}")
+assert app is not None, "create_app(bot=None) вернул None"
 
-print("4. Поиск POST-роутов с CSRF...")
-post_routes = []
-for r in app.routes:
-    if hasattr(r, "methods") and "POST" in r.methods:
-        post_routes.append(r.path)
-print(f"   POST-роутов: {len(post_routes)}")
 
-print("5. Поиск CSRF зависимостей в исходнике...")
-src = Path(_P("web_app.py")).read_text(encoding="utf-8")
-csrf_count = src.count("Depends(require_csrf_")
-print(f"   Depends(require_csrf_*): {csrf_count}")
+def _walk(routes):
+    """Разворачивает вложенные роутеры.
 
-print("6. Поиск старых зависимостей (только в POST-роутах должно быть 0)...")
-# Простая проверка: count всех Depends(require_auth/su/admin) — это нормально,
-# GET-роуты должны их использовать
-old_count = src.count("Depends(require_auth)") + src.count("Depends(require_su)") + src.count("Depends(require_admin)")
-old_csrf = src.count("Depends(require_csrf_auth)") + src.count("Depends(require_csrf_su)") + src.count("Depends(require_csrf_admin)")
-print(f"   Старых require_*: {old_count} (включая GET-роуты — это нормально)")
-print(f"   Новых require_csrf_*: {old_csrf}")
+    FastAPI кладёт в app.routes объект _IncludedRouter, а сами роуты прячет
+    в его original_router.routes. Без обхода счётчик видит только то, что
+    объявлено в самом create_app — после декомпозиции это ноль.
+    """
+    from starlette.routing import Route
+    for r in routes:
+        if isinstance(r, Route):
+            yield r
+        elif hasattr(r, "original_router"):
+            yield from _walk(r.original_router.routes)
 
-print("7. Проверка TRUSTED_PROXIES env...")
-print(f"   _TRUSTED_PROXIES = {web_app._TRUSTED_PROXIES}")
+
+_routes = list(_walk(app.routes))
+print(f"   OK, роутов: {len(_routes)}")
+assert len(_routes) >= 50, f"роутов подозрительно мало: {len(_routes)}"
+
+print("4. POST-роуты на месте...")
+_post = [r.path for r in _routes if r.methods and "POST" in r.methods]
+print(f"   POST-роутов: {len(_post)}")
+assert len(_post) >= 30, f"POST-роутов подозрительно мало: {len(_post)}"
+
+print("5. Хелперы авторизации доступны...")
+assert callable(web_app._csrf_token_for_username), "нет _csrf_token_for_username"
+assert web_app._csrf_token_for_username("su"), "пустой CSRF-токен для su"
 print(f"   CSRF token for 'su': {web_app._csrf_token_for_username('su')[:16]}...")
+
+print("6. TRUSTED_PROXIES прочитан...")
+assert hasattr(web_app, "_TRUSTED_PROXIES"), "нет _TRUSTED_PROXIES"
+print(f"   _TRUSTED_PROXIES = {web_app._TRUSTED_PROXIES}")
 
 print("\nALL OK")
