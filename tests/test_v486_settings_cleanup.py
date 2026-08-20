@@ -43,10 +43,14 @@ print("  ✓ app создан")
 # _bot_info — вложенная функция, её нет в public API. Достаём через reflection.
 # Альтернатива: вызвать /admin/settings через TestClient, но это требует auth.
 # Проще: проверить что в исходнике есть нужные поля.
+# v4.9.0 (Task 8): _bot_info() переехал в web/admin_settings.py — проверяем там.
 print("\n[4/7] Проверка исходника _bot_info() на новые поля...")
 src_path = _P("web_app.py")
 with open(src_path, "r") as f:
     src = f.read()
+src2_path = _P("web/admin_settings.py")
+with open(src2_path, "r") as f:
+    src2 = f.read()
 required_in_src = [
     "_APP_START_TIME",
     "memory_rss_bytes",
@@ -56,11 +60,12 @@ required_in_src = [
     "VmRSS",
 ]
 for token in required_in_src:
-    assert token in src, f"В исходнике отсутствует: {token}"
+    assert token in src2, f"В исходнике отсутствует: {token}"
     print(f"  ✓ найдено: {token}")
 
 # Проверка что psutil больше не используется
 assert "import psutil" not in src, "psutil всё ещё импортируется!"
+assert "import psutil" not in src2, "psutil всё ещё импортируется!"
 print("  ✓ import psutil удалён")
 
 # 5. admin_settings.html
@@ -91,12 +96,14 @@ assert "project_status_option_name" in tpl, "project_status_option_name поле
 print("  ✓ GitHub Projects блок сохранён")
 
 # 6. db_path не передаётся
+# v4.9.0 (Task 8): admin_settings_page() переехал в web/admin_settings.py —
+# TemplateResponse ищем там.
 print("\n[6/7] Проверка что db_path убран из контекста...")
 # Ищем блок с TemplateResponse для admin_settings
 import re
 m = re.search(
     r'return templates\.TemplateResponse\("admin_settings\.html", \{(.*?)\}\)',
-    src,
+    src2,
     re.DOTALL,
 )
 assert m, "Не найден TemplateResponse для admin_settings.html"
@@ -106,8 +113,10 @@ assert '"db_path_dir"' in ctx_block, "db_path_dir должен оставать�
 print('  ✓ db_path убран, db_path_dir остался')
 
 # 7. sys импортирован
+# v4.9.0 (Task 8): sys нужен _bot_info() (sys.version) — переехал вместе с
+# хелпером в web/admin_settings.py, в web_app.py стал бы неиспользуемым.
 print("\n[7/7] Проверка import sys...")
-assert "import sys" in src, "import sys не найден"
+assert "import sys" in src2, "import sys не найден"
 print("  ✓ import sys добавлен")
 
 print("\n" + "=" * 60)

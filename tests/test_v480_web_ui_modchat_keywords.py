@@ -32,6 +32,18 @@ os.environ.setdefault("SESSION_SECRET", "test-session-secret-1234567890")
 os.environ.setdefault("DB_PATH", ":memory:")
 
 WEB_APP_PY = ROOT / "web_app.py"
+# v4.9.0 (Task 5): роуты /admin/keywords* переехали из web_app.py в
+# web/admin_keywords.py. Структурные проверки, читавшие их из web_app.py,
+# переадресованы на новый файл — смысл проверок сохранён дословно.
+ADMIN_KEYWORDS_PY = ROOT / "web" / "admin_keywords.py"
+# v4.9.0 (Task 9): /admin/users* переехали из web_app.py в web/admin_users.py.
+ADMIN_USERS_PY = ROOT / "web" / "admin_users.py"
+# v4.9.0 (Task 10): /admin/presets* переехали из web_app.py в
+# web/admin_presets.py.
+ADMIN_PRESETS_PY = ROOT / "web" / "admin_presets.py"
+# v4.9.0 (Task 11): /admin/chats* (включая admin_chats_toggle) переехали
+# из web_app.py в web/admin_chats.py.
+ADMIN_CHATS_PY = ROOT / "web" / "admin_chats.py"
 ADMIN_CHATS_HTML = ROOT / "templates" / "admin_chats.html"
 ADMIN_KEYWORDS_HTML = ROOT / "templates" / "admin_keywords.html"
 BASE_HTML = ROOT / "templates" / "base.html"
@@ -47,16 +59,20 @@ def _read(p: Path) -> str:
 # ============================================================================
 
 class TestWebAppStructure(unittest.TestCase):
-    """Проверка, что в web_app.py есть новые маршруты и toggle field."""
+    """Проверка, что в web/admin_chats.py есть новые маршруты и toggle field.
+
+    v4.9.0 (Task 11): admin_chats_toggle переехал из web_app.py в
+    web/admin_chats.py — источник для тестов 01-04 переадресован туда.
+    """
 
     def setUp(self):
-        self.src = _read(WEB_APP_PY)
+        self.src = _read(ADMIN_CHATS_PY)
 
     def test_01_mod_chat_in_valid_fields(self):
         """'mod_chat' должен быть в valid_fields set у toggle endpoint."""
         # Найдём valid_fields set literal
         m = re.search(r'valid_fields\s*=\s*\{([^}]+)\}', self.src)
-        self.assertIsNotNone(m, "valid_fields set not found in web_app.py")
+        self.assertIsNotNone(m, "valid_fields set not found in web/admin_chats.py")
         contents = m.group(1)
         self.assertIn("mod_chat", contents,
                       "'mod_chat' must be in valid_fields set for toggle endpoint")
@@ -72,7 +88,7 @@ class TestWebAppStructure(unittest.TestCase):
         try:
             tree = ast.parse(self.src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_chats.py has syntax error: {e}")
 
         toggle_body = None
         for node in ast.walk(tree):
@@ -87,8 +103,11 @@ class TestWebAppStructure(unittest.TestCase):
         self.assertIsNotNone(toggle_body, "admin_chats_toggle not found")
         # Проверим, что в теле есть упоминание is_report_chat в контексте mod_chat
         # Ищем фрагмент между `if field == "mod_chat":` и концом блока.
+        # v4.9.0 (Task 11): функция больше не вложена в create_app (была на
+        # 12 пробелах отступа), теперь она модульная (8 пробелов) — регекс
+        # подстроен под новый уровень отступа, смысл проверки тот же.
         m = re.search(
-            r'if field == "mod_chat":(.*?)(?=\n            cs\.updated_at|\n            await session\.commit)',
+            r'if field == "mod_chat":(.*?)(?=\n        cs\.updated_at|\n        await session\.commit)',
             toggle_body,
             re.DOTALL,
         )
@@ -104,7 +123,7 @@ class TestWebAppStructure(unittest.TestCase):
         try:
             tree = ast.parse(self.src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_chats.py has syntax error: {e}")
 
         toggle_body = None
         for node in ast.walk(tree):
@@ -118,8 +137,10 @@ class TestWebAppStructure(unittest.TestCase):
 
         self.assertIsNotNone(toggle_body, "admin_chats_toggle not found")
         # Найдём ветку report_chat
+        # v4.9.0 (Task 11): отступ подстроен под модульную функцию (8 пробелов
+        # вместо 12 у вложенной в create_app), смысл проверки тот же.
         m = re.search(
-            r'elif field == "report_chat":(.*?)(?=\n            # v4\.8\.0|\n            if field == "mod_chat"|\n            cs\.updated_at)',
+            r'elif field == "report_chat":(.*?)(?=\n        # v4\.8\.0|\n        if field == "mod_chat"|\n        cs\.updated_at)',
             toggle_body,
             re.DOTALL,
         )
@@ -129,11 +150,17 @@ class TestWebAppStructure(unittest.TestCase):
                       "report_chat branch must check is_mod_chat for mutual exclusion")
 
     def test_05_keyword_routes_exist(self):
-        """Должны быть 4 маршрута: GET /admin/keywords, POST add/delete/toggle-ban-night."""
+        """Должны быть 4 маршрута: GET /admin/keywords, POST add/delete/toggle-ban-night.
+
+        v4.9.0 (Task 5): роуты переехали в web/admin_keywords.py, декоратор
+        сменился с @app.get/@app.post на @router.get/@router.post. Смысл
+        проверки прежний — читаем из нового файла.
+        """
+        kw_src = _read(ADMIN_KEYWORDS_PY)
         try:
-            tree = ast.parse(self.src)
+            tree = ast.parse(kw_src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_keywords.py has syntax error: {e}")
 
         route_paths = []
         for node in ast.walk(tree):
@@ -163,11 +190,17 @@ class TestWebAppStructure(unittest.TestCase):
                       "POST /admin/keywords/.../toggle-ban-night route missing")
 
     def test_06_keyword_routes_use_require_su(self):
-        """Все keyword маршруты должны использовать require_su, а не require_admin."""
+        """Все keyword маршруты должны использовать require_su, а не require_admin.
+
+        v4.9.0 (Task 5): роуты переехали в web/admin_keywords.py — без
+        переадресации этот тест молча не находил бы ни одной функции
+        (0 итераций цикла) и проходил бы, ничего не проверяя.
+        """
+        kw_src = _read(ADMIN_KEYWORDS_PY)
         try:
-            tree = ast.parse(self.src)
+            tree = ast.parse(kw_src)
         except SyntaxError as e:
-            self.fail(f"web_app.py has syntax error: {e}")
+            self.fail(f"web/admin_keywords.py has syntax error: {e}")
 
         # Найдём функции и их параметры Depends
         for node in ast.walk(tree):
@@ -192,7 +225,7 @@ class TestWebAppStructure(unittest.TestCase):
                 # Подстрокой одно в другом не содержится ("require_" + "csrf_su"),
                 # поэтому принимаем оба имени.
                 for default in node.args.defaults:
-                    src_lines = _read(WEB_APP_PY).splitlines()
+                    src_lines = kw_src.splitlines()
                     if hasattr(default, "lineno"):
                         line = src_lines[default.lineno - 1]
                         if "require_su" in line or "require_csrf_su" in line:
@@ -203,9 +236,15 @@ class TestWebAppStructure(unittest.TestCase):
                     f"(found defaults: {node.args.defaults})")
 
     def test_07_keywordwatch_imported(self):
-        """KeywordWatch должен быть импортирован из db."""
-        # Ищем `from db import (... KeywordWatch ...)`
-        m = re.search(r'from db import \(([^)]+)\)', self.src, re.DOTALL)
+        """KeywordWatch должен быть импортирован из db.
+
+        v4.9.0 (Task 5): импорт переехал в web/admin_keywords.py, где
+        принят однострочный стиль (`from db import KeywordWatch,
+        async_session`, без скобок) — как в web/admin_bans.py. Регекс
+        подогнан под этот стиль, смысл проверки прежний.
+        """
+        kw_src = _read(ADMIN_KEYWORDS_PY)
+        m = re.search(r'from db import ([^\n]+)', kw_src)
         self.assertIsNotNone(m, "from db import block not found")
         self.assertIn("KeywordWatch", m.group(1),
                       "KeywordWatch must be imported from db")
@@ -439,8 +478,10 @@ class TestKeywordWebRoutesBehavior(unittest.TestCase):
         # Импортируем модули один раз
         import web_app
         import db
+        import web.admin_keywords
         cls._web_app = web_app
         cls._db = db
+        cls._admin_keywords = web.admin_keywords
         # Создаём тестовое приложение
         cls._app = web_app.create_app()
 
@@ -467,6 +508,16 @@ class TestKeywordWebRoutesBehavior(unittest.TestCase):
         web_app_patcher = patch.object(self._web_app, "async_session", self.AsyncSessionLocal)
         web_app_patcher.start()
         self.addCleanup(web_app_patcher.stop)
+
+        # v4.9.0 (Task 5): /admin/keywords* переехали в web/admin_keywords.py,
+        # у которого async_session — свой импортированный символ, отдельный
+        # от web_app.async_session. Без этого патча роуты читали бы боевую
+        # БД мимо тестовой in-memory.
+        admin_keywords_patcher = patch.object(
+            self._admin_keywords, "async_session", self.AsyncSessionLocal
+        )
+        admin_keywords_patcher.start()
+        self.addCleanup(admin_keywords_patcher.stop)
 
         # Создаём схему
         async def _init():
@@ -816,8 +867,10 @@ class TestModChatToggleBehavior(unittest.TestCase):
     def setUpClass(cls):
         import web_app
         import db
+        import web.admin_chats
         cls._web_app = web_app
         cls._db = db
+        cls._admin_chats = web.admin_chats
         cls._app = web_app.create_app()
 
     def setUp(self):
@@ -836,6 +889,16 @@ class TestModChatToggleBehavior(unittest.TestCase):
         web_app_patcher = patch.object(self._web_app, "async_session", self.AsyncSessionLocal)
         web_app_patcher.start()
         self.addCleanup(web_app_patcher.stop)
+
+        # v4.9.0 (Task 11): /admin/chats/{id}/toggle переехал в
+        # web/admin_chats.py, у которого async_session — свой импортированный
+        # символ, отдельный от web_app.async_session. Без этого патча роут
+        # читал бы боевую БД мимо тестовой in-memory.
+        admin_chats_patcher = patch.object(
+            self._admin_chats, "async_session", self.AsyncSessionLocal
+        )
+        admin_chats_patcher.start()
+        self.addCleanup(admin_chats_patcher.stop)
 
         async def _init():
             async with self.engine.begin() as conn:
@@ -1051,8 +1114,12 @@ class TestNoRegression(unittest.TestCase):
     """Существующие поля toggle не сломаны после добавления mod_chat."""
 
     def test_80_existing_toggle_fields_preserved(self):
-        """Все 7 существующих полей toggle должны остаться в valid_fields."""
-        src = _read(WEB_APP_PY)
+        """Все 7 существующих полей toggle должны остаться в valid_fields.
+
+        v4.9.0 (Task 11): admin_chats_toggle переехал из web_app.py в
+        web/admin_chats.py — источник переадресован туда.
+        """
+        src = _read(ADMIN_CHATS_PY)
         m = re.search(r'valid_fields\s*=\s*\{([^}]+)\}', src)
         self.assertIsNotNone(m)
         contents = m.group(1)
@@ -1062,23 +1129,33 @@ class TestNoRegression(unittest.TestCase):
                           f"Existing field '{field}' must still be in valid_fields")
 
     def test_81_all_old_routes_still_exist(self):
-        """Все старые /admin/* маршруты на месте."""
-        try:
-            tree = ast.parse(_read(WEB_APP_PY))
-        except SyntaxError as e:
-            self.fail(f"Syntax error: {e}")
+        """Все старые /admin/* маршруты на месте.
 
+        v4.9.0 (Task 9): /admin/users и /admin/users/create переехали в
+        web/admin_users.py (декоратор @router.get/@router.post вместо
+        @app.get/@app.post). v4.9.0 (Task 10): /admin/presets и
+        /admin/presets/create переехали в web/admin_presets.py той же
+        схемой. v4.9.0 (Task 11): все /admin/chats* переехали в
+        web/admin_chats.py. Собираем маршруты из всех файлов — смысл
+        проверки прежний, изменился только источник для переехавших путей.
+        """
         route_paths = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef):
-                for dec in node.decorator_list:
-                    if isinstance(dec, ast.Call):
-                        if isinstance(dec.func, ast.Attribute):
-                            attr = dec.func.attr
-                            if attr in ("get", "post") and dec.args:
-                                first_arg = dec.args[0]
-                                if isinstance(first_arg, ast.Constant):
-                                    route_paths.add(first_arg.value)
+        for path in (WEB_APP_PY, ADMIN_USERS_PY, ADMIN_PRESETS_PY, ADMIN_CHATS_PY):
+            try:
+                tree = ast.parse(_read(path))
+            except SyntaxError as e:
+                self.fail(f"Syntax error in {path}: {e}")
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AsyncFunctionDef):
+                    for dec in node.decorator_list:
+                        if isinstance(dec, ast.Call):
+                            if isinstance(dec.func, ast.Attribute):
+                                attr = dec.func.attr
+                                if attr in ("get", "post") and dec.args:
+                                    first_arg = dec.args[0]
+                                    if isinstance(first_arg, ast.Constant):
+                                        route_paths.add(first_arg.value)
 
         expected_routes = [
             "/admin/users",
@@ -1132,13 +1209,27 @@ class TestSmokeAppCreation(unittest.TestCase):
         self.assertIsInstance(app, FastAPI, "create_app must return FastAPI instance")
 
     def test_91_all_keyword_routes_registered(self):
-        """Все 4 keyword-маршрута зарегистрированы в приложении."""
+        """Все 4 keyword-маршрута зарегистрированы в приложении.
+
+        v4.9.0 (Task 5): роуты подключаются через app.include_router(...),
+        а Starlette 1.6 кладёт в app.routes не сами Route, а обёртку
+        _IncludedRouter — плоский обход через hasattr(route, "path") их
+        больше не видит. Разворачиваем так же, как test_v490_decomposition.py
+        (_walk): смысл проверки прежний, изменился только способ дойти
+        до реальных Route.
+        """
+        from starlette.routing import Route
         import web_app
+
+        def _walk(routes):
+            for r in routes:
+                if isinstance(r, Route):
+                    yield r
+                elif hasattr(r, "original_router"):
+                    yield from _walk(r.original_router.routes)
+
         app = web_app.create_app()
-        paths = set()
-        for route in app.routes:
-            if hasattr(route, "path"):
-                paths.add(route.path)
+        paths = {r.path for r in _walk(app.routes)}
         self.assertIn("/admin/keywords", paths)
         self.assertIn("/admin/keywords/add", paths)
         self.assertIn("/admin/keywords/{keyword_id:int}/delete", paths)

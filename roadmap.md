@@ -2,7 +2,11 @@
 
 > Компиляция из трёх исходников: `ROADMAP_v4.8.x.md`, `ROADMAP_v4.9.0.md`,
 > `ROADMAP_v5.0.0.md`. Собрано в единый документ для удобной навигации.
-> Дата компиляции: 16 августа 2026.
+> Дата компиляции: 16 августа 2026. Сверено с кодом: 17 августа 2026.
+>
+> **Фактический источник истины по релизам — changelog в
+> `templates/base.html`**: он подробнее и обновляется с каждым релизом.
+> Этот документ описывает планы; отметки ✅/⚠️/❌ проставлены по факту сверки.
 
 ---
 
@@ -18,7 +22,9 @@
 - `db.py` — SQLite, SQLAlchemy async.
 - Модели: `User`, `Moderator`, `Punishment`, `ChatAdmin`, `ChatSettings`,
   `PermissionPreset`, `WebUser`, `KeywordWatch`, `LinkAllowlist`,
-  `BannedStickerPack`, `Base` (без `WordFilter` после v4.8.1).
+  `BannedStickerPack`, `WordFilter`, `Base`.
+  (`WordFilter` планировалось удалить в v4.8.1/v4.8.6 — решение отменено,
+  см. §3.2 и §8.)
 - Модули v4.8.x: `chat_modes.py`, `modchat.py`, `sticker_cache.py`.
   `backup.py` (B2-бэкапы) — отложен в v5.0.0.
 
@@ -36,9 +42,15 @@
 | v4.8.2 | Актуализация `/help` после реформы команд | ✅ релизнут 9 авг. 2026 |
 | v4.8.3 | Бан по @username/TGID + стикер/скриншот inline в отчёте | ✅ релизнут 11 авг. 2026 |
 | v4.8.4 | Прогрессивные автомьюты | ✅ релизнут 13 авг. 2026 |
-| v4.8.5 | `!idea` → GitHub Issue + GitHub Project, настройка через веб-панель | 📋 запланировано |
-| v4.8.6 | Финальная чистка, чистка вкладки Settings, подготовка MAJOR bump | 📋 запланировано |
-| v4.9.0 | Рефакторинг + behavioral-тесты + запросы модераторов (ждём совещания) | ⏳ ожидание совещания |
+| v4.8.5 | `!idea` → GitHub Issue + GitHub Project, настройка через веб-панель | ✅ релизнут + 4 хотфикса |
+| v4.8.6 | Финальная чистка, чистка вкладки Settings, подготовка MAJOR bump | ⚠️ релизнут частично (см. §8) |
+| v4.8.7 | Security + reliability: `tg_safe_call`, TTL сессии, `to_thread` на блокирующем I/O | ✅ релизнут |
+| v4.8.8 | CSRF на POST-роутах + `TRUSTED_PROXIES` для `X-Forwarded-For` | ✅ релизнут |
+| v4.8.9 | Декомпозиция, `app_state.py`, uv, Python 3.14, Alembic (выключен) | ✅ релизнут + 2 хотфикса |
+| v4.8.10 | Завершение декомпозиции `handle_group_command` + `!mywarns` | ✅ релизнут |
+| v4.8.11 | Починки `!mywarns`, разбан требует привязки TG, сюита + CI | ✅ релизнут 17 авг. 2026 |
+| v4.8.12 | FastAPI 0.115.6 → 0.141.1, Starlette 0.41 → 1.6 | ✅ релизнут 17 авг. 2026 |
+| v4.9.0 | `!mywarns` отвечает ephemeral в чате вместо DM | ✅ релизнут 19 авг. 2026 |
 | v5.0.0 | Bot Self-Awareness & Bothost Integration (самодиагностика, рестарт, логи, health) | 📋 скелет готов |
 
 **Логика переноса задач:** всё, что требует обсуждения с командой/модераторами
@@ -120,12 +132,21 @@
 порогам warn→mute→ban, CAS/link-filter бан, keyword-watch.
 
 **Файлы:** `bot_handlers.py`, `templates/base.html`,
-`scripts/test_v481_command_reform.py`. **Оценка:** ~1.5 дня.
+`tests/test_v481_command_reform.py`. **Оценка:** ~1.5 дня.
 
-### 3.2. Удаление deprecated word_filter
+### 3.2. Удаление deprecated word_filter — ❌ ОТМЕНЕНО
 
-Удалить из кода использование модели `WordFilter`, `handle_word_filter` и
-связанные функции; таблицу в БД оставить для истории. **Оценка:** ~0.5 дня.
+Планировалось удалить модель `WordFilter`, `handle_word_filter` и связанные
+функции. **Решение развёрнуто:** модель осталась активной и управляется через
+`/admin/presets` (секция «Запрещённые слова (Word Filter)»); CRUD живой в
+`web_app.py`, данные в `db.py`.
+
+Удалены только bot-команды `/addword`, `/delword`, `/listwords` (v4.8.1/v4.8.6)
+— слова ведутся через веб-панель, а в чатах их роль закрывает KeywordWatch.
+Из `handle_content_filters` word filter убран целиком.
+
+Issue #7 закрыт при отменённом решении — стоит оставить в нём комментарий,
+иначе следующий читатель снова пойдёт удалять модель.
 
 ### 3.3. Web unban — новая вкладка «Active bans» (#3)
 
@@ -137,7 +158,7 @@ Batch-unban и авто-уведомление юзера — не делаем.
 
 **Файлы:** `web_app.py`, `templates/admin_bans.html` (NEW), `bot_handlers.py`
 (вынос логики `!unban` в переиспользуемую функцию), `db.py`,
-`scripts/test_v481_web_unban.py`. **Оценка:** ~2 дня.
+`tests/test_v481_web_unban.py`. **Оценка:** ~2 дня.
 
 ### 3.4. Ослабление version-mismatch тестов
 
@@ -169,7 +190,7 @@ Batch-unban и авто-уведомление юзера — не делаем.
 - Добавили ссылку на `/admin/bans`.
 - Опционально сверили с `/sanitary`, `/nightmode`, `/warndecay`, `!alarm`.
 
-**Тесты:** `scripts/test_v482_help_actualization.py`.
+**Тесты:** отдельного файла нет — актуальность `/help` покрыта `tests/test_v4832_help_rich.py` (Rich Message) и `tests/test_v479_moderator_help.py`.
 **Примечание:** задача GitHub sync сайта правил (#11) перенесена в v4.9.0.
 **Оценка:** ~0.3 дня.
 
@@ -213,9 +234,9 @@ Batch-unban и авто-уведомление юзера — не делаем.
 
 **Файлы:** `bot_handlers.py`, `sticker_cache.py` (NEW),
 `requirements.txt` (+Pillow, +rlottie-python),
-`scripts/test_v483_ban_by_username.py`,
-`scripts/test_v483_sticker_inline_in_report.py`,
-`scripts/test_v483_screenshot_in_report.py`.
+`tests/test_v483_ban_by_username.py`,
+`tests/test_v483_sticker_inline_in_report.py`,
+`tests/test_v483_screenshot_in_report.py`.
 **Примечание:** B2-бэкап перенесён в v5.0.0.
 **Оценка:** ~3.2 дня.
 
@@ -245,7 +266,7 @@ Batch-unban и авто-уведомление юзера — не делаем.
   бесконечно, кэпа и автобана после N мутов нет; счётчик per-chat.
 
 **Файлы:** `db.py` (модель `AutomuteCounter`), `bot_handlers.py`, `web_app.py`,
-`templates/base.html`, `scripts/test_v484_progressive_automutes.py`.
+`templates/base.html`, `tests/test_v484_progressive_automutes.py`.
 **Оценка:** ~1 день.
 
 ---
@@ -297,18 +318,21 @@ idea_text, github_issue_url, github_issue_number, created_at, bot_version`.
 
 1. **Баг-фиксы**, накопленные за v4.8.3.x–v4.8.4 из продакшена.
 2. **Удаление неиспользуемого кода:**
-   - Окончательное удаление модели/таблицы `WordFilter` (после backup;
-     deprecated с v4.8.0, код убран в v4.8.1).
-   - Stub-команды `/addword`, `/delword`, `/listwords`, если ещё есть.
-   - Мёртвый код (через lint/codecov), устаревшие TODO/комментарии.
-3. **Чистка логов и документации:** унификация комментариев, финальная
-   проверка changelog в `base.html`, удаление debug-`print`.
-4. **Подготовка к v5.0.0:** активация `ROADMAP_v5.0.0.md`, перенос
-   оставшихся пунктов из `ROADMAP_v4.8.0.md`, архивация `ROADMAP_v4.8.x.md`.
-   TGS-апгрейд (`rlottie-python` → `lottie + cairosvg`) — опционально, если
-   fallback в проде окажется частым.
-5. **Полный регресс-прогон тестов** перед MAJOR bump.
-6. **Чистка вкладки Settings в веб-панели:** удалить неиспользуемые поля
+   - ❌ **отменено** — окончательное удаление модели/таблицы `WordFilter`.
+     Модель активна и управляется через `/admin/presets`, см. §3.2.
+   - ✅ Stub-команды `/addword`, `/delword`, `/listwords` удалены.
+   - ⏳ Мёртвый код, устаревшие TODO/комментарии — частично: ruff подключён
+     (`uv run ruff check .`), сплошной ревизии не было.
+3. **Чистка логов и документации:** ⚠️ частично. Changelog в `base.html`
+   ведётся, но debug-`print` остались: `db.py:1360` и четыре
+   диагностических `print` в `run_migrations_async` (`db.py:1477-1484`,
+   добавлены хотфиксом v4.8.9.2).
+4. **Подготовка к v5.0.0:** ⏳ каталог `roadmaps/` на месте, архивации и
+   переноса не было. TGS-апгрейд не делался.
+5. **Полный регресс-прогон тестов** перед MAJOR bump — ✅ **возможен**:
+   `uv run python tools/run_tests.py`, 64 файла. На момент написания этого
+   пункта тестов в репозитории не было вовсе.
+6. **Чистка вкладки Settings в веб-панели:** ✅ сделано. Удалить неиспользуемые поля
    (в т.ч. word_filter-настройки), убрать дубликаты, сгруппировать по
    блокам (Модерация/Уведомления/Интеграции/Прочее), привести к единому
    стилю. Настройки GitHub Projects (из v4.8.5) — оставить как есть.
@@ -321,11 +345,15 @@ idea_text, github_issue_url, github_issue_number, created_at, bot_version`.
 
 ---
 
-## 9. v4.9.0 — Рефакторинг + запросы модераторов ⏳
+## 9. v4.9.0 — Рефакторинг + запросы модераторов ✅
 
-**Статус:** ожидание совещания команды (Бабай + модераторы). На момент
-компиляции — совещание не состоялось (один модератор на работе, у второго
-съёмки, дата TBD).
+**Статус:** релизнут 19 августа 2026. §1 (рефакторинг + behavioral-тесты) и
+§2.1 (`!mywarns`) закрылись досрочно ещё в v4.8.9–v4.8.11, так что в самой
+v4.9.0 доехала починка адресации `!mywarns`: ответ в группе уходит ephemeral
+в тот же чат вместо DM.
+
+Совещание команды (Бабай + модераторы) так и не состоялось, поэтому пункты
+§2.2 и далее не сформированы — они переезжают в следующий MINOR.
 
 ### 9.1. §1 — Рефакторинг + behavioral-тесты (перенесено из v4.8.4)
 
@@ -333,23 +361,42 @@ idea_text, github_issue_url, github_issue_number, created_at, bot_version`.
 остался чисто баг-фикс патчем; рефакторинг логичнее делать вместе с
 архитектурными изменениями MINOR-цикла.
 
-1. **Перенос `_alarm_auto_off_tick`** из `bot.py` в `bot_handlers.py`
-   (уменьшение coupling между точкой входа и бизнес-логикой). Другие тики
-   (`_night_mode_tick`, `_sanitary_day_tick`) не трогаем. **~0.5 дня.**
-2. **Расширение behavioral-тестов веб-панели** — `TestClient` (FastAPI) +
-   in-memory SQLite + `StaticPool`. Покрыть: `/admin/bans`, `/admin/keywords`,
-   `/api/unban`, toggle-эндпоинты чатов. Сценарии: SU-only доступ,
-   unauthenticated → redirect, invalid input, edge cases, Telegram API
-   failure. **~1 день.**
-3. **Баг-фиксы, накопленные** за v4.8.x. **~0.5 дня.**
+1. ✅ **Перенос `_alarm_auto_off_tick`** — сделано в v4.8.9, но в
+   `chat_modes.py`, а не в `bot_handlers.py`: режимы чата — её домен.
+   Заодно снят хак `sys.modules.setdefault("bot", ...)`, вместо него
+   service locator `app_state.py`.
+2. ✅ **Behavioral-тесты веб-панели** — покрыты `/admin/bans`,
+   `/admin/keywords`, `/api/unban`, toggle-эндпоинты. Сюита целиком:
+   64 файла, 1329 тестов, `uv run python tools/run_tests.py`.
+3. ⏳ **Баг-фиксы, накопленные** за v4.8.x — по мере поступления.
 
-**Итого §1:** ~2 дня.
+**Статус §1:** пункты 1–2 закрыты досрочно в v4.8.9–v4.8.11.
 
 ### 9.2. §2 — Запросы модераторов
 
-**2.1. Самопроверка варнов обычными юзерами** (запрос @Gleb, 11 августа 2026,
-через бустерский чат) — единственный уже зафиксированный запрос, остальные
-ждут совещания.
+**2.1. Самопроверка варнов обычными юзерами** ✅ **РЕАЛИЗОВАНО** (запрос
+@Gleb, 11 августа 2026, через бустерский чат).
+
+Вышло досрочно в v4.8.10 как `!mywarns` (не `/mywarns`). Дизайн ниже описывает
+предложение на момент планирования; фактическое поведение: в группе команда
+удаляется и сводка уходит в личку, в личке — сводка по всем чатам,
+per-user per-chat таймаут 5 минут silent. Причины и авторов варнов не
+показывает, только количество и дату последнего.
+
+В v4.8.11 починены четыре дефекта: приватность при таймауте (команда не
+удалялась), утечка памяти в реестре таймаутов, отсутствие `tg_safe_call`,
+английский месяц в дате. Покрыта 13 тестами.
+
+В v4.9.0 починена адресация ответа. Сводка уходила в DM, а DM в Telegram
+невозможен, пока юзер сам не запустил бота — при том что `/start` открыт
+только модераторам (осознанное решение, менять его не планируется). Обычный
+участник, ради которого фича делалась, вводил команду и не получал ничего.
+Теперь ответ — ephemeral-сообщение в тот же чат: `/start` не нужен, видит его
+только автор команды, авто-удаление через 30 секунд. Публичного фолбэка нет
+намеренно — при отказе ephemeral бот молчит, а не публикует варны всему чату.
+
+Осталось решить: анонсировать ли модераторам (пока «пробная фича») и нужен
+ли алиас `/mywarns` к `!mywarns`.
 
 - **Проблема:** сейчас `!warns` доступен только модераторам (reply-only,
   guard `_is_admin`), результат уходит модератору в DM. Юзеры регулярно
@@ -370,7 +417,7 @@ idea_text, github_issue_url, github_issue_number, created_at, bot_version`.
 
 **Файлы:** `bot_handlers.py` (regex `_CMD_MYWARNS`, handler `cmd_mywarns`,
 хелперы `_format_user_warns_summary`/`_format_user_warns_for_chat`),
-help-тексты, `templates/base.html`, `scripts/test_v490_mywarns.py`.
+help-тексты, `templates/base.html`, `tests/test_v4811_mywarns.py`.
 
 **Оценка:** ~1 день. **Приоритет:** высокий (простой запрос, частая боль
 модераторов).
@@ -381,8 +428,9 @@ help-тексты, `templates/base.html`, `scripts/test_v490_mywarns.py`.
 
 ### 9.3. Деплой v4.9.0
 
-Полный релиз `ded-vobzhak-4.9.0.zip`, дельта от v4.8.5, тесты, changelog —
-всё в `/home/z/my-project/download/`. `APP_VERSION = "v4.9.0"`.
+По общей схеме из §12: ветка → PR → `main`, CI прогоняет ruff, сюиту и
+`docker build`. `APP_VERSION = "v4.9.0"` в `web_app.py` и `pyproject.toml`,
+changelog — в `templates/base.html`.
 
 ---
 
@@ -468,7 +516,7 @@ JSON: `status(ok/degraded/down)`, `bot_id`, `container_id`, `version`,
 Класс `BothostAgent`: авто-детект URL агента (`BOTHOST_AGENT_URL` →
 `agent:8000` → `agent.bothost.ru`), методы `restart_self()`, `get_stats()`,
 `get_logs(lines)`, `close()`. Используется в задачах 02/03/04/05.
-(Полный код-скелет — в исходном `Roadmap_5_0_0.md`.)
+(Полный код-скелет — в исходном `roadmaps/ROADMAP_v5.0.0_self_awareness.md`.)
 
 ---
 
@@ -495,25 +543,43 @@ JSON: `status(ok/degraded/down)`, `bot_id`, `container_id`, `version`,
 
 ## 12. Деплой (общая схема для всех версий)
 
-Каждая версия собирается по единой схеме:
-- Полный релиз: `ded-vobzhak-{VERSION}.zip`.
-- Дельта от предыдущей версии: `ded-vobzhak-{VERSION}_delta_from_{PREV}.zip`.
-- Тесты: `ded-vobzhak-{VERSION}_tests.zip`.
-- Changelog: `ded-vobzhak-{VERSION}_CHANGES.md`.
+Деплой идёт через git + Docker, без сборки архивов.
 
-Все архивы — в `/home/z/my-project/download/`. Версия бампается в
-`web_app.py: APP_VERSION`.
+- Ветка `dev` → PR → `main`. CI (`.github/workflows/ci.yml`) на каждый push и
+  PR гоняет `ruff check`, всю сюиту (`tools/run_tests.py`) и `docker build`.
+- Прод собирается из `Dockerfile`: `python:3.14.7-slim` + `uv sync --frozen`
+  из `uv.lock`. Зависимости фиксируются локом, `requirements.txt` удалён.
+- Версия бампается в `web_app.py: APP_VERSION` и дублируется в
+  `pyproject.toml`; changelog пишется в `templates/base.html`.
+- На проде обязателен `DB_USE_LEGACY_MIGRATIONS=1` — Alembic выключен
+  (см. §8).
+
+Прежняя схема с zip-архивами в `/home/z/my-project/download/` была артефактом
+среды, в которой генерировался этот документ, и к репозиторию отношения не
+имела.
 
 ---
 
 ## 13. Итого — что дальше по хронологии
 
-1. ✅ v4.8.1 → v4.8.4 — релизнуты (8–13 августа 2026).
-2. 📋 v4.8.5 — `!idea` → GitHub, следующая в очереди на реализацию.
-3. 📋 v4.8.6 — финальная чистка перед мажорным апдейтом.
-4. ⏳ v4.9.0 — рефакторинг (§1, ~2 дня, можно начинать без совещания) +
-   §2.1 «/mywarns» (готов дизайн, ждёт подтверждения деталей от
-   пользователя) + остальные пункты §2 ждут совещания модераторов.
-5. 📋 v5.0.0 — Bot Self-Awareness & Bothost Integration, порядок внедрения
+1. ✅ v4.8.1 → v4.8.12 — релизнуты (8–17 августа 2026).
+2. ✅ v4.9.0 — релизнут 19 августа 2026. §1 и §2.1 закрылись досрочно в
+   v4.8.9–v4.8.11, в самой версии — починка адресации `!mywarns` (ephemeral
+   в чате вместо DM) и ретрай на flood control внутри `_send_ephemeral`.
+   Остальные пункты §2 по-прежнему ждут совещания модераторов; по `!mywarns`
+   нужно решить, анонсировать ли его.
+3. 📋 v5.0.0 — Bot Self-Awareness & Bothost Integration, порядок внедрения
    расписан в §10.1 (начать с 5.0.0-01 и 5.0.0-07 — низкий риск и нет
-   зависимостей).
+   зависимостей). 5.0.0-01 уже сделан досрочно в v4.8.6 (`_bot_info()`);
+   5.0.0-07 частично: `/health` есть, но без memory/latency/503.
+
+**Долги, не привязанные к версии:**
+
+- Alembic добавлен в v4.8.9, но выключен: прод работает через
+  `DB_USE_LEGACY_MIGRATIONS=1`. Включать только после проверки на staging —
+  auto-stamp на существующей БД дважды ронял прод.
+- `create_app()` разобран на 7 роутов из 52.
+- `tg_safe_call` покрывает 22 call site из сотен вызовов Telegram API.
+- FastAPI пришпилен к 0.115.6: `asyncio.iscoroutinefunction` удалят в
+  Python 3.16. Под сюитой обновляться уже безопасно.
+- Debug-`print` в `db.py:1360` и `db.py:1477-1484`.

@@ -38,7 +38,7 @@ docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
 ### Тесты
 
 ```bash
-uv run python tools/run_tests.py          # вся сюита, 64 файла
+uv run python tools/run_tests.py          # вся сюита, 67 файлов
 uv run python tools/run_tests.py -k alarm # подмножество по имени файла
 uv run pytest tests/test_v487_sanity.py -q  # один файл
 ```
@@ -51,7 +51,7 @@ uv run pytest tests/test_v487_sanity.py -q  # один файл
 процесс. `pytest tests` напрямую покажет 3 ошибки сбора — это ожидаемо.
 
 `tests/known_failing.txt` — список временно отложенных файлов. Сейчас **пуст**:
-все 64 файла зелёные. Пока файл в списке, его падение не роняет сборку, но как
+все 67 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
 только он начинает проходить, раннер требует убрать строку.
 
 Около 40 тестов помечены `@unittest.skip` — это проверки удалённых фич
@@ -117,10 +117,17 @@ _exit_night_mode = get_exit_night_mode()
 - `mod_commands.py` (1.1k) — 12 мод-команд, вынесенных из `handle_group_command`
   в v4.8.9/v4.8.10. Модуль импортирует хелперы из `bot_handlers` по именам,
   поэтому в тестах патчить надо `mod_commands.X`, а не `bot_handlers.X`.
-- `web_app.py` (4.9k) — веб-панель. Большинство роутов по-прежнему внутри
-  `create_app()` через замыкание на `bot`; 6 вынесено в `web/`.
-- `web/` — `deps.py`, `auth.py`, `me.py`, `api.py`, `health.py`: начало
-  декомпозиции `create_app()` (v4.8.9/v4.8.10).
+- `web_app.py` (999 строк) — конфигурация, авторизация, module-level
+  хелперы и `create_app()` как сборщик (~243 строки, 0 роутов внутри).
+  В `web/` всего 54 роута: 7 вынесены раньше (v4.8.9/v4.8.10 — `/health`,
+  `/logout`, `/`, `/avatar/{id}`, `/api/presets`, `/api/automute-count`),
+  ещё 47 — в этот раунд (Task 1–11).
+- `web/` — 11 модулей с роутами по предметным областям: `auth`, `me`,
+  `api`, `health`, `admin_bans`, `admin_chats`, `admin_cleanup`,
+  `admin_keywords`, `admin_presets`, `admin_settings`, `admin_users`,
+  плюс `deps.py` с общими зависимостями (`require_auth`, `get_bot`,
+  `get_templates` и др.). `bot` и `templates` приходят через `app.state`
+  + `Depends`, не через замыкание. Декомпозиция завершена в v4.10.0.
 - `app_state.py` — service locator, заменивший хак с `sys.modules`.
 - `db.py` (1.6k) — модели SQLAlchemy + `init_db()`.
 - `chat_modes.py` — snapshot/restore/apply прав чата (v4.8.0) и
@@ -221,20 +228,32 @@ ORM подставляет в SELECT все колонки модели и па�
 - **`asyncio.create_task` только через `_spawn_background_task`**
   (`bot_handlers.py:214`). Голый `create_task` без сохранения ссылки GC может
   собрать на середине. Инвариант сторожит `tests/test_v487_sanity.py` [9].
-- **Блокирующий `open()` в async-роутах** — `web_app.py:738, 3333`. Остальное
-  (`sqlite3`, `VACUUM`, `shutil.copy2`) вынесено в `asyncio.to_thread` в v4.8.7,
-  но `open()` тогда пропустили. Ruff видит это как `ASYNC230`, замечания
-  вынесены в `per-file-ignores` с пометкой.
+- **Блокирующий `open()` в async-функциях** — `_fetch_and_save_avatar`
+  (`web_app.py`) и `_bot_info` (`web/admin_settings.py`). Остальное (`sqlite3`, `VACUUM`, `shutil.copy2`)
+  вынесено в `asyncio.to_thread` в v4.8.7, но `open()` тогда пропустили. Ruff
+  видит это как `ASYNC230`, замечания вынесены в `per-file-ignores` с пометкой.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
   `bot_handlers.py` и `modchat.py` — правь обе копии.
 - **Alembic есть, но выключен.** `migrations/` и `alembic.ini` в репозитории,
   однако прод работает через `DB_USE_LEGACY_MIGRATIONS=1` → старый `init_db()`.
   Попытка включить Alembic в v4.8.9 дважды уронила прод (auto-stamp на
   существующей БД). Не включай без проверки на staging.
-- **FastAPI 0.115.6 использует `asyncio.iscoroutinefunction`** (`fastapi/routing.py:233`),
-  который удалят в Python 3.16. Сейчас это только `DeprecationWarning` и приложение
-  работает, но обновиться придётся. Актуальная версия 0.141.1 тянет Starlette 1.6.0,
-  то есть смену мажорной — делать под тестами, см. Task 17 плана.
+- **`Form(...)` не принимает пустую строку.** После обновления стека (FastAPI
+  0.115.6 → 0.141.1, Starlette 0.41 → 1.6, Task 17) пустое текстовое поле
+  формы валидация считает отсутствующим значением и отсекает запрос ещё до
+  хендлера сырым 422 (`{"detail":[{"type":"missing",...}]}`) — раньше `""`
+  доходила до обработчика, и тот сам отвечал понятной ошибкой. Поэтому
+  текстовые поля, которые пользователь заполняет руками, объявляются как
+  `Form("")`, а не `Form(...)`; числовых (`punishment_id`, `user_id`,
+  `chat_id`) это не касается — они приходят из сгенерированных форм. Контракт
+  закреплён в `tests/test_v4812_empty_form_fields.py`.
+- **Роутеры `web/` импортируются только внутри `create_app()`.** Top-level
+  импорт `web.X` в `web_app.py` даёт цикл: `web_app → web.X → web.deps →
+  web_app` (модули `web/` сами обращаются к `web_app` за хелперами).
+- **Модули `web/` зовут хелперы `web_app` через модуль** (`web_app._helper(...)`),
+  а не `from web_app import _helper`. Тесты патчат хелперы как атрибуты
+  модуля `web_app`; именной импорт фиксирует значение на момент импорта, и
+  патч в тестах перестаёт действовать.
 
 ## Стиль
 

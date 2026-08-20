@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 from unittest.mock import patch, AsyncMock, MagicMock
 
 sys.path.insert(0, _P())
@@ -111,7 +112,9 @@ class TestV472Toggles(unittest.IsolatedAsyncioTestCase):
 
     # ── Test 1: APP_VERSION ──────────────────────────────────────────
     async def test_app_version_is_v472(self):
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.7.2",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(web_app.APP_VERSION), ver("v4.7.2"),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.2")
 
     # ── Test 2: DB колонка sanitary_days_enabled ─────────────────────

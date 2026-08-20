@@ -168,9 +168,12 @@ class TestBotHandlersStructural(unittest.TestCase):
 # ════════════════════════════════════════════════════════════════════════════
 class TestWebAppStructural(unittest.TestCase):
 
+    # v4.9.0 (Task 11): admin_chats_toggle/admin_chats_update переехали из
+    # web_app.py в web/admin_chats.py — проверки 11-14 читают новый файл.
+
     def test_11_via_bot_filter_in_toggle_valid_fields(self):
         """`via_bot_filter` added to valid toggle fields."""
-        src = _read("web_app.py")
+        src = _read("web/admin_chats.py")
         self.assertIn("\"via_bot_filter\"", src,
                       "via_bot_filter must be in valid_fields set")
         # Must appear in valid_fields literal
@@ -182,7 +185,7 @@ class TestWebAppStructural(unittest.TestCase):
 
     def test_12_via_bot_filter_form_fields_in_update(self):
         """Form fields via_bot_rate_limit_seconds + via_bot_mute_minutes in update route."""
-        src = _read("web_app.py")
+        src = _read("web/admin_chats.py")
         self.assertIn("via_bot_rate_limit_seconds: str = Form(", src,
                       "via_bot_rate_limit_seconds form field missing")
         self.assertIn("via_bot_mute_minutes: str = Form(", src,
@@ -190,7 +193,7 @@ class TestWebAppStructural(unittest.TestCase):
 
     def test_13_via_bot_settings_saved_to_cs(self):
         """Settings are saved to ChatSettings object."""
-        src = _read("web_app.py")
+        src = _read("web/admin_chats.py")
         self.assertIn("cs.via_bot_rate_limit_seconds =", src,
                       "via_bot_rate_limit_seconds not saved to cs")
         self.assertIn("cs.via_bot_mute_minutes =", src,
@@ -198,7 +201,7 @@ class TestWebAppStructural(unittest.TestCase):
 
     def test_14_toggle_via_bot_filter_logic(self):
         """Toggle handler has a via_bot_filter branch."""
-        src = _read("web_app.py")
+        src = _read("web/admin_chats.py")
         # Must have an elif branch that toggles cs.via_bot_filter_enabled
         self.assertIn('elif field == "via_bot_filter":', src,
                       "via_bot_filter toggle branch missing")

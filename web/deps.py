@@ -10,6 +10,9 @@ require_csrf_*, COOKIE_NAME, APP_VERSION без циклических зави�
 """
 from __future__ import annotations
 
+from fastapi import Request
+from fastapi.templating import Jinja2Templates
+
 # Реэкспортируем из web_app.py — там они определены.
 # В v4.9.0 эти определения переедут сюда.
 from web_app import (
@@ -24,6 +27,27 @@ from web_app import (
     require_su,
 )
 
+
+def get_templates(request: Request) -> Jinja2Templates:
+    """Jinja2Templates, собранный в create_app().
+
+    v4.9.0 (Task 10): роутеры из web/ больше не замыкаются на локальную
+    переменную create_app — берут объект из app.state. На нём уже висит
+    обёртка, прокидывающая csrf_token в контекст каждого шаблона.
+    """
+    return request.app.state.templates
+
+
+def get_bot(request: Request):
+    """Экземпляр aiogram.Bot или None.
+
+    None — штатная ситуация: вся сюита зовёт create_app() без бота, и
+    роуты, которым бот нужен, отвечают 503. Поэтому getattr с дефолтом,
+    а не обращение к атрибуту напрямую.
+    """
+    return getattr(request.app.state, "bot", None)
+
+
 __all__ = [
     "AuthUser",
     "APP_VERSION",
@@ -34,4 +58,6 @@ __all__ = [
     "require_csrf_auth",
     "require_csrf_su",
     "require_csrf_admin",
+    "get_templates",
+    "get_bot",
 ]

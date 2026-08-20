@@ -186,11 +186,14 @@ class TestV478Login500Fix(unittest.IsolatedAsyncioTestCase):
 class TestV478SourceCodePatterns(unittest.TestCase):
 
     def test_07_login_handler_has_try_except_around_last_login_at(self):
-        """В web_app.py login handler содержит try/except вокруг last_login_at update."""
-        with open(_P("web_app.py")) as f:
+        """login handler содержит try/except вокруг last_login_at update.
+
+        v4.9.0 (Task 10): роут переехал из web_app.py в web/auth.py,
+        проверка ищет там же. Смысл прежний — обновление метрики не
+        должно ронять логин (см. v4.7.8).
+        """
+        with open(_P("web/auth.py")) as f:
             content = f.read()
-        # Ищем паттерн: 'try:' followed by 'last_login_at = ' followed by 'except Exception'
-        # в SU блоке
         self.assertIn("login: failed to update su.last_login_at", content)
         self.assertIn("login: failed to update %s.last_login_at", content)
 

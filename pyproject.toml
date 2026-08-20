@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "4.8.11"  # держать в синхроне с APP_VERSION в web_app.py
+version = "4.10.1"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [
@@ -16,7 +16,7 @@ dependencies = [
     "aiogram==3.30.0",
     "aiosqlite==0.20.0",
     "sqlalchemy[asyncio]==2.0.36",
-    "fastapi==0.115.6",
+    "fastapi==0.141.1",
     "uvicorn[standard]==0.34.0",
     "jinja2==3.1.5",
     "python-multipart==0.0.18",
@@ -110,12 +110,12 @@ ignore = [
     "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "B904", "E402",
     "B007", "B023", "RUF059",
 ]
-# В web_app.py 4846 строк — аналогично.
+# В web_app.py ~1000 строк (после выноса роутов в web/, v4.10.0).
 # E402 — `from db import (...)` стоит после `_req_logger = logging.getLogger(...)`.
 # Это намеренно: logger инициализируется до импорта db, чтобы в случае ошибки
 # импорта db логгер уже был готов.
 # B904 — pre-existing raise без `from err` в _parse_int_field.
-# ASYNC230 — blocking open() в async-роутах (строки 738, 3333). Это долг из
+# ASYNC230 — blocking open() в _fetch_and_save_avatar. Это долг из
 # той же серии, что чинил v4.8.7 (sqlite/VACUUM/copy2 вынесены в to_thread),
 # но open() тогда пропустили. Снимается в Task 6 плана стабилизации.
 # RUF023/RUF059 — несортированный __slots__ и неиспользуемая распакованная
@@ -132,6 +132,18 @@ ignore = [
 "github_client.py" = ["RUF019"]
 # RUF022 — несортированный __all__.
 "web/deps.py" = ["RUF022"]
+# RUF059 — неиспользуемая распакованная переменная `deleted_chat_admins`
+# (тело перенесено дословно из web_app.py, где это же было в общем
+# RUF059-игноре модуля; Task 4, v4.9.0).
+"web/admin_cleanup.py" = ["RUF059"]
+# ASYNC230 — blocking open("/proc/self/status") в _bot_info. Долг из той же
+# серии, что чинил v4.8.7; переехал сюда вместе с хелпером в v4.9.0.
+# Снимается в Task 6 плана стабилизации.
+"web/admin_settings.py" = ["ASYNC230"]
+# B904 — pre-existing raise без `from err` в _parse_int (тело перенесено
+# дословно из web_app.py, где это же было в общем B904-игноре модуля;
+# Task 11, v4.9.0).
+"web/admin_chats.py" = ["B904"]
 
 # ── pytest конфигурация ─────────────────────────────────────────────────────
 [tool.pytest.ini_options]

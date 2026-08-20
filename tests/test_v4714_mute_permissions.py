@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -118,7 +119,9 @@ class TestV4714MutePermissions(unittest.TestCase):
         """APP_VERSION должен быть >= v4.7.14 (тест ослаблен в v4.7.15)."""
         # v4.7.15: ослаблен с == "v4.7.14" на >= v4.7.14 — чтобы не падать
         # на каждом следующем релизе.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.14",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.14"),
                                 f"APP_VERSION should be >= v4.7.14, got {APP_VERSION}")
 
     def test_02_release_date(self):

@@ -8,7 +8,14 @@
   - Логин как SU работает с hmac.compare_digest + secure cookie
   - Token expiry работает через HTTP (протухшая кука → /login redirect)
 
-Запуск: python scripts/test_v487_async_routes.py
+Запуск: uv run pytest tests/test_v487_async_routes.py
+
+Внимание: прямой запуск (`python tests/test_v487_async_routes.py`) даёт три
+ложных провала на POST-роутах. Файл написан до v4.8.8, когда CSRF-защиты не
+было, и постит формы без токена; сейчас токен подставляет шим из
+tests/_csrf.py, а он ставится в conftest.py — то есть только под pytest.
+Без conftest сервер законно отвечает 403 вместо 303. Это артефакт способа
+запуска, а не дефект: под pytest и под раннером файл зелёный.
 """
 from _paths import _P  # noqa: E402  (корень вычисляется от __file__)
 import os

@@ -51,6 +51,7 @@ import sys
 import re
 import json
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 
 sys.path.insert(0, _P())
 sys.path.insert(0, _P("tests"))
@@ -92,7 +93,9 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
         """APP_VERSION должен быть >= v4.7.11 (тест ослаблен в v4.7.13)."""
         # v4.7.13: ослаблен с == "v4.7.11" на >= v4.7.11 — чтобы не падать
         # на каждом следующем релизе.
-        self.assertGreaterEqual(APP_VERSION, "v4.7.11",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.11"),
                                 f"APP_VERSION should be >= v4.7.11, got {APP_VERSION}")
 
     # ─── 2. Воспроизведение исходного бага ─────────────────────────────
@@ -340,19 +343,23 @@ class TestV4711SanitaryRoundtrip(unittest.TestCase):
     # ─── 19. Regression: web_app.py больше не делает `for s, e in` ────
 
     def test_19_web_app_no_unpacking_bug(self):
-        """В web_app.py больше не должно быть `for s, e in san_pairs`."""
-        with open(_P("web_app.py"), "r",
+        """В web/admin_chats.py больше не должно быть `for s, e in san_pairs`.
+
+        v4.9.0 (Task 11): admin_chats_update вынесен из web_app.py в
+        web/admin_chats.py — проверка переехала вместе с кодом.
+        """
+        with open(_P("web/admin_chats.py"), "r",
                    encoding="utf-8") as f:
             src = f.read()
         # Ищем паттерн `for s, e in san_pairs` — это баг.
         bad = re.search(r'for\s+s\s*,\s*e\s+in\s+san_pairs', src)
         self.assertIsNone(
             bad,
-            f"web_app.py still has buggy `for s, e in san_pairs` at pos {bad.start() if bad else -1}"
+            f"web/admin_chats.py still has buggy `for s, e in san_pairs` at pos {bad.start() if bad else -1}"
         )
         # Должно быть `for entry in san_pairs`
         good = re.search(r'for\s+entry\s+in\s+san_pairs', src)
-        self.assertIsNotNone(good, "web_app.py should have `for entry in san_pairs`")
+        self.assertIsNotNone(good, "web/admin_chats.py should have `for entry in san_pairs`")
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────

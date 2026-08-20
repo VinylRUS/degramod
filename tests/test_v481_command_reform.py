@@ -50,6 +50,14 @@ _WEB_APP_SRC = _read_file(_WEB_APP_PATH)
 _MOD_COMMANDS_PATH = os.path.join(_PROJ_ROOT, "mod_commands.py")
 _MOD_COMMANDS_SRC = _read_file(_MOD_COMMANDS_PATH) if os.path.exists(_MOD_COMMANDS_PATH) else ""
 
+# v4.9.0 (Task 3): GET /admin/bans переехал из web_app.py в web/admin_bans.py.
+_ADMIN_BANS_PATH = os.path.join(_PROJ_ROOT, "web", "admin_bans.py")
+_ADMIN_BANS_SRC = _read_file(_ADMIN_BANS_PATH) if os.path.exists(_ADMIN_BANS_PATH) else ""
+
+# v4.9.0 (Task 6): POST /api/unban переехал из web_app.py в web/api.py.
+_API_PATH = os.path.join(_PROJ_ROOT, "web", "api.py")
+_API_SRC = _read_file(_API_PATH) if os.path.exists(_API_PATH) else ""
+
 
 def _dispatch_src() -> str:
     """Тело handle_group_command вместе с модулем, куда вынесли его ветви."""
@@ -425,23 +433,34 @@ class TestWebAppRoutes(unittest.TestCase):
     """Проверка новых маршрутов /admin/bans и /api/unban в web_app.py."""
 
     def test_70_admin_bans_route_exists(self):
-        """Маршрут GET /admin/bans зарегистрирован."""
-        self.assertIn('@app.get("/admin/bans"', _WEB_APP_SRC,
+        """Маршрут GET /admin/bans зарегистрирован.
+
+        v4.9.0 (Task 3): роут переехал из web_app.py в web/admin_bans.py,
+        декоратор — @router.get (не @app.get). Смысл проверки прежний.
+        """
+        self.assertIn('@router.get("/admin/bans"', _ADMIN_BANS_SRC,
                       "/admin/bans GET route must be registered")
-        self.assertIn("async def admin_bans_page", _WEB_APP_SRC,
+        self.assertIn("async def admin_bans_page", _ADMIN_BANS_SRC,
                       "admin_bans_page handler must exist")
 
     def test_71_api_unban_route_exists(self):
-        """Маршрут POST /api/unban зарегистрирован."""
-        self.assertIn('@app.post("/api/unban"', _WEB_APP_SRC,
+        """Маршрут POST /api/unban зарегистрирован.
+
+        v4.9.0 (Task 6): роут переехал из web_app.py в web/api.py,
+        декоратор — @router.post (не @app.post). Смысл проверки прежний.
+        """
+        self.assertIn('@router.post("/api/unban"', _API_SRC,
                       "/api/unban POST route must be registered")
-        self.assertIn("async def api_unban", _WEB_APP_SRC,
+        self.assertIn("async def api_unban", _API_SRC,
                        "api_unban handler must exist")
 
     def test_72_admin_bans_uses_require_auth(self):
-        """Доступ к /admin/bans — require_auth (все веб-юзеры)."""
+        """Доступ к /admin/bans — require_auth (все веб-юзеры).
+
+        v4.9.0 (Task 3): функция теперь в web/admin_bans.py.
+        """
         # Найдём функцию admin_bans_page и проверим что в ней есть require_auth
-        body = _extract_func_body(_WEB_APP_SRC, "admin_bans_page")
+        body = _extract_func_body(_ADMIN_BANS_SRC, "admin_bans_page")
         self.assertIsNotNone(body)
         self.assertIn("require_auth", body,
                       "admin_bans_page must use require_auth (not require_su)")
@@ -464,7 +483,8 @@ class TestWebAppRoutes(unittest.TestCase):
         self.assertIn("is_revoked", _extract_func_body(_HANDLERS_SRC, "_revoke_last_action") or "",
                       "_revoke_last_action must set is_revoked")
         # Роут действительно делегирует общей функции.
-        route = _extract_func_body(_WEB_APP_SRC, "api_unban")
+        # v4.9.0 (Task 6): api_unban теперь в web/api.py.
+        route = _extract_func_body(_API_SRC, "api_unban")
         self.assertIn("revoke_user_ban", route,
                       "api_unban must delegate to revoke_user_ban")
 

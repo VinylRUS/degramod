@@ -26,6 +26,7 @@ import re
 import sys
 import tempfile
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, _P())
@@ -94,7 +95,9 @@ class TestV473VersionAndSource(unittest.IsolatedAsyncioTestCase):
 
     # ── Test 1: APP_VERSION ─────────────────────────────────────────
     async def test_app_version_is_v473(self):
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.7.3",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(web_app.APP_VERSION), ver("v4.7.3"),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.3")
 
     # ── Test 2: lifespan использует asyncio.TaskGroup ───────────────

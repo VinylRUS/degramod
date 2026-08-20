@@ -38,6 +38,7 @@ import os
 import re
 import sys
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 
 # ── Пути ────────────────────────────────────────────────────────────────────
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -135,7 +136,9 @@ class TestV4715DeleteViolationMessage(unittest.TestCase):
     # ─── 1. Version ────────────────────────────────────────────────────
 
     def test_01_app_version_bumped(self):
-        self.assertGreaterEqual(APP_VERSION, "v4.7.15",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.15"),
                          f"APP_VERSION should be >= v4.7.15, got {APP_VERSION}")
 
     # ─── 2-4. Все карательные команды удаляют сообщение ────────────────

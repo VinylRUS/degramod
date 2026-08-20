@@ -51,6 +51,7 @@ import sys
 import tempfile
 import json
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 from unittest.mock import MagicMock, AsyncMock
 
 sys.path.insert(0, _P())
@@ -273,7 +274,9 @@ class TestV476E2EWebApp(unittest.IsolatedAsyncioTestCase):
 
     def test_11_app_version(self):
         """APP_VERSION = 'v4.7.6'."""
-        self.assertGreaterEqual(web_app.APP_VERSION, "v4.7.6",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(web_app.APP_VERSION), ver("v4.7.6"),
             f"APP_VERSION={web_app.APP_VERSION} should be >= v4.7.6")
 
     def test_12_chats_page_has_datetime_picker(self):
@@ -441,8 +444,12 @@ class TestV476SourceCodePatterns(unittest.TestCase):
     """Проверка исходников на наличие/отсутствие нужных паттернов."""
 
     def test_21_sanitary_handlers_in_web_app(self):
-        """В web_app.py есть handlers /sanitary/add и /sanitary/{idx}/delete."""
-        with open(_P("web_app.py")) as f:
+        """В web/admin_chats.py есть handlers /sanitary/add и /sanitary/{idx}/delete.
+
+        v4.9.0 (Task 11): admin_chats_sanitary_add/admin_chats_sanitary_delete
+        переехали из web_app.py в web/admin_chats.py.
+        """
+        with open(_P("web/admin_chats.py")) as f:
             src = f.read()
         self.assertIn("/sanitary/add", src)
         self.assertIn("/sanitary/{idx_str}/delete", src)
@@ -450,8 +457,12 @@ class TestV476SourceCodePatterns(unittest.TestCase):
         self.assertIn("admin_chats_sanitary_delete", src)
 
     def test_22_valid_fields_no_private(self):
-        """В web_app.py valid_fields не содержит 'private'."""
-        with open(_P("web_app.py")) as f:
+        """В web/admin_chats.py valid_fields не содержит 'private'.
+
+        v4.9.0 (Task 11): admin_chats_toggle (где определён valid_fields)
+        переехал из web_app.py в web/admin_chats.py.
+        """
+        with open(_P("web/admin_chats.py")) as f:
             src = f.read()
         # Find the valid_fields line
         import re

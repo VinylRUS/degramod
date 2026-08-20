@@ -2,8 +2,14 @@
 test_v4811_mywarns.py — тесты команды !mywarns (v4.8.10) и её починок (v4.8.11).
 
 Команда позволяет любому участнику чата посмотреть свои активные варны:
-  • в группе — бот удаляет команду и присылает сводку в личку;
+  • в группе — бот удаляет команду и отвечает ephemeral-сообщением в тот же
+    чат: оно видно ТОЛЬКО автору команды (v4.9.0);
   • в личке — отвечает сводкой по всем чатам.
+
+v4.9.0: в группе ответ больше не уходит в личку. Личка требовала, чтобы юзер
+запустил бота, а /start открыт только модераторам — то есть обычный участник,
+ради которого фича и делалась, не получал ничего. Ephemeral доставляется без
+/start и при этом не показывает варны остальному чату.
 
 Тесты закрывают то, что при добавлении команды осталось непокрытым:
 
@@ -15,6 +21,8 @@ test_v4811_mywarns.py — тесты команды !mywarns (v4.8.10) и её �
   T5. Отправка идёт через tg_safe_call: при 429 от Telegram сообщение
       доходит после ретрая, а не теряется.
   T6. Месяц в дате — по-русски независимо от локали окружения.
+  T7. Адресация ephemeral: ответ уходит в чат с receiver_user_id автора,
+      а не в личку и не публично.
 """
 from __future__ import annotations
 
@@ -24,7 +32,7 @@ import sys
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from _paths import _P
 
@@ -113,11 +121,22 @@ def _make_dm_message() -> MagicMock:
 
 
 class _MywarnsTestCase(unittest.IsolatedAsyncioTestCase):
-    """Общий сброс состояния: БД и реестр таймаутов."""
+    """Общий сброс состояния: БД и реестр таймаутов.
+
+    Планировщик авто-удаления ephemeral подменяется заглушкой: настоящий
+    спавнит фоновую таску со sleep(30), которая переживёт тест и будет
+    убита при закрытии event loop. Само авто-удаление проверяется в
+    tests/test_v456_ephemeral_autodelete.py — здесь оно не предмет теста.
+    """
 
     async def asyncSetUp(self):
         await _reset_db()
         bot_handlers._mywarns_last_call.clear()
+        patcher = patch.object(
+            bot_handlers, "_schedule_ephemeral_delete", AsyncMock(),
+        )
+        self._sched_mock = patcher.start()
+        self.addCleanup(patcher.stop)
 
     async def asyncTearDown(self):
         bot_handlers._mywarns_last_call.clear()
@@ -215,16 +234,75 @@ class TestMywarnsGroupPrivacy(_MywarnsTestCase):
 
         second.bot.send_message.assert_not_awaited()
 
-    async def test_sends_dm_with_warn_count(self):
-        """Сводка уходит в личку, а не в общий чат."""
+
+# ── T7. Адресация ephemeral ─────────────────────────────────────────────────
+
+class TestMywarnsEphemeralDelivery(_MywarnsTestCase):
+    """v4.9.0: ответ в группе — ephemeral в тот же чат, не личка.
+
+    Личка требовала /start, а он открыт только модераторам: обычный юзер,
+    ради которого фича делалась, не получал ничего.
+    """
+
+    async def test_answer_goes_to_group_chat_not_dm(self):
+        """Сообщение уходит в чат, где введена команда, а не в личку юзеру."""
         await _add_warn()
         msg = _make_group_message()
         await bot_handlers.handle_mywarns_group(msg)
 
         msg.bot.send_message.assert_awaited_once()
         kwargs = msg.bot.send_message.await_args.kwargs
-        self.assertEqual(kwargs["chat_id"], _USER_ID)
-        self.assertIn("Варнов: 1", kwargs["text"])
+        self.assertEqual(
+            kwargs["chat_id"], _CHAT_ID,
+            "ответ должен уходить в групповой чат, а не в личку",
+        )
+
+    async def test_answer_is_addressed_to_command_author(self):
+        """receiver_user_id — автор команды: остальные участники ответа не видят."""
+        await _add_warn()
+        msg = _make_group_message()
+        await bot_handlers.handle_mywarns_group(msg)
+
+        kwargs = msg.bot.send_message.await_args.kwargs
+        self.assertEqual(
+            kwargs.get("receiver_user_id"), _USER_ID,
+            "без receiver_user_id сообщение станет публичным для всего чата",
+        )
+
+    async def test_answer_contains_warn_count(self):
+        """В тексте — количество активных варнов."""
+        await _add_warn()
+        msg = _make_group_message()
+        await bot_handlers.handle_mywarns_group(msg)
+
+        self.assertIn("Варнов: 1", msg.bot.send_message.await_args.kwargs["text"])
+
+    async def test_empty_case_is_ephemeral_too(self):
+        """«Нет варнов» тоже адресное, а не публичное.
+
+        Публичное «у вас нет варнов» раскрывает чату, что юзер проверялся —
+        ровно то, ради чего удаляется сама команда.
+        """
+        msg = _make_group_message()
+        await bot_handlers.handle_mywarns_group(msg)
+
+        msg.bot.send_message.assert_awaited_once()
+        kwargs = msg.bot.send_message.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], _CHAT_ID)
+        self.assertEqual(kwargs.get("receiver_user_id"), _USER_ID)
+        self.assertIn("нет активных варнов", kwargs["text"])
+
+    async def test_autodelete_is_scheduled(self):
+        """Авто-удаление планируется: ephemeral в Telegram сам не исчезает."""
+        await _add_warn()
+        msg = _make_group_message()
+        await bot_handlers.handle_mywarns_group(msg)
+
+        self._sched_mock.assert_awaited_once()
+        self.assertGreater(
+            self._sched_mock.await_args.kwargs["delete_after"], 0,
+            "без положительного delete_after сообщение останется в чате навсегда",
+        )
 
 
 # ── T4. Реестр таймаутов не растёт бесконечно ───────────────────────────────
@@ -264,12 +342,16 @@ class TestMywarnsTimeoutRegistry(_MywarnsTestCase):
 
 class TestMywarnsFloodControl(_MywarnsTestCase):
 
-    async def test_group_dm_retries_after_flood_control(self):
+    async def test_group_ephemeral_retries_after_flood_control(self):
         """При 429 сообщение доходит после ретрая, а не теряется.
 
         Правило проекта: Telegram-вызовы идут через tg_safe_call. Здесь это
         особенно заметно, потому что таймаут уже записан — без ретрая юзер
         не сможет повторить запрос ещё 5 минут.
+
+        v4.9.0: отправка переехала в _send_ephemeral, и защита должна была
+        переехать вместе с ней. Обёртка живёт внутри хелпера — снаружи её
+        не навесить, он глотает TelegramAPIError сам.
         """
         await _add_warn()
         msg = _make_group_message()

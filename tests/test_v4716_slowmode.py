@@ -49,6 +49,7 @@ import os
 import re
 import sys
 import unittest
+from _version import ver  # noqa: E402  (сравнение версий как кортежей, не строк)
 import asyncio
 import tempfile
 
@@ -94,6 +95,12 @@ spec_bot.loader.exec_module(bot_module)
 BOT_PY = os.path.join(PROJECT_DIR, "bot.py")
 BOT_HANDLERS_PY = os.path.join(PROJECT_DIR, "bot_handlers.py")
 WEB_APP_PY = os.path.join(PROJECT_DIR, "web_app.py")
+# v4.9.0 (Task 10): admin_presets_create переехал из web_app.py в
+# web/admin_presets.py.
+ADMIN_PRESETS_PY = os.path.join(PROJECT_DIR, "web", "admin_presets.py")
+# v4.9.0 (Task 11): admin_chats_update (и вложенный хелпер _resolve_perms)
+# переехал из web_app.py в web/admin_chats.py.
+ADMIN_CHATS_PY = os.path.join(PROJECT_DIR, "web", "admin_chats.py")
 DB_PY = os.path.join(PROJECT_DIR, "db.py")
 BASE_HTML = os.path.join(PROJECT_DIR, "templates", "base.html")
 ADMIN_PRESETS_HTML = os.path.join(PROJECT_DIR, "templates", "admin_presets.html")
@@ -115,6 +122,8 @@ class TestV4716SlowMode(unittest.TestCase):
         self.bot_py = _read(BOT_PY)
         self.bot_handlers_py = _read(BOT_HANDLERS_PY)
         self.web_app_py = _read(WEB_APP_PY)
+        self.admin_presets_py = _read(ADMIN_PRESETS_PY)
+        self.admin_chats_py = _read(ADMIN_CHATS_PY)
         self.db_py = _read(DB_PY)
         self.base_html = _read(BASE_HTML)
         self.admin_presets_html = _read(ADMIN_PRESETS_HTML)
@@ -123,7 +132,9 @@ class TestV4716SlowMode(unittest.TestCase):
     # ─── 1-2. Version ──────────────────────────────────────────────────
 
     def test_01_app_version(self):
-        self.assertGreaterEqual(APP_VERSION, "v4.7.16",
+        # v4.10.0: FIX сравнение строк ломалось на двузначном minor
+        # ("v4.10.0" < "v4.7.x" лексикографически) — сравниваем через ver().
+        self.assertGreaterEqual(ver(APP_VERSION), ver("v4.7.16"),
             f"APP_VERSION={APP_VERSION} should be >= v4.7.16")
 
     def test_02_app_release_date(self):
@@ -328,30 +339,36 @@ class TestV4716SlowMode(unittest.TestCase):
 
     # ─── 18-20. admin_presets_create ──────────────────────────────────
 
+    # v4.9.0 (Task 10): admin_presets_create переехал из web_app.py в
+    # web/admin_presets.py — тесты 18-20 читают новый файл. Функция теперь
+    # объявлена на верхнем уровне модуля (не внутри create_app()), поэтому
+    # закрывающая скобка сигнатуры — "):" без отступа (была "    ):" при
+    # 4-пробельном отступе вложенной функции).
+
     def test_18_admin_presets_create_accepts_slow_mode_delay(self):
         """admin_presets_create должен принимать Form field slow_mode_delay."""
         # Find the function
-        idx = self.web_app_py.find("async def admin_presets_create(")
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
         self.assertGreater(idx, 0, "admin_presets_create not found")
         # Find the end of the function signature (next def or return)
-        fn_end = self.web_app_py.find("    ):",
-        idx) + len("    ):")
-        fn_sig = self.web_app_py[idx:fn_end]
+        fn_end = self.admin_presets_py.find("):",
+        idx) + len("):")
+        fn_sig = self.admin_presets_py[idx:fn_end]
         self.assertIn("slow_mode_delay", fn_sig,
                       "slow_mode_delay Form field missing in admin_presets_create signature")
 
     def test_19_admin_presets_create_validates_int_and_range(self):
         """Валидация: int + 0..36400."""
-        idx = self.web_app_py.find("async def admin_presets_create(")
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
         # Get a chunk of the function body
-        chunk = self.web_app_py[idx:idx+5000]
+        chunk = self.admin_presets_py[idx:idx+5000]
         self.assertIn("int(slow_mode_raw)", chunk, "int parsing missing")
         self.assertIn("36400", chunk, "range check 36400 missing")
 
     def test_20_admin_presets_create_saves_slow_mode_delay(self):
         """admin_presets_create должен сохранять slow_mode_delay в PermissionPreset."""
-        idx = self.web_app_py.find("async def admin_presets_create(")
-        chunk = self.web_app_py[idx:idx+6000]
+        idx = self.admin_presets_py.find("async def admin_presets_create(")
+        chunk = self.admin_presets_py[idx:idx+6000]
         # Look for PermissionPreset(...) constructor with slow_mode_delay
         self.assertIn("slow_mode_delay=slow_mode_value", chunk,
                       "slow_mode_delay не передаётся в PermissionPreset constructor")
@@ -359,10 +376,14 @@ class TestV4716SlowMode(unittest.TestCase):
     # ─── 21-22. admin_chats_update ────────────────────────────────────
 
     def test_21_resolve_perms_returns_tuple_with_slow_mode(self):
-        """_resolve_perms должен возвращать (permissions_json, slow_mode_delay)."""
-        idx = self.web_app_py.find("def _resolve_perms(")
+        """_resolve_perms должен возвращать (permissions_json, slow_mode_delay).
+
+        v4.9.0 (Task 11): _resolve_perms живёт внутри admin_chats_update,
+        которая переехала из web_app.py в web/admin_chats.py.
+        """
+        idx = self.admin_chats_py.find("def _resolve_perms(")
         self.assertGreater(idx, 0, "_resolve_perms not found")
-        chunk = self.web_app_py[idx:idx+1500]
+        chunk = self.admin_chats_py[idx:idx+1500]
         # Return type annotation or return statements
         self.assertIn("slow_mode_delay", chunk,
                       "_resolve_perms должен возвращать slow_mode_delay")
@@ -373,11 +394,14 @@ class TestV4716SlowMode(unittest.TestCase):
         )
 
     def test_22_admin_chats_update_copies_slow_mode_to_chat_settings(self):
-        """admin_chats_update должен копировать slow_mode из пресета в ChatSettings."""
+        """admin_chats_update должен копировать slow_mode из пресета в ChatSettings.
+
+        v4.9.0 (Task 11): роут переехал из web_app.py в web/admin_chats.py.
+        """
         # Find the save block
-        idx = self.web_app_py.find("cs.day_slow_mode_delay = ")
+        idx = self.admin_chats_py.find("cs.day_slow_mode_delay = ")
         self.assertGreater(idx, 0, "cs.day_slow_mode_delay assignment not found")
-        idx2 = self.web_app_py.find("cs.night_mode_slow_mode_delay = ")
+        idx2 = self.admin_chats_py.find("cs.night_mode_slow_mode_delay = ")
         self.assertGreater(idx2, 0, "cs.night_mode_slow_mode_delay assignment not found")
 
     # ─── 23-25. Templates ─────────────────────────────────────────────

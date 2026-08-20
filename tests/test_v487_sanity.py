@@ -77,18 +77,17 @@ print("    ✓ WEB_COOKIE_SECURE=0 → _COOKIE_SECURE=False (dev mode)")
 importlib.reload(web_app)
 
 # 4. SU password uses hmac.compare_digest
-print("\n[4] web_app.py: SU password compare_digest...")
-# Find "hmac.compare_digest(password, WEB_PASSWORD)" in source
-assert re.search(r"hmac\.compare_digest\s*\(\s*password\s*,\s*WEB_PASSWORD\s*\)", wa_src), \
-    "SU login should use hmac.compare_digest(password, WEB_PASSWORD)"
-# Also check there's no remaining `password != WEB_PASSWORD`
-# Allow it in comments, but not in actual code path
-# Quick heuristic: no `password != WEB_PASSWORD` outside of strings/comments
-src_lines = wa_src.split("\n")
+print("\n[4] web/auth.py: SU password compare_digest...")
+# v4.9.0 (Task 10): роут /login переехал из web_app.py в web/auth.py.
+with open(_P("web/auth.py")) as f:
+    auth_src = f.read()
+assert re.search(r"hmac\.compare_digest\s*\(\s*password\s*,\s*web_app\.WEB_PASSWORD\s*\)", auth_src), \
+    "SU login should use hmac.compare_digest(password, web_app.WEB_PASSWORD)"
+src_lines = auth_src.split("\n")
 violations = []
 for i, line in enumerate(src_lines, 1):
-    stripped = line.split("#", 1)[0].strip()  # strip comments
-    if "password != WEB_PASSWORD" in stripped:
+    stripped = line.split("#", 1)[0].strip()
+    if "password != web_app.WEB_PASSWORD" in stripped:
         violations.append((i, line))
 assert not violations, f"found `password != WEB_PASSWORD` at lines: {violations}"
 print("    ✓ SU login uses hmac.compare_digest (no != comparison)")
@@ -239,8 +238,14 @@ print(f"    ✓ {len(tg_calls)} tg_safe_call(lambda: ...) call sites (expected �
 
 # 11. Blocking SQLite wrapped in asyncio.to_thread
 print("\n[11] web_app.py: blocking SQLite wrapped in asyncio.to_thread...")
-# Count asyncio.to_thread calls
-to_thread_count = len(re.findall(r"asyncio\.to_thread\s*\(", wa_src))
+# Count asyncio.to_thread calls.
+# v4.9.0 (Task 4): вызовы разъехались по web/ вместе с роутами
+# (/admin/cleanup → web/admin_cleanup.py, дальше — по мере декомпозиции).
+_to_thread_sources = [_P("web_app.py"), _P("web/admin_cleanup.py"), _P("web/admin_settings.py")]
+to_thread_count = sum(
+    len(re.findall(r"asyncio\.to_thread\s*\(", open(_src).read()))
+    for _src in _to_thread_sources if os.path.exists(_src)
+)
 assert to_thread_count >= 7, f"expected ≥7 asyncio.to_thread calls (7 blocking sites), got {to_thread_count}"
 print(f"    ✓ {to_thread_count} asyncio.to_thread() calls (expected ≥7)")
 # Verify _wal_checkpoint_async and _backup_db_async exist
