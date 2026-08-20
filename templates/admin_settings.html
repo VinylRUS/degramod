@@ -113,7 +113,7 @@
         <tr><td style="color: var(--text-dim); padding: 4px 0;">Токен</td>
             <td>{% if agent_info.has_token %}<span style="color: var(--accent);">задан</span>{% else %}<span style="color: var(--text-dim);">нет BOT_API_TOKEN</span>{% endif %}</td></tr>
         <tr><td style="color: var(--text-dim); padding: 4px 0;">Внутренний</td><td>{{ agent_info.internal or '—' }}</td></tr>
-        <tr><td style="color: var(--text-dim); padding: 4px 0;">Ключ из</td><td>{{ agent_info.token_source or '— ни одна переменная не задана' }}</td></tr>
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">Ключ из</td><td>{{ agent_info.token_source or '— ни одна переменная не задана' }}{% if agent_info.token_shape %} ({{ agent_info.token_shape }}){% endif %}</td></tr>
         {% for name, verdict in agent_info.token_report %}
         <tr><td style="color: var(--text-dim); padding: 4px 0;">{{ name }}</td>
             <td>{% if verdict.startswith('принят') %}<span style="color: var(--accent);">{{ verdict }}</span>{% else %}<span style="color: var(--text-dim);">{{ verdict }}</span>{% endif %}</td></tr>

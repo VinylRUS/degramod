@@ -159,6 +159,31 @@ def _bot_id() -> str | None:
 TOKEN_ENV_NAMES = ("BOT_API_TOKEN", "API_TOKEN", "BOTHOST_API_TOKEN", "AGENT_TOKEN")
 
 
+def _clean_token(raw: str | None) -> str:
+    """Убирает то, что добавляет панель переменных окружения.
+
+    v5.1.0 (fix-6): перевод строки на конце, обрамляющие пробелы и кавычки
+    попадают в значение незаметно, а Bearer с таким хвостом агент отвергает
+    как invalid token — по виду переменной этого не понять.
+    """
+    value = (raw or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+def token_shape() -> str:
+    """Форма ключа для диагностики: длина и факт очистки, без значения."""
+    raw = next((os.getenv(n) for n in TOKEN_ENV_NAMES if os.getenv(n)), None)
+    if raw is None:
+        return "не задан"
+    clean = _clean_token(raw)
+    if not clean:
+        return "пустой после очистки"
+    note = ", очищен от пробелов/кавычек" if clean != raw else ""
+    return f"длина {len(clean)}{note}"
+
+
 def token_source() -> str | None:
     """Имя переменной, из которой взят ключ. Значение не раскрывается."""
     for name in TOKEN_ENV_NAMES:
@@ -179,6 +204,7 @@ def _auth_headers(token: str | None = None) -> dict[str, str]:
     # именами; порядок TOKEN_ENV_NAMES задаёт приоритет.
     if token is None:
         token = next((os.getenv(n) for n in TOKEN_ENV_NAMES if os.getenv(n)), "")
+    token = _clean_token(token)
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 

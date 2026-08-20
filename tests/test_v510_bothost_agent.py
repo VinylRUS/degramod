@@ -215,6 +215,63 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestTokenSanitizing(_AgentCase):
+    """Значение ключа чистится от того, что добавляет панель хостинга.
+
+    v5.1.0 (fix-6): панели переменных окружения регулярно сохраняют
+    значение с переводом строки на конце или в кавычках. Bearer с таким
+    хвостом агент отвергает как invalid token, а по виду переменной это
+    не заметно — отсюда потерянные итерации.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ["BOTHOST_AGENT_URL"] = "http://agent-test:8000"
+        self._prev = os.environ.get("BOT_API_TOKEN")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._prev is None:
+            os.environ.pop("BOT_API_TOKEN", None)
+        else:
+            os.environ["BOT_API_TOKEN"] = self._prev
+
+    def _sent_token(self):
+        response = MagicMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={"ok": True})
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.request = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_stats())
+        return session.request.call_args.kwargs["headers"]["Authorization"]
+
+    def test_trailing_newline_stripped(self):
+        os.environ["BOT_API_TOKEN"] = "abc123\n"
+        self.assertEqual(self._sent_token(), "Bearer abc123")
+
+    def test_surrounding_spaces_stripped(self):
+        os.environ["BOT_API_TOKEN"] = "  abc123  "
+        self.assertEqual(self._sent_token(), "Bearer abc123")
+
+    def test_surrounding_quotes_stripped(self):
+        os.environ["BOT_API_TOKEN"] = '"abc123"'
+        self.assertEqual(self._sent_token(), "Bearer abc123")
+
+    def test_token_shape_reports_length_not_value(self):
+        """Форма ключа для диагностики: длина есть, значения нет."""
+        os.environ["BOT_API_TOKEN"] = "  secret_value_42\n"
+        shape = bothost_agent.token_shape()
+        self.assertIn("15", shape)  # len("secret_value_42")
+        self.assertIn("очищен", shape)
+        self.assertNotIn("secret_value_42", shape)
+
+
 class TestTokenDiagnosis(_AgentCase):
     """Перебор переменных с ключом: какая из них устраивает агента.
 
