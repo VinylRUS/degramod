@@ -54,6 +54,7 @@ _INTERNAL_CANDIDATES: tuple[tuple[str, int], ...] = (
 # на каждый запрос незачем.
 _cached_url: str | None = None
 _internal_report: list[tuple[str, str]] = []
+_scan_cache: list[str] | None = None
 
 
 @dataclass
@@ -70,11 +71,17 @@ class AgentResult:
     error: str | None = None
 
 
+def message_of(result: AgentResult) -> str | None:
+    """Текст, присланный агентом при успехе (поле message)."""
+    return (result.data or {}).get("message") or (result.data or {}).get("msg")
+
+
 def reset_cache() -> None:
     """Сбрасывает кеш адреса. Нужен тестам для изоляции."""
-    global _cached_url, _internal_report
+    global _cached_url, _internal_report, _scan_cache
     _cached_url = None
     _internal_report = []
+    _scan_cache = None
 
 
 # Таймаут проверки доступности — накладывается снаружи через asyncio.wait_for
@@ -136,6 +143,57 @@ def _derived_candidates() -> list[tuple[str, int]]:
     if len(parts) != 4:
         return []
     return [(f"{parts[0]}.{parts[1]}.{parts[2]}.1", _INTERNAL_PORT)]
+
+
+# Параметры перебора подсети: таймаут на адрес и сколько проверять разом.
+# 254 адреса по 0.3s при 64 параллельных проверках укладываются в пару секунд.
+_SCAN_TIMEOUT = 0.3
+_SCAN_CONCURRENCY = 64
+
+
+def _is_private(ip: str) -> bool:
+    """Только приватные диапазоны: чужие сети не наша забота."""
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(x.isdigit() for x in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
+
+
+async def scan_subnet() -> list[str]:
+    """Ищет в собственной подсети хосты, слушающие порт агента.
+
+    v5.1.0 (fix-9): на проде шлюз подсети ОТВЕРГАЕТ соединение — то есть
+    достижим, просто на 8000 никто не слушает, — а имена agent и
+    bothost-agent не резолвятся вовсе. Значит агент может стоять рядом под
+    другим именем: по имени его не найти, по адресу — можно.
+
+    Перебор ограничен собственной /24 и приватными диапазонами.
+    """
+    global _scan_cache
+    if _scan_cache is not None:
+        return list(_scan_cache)
+    ip = _own_ip()
+    if not ip or not _is_private(ip):
+        return []
+    prefix = ".".join(ip.split(".")[:3])
+    semaphore = asyncio.Semaphore(_SCAN_CONCURRENCY)
+
+    async def probe_host(addr: str) -> str | None:
+        async with semaphore:
+            try:
+                await asyncio.wait_for(
+                    _can_connect(addr, _INTERNAL_PORT), timeout=_SCAN_TIMEOUT,
+                )
+            except (OSError, TimeoutError):
+                return None
+            return f"{addr}:{_INTERNAL_PORT}"
+
+    targets = [f"{prefix}.{n}" for n in range(1, 255) if f"{prefix}.{n}" != ip]
+    results = await asyncio.gather(*(probe_host(a) for a in targets))
+    _scan_cache = [r for r in results if r]
+    logger.info("Перебор подсети %s.0/24: %s", prefix, _scan_cache or "никто не слушает 8000")
+    return list(_scan_cache)
 
 
 def container_info() -> str:
@@ -319,7 +377,10 @@ async def _request(method: str, path: str, token: str | None = None, **kwargs) -
                     return AgentResult(
                         ok=False,
                         data=payload,
-                        error=payload.get("msg") or f"агент ответил ok=false (HTTP {response.status})",
+                        # v5.1.0 (fix-10): агент кладёт текст и в msg, и в
+                        # message — читаем оба, иначе причина теряется.
+                        error=(payload.get("msg") or payload.get("message")
+                               or f"агент ответил ok=false (HTTP {response.status})"),
                     )
                 return AgentResult(ok=True, data=payload)
     except TimeoutError:

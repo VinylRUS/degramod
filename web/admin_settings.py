@@ -149,6 +149,14 @@ async def _agent_info() -> dict:
         # v5.1.0 (fix-8): имя и адрес контейнера — доказательство для
         # поддержки хостинга, если ни один кандидат не отзовётся.
         "container": bothost_agent.container_info(),
+        # v5.1.0 (fix-9): перебор подсети — крайняя мера, только когда ни
+        # один известный адрес не отозвался. Результат кешируется, поэтому
+        # на каждый рендер страницы сканирование не повторяется.
+        "scan": (
+            await bothost_agent.scan_subnet()
+            if not any("доступен" in why for _, why in bothost_agent.internal_report())
+            else []
+        ),
         "token_source": bothost_agent.token_source(),
         "token_shape": bothost_agent.token_shape(),
         # v5.1.0 (fix-5): перебор кандидатов запускается только при отказе

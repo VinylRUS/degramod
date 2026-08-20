@@ -353,6 +353,125 @@ class TestOwnNetwork(unittest.TestCase):
         self.assertEqual(len(addrs), len(set(addrs)))
 
 
+class TestTelegramTokenNeverLeaks(unittest.TestCase):
+    """BOT_TOKEN — токен Telegram, и в Bothost он уходить не должен.
+
+    Документация Bothost перечисляет среди переменных бота BOT_TOKEN, TOKEN,
+    TELEGRAM_BOT_TOKEN, DISCORD_TOKEN — но там же сказано прямо: «BOT_TOKEN
+    служит для подключения к платформе (Telegram/Discord), не для API
+    агента». Добавить их в TOKEN_ENV_NAMES «для полноты» — значит отправить
+    токен бота стороннему сервису. Тест сторожит именно это.
+    """
+
+    def test_platform_tokens_are_not_candidates(self):
+        for name in ("BOT_TOKEN", "TOKEN", "TELEGRAM_BOT_TOKEN", "DISCORD_TOKEN"):
+            self.assertNotIn(name, bothost_agent.TOKEN_ENV_NAMES)
+
+    def test_telegram_token_not_sent_even_if_only_one_set(self):
+        prev = {n: os.environ.get(n) for n in bothost_agent.TOKEN_ENV_NAMES}
+        for n in bothost_agent.TOKEN_ENV_NAMES:
+            os.environ.pop(n, None)
+        os.environ["BOT_TOKEN"] = "123456:SECRET_TELEGRAM_TOKEN"
+        try:
+            self.assertEqual(bothost_agent._auth_headers(), {})
+        finally:
+            os.environ.pop("BOT_TOKEN", None)
+            for n, v in prev.items():
+                if v is not None:
+                    os.environ[n] = v
+
+
+class TestMessageField(_AgentCase):
+    """Агент кладёт текст в msg при ошибке и в message при успехе.
+
+    v5.1.0 (fix-10): читался только msg, поэтому текст успеха
+    («Бот ... перезапущен») терялся, а ошибка, присланная в message,
+    превращалась в безликое «агент ответил ok=false».
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ["BOTHOST_AGENT_URL"] = "http://agent-test:8000"
+
+    def _result_for(self, payload, status=200):
+        response = MagicMock()
+        response.status = status
+        response.json = AsyncMock(return_value=payload)
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.request = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            return asyncio.run(bothost_agent.restart_self())
+
+    def test_error_text_from_message_field(self):
+        result = self._result_for({"ok": False, "message": "контейнер занят"})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "контейнер занят")
+
+    def test_success_message_available(self):
+        result = self._result_for({"ok": True, "message": "Бот перезапущен"})
+        self.assertTrue(result.ok)
+        self.assertEqual(bothost_agent.message_of(result), "Бот перезапущен")
+
+    def test_msg_still_wins_when_both_present(self):
+        result = self._result_for({"ok": False, "msg": "точная причина", "message": "общая"})
+        self.assertEqual(result.error, "точная причина")
+
+
+class TestSubnetScan(unittest.TestCase):
+    """Поиск агента по собственной подсети, когда DNS молчит.
+
+    v5.1.0 (fix-9): на проде видно, что шлюз 192.168.80.1 ОТВЕРГАЕТ
+    соединение — то есть сетево достижим, просто на 8000 никто не слушает.
+    Остальные кандидаты падают на резолвинге. Значит агент может стоять в
+    той же подсети под другим именем: по имени не найдёшь, по адресу —
+    найдёшь.
+    """
+
+    def setUp(self):
+        bothost_agent.reset_cache()
+        self.addCleanup(bothost_agent.reset_cache)
+
+    def test_finds_listening_host(self):
+        async def selective(host, port, **_kw):
+            if host != "192.168.80.7":
+                raise ConnectionRefusedError("nope")
+            writer = MagicMock()
+            writer.close = MagicMock()
+            writer.wait_closed = AsyncMock()
+            return MagicMock(), writer
+
+        with patch.object(bothost_agent, "_own_ip", return_value="192.168.80.2"), \
+                patch.object(bothost_agent.asyncio, "open_connection", new=selective):
+            found = asyncio.run(bothost_agent.scan_subnet())
+        self.assertEqual(found, ["192.168.80.7:8000"])
+
+    def test_skips_own_address(self):
+        seen = []
+
+        async def record(host, port, **_kw):
+            seen.append(host)
+            raise ConnectionRefusedError("nope")
+
+        with patch.object(bothost_agent, "_own_ip", return_value="192.168.80.2"), \
+                patch.object(bothost_agent.asyncio, "open_connection", new=record):
+            asyncio.run(bothost_agent.scan_subnet())
+        self.assertNotIn("192.168.80.2", seen)
+
+    def test_refuses_public_ranges(self):
+        """Сканируем только приватные сети — чужие адреса не трогаем."""
+        with patch.object(bothost_agent, "_own_ip", return_value="93.184.216.34"):
+            self.assertEqual(asyncio.run(bothost_agent.scan_subnet()), [])
+
+    def test_nothing_without_own_address(self):
+        with patch.object(bothost_agent, "_own_ip", return_value=None):
+            self.assertEqual(asyncio.run(bothost_agent.scan_subnet()), [])
+
+
 class TestTokenSanitizing(_AgentCase):
     """Значение ключа чистится от того, что добавляет панель хостинга.
 
