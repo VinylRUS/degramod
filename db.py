@@ -10,6 +10,7 @@ import hmac
 import logging
 import os
 import secrets
+import sys
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -1484,6 +1485,32 @@ async def run_migrations_async() -> None:
     print("[v4.8.9.2] run_migrations_async: alembic upgrade head done", flush=True)
 
 
+def _known_revisions(alembic_ini) -> set[str]:
+    """Идентификаторы ревизий, лежащих в migrations/versions.
+
+    Нужны, чтобы отличить «в базе стоит наша ревизия» от «в базе стоит
+    ревизия, которой в этом коде нет» — второе бывает при откате версии
+    назад и без обработки роняет старт с CommandError.
+
+    При любой ошибке чтения возвращает пустое множество: вызывающий
+    трактует это как «проверить не удалось» и ревизию не трогает.
+    """
+    from pathlib import Path as _Path
+    try:
+        versions_dir = _Path(alembic_ini).resolve().parent / "migrations" / "versions"
+        found = set()
+        for f in versions_dir.glob("*.py"):
+            for line in f.read_text(encoding="utf-8").splitlines():
+                if line.startswith("revision:") or line.startswith("revision ="):
+                    parts = line.split("=", 1)
+                    if len(parts) == 2:
+                        found.add(parts[1].strip().strip("'\""))
+                    break
+        return found
+    except OSError:
+        return set()
+
+
 def _auto_stamp_if_needed(config, alembic_ini) -> None:
     """v4.8.9.1: если БД существует с таблицами, но без alembic_version —
     автоматически stamp head.
@@ -1522,12 +1549,46 @@ def _auto_stamp_if_needed(config, alembic_ini) -> None:
 
             has_alembic = "alembic_version" in all_tables
             if has_alembic:
-                # Проверим какая версия стоит
+                # v4.11.0 (Task 12): проверяем НАЛИЧИЕ ЗАПИСИ, а не только
+                # таблицы. Раньше здесь стоял безусловный return, и это
+                # дважды роняло прод.
+                #
+                # Alembic создаёт alembic_version ДО того, как запишет в неё
+                # ревизию. Если первый upgrade упал (а он падал — на уже
+                # существующих таблицах legacy-БД), таблица остаётся пустой.
+                # Старый код видел её, считал базу размеченной и выходил;
+                # Alembic дальше читал ревизию, получал пусто, решал, что не
+                # применено ничего, и запускал baseline с нуля — CREATE TABLE
+                # на существующей таблице. Бот не стартовал.
+                #
+                # Диагноз подтверждён 20.08.2026 на копии боевой БД: таблица
+                # есть, строк ноль.
                 try:
-                    version_row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-                    print(f"[v4.8.9.2] auto-stamp: alembic_version present, version={version_row[0] if version_row else 'NULL'}", flush=True)
+                    version_row = conn.execute(
+                        "SELECT version_num FROM alembic_version"
+                    ).fetchone()
                 except sqlite3.Error as e:
-                    print(f"[v4.8.9.2] auto-stamp: alembic_version present but error reading version: {e}", flush=True)
+                    print(f"[v4.11.0] auto-stamp: cannot read alembic_version: {e} — stamping head", flush=True)
+                    version_row = None
+
+                if version_row and version_row[0]:
+                    current = version_row[0]
+                    known = _known_revisions(alembic_ini)
+                    if not known or current in known:
+                        print(f"[v4.11.0] auto-stamp: alembic_version={current} — ok, nothing to do", flush=True)
+                        return
+                    # Ревизия есть, но репозиторий её не знает: код откатили
+                    # на версию без этой миграции. upgrade кинул бы
+                    # CommandError и не дал боту стартовать.
+                    print(f"[v4.11.0] auto-stamp: unknown revision {current!r} — re-stamping head", flush=True)
+                    conn.execute("DELETE FROM alembic_version")
+                    conn.commit()
+                else:
+                    print("[v4.11.0] auto-stamp: alembic_version table is EMPTY — stamping head", flush=True)
+                    print("[v4.11.0] auto-stamp: это след упавшего upgrade (таблица создаётся до записи ревизии)", flush=True)
+
+                command.stamp(config, "head")
+                print("[v4.11.0] auto-stamp: stamp head done", flush=True)
                 return
 
             # БД существует, таблицы есть, alembic_version нет → auto-stamp.
@@ -1562,7 +1623,32 @@ async def init_db_with_fallback() -> None:
     Это точка входа из bot.py lifespan startup.
     """
     if os.getenv("DB_USE_LEGACY_MIGRATIONS") == "1":
-        # Escape hatch: если Alembic что-то сломал — можно откатиться.
+        # Рубильник: принудительно старый путь, Alembic не вызывается вовсе.
         await init_db()
-    else:
+        return
+
+    # v4.11.0 (Task 12): настоящий fallback. Раньше функция называлась
+    # «with_fallback», но никакого запасного пути в ней не было: любое
+    # исключение из миграций поднималось наверх и бот не стартовал. Именно
+    # так прод дважды и лёг.
+    #
+    # Миграции — не та операция, ради которой стоит держать бота
+    # выключенным. init_db() идемпотентна (PRAGMA table_info → ALTER TABLE
+    # ADD COLUMN) и отрабатывает на каждом старте, так что запасной путь
+    # безопасен по построению.
+    try:
         await run_migrations_async()
+    except Exception as e:
+        logger.error(
+            "MIGRATIONS FAILED (%s: %s) — откат на init_db(). "
+            "Бот поднимется, но схему нужно разобрать вручную: "
+            "проверьте alembic_version и migrations/versions.",
+            type(e).__name__, e,
+        )
+        # print — дублируем в stderr: в Bothost логи logging могут
+        # фильтроваться по уровню, а stderr показывается всегда.
+        print(
+            f"[v4.11.0] MIGRATIONS FAILED: {type(e).__name__}: {e} — falling back to init_db()",
+            file=sys.stderr, flush=True,
+        )
+        await init_db()
