@@ -35,6 +35,15 @@ class _AgentCase(unittest.TestCase):
         self._prev_bot_id = os.environ.get("BOT_ID")
         self._prev_url = os.environ.get("BOTHOST_AGENT_URL")
         os.environ["BOT_ID"] = "bot_test_123"
+        # v5.1.0 (fix-1): по умолчанию агент «недоступен» без обращения к сети.
+        # reset_cache() выше заставляет resolve_agent_url() каждый раз заново
+        # проверять agent:8000, а это реальный DNS-резолв: в изоляции тест шёл
+        # 0.30s, в составе файла — 3.8s, то есть время зависело от резолвера,
+        # а не от кода. Тесты, которым нужно именно поведение проверки, ставят
+        # свой patch поверх этого — внутренний контекст-менеджер побеждает.
+        _patcher = patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=False))
+        _patcher.start()
+        self.addCleanup(_patcher.stop)
 
     def tearDown(self):
         for key, prev in (("BOT_ID", self._prev_bot_id),
@@ -187,26 +196,111 @@ class TestFailureHandling(_AgentCase):
 
 
 class TestSettingsAgentBlock(unittest.TestCase):
-    """Страница Settings показывает состояние агента и не падает без него."""
+    """Страница Settings показывает состояние агента и не падает без него.
+
+    v5.1.0 (fix-1): раньше эти тесты звали `_agent_info()` без единого мока —
+    внутри это реальный `bothost_agent.probe()` → `resolve_agent_url()` →
+    TCP-проверка `agent:8000` и настоящий HTTP-запрос. На CI/локально агент
+    недоступен, но тест всё равно уходил в сеть и ждал таймаут (замерено
+    ревьюером: 6.25s). Теперь `probe`/`resolve_agent_url` мокаются
+    асинхронными заглушками — `_agent_info()` делает `import bothost_agent`
+    внутри функции, поэтому патчить нужно атрибуты самого модуля
+    `bothost_agent`, а не то, что импортировано в `web.admin_settings`.
+    """
 
     def setUp(self):
         os.environ["WEB_PASSWORD"] = "test-pwd"
         os.environ["WEB_ALLOW_NO_SECRET"] = "1"
+        self._prev_bot_id = os.environ.get("BOT_ID")
+        os.environ["BOT_ID"] = "bot_test_456"
+
+    def tearDown(self):
+        if self._prev_bot_id is None:
+            os.environ.pop("BOT_ID", None)
+        else:
+            os.environ["BOT_ID"] = self._prev_bot_id
 
     def test_agent_info_present_in_context(self):
-        """Хелпер отдаёт словарь с адресом и доступностью."""
+        """Хелпер отдаёт словарь с конкретными значениями из мока, не просто с ключами.
+
+        v5.1.0 (fix-1): раньше тест проверял только `assertIn(key, info)` —
+        такая проверка не ловит регресс «забыли await перед
+        resolve_agent_url()»: без await в `url` оказался бы объект корутины,
+        а `assertIn` всё равно был бы доволен. Теперь проверяем ТИП (`str`)
+        и ЗНАЧЕНИЕ (равенство адресу, подставленному мокой) — если await
+        пропадёт, `info["url"]` станет корутиной, `assertIsInstance` упадёт.
+        """
         import web.admin_settings as admin_settings
 
-        info = asyncio.run(admin_settings._agent_info())
-        for key in ("url", "available", "error", "raw"):
-            self.assertIn(key, info)
+        mock_url = "http://mock-agent:9999"
+        mock_result = bothost_agent.AgentResult(
+            ok=True, data={"stats": {"cpu_percent": 42.0}}, error=None,
+        )
+        with patch.object(bothost_agent, "probe", new=AsyncMock(return_value=mock_result)), \
+                patch.object(bothost_agent, "resolve_agent_url", new=AsyncMock(return_value=mock_url)):
+            info = asyncio.run(admin_settings._agent_info())
+
+        self.assertIsInstance(info["url"], str)
+        self.assertEqual(info["url"], mock_url)
+        self.assertEqual(info["bot_id"], "bot_test_456")
+        self.assertTrue(info["available"])
+        self.assertIsNone(info["error"])
+        self.assertEqual(info["raw"], {"stats": {"cpu_percent": 42.0}})
 
     def test_unavailable_agent_does_not_raise(self):
         """Агента нет — это состояние, а не ошибка страницы."""
         import web.admin_settings as admin_settings
 
-        info = asyncio.run(admin_settings._agent_info())
-        self.assertIn(info["available"], (True, False))
+        mock_result = bothost_agent.AgentResult(
+            ok=False, error="агент недоступен: ConnectionError",
+        )
+        with patch.object(bothost_agent, "probe", new=AsyncMock(return_value=mock_result)), \
+                patch.object(bothost_agent, "resolve_agent_url",
+                             new=AsyncMock(return_value="http://agent.bothost.ru")):
+            info = asyncio.run(admin_settings._agent_info())
+
+        self.assertFalse(info["available"])
+        self.assertEqual(info["error"], "агент недоступен: ConnectionError")
+
+
+class TestSettingsAgentPageRender(unittest.TestCase):
+    """Блок диагностики агента реально попадает в отрендеренный HTML страницы.
+
+    v5.1.0 (fix-1): до этого блок в шаблоне не проверялся ничем —
+    `test_v486_settings_render.py` использует print вместо assert и про
+    Agent-блок не знает вовсе. Логин настоящей su-кукой в TestClient не
+    работает (значение куки с запятыми httpx квотирует иначе, чем ожидает
+    require_auth) — обходим авторизацию через dependency_overrides.
+    """
+
+    def setUp(self):
+        os.environ["WEB_PASSWORD"] = "test-pwd"
+        os.environ["WEB_ALLOW_NO_SECRET"] = "1"
+
+    def test_agent_block_rendered_on_settings_page(self):
+        from fastapi.testclient import TestClient
+
+        import web_app
+        from web_app import AuthUser, require_auth, require_su
+
+        mock_url = "http://mock-agent:9999"
+        mock_result = bothost_agent.AgentResult(
+            ok=True, data={"stats": {"cpu_percent": 7.0}}, error=None,
+        )
+        fake_user = AuthUser(username="su_test", is_su=True, role="su")
+
+        app = web_app.create_app(bot=None)
+        app.dependency_overrides[require_su] = lambda: fake_user
+        app.dependency_overrides[require_auth] = lambda: fake_user
+        client = TestClient(app)
+
+        with patch.object(bothost_agent, "probe", new=AsyncMock(return_value=mock_result)), \
+                patch.object(bothost_agent, "resolve_agent_url", new=AsyncMock(return_value=mock_url)):
+            r = client.get("/admin/settings", follow_redirects=False)
+
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('id="agent"', r.text)
+        self.assertIn(mock_url, r.text)
 
 
 if __name__ == "__main__":
