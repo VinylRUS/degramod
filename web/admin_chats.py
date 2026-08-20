@@ -707,7 +707,14 @@ async def admin_chats_delete(
     leave_msg = ""
     if bot is not None:
         try:
-            await bot.leave_chat(chat_id=chat_id)
+            # v4.10.3 (Task 4): через tg_safe_call — при 429 бот остался бы
+            # в чате, хотя из панели чат уже удалён: состояние разъезжается,
+            # а повторить операцию неоткуда, кнопка уже отработала.
+            from bot_handlers import tg_safe_call
+            await tg_safe_call(
+                lambda: bot.leave_chat(chat_id=chat_id),
+                label="admin_chats_leave",
+            )
             leave_msg = "+bot+left"
             web_app._req_logger.info("admin_chats_delete: bot left chat_id=%s", chat_id)
         except TelegramBadRequest as e:

@@ -910,8 +910,14 @@ async def cmd_warns(message: types.Message, ctx: ModContext) -> None:
                 async with _EPHEMERAL_DELETE_SEM:
                     await asyncio.sleep(30)
                     try:
-                        await message.bot.delete_message(
-                            chat_id=chat_id, message_id=sent.message_id,
+                        # v4.10.3 (Task 4): через tg_safe_call — при 429
+                        # сообщение осталось бы висеть в чате навсегда:
+                        # повторить удаление некому, таска одноразовая.
+                        await tg_safe_call(
+                            lambda: message.bot.delete_message(
+                                chat_id=chat_id, message_id=sent.message_id,
+                            ),
+                            label="warn_notice_delete",
                         )
                     except TelegramAPIError:
                         pass

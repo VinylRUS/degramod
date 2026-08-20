@@ -341,11 +341,23 @@ async def _apply_chat_permissions(
     Returns:
       True при успехе, False при ошибке (сетевая / права бота / чат удалён).
     """
+    # v4.10.3 (Task 4): через tg_safe_call — при flood control (429) права
+    # применяются после ретрая, а не теряются. Потерянный вызов оставил бы
+    # чат в правах предыдущего режима, и следующий тик снял бы snapshot уже
+    # с испорченного состояния — ровно то «залипание», ради которого
+    # существует порядок тиков alarm → sanitary → night.
+    #
+    # Импорт внутри функции: chat_modes загружается раньше bot_handlers,
+    # и top-level импорт развернул бы порядок инициализации модулей.
+    from bot_handlers import tg_safe_call
     try:
-        await bot.set_chat_permissions(
-            chat_id=chat_id,
-            permissions=perms,
-            use_independent_chat_permissions=True,
+        await tg_safe_call(
+            lambda: bot.set_chat_permissions(
+                chat_id=chat_id,
+                permissions=perms,
+                use_independent_chat_permissions=True,
+            ),
+            label="apply_chat_permissions",
         )
         return True
     except TelegramAPIError as e:
