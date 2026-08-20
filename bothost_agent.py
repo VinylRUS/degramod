@@ -15,9 +15,9 @@ docs/superpowers/specs/2026-08-20-bothost-agent-integration-design.md
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-import socket
 from dataclasses import dataclass
 
 import aiohttp
@@ -57,16 +57,34 @@ def reset_cache() -> None:
     _cached_url = None
 
 
-def _can_connect(host: str, port: int, timeout: float = 1.0) -> bool:
-    """Проверяет TCP-доступность. Вынесено отдельно, чтобы мокать в тестах."""
+# Таймаут проверки доступности — накладывается снаружи через asyncio.wait_for
+# (ASYNC109: async-функция не должна принимать параметр timeout сама).
+_CONNECT_CHECK_TIMEOUT = 1.0
+
+
+async def _can_connect(host: str, port: int) -> bool:
+    """Проверяет TCP-доступность без блокировки event loop.
+
+    v5.1.0: синхронный socket.create_connection здесь не годился — его
+    параметр timeout не покрывает фазу DNS-резолвинга, и вызов замирал на
+    несколько секунд (замерено: 3.61s при timeout=1.0), останавливая
+    обработку сообщений во всех чатах. Таймаут накладывает вызывающий
+    (resolve_agent_url) через asyncio.wait_for — он ограничивает операцию
+    целиком, включая резолвинг.
+    """
     try:
-        socket.create_connection((host, port), timeout=timeout).close()
-        return True
+        _reader, writer = await asyncio.open_connection(host, port)
     except OSError:
         return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
 
 
-def resolve_agent_url() -> str:
+async def resolve_agent_url() -> str:
     """Адрес агента по алгоритму из документации Bothost.
 
     Порядок: внутренний agent:8000 → BOTHOST_AGENT_URL → публичный дефолт.
@@ -75,7 +93,15 @@ def resolve_agent_url() -> str:
     if _cached_url is not None:
         return _cached_url
 
-    if _can_connect(_INTERNAL_HOST, _INTERNAL_PORT):
+    try:
+        reachable = await asyncio.wait_for(
+            _can_connect(_INTERNAL_HOST, _INTERNAL_PORT),
+            timeout=_CONNECT_CHECK_TIMEOUT,
+        )
+    except TimeoutError:
+        reachable = False
+
+    if reachable:
         _cached_url = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
     else:
         _cached_url = os.getenv("BOTHOST_AGENT_URL") or _PUBLIC_FALLBACK
@@ -93,7 +119,7 @@ async def _request(method: str, path: str, **kwargs) -> AgentResult:
     Любая сетевая проблема, таймаут или неразбираемый ответ превращаются в
     AgentResult(ok=False) с внятной причиной.
     """
-    url = f"{resolve_agent_url()}{path}"
+    url = f"{await resolve_agent_url()}{path}"
     timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:

@@ -51,29 +51,45 @@ class TestUrlResolution(_AgentCase):
 
     def test_prefers_internal_docker_address(self):
         """Внутри сети Bothost агент доступен как agent:8000."""
-        with patch.object(bothost_agent, "_can_connect", return_value=True):
-            self.assertEqual(bothost_agent.resolve_agent_url(), "http://agent:8000")
+        with patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=True)):
+            self.assertEqual(
+                asyncio.run(bothost_agent.resolve_agent_url()), "http://agent:8000",
+            )
 
     def test_falls_back_to_env_variable(self):
         os.environ["BOTHOST_AGENT_URL"] = "http://msk1.bothost.ru"
-        with patch.object(bothost_agent, "_can_connect", return_value=False):
+        with patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=False)):
             self.assertEqual(
-                bothost_agent.resolve_agent_url(), "http://msk1.bothost.ru",
+                asyncio.run(bothost_agent.resolve_agent_url()), "http://msk1.bothost.ru",
             )
 
     def test_falls_back_to_public_default(self):
         os.environ.pop("BOTHOST_AGENT_URL", None)
-        with patch.object(bothost_agent, "_can_connect", return_value=False):
+        with patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=False)):
             self.assertEqual(
-                bothost_agent.resolve_agent_url(), "http://agent.bothost.ru",
+                asyncio.run(bothost_agent.resolve_agent_url()), "http://agent.bothost.ru",
             )
 
     def test_result_is_cached(self):
         """Адрес не меняется в пределах жизни контейнера — socket дёргаем раз."""
-        with patch.object(bothost_agent, "_can_connect", return_value=True) as probe:
-            bothost_agent.resolve_agent_url()
-            bothost_agent.resolve_agent_url()
+        probe = AsyncMock(return_value=True)
+        with patch.object(bothost_agent, "_can_connect", new=probe):
+            asyncio.run(bothost_agent.resolve_agent_url())
+            asyncio.run(bothost_agent.resolve_agent_url())
         self.assertEqual(probe.call_count, 1)
+
+    def test_connect_check_does_not_block_event_loop(self):
+        """Проверка доступности не морозит event loop.
+
+        Регресс: синхронный socket.create_connection блокировал общий loop
+        бота и панели на время DNS-резолвинга — несколько секунд, в течение
+        которых бот не отвечал ни в одном чате.
+        """
+        import inspect
+        self.assertTrue(
+            inspect.iscoroutinefunction(bothost_agent._can_connect),
+            "_can_connect должна быть асинхронной, иначе блокирует event loop",
+        )
 
 
 class TestMissingBotId(_AgentCase):
