@@ -137,8 +137,11 @@ async def _agent_info() -> dict:
 
     result = await bothost_agent.probe()
     return {
+        # v5.1.0 (fix-2): адрес может быть None — публичного дефолта больше нет.
         "url": await bothost_agent.resolve_agent_url(),
         "bot_id": os.getenv("BOT_ID") or None,
+        # Только факт наличия токена: само значение в панель не выводится.
+        "has_token": bool(os.getenv("BOT_API_TOKEN")),
         "available": result.ok,
         "error": result.error,
         "raw": result.data,

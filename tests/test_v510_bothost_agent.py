@@ -35,6 +35,11 @@ class _AgentCase(unittest.TestCase):
         self._prev_bot_id = os.environ.get("BOT_ID")
         self._prev_url = os.environ.get("BOTHOST_AGENT_URL")
         os.environ["BOT_ID"] = "bot_test_123"
+        # v5.1.0 (fix-2): базовый адрес для тестов запросов. Раньше его роль
+        # играл выдуманный публичный дефолт внутри модуля; теперь дефолта нет,
+        # и адрес обязан приходить снаружи. Тесты, проверяющие его отсутствие,
+        # переменную удаляют сами.
+        os.environ["BOTHOST_AGENT_URL"] = "http://agent-test:8000"
         # v5.1.0 (fix-1): по умолчанию агент «недоступен» без обращения к сети.
         # reset_cache() выше заставляет resolve_agent_url() каждый раз заново
         # проверять agent:8000, а это реальный DNS-резолв: в изоляции тест шёл
@@ -72,12 +77,27 @@ class TestUrlResolution(_AgentCase):
                 asyncio.run(bothost_agent.resolve_agent_url()), "http://msk1.bothost.ru",
             )
 
-    def test_falls_back_to_public_default(self):
+    def test_no_address_when_internal_down_and_env_unset(self):
+        """Без внутреннего агента и без переменной адреса нет — и мы это признаём.
+
+        v5.1.0 (fix-2): здесь стоял выдуманный дефолт http://agent.bothost.ru.
+        Такого хоста не существует: он резолвится, но отказывает в соединении
+        на 80, 443 и 8000. Бот стучался в никуда и сообщал «агент недоступен»,
+        как будто адрес верный, а агент лежит. Честный ответ — None.
+        """
         os.environ.pop("BOTHOST_AGENT_URL", None)
         with patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=False)):
-            self.assertEqual(
-                asyncio.run(bothost_agent.resolve_agent_url()), "http://agent.bothost.ru",
-            )
+            self.assertIsNone(asyncio.run(bothost_agent.resolve_agent_url()))
+
+    def test_request_without_address_does_not_touch_network(self):
+        """Нет адреса — сразу внятная ошибка, без похода в сеть."""
+        os.environ.pop("BOTHOST_AGENT_URL", None)
+        with patch.object(bothost_agent, "_can_connect", new=AsyncMock(return_value=False)), \
+                patch.object(bothost_agent.aiohttp, "ClientSession") as session_cls:
+            result = asyncio.run(bothost_agent.get_stats())
+        session_cls.assert_not_called()
+        self.assertFalse(result.ok)
+        self.assertIn("адрес агента не задан", result.error)
 
     def test_result_is_cached(self):
         """Адрес не меняется в пределах жизни контейнера — socket дёргаем раз."""
@@ -195,6 +215,88 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestAuthorization(_AgentCase):
+    """Запросы к агенту авторизуются токеном BOT_API_TOKEN.
+
+    v5.1.0 (fix-2): токена не было вовсе. roadmaps/ROADMAP_v5.0.0.md:651
+    прямо говорит «Нужен Bearer token для авторизации на agent API», но при
+    переносе в спеку v5.1.0 пункт выпал, и модуль ходил без авторизации.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._prev_token = os.environ.get("BOT_API_TOKEN")
+        os.environ["BOT_API_TOKEN"] = "tok_secret_42"
+        os.environ["BOTHOST_AGENT_URL"] = "http://agent-test:8000"
+
+    def tearDown(self):
+        if self._prev_token is None:
+            os.environ.pop("BOT_API_TOKEN", None)
+        else:
+            os.environ["BOT_API_TOKEN"] = self._prev_token
+        super().tearDown()
+
+    def _session(self):
+        response = MagicMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={"ok": True})
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.request = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        return session
+
+    def test_bearer_token_sent(self):
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_stats())
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer tok_secret_42")
+
+    def test_no_header_without_token(self):
+        """Токена нет — заголовок не выдумываем, шлём запрос без него."""
+        os.environ.pop("BOT_API_TOKEN", None)
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_stats())
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertNotIn("Authorization", headers)
+
+    def test_restart_keeps_bot_id_header_alongside_token(self):
+        """X-Bot-ID и Authorization должны сосуществовать, а не вытеснять друг друга."""
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.restart_self())
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer tok_secret_42")
+        self.assertEqual(headers["X-Bot-ID"], "bot_test_123")
+
+    def test_error_names_the_url_that_failed(self):
+        """404 обязан сказать, КУДА мы стучались, иначе диагностика бесполезна.
+
+        Прод отдавал «агент вернул не JSON (HTTP 404): 404 page not found»
+        без единого намёка на адрес и путь — по такому сообщению нельзя
+        отличить неверный хост от неверного эндпоинта.
+        """
+        response = MagicMock()
+        response.status = 404
+        response.json = AsyncMock(side_effect=ValueError("not json"))
+        response.text = AsyncMock(return_value="404 page not found")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.request = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            result = asyncio.run(bothost_agent.get_stats())
+        self.assertFalse(result.ok)
+        self.assertIn("http://agent-test:8000/api/bots/bot_test_123/stats", result.error)
+
+
 class TestSettingsAgentBlock(unittest.TestCase):
     """Страница Settings показывает состояние агента и не падает без него.
 
@@ -256,7 +358,7 @@ class TestSettingsAgentBlock(unittest.TestCase):
         )
         with patch.object(bothost_agent, "probe", new=AsyncMock(return_value=mock_result)), \
                 patch.object(bothost_agent, "resolve_agent_url",
-                             new=AsyncMock(return_value="http://agent.bothost.ru")):
+                             new=AsyncMock(return_value="http://agent:8000")):
             info = asyncio.run(admin_settings._agent_info())
 
         self.assertFalse(info["available"])
