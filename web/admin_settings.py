@@ -122,6 +122,29 @@ async def _bot_info() -> dict:
     return info
 
 
+async def _agent_info() -> dict:
+    """Состояние связи с Bothost Agent для блока диагностики.
+
+    v5.1.0: агент доступен только изнутри Docker-сети Bothost. Локально его
+    нет, и это нормально — блок покажет «недоступен», страница продолжит
+    работать.
+
+    Поле `raw` намеренно отдаёт сырой ответ: документация Bothost датирована
+    2025 годом, и первое, что нужно увидеть на проде, — совпадает ли
+    фактический формат с описанным.
+    """
+    import bothost_agent
+
+    result = await bothost_agent.probe()
+    return {
+        "url": await bothost_agent.resolve_agent_url(),
+        "bot_id": os.getenv("BOT_ID") or None,
+        "available": result.ok,
+        "error": result.error,
+        "raw": result.data,
+    }
+
+
 @router.get("/admin/settings", response_class=HTMLResponse)
 async def admin_settings_page(
     request: Request,
@@ -206,6 +229,7 @@ async def admin_settings_page(
         "counts": counts,
         "db_path_dir": os.path.dirname(DB_PATH) or ".",
         "bot_info": await _bot_info(),
+        "agent_info": await _agent_info(),
         "github_settings": github_settings,
         "idea_stats": idea_stats,
     })

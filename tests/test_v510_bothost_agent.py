@@ -186,5 +186,28 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestSettingsAgentBlock(unittest.TestCase):
+    """Страница Settings показывает состояние агента и не падает без него."""
+
+    def setUp(self):
+        os.environ["WEB_PASSWORD"] = "test-pwd"
+        os.environ["WEB_ALLOW_NO_SECRET"] = "1"
+
+    def test_agent_info_present_in_context(self):
+        """Хелпер отдаёт словарь с адресом и доступностью."""
+        import web.admin_settings as admin_settings
+
+        info = asyncio.run(admin_settings._agent_info())
+        for key in ("url", "available", "error", "raw"):
+            self.assertIn(key, info)
+
+    def test_unavailable_agent_does_not_raise(self):
+        """Агента нет — это состояние, а не ошибка страницы."""
+        import web.admin_settings as admin_settings
+
+        info = asyncio.run(admin_settings._agent_info())
+        self.assertIn(info["available"], (True, False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -10,6 +10,8 @@
     <span class="label">Jump:</span>
     <a href="#bot-info">Bot info</a>
     <span class="dim" style="padding: 0 4px;">·</span>
+    <a href="#agent">Agent</a>
+    <span class="dim" style="padding: 0 4px;">·</span>
     <a href="#database">Database</a>
     <span class="dim" style="padding: 0 4px; font-size: 10px;">(</span>
     <a href="#backup" style="font-size: 10px;">backup</a>
@@ -96,6 +98,29 @@
             <td>{{ bot_info.punishments_total }}</td>
         </tr>
     </table>
+</div>
+
+{# ── Bothost Agent ────────────────────────────────────────────────────────── #}
+<div id="agent" class="section-title" style="margin-top: var(--sp-6);">Bothost Agent <a class="anchor" href="#agent" style="color: var(--text-dim); font-weight: normal; text-transform: none; letter-spacing: 0;">#</a></div>
+<div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4); margin-left: var(--sp-4); border-left: 3px solid {% if agent_info.available %}var(--accent){% else %}var(--text-dim){% endif %};">
+    <div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-3); line-height: 1.7;">
+        Служебный API хостинга: логи, статистика контейнера и перезапуск.
+        Доступен только изнутри Docker-сети Bothost — вне контейнера
+        показывает «недоступен», и это нормально.
+    </div>
+    <table style="width: 100%; font-size: 12px; font-family: var(--font-mono);">
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">URL</td><td>{{ agent_info.url }}</td></tr>
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">BOT_ID</td><td>{{ agent_info.bot_id or '—' }}</td></tr>
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">Статус</td>
+            <td>{% if agent_info.available %}<span style="color: var(--accent);">● отвечает</span>{% else %}<span style="color: var(--text-dim);">○ недоступен</span>{% endif %}</td></tr>
+        {% if agent_info.error %}
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">Причина</td><td style="color: var(--warn);">{{ agent_info.error }}</td></tr>
+        {% endif %}
+    </table>
+    {% if agent_info.raw %}
+    <div style="font-size: 11px; color: var(--text-dim); margin-top: var(--sp-3); margin-bottom: 4px;">Сырой ответ агента:</div>
+    <pre style="background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); padding: var(--sp-3); font-size: 11px; overflow-x: auto; margin: 0;">{{ agent_info.raw | tojson(indent=2) }}</pre>
+    {% endif %}
 </div>
 
 {# ════════════════════════════════════════════════════════════════════════ #}
