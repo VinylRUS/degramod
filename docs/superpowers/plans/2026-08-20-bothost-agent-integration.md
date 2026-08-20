@@ -86,7 +86,10 @@ API: чтение логов и статистики, ручной переза�
 **Interfaces:**
 - Produces:
   - `AgentResult` — датакласс с полями `ok: bool`, `data: dict | None`, `error: str | None`
-  - `resolve_agent_url() -> str`
+  - `async resolve_agent_url() -> str`  # ВНИМАНИЕ: асинхронная. Стала такой в Task 1 (fix round 1):
+    #   проверка TCP-доступности agent:8000 идёт через asyncio.open_connection + wait_for,
+    #   потому что socket.create_connection блокировал event loop на 3.61s (DNS не покрыт timeout).
+    #   Любой вызов ОБЯЗАН быть await-нутым.
   - `reset_cache() -> None`
   - `async probe() -> AgentResult`
   - `async get_stats() -> AgentResult`
@@ -151,27 +154,27 @@ class TestUrlResolution(_AgentCase):
     def test_prefers_internal_docker_address(self):
         """Внутри сети Bothost агент доступен как agent:8000."""
         with patch.object(bothost_agent, "_can_connect", return_value=True):
-            self.assertEqual(bothost_agent.resolve_agent_url(), "http://agent:8000")
+            self.assertEqual(await bothost_agent.resolve_agent_url(), "http://agent:8000")
 
     def test_falls_back_to_env_variable(self):
         os.environ["BOTHOST_AGENT_URL"] = "http://msk1.bothost.ru"
         with patch.object(bothost_agent, "_can_connect", return_value=False):
             self.assertEqual(
-                bothost_agent.resolve_agent_url(), "http://msk1.bothost.ru",
+                await bothost_agent.resolve_agent_url(), "http://msk1.bothost.ru",
             )
 
     def test_falls_back_to_public_default(self):
         os.environ.pop("BOTHOST_AGENT_URL", None)
         with patch.object(bothost_agent, "_can_connect", return_value=False):
             self.assertEqual(
-                bothost_agent.resolve_agent_url(), "http://agent.bothost.ru",
+                await bothost_agent.resolve_agent_url(), "http://agent.bothost.ru",
             )
 
     def test_result_is_cached(self):
         """Адрес не меняется в пределах жизни контейнера — socket дёргаем раз."""
         with patch.object(bothost_agent, "_can_connect", return_value=True) as probe:
-            bothost_agent.resolve_agent_url()
-            bothost_agent.resolve_agent_url()
+            await bothost_agent.resolve_agent_url()
+            await bothost_agent.resolve_agent_url()
         self.assertEqual(probe.call_count, 1)
 
 
@@ -270,7 +273,7 @@ def _can_connect(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
-def resolve_agent_url() -> str:
+async def resolve_agent_url() -> str:
     """Адрес агента по алгоритму из документации Bothost.
 
     Порядок: внутренний agent:8000 → BOTHOST_AGENT_URL → публичный дефолт.
@@ -297,7 +300,7 @@ async def _request(method: str, path: str, **kwargs) -> AgentResult:
     Любая сетевая проблема, таймаут или неразбираемый ответ превращаются в
     AgentResult(ok=False) с внятной причиной.
     """
-    url = f"{resolve_agent_url()}{path}"
+    url = f"{await resolve_agent_url()}{path}"
     timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -501,7 +504,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/test_v510_bothost_agent.py`
 
 **Interfaces:**
-- Consumes: `bothost_agent.probe()`, `bothost_agent.resolve_agent_url()` (Task 1)
+- Consumes: `bothost_agent.probe()`, `await bothost_agent.resolve_agent_url()` (Task 1; обе асинхронные)
 - Produces: ключ `agent_info` в контексте шаблона `admin_settings.html`
 
 - [ ] **Step 1: Написать падающий тест**
@@ -557,7 +560,7 @@ async def _agent_info() -> dict:
 
     result = await bothost_agent.probe()
     return {
-        "url": bothost_agent.resolve_agent_url(),
+        "url": await bothost_agent.resolve_agent_url(),
         "bot_id": os.getenv("BOT_ID") or None,
         "available": result.ok,
         "error": result.error,
