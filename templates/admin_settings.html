@@ -112,6 +112,7 @@
         <tr><td style="color: var(--text-dim); padding: 4px 0;">URL</td><td>{{ agent_info.url or '— не задан (BOTHOST_AGENT_URL)' }}</td></tr>
         <tr><td style="color: var(--text-dim); padding: 4px 0;">Токен</td>
             <td>{% if agent_info.has_token %}<span style="color: var(--accent);">задан</span>{% else %}<span style="color: var(--text-dim);">нет BOT_API_TOKEN</span>{% endif %}</td></tr>
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">Внутренний</td><td>{{ agent_info.internal or '—' }}</td></tr>
         <tr><td style="color: var(--text-dim); padding: 4px 0;">BOT_ID</td><td>{{ agent_info.bot_id or '—' }}</td></tr>
         <tr><td style="color: var(--text-dim); padding: 4px 0;">Статус</td>
             <td>{% if agent_info.available %}<span style="color: var(--accent);">● отвечает</span>{% else %}<span style="color: var(--text-dim);">○ недоступен</span>{% endif %}</td></tr>

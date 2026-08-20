@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 from dataclasses import dataclass
 
 import aiohttp
@@ -41,6 +42,7 @@ _INTERNAL_PORT = 8000
 # Кеш адреса: в пределах жизни контейнера он не меняется, дёргать socket
 # на каждый запрос незачем.
 _cached_url: str | None = None
+_internal_reason: str | None = None
 
 
 @dataclass
@@ -59,8 +61,9 @@ class AgentResult:
 
 def reset_cache() -> None:
     """Сбрасывает кеш адреса. Нужен тестам для изоляции."""
-    global _cached_url
+    global _cached_url, _internal_reason
     _cached_url = None
+    _internal_reason = None
 
 
 # Таймаут проверки доступности — накладывается снаружи через asyncio.wait_for
@@ -69,7 +72,7 @@ _CONNECT_CHECK_TIMEOUT = 1.0
 
 
 async def _can_connect(host: str, port: int) -> bool:
-    """Проверяет TCP-доступность без блокировки event loop.
+    """Устанавливает TCP-соединение. Ошибки пробрасывает наружу.
 
     v5.1.0: синхронный socket.create_connection здесь не годился — его
     параметр timeout не покрывает фазу DNS-резолвинга, и вызов замирал на
@@ -78,16 +81,45 @@ async def _can_connect(host: str, port: int) -> bool:
     (resolve_agent_url) через asyncio.wait_for — он ограничивает операцию
     целиком, включая резолвинг.
     """
-    try:
-        _reader, writer = await asyncio.open_connection(host, port)
-    except OSError:
-        return False
+    # v5.1.0 (fix-3): OSError больше НЕ глушится здесь. gaierror и
+    # ConnectionRefusedError — его наследники, и, проглотив их, мы теряли
+    # единственное, что отличает «бот не в сети агента» от «порт закрыт».
+    # Разбирает исключения diagnose_internal, она же превращает их в текст.
+    _reader, writer = await asyncio.open_connection(host, port)
     writer.close()
     try:
         await writer.wait_closed()
     except OSError:
         pass
     return True
+
+
+async def diagnose_internal() -> tuple[bool, str]:
+    """Проверяет agent:8000 и объясняет исход человеческими словами.
+
+    v5.1.0 (fix-3): раньше здесь было голое True/False, и три разных
+    диагноза выглядели одинаково. Различать их обязательно:
+      • имя не резолвится — контейнер бота не в Docker-сети агента;
+      • соединение отвергнуто — сеть та, но на порту никто не слушает;
+      • таймаут — проверка не уложилась в отведённое время, агент может
+        быть жив, а отбраковали мы его сами.
+    """
+    try:
+        reachable = await asyncio.wait_for(
+            _can_connect(_INTERNAL_HOST, _INTERNAL_PORT),
+            timeout=_CONNECT_CHECK_TIMEOUT,
+        )
+    except TimeoutError:
+        return False, f"таймаут {_CONNECT_CHECK_TIMEOUT}s при проверке {_INTERNAL_HOST}:{_INTERNAL_PORT}"
+    except socket.gaierror as e:
+        return False, f"имя {_INTERNAL_HOST} не резолвится ({e})"
+    except ConnectionRefusedError:
+        return False, f"соединение с {_INTERNAL_HOST}:{_INTERNAL_PORT} отвергнуто"
+    except OSError as e:
+        return False, f"{type(e).__name__}: {e}"
+    if reachable:
+        return True, f"{_INTERNAL_HOST}:{_INTERNAL_PORT} доступен"
+    return False, f"{_INTERNAL_HOST}:{_INTERNAL_PORT} не отвечает"
 
 
 async def resolve_agent_url() -> str | None:
@@ -101,24 +133,23 @@ async def resolve_agent_url() -> str | None:
     if _cached_url is not None:
         return _cached_url
 
-    try:
-        reachable = await asyncio.wait_for(
-            _can_connect(_INTERNAL_HOST, _INTERNAL_PORT),
-            timeout=_CONNECT_CHECK_TIMEOUT,
-        )
-    except TimeoutError:
-        reachable = False
+    global _internal_reason
+    reachable, _internal_reason = await diagnose_internal()
 
     if reachable:
         _cached_url = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
     else:
         _cached_url = (os.getenv("BOTHOST_AGENT_URL") or "").rstrip("/") or None
     logger.info(
-        "Bothost agent URL: %s (внутренний agent:%s %s)",
-        _cached_url or "не задан", _INTERNAL_PORT,
-        "доступен" if reachable else "не отвечает",
+        "Bothost agent URL: %s (внутренний: %s)",
+        _cached_url or "не задан", _internal_reason,
     )
     return _cached_url
+
+
+def internal_reason() -> str | None:
+    """Последний диагноз по внутреннему адресу — для блока диагностики."""
+    return _internal_reason
 
 
 def _bot_id() -> str | None:

@@ -215,6 +215,62 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestInternalDiagnosis(unittest.TestCase):
+    """Причина недоступности внутреннего agent:8000 называется конкретно.
+
+    v5.1.0 (fix-3): _can_connect возвращала голое True/False, выбрасывая
+    причину. На проде это оставило неразличимыми три совершенно разных
+    случая — имя agent не резолвится, соединение отвергнуто, проверка не
+    уложилась в таймаут. Первый означает «бот не в сети агента», второй —
+    «сеть та, порт не тот», третий — «таймаут слишком тугой». Лечатся они
+    по-разному, поэтому диагноз обязан их различать.
+    """
+
+    def setUp(self):
+        # НЕ наследуемся от _AgentCase: он мокает _can_connect заглушкой, и
+        # до реального open_connection дело бы не дошло — диагноз всегда
+        # выходил бы «не отвечает», а именно его мы и проверяем.
+        bothost_agent.reset_cache()
+
+    def _diagnose(self, exc):
+        async def boom(*_a, **_kw):
+            raise exc
+        with patch.object(bothost_agent.asyncio, "open_connection", new=boom):
+            return asyncio.run(bothost_agent.diagnose_internal())
+
+    def test_unresolved_name_is_named(self):
+        import socket
+        reachable, reason = self._diagnose(socket.gaierror("Name does not resolve"))
+        self.assertFalse(reachable)
+        self.assertIn("не резолвится", reason)
+
+    def test_refused_connection_is_named(self):
+        reachable, reason = self._diagnose(ConnectionRefusedError("refused"))
+        self.assertFalse(reachable)
+        self.assertIn("отвергнуто", reason)
+
+    def test_timeout_is_named(self):
+        async def hang(*_a, **_kw):
+            await asyncio.sleep(60)
+        with patch.object(bothost_agent.asyncio, "open_connection", new=hang), \
+                patch.object(bothost_agent, "_CONNECT_CHECK_TIMEOUT", 0.05):
+            reachable, reason = asyncio.run(bothost_agent.diagnose_internal())
+        self.assertFalse(reachable)
+        self.assertIn("таймаут", reason)
+
+    def test_success_is_named(self):
+        writer = MagicMock()
+        writer.close = MagicMock()
+        writer.wait_closed = AsyncMock()
+
+        async def ok(*_a, **_kw):
+            return MagicMock(), writer
+        with patch.object(bothost_agent.asyncio, "open_connection", new=ok):
+            reachable, reason = asyncio.run(bothost_agent.diagnose_internal())
+        self.assertTrue(reachable)
+        self.assertIn("доступен", reason)
+
+
 class TestAuthorization(_AgentCase):
     """Запросы к агенту авторизуются токеном BOT_API_TOKEN.
 

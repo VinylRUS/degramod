@@ -142,6 +142,10 @@ async def _agent_info() -> dict:
         "bot_id": os.getenv("BOT_ID") or None,
         # Только факт наличия токена: само значение в панель не выводится.
         "has_token": bool(os.getenv("BOT_API_TOKEN")),
+        # v5.1.0 (fix-3): конкретная причина по внутреннему agent:8000 —
+        # не резолвится / отвергнуто / таймаут. Заполняется resolve_agent_url,
+        # поэтому читается строго после probe().
+        "internal": bothost_agent.internal_reason(),
         "available": result.ok,
         "error": result.error,
         "raw": result.data,
