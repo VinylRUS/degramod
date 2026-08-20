@@ -145,7 +145,7 @@ async def _agent_info() -> dict:
         # v5.1.0 (fix-3): конкретная причина по внутреннему agent:8000 —
         # не резолвится / отвергнуто / таймаут. Заполняется resolve_agent_url,
         # поэтому читается строго после probe().
-        "internal": bothost_agent.internal_reason(),
+        "internal_report": bothost_agent.internal_report(),
         "token_source": bothost_agent.token_source(),
         "token_shape": bothost_agent.token_shape(),
         # v5.1.0 (fix-5): перебор кандидатов запускается только при отказе

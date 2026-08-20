@@ -215,6 +215,95 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestBotIdHeader(_AgentCase):
+    """X-Bot-ID уходит на КАЖДОМ запросе — это и есть авторизация агента.
+
+    v5.1.0 (fix-7): документация Bothost прямо говорит «Без Bearer-токена:
+    используется только X-Bot-ID». Заголовок стоял только у restart_self,
+    а stats и logs уходили без него.
+    """
+
+    def setUp(self):
+        super().setUp()
+        os.environ["BOTHOST_AGENT_URL"] = "http://agent-test:8000"
+
+    def _session(self):
+        response = MagicMock()
+        response.status = 200
+        response.json = AsyncMock(return_value={"ok": True})
+        response.text = AsyncMock(return_value="")
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        session = MagicMock()
+        session.request = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        return session
+
+    def test_stats_carries_bot_id(self):
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_stats())
+        self.assertEqual(session.request.call_args.kwargs["headers"]["X-Bot-ID"], "bot_test_123")
+
+    def test_logs_carry_bot_id(self):
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_logs())
+        self.assertEqual(session.request.call_args.kwargs["headers"]["X-Bot-ID"], "bot_test_123")
+
+
+class TestInternalCandidates(unittest.TestCase):
+    """Внутренний адрес ищется перебором, а не одним именем.
+
+    v5.1.0 (fix-7): на проде имя `agent` не резолвится — контейнер бота не в
+    той Docker-сети. Документация сама советует «определяйте URL
+    автоматически», поэтому проверяем несколько известных вариантов и
+    показываем исход каждого.
+    """
+
+    def setUp(self):
+        bothost_agent.reset_cache()
+        self._prev = os.environ.get("BOTHOST_AGENT_URL")
+        os.environ.pop("BOTHOST_AGENT_URL", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._prev is None:
+            os.environ.pop("BOTHOST_AGENT_URL", None)
+        else:
+            os.environ["BOTHOST_AGENT_URL"] = self._prev
+        bothost_agent.reset_cache()
+
+    def test_uses_second_candidate_when_first_unresolvable(self):
+        import socket
+        working = bothost_agent._INTERNAL_CANDIDATES[1]
+
+        async def selective(host, port, **_kw):
+            if (host, port) != working:
+                raise socket.gaierror("Name or service not known")
+            writer = MagicMock()
+            writer.close = MagicMock()
+            writer.wait_closed = AsyncMock()
+            return MagicMock(), writer
+
+        with patch.object(bothost_agent.asyncio, "open_connection", new=selective):
+            url = asyncio.run(bothost_agent.resolve_agent_url())
+        self.assertEqual(url, f"http://{working[0]}:{working[1]}")
+
+    def test_report_covers_every_candidate(self):
+        import socket
+
+        async def always_fail(*_a, **_kw):
+            raise socket.gaierror("Name or service not known")
+
+        with patch.object(bothost_agent.asyncio, "open_connection", new=always_fail):
+            url, report = asyncio.run(bothost_agent.diagnose_internal())
+        self.assertIsNone(url)
+        self.assertEqual(len(report), len(bothost_agent._INTERNAL_CANDIDATES))
+        self.assertTrue(all("не резолвится" in reason for _, reason in report))
+
+
 class TestTokenSanitizing(_AgentCase):
     """Значение ключа чистится от того, что добавляет панель хостинга.
 
@@ -361,7 +450,7 @@ class TestInternalDiagnosis(unittest.TestCase):
         async def boom(*_a, **_kw):
             raise exc
         with patch.object(bothost_agent.asyncio, "open_connection", new=boom):
-            return asyncio.run(bothost_agent.diagnose_internal())
+            return asyncio.run(bothost_agent._diagnose_one(bothost_agent._INTERNAL_HOST, 8000))
 
     def test_unresolved_name_is_named(self):
         import socket
@@ -379,7 +468,7 @@ class TestInternalDiagnosis(unittest.TestCase):
             await asyncio.sleep(60)
         with patch.object(bothost_agent.asyncio, "open_connection", new=hang), \
                 patch.object(bothost_agent, "_CONNECT_CHECK_TIMEOUT", 0.05):
-            reachable, reason = asyncio.run(bothost_agent.diagnose_internal())
+            reachable, reason = asyncio.run(bothost_agent._diagnose_one(bothost_agent._INTERNAL_HOST, 8000))
         self.assertFalse(reachable)
         self.assertIn("таймаут", reason)
 
@@ -391,7 +480,7 @@ class TestInternalDiagnosis(unittest.TestCase):
         async def ok(*_a, **_kw):
             return MagicMock(), writer
         with patch.object(bothost_agent.asyncio, "open_connection", new=ok):
-            reachable, reason = asyncio.run(bothost_agent.diagnose_internal())
+            reachable, reason = asyncio.run(bothost_agent._diagnose_one(bothost_agent._INTERNAL_HOST, 8000))
         self.assertTrue(reachable)
         self.assertIn("доступен", reason)
 

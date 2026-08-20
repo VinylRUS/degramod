@@ -32,6 +32,17 @@ _TIMEOUT_SECONDS = 10
 _INTERNAL_HOST = "agent"
 _INTERNAL_PORT = 8000
 
+# v5.1.0 (fix-7): на проде имя `agent` не резолвится — контейнер бота не в
+# Docker-сети агента. Документация советует «определяйте URL автоматически»,
+# поэтому проверяем известные варианты: штатное имя, альтернативное имя
+# сервиса и адрес хоста через шлюз Docker.
+_INTERNAL_CANDIDATES: tuple[tuple[str, int], ...] = (
+    (_INTERNAL_HOST, _INTERNAL_PORT),
+    ("bothost-agent", _INTERNAL_PORT),
+    ("host.docker.internal", _INTERNAL_PORT),
+    ("172.17.0.1", _INTERNAL_PORT),
+)
+
 # v5.1.0 (fix-2): публичного дефолта здесь больше нет. Стоял выдуманный
 # http://agent.bothost.ru — хост резолвится, но отказывает в соединении на
 # 80, 443 и 8000, то есть бот стучался в никуда и рапортовал «агент
@@ -42,7 +53,7 @@ _INTERNAL_PORT = 8000
 # Кеш адреса: в пределах жизни контейнера он не меняется, дёргать socket
 # на каждый запрос незачем.
 _cached_url: str | None = None
-_internal_reason: str | None = None
+_internal_report: list[tuple[str, str]] = []
 
 
 @dataclass
@@ -61,9 +72,9 @@ class AgentResult:
 
 def reset_cache() -> None:
     """Сбрасывает кеш адреса. Нужен тестам для изоляции."""
-    global _cached_url, _internal_reason
+    global _cached_url, _internal_report
     _cached_url = None
-    _internal_reason = None
+    _internal_report = []
 
 
 # Таймаут проверки доступности — накладывается снаружи через asyncio.wait_for
@@ -94,8 +105,8 @@ async def _can_connect(host: str, port: int) -> bool:
     return True
 
 
-async def diagnose_internal() -> tuple[bool, str]:
-    """Проверяет agent:8000 и объясняет исход человеческими словами.
+async def _diagnose_one(host: str, port: int) -> tuple[bool, str]:
+    """Проверяет один адрес и объясняет исход человеческими словами.
 
     v5.1.0 (fix-3): раньше здесь было голое True/False, и три разных
     диагноза выглядели одинаково. Различать их обязательно:
@@ -106,20 +117,34 @@ async def diagnose_internal() -> tuple[bool, str]:
     """
     try:
         reachable = await asyncio.wait_for(
-            _can_connect(_INTERNAL_HOST, _INTERNAL_PORT),
-            timeout=_CONNECT_CHECK_TIMEOUT,
+            _can_connect(host, port), timeout=_CONNECT_CHECK_TIMEOUT,
         )
     except TimeoutError:
-        return False, f"таймаут {_CONNECT_CHECK_TIMEOUT}s при проверке {_INTERNAL_HOST}:{_INTERNAL_PORT}"
+        return False, f"таймаут {_CONNECT_CHECK_TIMEOUT}s при проверке {host}:{port}"
     except socket.gaierror as e:
-        return False, f"имя {_INTERNAL_HOST} не резолвится ({e})"
+        return False, f"имя {host} не резолвится ({e})"
     except ConnectionRefusedError:
-        return False, f"соединение с {_INTERNAL_HOST}:{_INTERNAL_PORT} отвергнуто"
+        return False, f"соединение с {host}:{port} отвергнуто"
     except OSError as e:
         return False, f"{type(e).__name__}: {e}"
     if reachable:
-        return True, f"{_INTERNAL_HOST}:{_INTERNAL_PORT} доступен"
-    return False, f"{_INTERNAL_HOST}:{_INTERNAL_PORT} не отвечает"
+        return True, f"{host}:{port} доступен"
+    return False, f"{host}:{port} не отвечает"
+
+
+async def diagnose_internal() -> tuple[str | None, list[tuple[str, str]]]:
+    """Перебирает внутренние адреса и возвращает первый рабочий плюс отчёт."""
+    found: str | None = None
+    report: list[tuple[str, str]] = []
+    for host, port in _INTERNAL_CANDIDATES:
+        reachable, reason = await _diagnose_one(host, port)
+        report.append((f"{host}:{port}", reason))
+        if reachable:
+            # Нашли рабочий — остальных не трогаем: лишние сокеты незачем,
+            # да и кеш адреса рассчитан на одну проверку за жизнь контейнера.
+            found = f"http://{host}:{port}"
+            break
+    return found, report
 
 
 async def resolve_agent_url() -> str | None:
@@ -133,23 +158,24 @@ async def resolve_agent_url() -> str | None:
     if _cached_url is not None:
         return _cached_url
 
-    global _internal_reason
-    reachable, _internal_reason = await diagnose_internal()
+    global _internal_report
+    internal_url, _internal_report = await diagnose_internal()
 
-    if reachable:
-        _cached_url = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
+    if internal_url:
+        _cached_url = internal_url
     else:
         _cached_url = (os.getenv("BOTHOST_AGENT_URL") or "").rstrip("/") or None
     logger.info(
-        "Bothost agent URL: %s (внутренний: %s)",
-        _cached_url or "не задан", _internal_reason,
+        "Bothost agent URL: %s (внутренние: %s)",
+        _cached_url or "не задан",
+        "; ".join(f"{addr} — {why}" for addr, why in _internal_report) or "не проверялись",
     )
     return _cached_url
 
 
-def internal_reason() -> str | None:
-    """Последний диагноз по внутреннему адресу — для блока диагностики."""
-    return _internal_reason
+def internal_report() -> list[tuple[str, str]]:
+    """Исход по каждому внутреннему кандидату — для блока диагностики."""
+    return list(_internal_report)
 
 
 def _bot_id() -> str | None:
@@ -224,7 +250,14 @@ async def _request(method: str, path: str, token: str | None = None, **kwargs) -
     url = f"{base}{path}"
     # Заголовки вызывающего (X-Bot-ID у restart_self) дополняются авторизацией,
     # а не заменяются ею.
-    headers = {**_auth_headers(token), **(kwargs.pop("headers", None) or {})}
+    # v5.1.0 (fix-7): X-Bot-ID — штатная авторизация агента по документации
+    # («Без Bearer-токена: используется только X-Bot-ID»). Раньше стоял лишь
+    # у restart_self. Bearer оставлен для внешнего шлюза, если ключ задан.
+    base_headers: dict[str, str] = {}
+    if _bot_id():
+        base_headers["X-Bot-ID"] = _bot_id()
+    base_headers.update(_auth_headers(token))
+    headers = {**base_headers, **(kwargs.pop("headers", None) or {})}
     timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
