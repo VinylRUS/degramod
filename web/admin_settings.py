@@ -33,6 +33,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 
+import health_probe
 import web_app
 from db import DB_PATH, GithubSettings, _decrypt_pat, _encrypt_pat, async_session
 from web.admin_cleanup import _cleanup_counts
@@ -80,18 +81,10 @@ async def _bot_info() -> dict:
             info["db_size_bytes"] = os.path.getsize(DB_PATH)
     except OSError:
         pass
-    # Memory RSS: читаем из /proc/self/status (Linux only).
-    # VmRSS line: "VmRSS:\t    12345 kB\n"
-    try:
-        with open("/proc/self/status", "r") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        info["memory_rss_bytes"] = int(parts[1]) * 1024
-                    break
-    except (OSError, ValueError):
-        pass
+    # Memory RSS. v4.10.2 (Task 16): чтение /proc/self/status вынесено в
+    # health_probe — тот же код понадобился /healthz, и держать две копии,
+    # расходящиеся при первой же правке, незачем.
+    info["memory_rss_bytes"] = health_probe.memory_rss_bytes()
     # Счётчики из БД — v4.8.7: blocking SQLite в потоке.
     def _counts_sync() -> dict:
         result = {

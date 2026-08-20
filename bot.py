@@ -36,6 +36,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
+# v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
+# Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
+# См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
+import health_probe
+
 # v4.5.2: helpers для night mode background task (defined in bot_handlers)
 # v4.5.3: добавлен _night_mode_in_window для поддержки per-chat tz + weekend.
 # v4.5.4: добавлены helpers для санитарных дней (chat-level ChatPermissions lockdown).
@@ -72,10 +77,6 @@ from bot_handlers import (
     parse_sanitary_days_json,
 )
 from bot_handlers import router as mod_router
-
-# v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
-# Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
-# См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
 from chat_modes import (
     _alarm_auto_off_tick,  # v4.8.9: перенесено из bot.py
     _apply_chat_permissions,
@@ -192,6 +193,28 @@ async def _night_mode_loop():
             await _night_mode_tick()
         except Exception as e:
             logger.error("Alarm/sanitary/night mode tick error: %s", e)
+        await asyncio.sleep(60)
+
+
+async def _health_probe_loop():
+    """Background loop: раз в минуту проверяет связь с Telegram для /healthz.
+
+    v4.10.2 (Task 16): отдельная таска, а НЕ тик внутри _night_mode_loop.
+    Там инвариант порядка (alarm → sanitary → night), и подвисший get_me
+    задержал бы снятие режимов чата — права в чате «залипли» бы до
+    следующего круга.
+
+    Результат кладётся в health_probe, роут /healthz читает готовый снимок
+    и в сеть не ходит: мониторинг опрашивает его куда чаще, чем раз в
+    минуту, и каждый такой опрос уходил бы в Bot API.
+    """
+    # Как и night_mode_loop, ждём подъёма вебхука/поллинга.
+    await asyncio.sleep(30)
+    logger.info("Health probe background task started (interval=60s)")
+    while True:
+        # probe_tick сам глушит исключения: таска, падающая от сетевого
+        # сбоя, перестала бы следить за здоровьем ровно когда это нужнее.
+        await health_probe.probe_tick(bot)
         await asyncio.sleep(60)
 
 
@@ -1405,6 +1428,11 @@ async def lifespan(app):
             night_task = tg.create_task(
                 _night_mode_loop(), name="night_mode_loop",
             )
+            # v4.10.2: пробник Telegram для /healthz — отдельной таской,
+            # чтобы его задержки не влияли на тики режимов чата.
+            health_task = tg.create_task(
+                _health_probe_loop(), name="health_probe_loop",
+            )
             # Long polling — только если вебхук не установлен.
             if use_polling:
                 polling_task = tg.create_task(
@@ -1419,7 +1447,10 @@ async def lifespan(app):
             # их завершения; мы добавляем сверху asyncio.wait_for с hard cap,
             # чтобы зависшая задача не подвесила весь shutdown.
             logger.info("Shutdown: cancelling background tasks...")
-            bg_tasks = [night_task]
+            # v4.10.2: health_task обязан быть в списке. Забыть его —
+            # значит подвесить shutdown: TaskGroup ждёт завершения всех
+            # задач, а бесконечный while True сам не выйдет.
+            bg_tasks = [night_task, health_task]
             if polling_task is not None:
                 bg_tasks.append(polling_task)
             for t in bg_tasks:

@@ -56,12 +56,22 @@ required_in_src = [
     "memory_rss_bytes",
     "python_version",
     "sys.version",
-    "/proc/self/status",
-    "VmRSS",
 ]
 for token in required_in_src:
     assert token in src2, f"В исходнике отсутствует: {token}"
     print(f"  ✓ найдено: {token}")
+
+# v4.10.2 (Task 16): чтение /proc/self/status вынесено из _bot_info в
+# health_probe — тот же код понадобился /healthz. Проверяем там же, где
+# он теперь живёт; смысл прежний: RSS читается из procfs, без psutil.
+src3_path = _P("health_probe.py")
+with open(src3_path, "r") as f:
+    src3 = f.read()
+for token in ("/proc/self/status", "VmRSS"):
+    assert token in src3, f"В health_probe.py отсутствует: {token}"
+    print(f"  ✓ найдено в health_probe.py: {token}")
+assert "health_probe.memory_rss_bytes()" in src2, \
+    "web/admin_settings.py больше не берёт RSS из health_probe"
 
 # Проверка что psutil больше не используется
 assert "import psutil" not in src, "psutil всё ещё импортируется!"

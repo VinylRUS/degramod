@@ -32,8 +32,9 @@ from starlette.routing import Route  # noqa: E402
 import web_app  # noqa: E402
 from web.deps import get_bot, get_templates  # noqa: E402
 
-# Эталон на v4.9.0 (4e3d5b2): 47 роутов в create_app + 7 в web/.
-_EXPECTED_ROUTES = 54
+# Эталон: 54 роута после декомпозиции (47 из create_app + 7 вынесенных
+# раньше) плюс /healthz, добавленный в v4.10.2 (Task 16).
+_EXPECTED_ROUTES = 55
 
 
 def _walk(routes):
