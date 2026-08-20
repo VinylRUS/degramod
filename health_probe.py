@@ -21,12 +21,19 @@ from __future__ import annotations
 
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 
 # Пороги из roadmap.md, 5.0.0-07.
 _MEMORY_DEGRADED_PERCENT = 85.0
 _MEMORY_DOWN_PERCENT = 95.0
 _TELEGRAM_SLOW_MS = 1000
+
+# roadmap 5.0.0-08: сколько подряд медленных ответов считаем деградацией и
+# как часто позволяем беспокоить SU.
+_ALERT_STREAK = 5
+_ALERT_COOLDOWN_SECONDS = 30 * 60
+_HISTORY_SIZE = 10
 
 # cgroup v2 пишет литерал `max`, если лимита нет; v1 в той же ситуации
 # отдаёт число размером с адресное пространство. Всё, что выше этого
@@ -48,11 +55,65 @@ _state: dict = {
 }
 
 
+# История последних замеров для детекции устойчивых задержек (5.0.0-08).
+# None означает «связи не было» — в серию медленных не засчитывается.
+_latency_history: deque = deque(maxlen=_HISTORY_SIZE)
+
+# Когда в последний раз беспокоили SU. Ноль — не беспокоили ни разу.
+_alert_state: dict = {"last_sent": 0.0}
+
+
 def reset_state() -> None:
-    """Сбрасывает снимок. Нужен тестам, чтобы файлы не влияли друг на друга."""
+    """Сбрасывает снимок и историю. Нужен тестам для изоляции."""
     _state["telegram_connected"] = None
     _state["telegram_api_latency_ms"] = None
     _state["checked_at"] = None
+    _latency_history.clear()
+    _alert_state["last_sent"] = 0.0
+
+
+def record_latency(value_ms: int | None) -> None:
+    """Добавляет замер в историю. None — обрыв связи, не «медленно»."""
+    _latency_history.append(value_ms)
+
+
+def latency_history() -> list:
+    """Копия истории замеров, свежие в конце."""
+    return list(_latency_history)
+
+
+def latency_average_ms() -> int | None:
+    """Среднее по успешным замерам. None, если успешных нет."""
+    values = [v for v in _latency_history if v is not None]
+    if not values:
+        return None
+    return int(sum(values) / len(values))
+
+
+def should_alert() -> bool:
+    """Пора ли слать SU алерт о задержках Telegram.
+
+    Условие из roadmap 5.0.0-08: пять последних замеров подряд выше порога.
+    Пробник ходит раз в минуту, то есть это пять минут стабильных тормозов,
+    а не случайный всплеск.
+
+    Обрыв связи (None) серию не продолжает и не начинает: это отдельная
+    авария, её показывает `degraded` в /healthz. Если считать её медленным
+    ответом, SU получит алерт про задержки вместо «Telegram недоступен».
+
+    Антиспам: не чаще раза в 30 минут.
+    """
+    if len(_latency_history) < _ALERT_STREAK:
+        return False
+    tail = list(_latency_history)[-_ALERT_STREAK:]
+    if not all(v is not None and v > _TELEGRAM_SLOW_MS for v in tail):
+        return False
+    return (time.time() - _alert_state["last_sent"]) >= _ALERT_COOLDOWN_SECONDS
+
+
+def mark_alert_sent() -> None:
+    """Запоминает момент отправки — включает антиспам-окно."""
+    _alert_state["last_sent"] = time.time()
 
 
 def _read_first_int(path: str) -> int | None:
@@ -139,9 +200,12 @@ async def probe_tick(bot) -> None:
     except Exception:
         _state["telegram_connected"] = False
         _state["telegram_api_latency_ms"] = None
+        record_latency(None)
     else:
         _state["telegram_connected"] = True
-        _state["telegram_api_latency_ms"] = int((time.monotonic() - started) * 1000)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _state["telegram_api_latency_ms"] = elapsed_ms
+        record_latency(elapsed_ms)
     _state["checked_at"] = time.time()
 
 
@@ -176,5 +240,7 @@ def collect_health(app_version: str, start_time: float) -> dict:
         "memory_percent": percent,
         "telegram_connected": snap["telegram_connected"],
         "telegram_api_latency_ms": snap["telegram_api_latency_ms"],
+        # 5.0.0-08: среднее по истории — по одному замеру не видно тренда.
+        "telegram_api_latency_avg_ms": latency_average_ms(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

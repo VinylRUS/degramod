@@ -5836,6 +5836,74 @@ async def _send_idea_alert_to_su(
             )
 
 
+async def send_latency_alert_to_su(
+    bot: types.Bot, *, streak: int, avg_ms: int | None, last_ms: int | None,
+) -> None:
+    """Алерт каждому SU: Telegram API устойчиво тормозит (roadmap 5.0.0-08).
+
+    Зовётся из фонового пробника, когда `health_probe.should_alert()` видит
+    серию медленных ответов. Смысл — предупредить до того, как торможение
+    станет отказом: команды модераторов начнут отваливаться по таймауту, а в
+    логах это выглядит как редкие несвязанные ошибки.
+
+    В тексте обязательно цифры. «Что-то тормозит» — не повод к действию;
+    длина серии и средняя задержка позволяют решить, ждать или идти смотреть
+    статус Telegram.
+
+    Доставка best-effort, как и у _send_idea_alert_to_su: SU мог не начать
+    диалог с ботом или заблокировать его. Недоставка одному не должна лишать
+    алерта остальных.
+    """
+    su_tg_ids: set[int] = set(ADMIN_IDS)
+    try:
+        async with async_session() as session:
+            su_wus = (await session.execute(
+                select(WebUser).where(WebUser.role == "su", WebUser.is_active.is_(True))
+            )).scalars().all()
+            for wu in su_wus:
+                if wu.tg_user_id:
+                    su_tg_ids.add(wu.tg_user_id)
+    except Exception as e:
+        # БД может быть недоступна — алерт всё равно уйдёт тем, кто в env.
+        logger.warning("send_latency_alert_to_su: cannot read WebUser: %s", e)
+
+    if not su_tg_ids:
+        logger.warning(
+            "send_latency_alert_to_su: no SU configured — alert lost "
+            "(streak=%s avg=%sms)", streak, avg_ms,
+        )
+        return
+
+    avg_text = f"{avg_ms} мс" if avg_ms is not None else "неизвестно"
+    last_text = f"{last_ms} мс" if last_ms is not None else "неизвестно"
+    text = (
+        "🐌 <b>Telegram API отвечает медленно</b>\n\n"
+        f"Подряд медленных проверок: <b>{streak}</b>\n"
+        f"Средняя задержка: <b>{avg_text}</b>\n"
+        f"Последняя: <b>{last_text}</b>\n\n"
+        "Бот работает, но команды модераторов могут отваливаться по таймауту. "
+        "Подробности — в <code>/healthz</code>."
+    )
+
+    for su_id in su_tg_ids:
+        try:
+            await tg_safe_call(
+                lambda sid=su_id: bot.send_message(
+                    chat_id=sid, text=text, parse_mode="HTML",
+                ),
+                label="latency_alert_su",
+            )
+        except TelegramAPIError as e:
+            logger.warning(
+                "send_latency_alert_to_su: failed to DM su_id=%s: %s", su_id, e,
+            )
+        except Exception as e:
+            logger.warning(
+                "send_latency_alert_to_su: unexpected error for su_id=%s: %s",
+                su_id, e,
+            )
+
+
 async def _process_idea_submission(
     message: types.Message, idea_text: str, source: str,
     source_chat_id: int | None,

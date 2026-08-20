@@ -75,6 +75,7 @@ from bot_handlers import (
     _parse_night_mode_permissions,
     is_sanitary_day_today,
     parse_sanitary_days_json,
+    send_latency_alert_to_su,
 )
 from bot_handlers import router as mod_router
 from chat_modes import (
@@ -215,6 +216,24 @@ async def _health_probe_loop():
         # probe_tick сам глушит исключения: таска, падающая от сетевого
         # сбоя, перестала бы следить за здоровьем ровно когда это нужнее.
         await health_probe.probe_tick(bot)
+
+        # v5.0.0 (roadmap 5.0.0-08): устойчивые задержки Telegram — повод
+        # предупредить SU до того, как торможение станет отказом. Условие
+        # (пять медленных подряд + антиспам 30 минут) живёт в health_probe.
+        try:
+            if health_probe.should_alert():
+                snap = health_probe.snapshot()
+                await send_latency_alert_to_su(
+                    bot,
+                    streak=health_probe._ALERT_STREAK,
+                    avg_ms=health_probe.latency_average_ms(),
+                    last_ms=snap["telegram_api_latency_ms"],
+                )
+                health_probe.mark_alert_sent()
+        except Exception as e:
+            # Сбой алерта не должен останавливать наблюдение за здоровьем.
+            logger.warning("health probe: latency alert failed: %s", e)
+
         await asyncio.sleep(60)
 
 
