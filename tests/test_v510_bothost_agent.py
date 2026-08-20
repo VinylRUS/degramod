@@ -215,6 +215,74 @@ class TestFailureHandling(_AgentCase):
         self.assertEqual(kwargs["headers"]["X-Bot-ID"], "bot_test_123")
 
 
+class TestTokenDiagnosis(_AgentCase):
+    """Перебор переменных с ключом: какая из них устраивает агента.
+
+    v5.1.0 (fix-5): прод отвечал «Unauthorized: invalid token» — путь и
+    схема верные, отвергается значение. Переменных-кандидатов несколько
+    (BOT_API_TOKEN, API_TOKEN и др.), какая из них «та самая» — снаружи
+    не видно. Диагностика спрашивает у агента напрямую, вместо того чтобы
+    гадать, и показывает ИМЕНА переменных, никогда не значения.
+    """
+
+    def setUp(self):
+        super().setUp()
+        for name in bothost_agent.TOKEN_ENV_NAMES:
+            os.environ.pop(name, None)
+        self.addCleanup(self._restore)
+        self._saved = {}
+
+    def _restore(self):
+        for name in bothost_agent.TOKEN_ENV_NAMES:
+            os.environ.pop(name, None)
+
+    def _session_for(self, verdicts):
+        """Отвечает по значению присланного Bearer-токена."""
+        def make_request(method, url, **kwargs):
+            token = kwargs["headers"].get("Authorization", "").removeprefix("Bearer ")
+            good = verdicts.get(token, False)
+            response = MagicMock()
+            response.status = 200 if good else 401
+            response.json = AsyncMock(return_value=(
+                {"ok": True, "stats": {"cpu": 1}} if good
+                else {"ok": False, "msg": "Unauthorized: invalid token"}
+            ))
+            response.text = AsyncMock(return_value="")
+            response.__aenter__ = AsyncMock(return_value=response)
+            response.__aexit__ = AsyncMock(return_value=False)
+            return response
+        session = MagicMock()
+        session.request = MagicMock(side_effect=make_request)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+        return session
+
+    def test_finds_the_accepted_variable(self):
+        os.environ["BOT_API_TOKEN"] = "wrong_one"
+        os.environ["API_TOKEN"] = "right_one"
+        session = self._session_for({"right_one": True})
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            report = asyncio.run(bothost_agent.diagnose_tokens())
+        verdicts = dict(report)
+        self.assertTrue(verdicts["API_TOKEN"].startswith("принят"))
+        self.assertIn("invalid token", verdicts["BOT_API_TOKEN"])
+
+    def test_skips_unset_variables(self):
+        os.environ["API_TOKEN"] = "right_one"
+        session = self._session_for({"right_one": True})
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            report = asyncio.run(bothost_agent.diagnose_tokens())
+        self.assertEqual([name for name, _ in report], ["API_TOKEN"])
+
+    def test_report_never_contains_token_values(self):
+        """В панель уходят имена переменных, значения — никогда."""
+        os.environ["BOT_API_TOKEN"] = "s3cret_value_do_not_leak"
+        session = self._session_for({})
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            report = asyncio.run(bothost_agent.diagnose_tokens())
+        self.assertNotIn("s3cret_value_do_not_leak", repr(report))
+
+
 class TestInternalDiagnosis(unittest.TestCase):
     """Причина недоступности внутреннего agent:8000 называется конкретно.
 

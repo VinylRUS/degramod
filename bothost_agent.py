@@ -156,7 +156,18 @@ def _bot_id() -> str | None:
     return os.getenv("BOT_ID") or None
 
 
-def _auth_headers() -> dict[str, str]:
+TOKEN_ENV_NAMES = ("BOT_API_TOKEN", "API_TOKEN", "BOTHOST_API_TOKEN", "AGENT_TOKEN")
+
+
+def token_source() -> str | None:
+    """Имя переменной, из которой взят ключ. Значение не раскрывается."""
+    for name in TOKEN_ENV_NAMES:
+        if os.getenv(name):
+            return name
+    return None
+
+
+def _auth_headers(token: str | None = None) -> dict[str, str]:
     """Заголовок авторизации агента, если токен задан.
 
     v5.1.0 (fix-2): раньше запросы уходили вовсе без авторизации, хотя
@@ -164,13 +175,14 @@ def _auth_headers() -> dict[str, str]:
     при переносе в спеку v5.1.0 пункт потерялся. Токена нет — заголовок
     не выдумываем: пусть агент ответит 401, это внятнее подделки.
     """
-    # v5.1.0 (fix-4): у платформы переменная встречается под двумя именами.
-    # Приоритет у более конкретного BOT_API_TOKEN.
-    token = os.getenv("BOT_API_TOKEN") or os.getenv("API_TOKEN") or ""
+    # v5.1.0 (fix-4): у платформы переменная встречается под несколькими
+    # именами; порядок TOKEN_ENV_NAMES задаёт приоритет.
+    if token is None:
+        token = next((os.getenv(n) for n in TOKEN_ENV_NAMES if os.getenv(n)), "")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-async def _request(method: str, path: str, **kwargs) -> AgentResult:
+async def _request(method: str, path: str, token: str | None = None, **kwargs) -> AgentResult:
     """Один запрос к агенту с полной обработкой отказов.
 
     Любая сетевая проблема, таймаут или неразбираемый ответ превращаются в
@@ -186,7 +198,7 @@ async def _request(method: str, path: str, **kwargs) -> AgentResult:
     url = f"{base}{path}"
     # Заголовки вызывающего (X-Bot-ID у restart_self) дополняются авторизацией,
     # а не заменяются ею.
-    headers = {**_auth_headers(), **(kwargs.pop("headers", None) or {})}
+    headers = {**_auth_headers(token), **(kwargs.pop("headers", None) or {})}
     timeout = aiohttp.ClientTimeout(total=_TIMEOUT_SECONDS)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -217,12 +229,33 @@ async def _request(method: str, path: str, **kwargs) -> AgentResult:
         return AgentResult(ok=False, error=f"{type(e).__name__}: {e}")
 
 
-async def get_stats() -> AgentResult:
+async def get_stats(token: str | None = None) -> AgentResult:
     """CPU, память и uptime контейнера."""
     bot_id = _bot_id()
     if not bot_id:
         return AgentResult(ok=False, error="BOT_ID не задан в окружении")
-    return await _request("GET", f"/api/bots/{bot_id}/stats")
+    return await _request("GET", f"/api/bots/{bot_id}/stats", token=token)
+
+
+async def diagnose_tokens() -> list[tuple[str, str]]:
+    """Спрашивает у агента, какая из переменных с ключом ему подходит.
+
+    v5.1.0 (fix-5): прод отвечал «Unauthorized: invalid token» — значит
+    адрес, путь и схема Bearer верны, а отвергается значение. Какая из
+    переменных окружения «та самая», снаружи не видно, поэтому не гадаем,
+    а спрашиваем у самого агента.
+
+    Возвращает пары (имя переменной, вердикт). Значения ключей в отчёт не
+    попадают никогда — он уходит в веб-панель.
+    """
+    report: list[tuple[str, str]] = []
+    for name in TOKEN_ENV_NAMES:
+        value = os.getenv(name)
+        if not value:
+            continue
+        result = await get_stats(token=value)
+        report.append((name, "принят агентом" if result.ok else (result.error or "отказ")))
+    return report
 
 
 async def probe() -> AgentResult:

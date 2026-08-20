@@ -146,6 +146,15 @@ async def _agent_info() -> dict:
         # не резолвится / отвергнуто / таймаут. Заполняется resolve_agent_url,
         # поэтому читается строго после probe().
         "internal": bothost_agent.internal_reason(),
+        "token_source": bothost_agent.token_source(),
+        # v5.1.0 (fix-5): перебор кандидатов запускается только при отказе
+        # авторизации — в норме это лишние запросы к агенту. В отчёте имена
+        # переменных, значения ключей туда не попадают.
+        "token_report": (
+            await bothost_agent.diagnose_tokens()
+            if (result.error or "").lower().find("unauthorized") >= 0
+            else []
+        ),
         "available": result.ok,
         "error": result.error,
         "raw": result.data,
