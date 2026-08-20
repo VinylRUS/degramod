@@ -1,85 +1,126 @@
-#!/usr/bin/env python3
-"""v4.8.3.1 — диагностика regex-ов _CMD_SMUTE / _CMD_SWARN / _CMD_SBAN.
+"""v4.8.3.1 — разбор аргументов у стелс-команд !smute / !swarn / !sban.
 
-Цель: понять, какие варианты вызова !smute/!swarn/!sban матчатся,
-а какие — нет, и какие группы (target/dur/reason) при этом получаются.
+Хотфикс v4.8.3.1 переосмыслил три regex: в v4.8.3 `_CMD_SWARN`/`_CMD_SBAN`
+не матчили вызов с одним только target, а `_CMD_SMUTE` делал всё тело
+опциональным, из-за чего `!smute` без длительности проходил дальше и падал
+на `_parse_duration(None)`.
+
+v4.10.1 (Task 18): файл был диагностическим скриптом — печатал разбор и
+всегда возвращал 0, не проверяя ничего. Хуже: regex в нём лежали
+**копиями** из v4.8.3 и уже разошлись с актуальными (`_CMD_SWARN` в коде
+давно без внешней необязательной группы). Тест на копии не защищает ничего,
+поэтому теперь regex импортируются из `bot_handlers` — проверяется рабочий
+код, а не его слепок.
+
+Что фиксируем:
+  • у всех трёх команд target и reason опциональны и распознаются порознь;
+  • `!smute` принимает длительность и латиницей, и кириллицей (`1d`, `1д`);
+  • голая команда матчится с пустыми группами — обработчик сам решает, что
+    делать с отсутствующей длительностью (см. `_parse_duration`).
 """
-import re
+from __future__ import annotations
+
+import os
 import sys
+import unittest
 
-# Точные копии regex-ов из v4.8.3 bot_handlers.py
-_CMD_SMUTE = re.compile(
-    r"^!smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
-    re.IGNORECASE,
-)
-_CMD_SWARN = re.compile(
-    r"^!swarn(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
-    re.IGNORECASE,
-)
-_CMD_SBAN = re.compile(
-    r"^!sban(?:\s+(?:(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?)?$",
-    re.IGNORECASE,
-)
+from _paths import _P
+
+os.environ.setdefault("BOT_TOKEN", "1:test")
+os.environ.setdefault("ADMIN_IDS", "1")
+
+sys.path.insert(0, _P())
+
+from bot_handlers import _CMD_SBAN, _CMD_SMUTE, _CMD_SWARN  # noqa: E402
 
 
-def _show(label: str, pat: re.Pattern, text: str) -> None:
-    m = pat.match(text)
-    if m is None:
-        print(f"  [{label}] NO MATCH: {text!r}")
-        return
-    gd = m.groupdict()
-    print(f"  [{label}] OK: {text!r}  → target={gd.get('target')!r} "
-          f"dur={gd.get('dur')!r} reason={gd.get('reason')!r}")
+class TestSmuteRegex(unittest.TestCase):
+    """`!smute [target] <duration> [reason]`."""
+
+    def _groups(self, text: str) -> dict:
+        m = _CMD_SMUTE.match(text)
+        self.assertIsNotNone(m, f"не сматчилось: {text!r}")
+        return m.groupdict()
+
+    def test_bare_command_matches_with_empty_groups(self):
+        """Голая команда матчится — длительность проверяет обработчик.
+
+        Именно этот случай ронял бота в v4.8.3: regex не матчил, ветка
+        уходила в _parse_duration(None) и падала на None.strip().
+        """
+        self.assertEqual(self._groups("!smute"),
+                         {"target": None, "dur": None, "reason": None})
+
+    def test_duration_only(self):
+        self.assertEqual(self._groups("!smute 1d"),
+                         {"target": None, "dur": "1d", "reason": None})
+
+    def test_duration_and_reason(self):
+        self.assertEqual(self._groups("!smute 1d Причина"),
+                         {"target": None, "dur": "1d", "reason": "Причина"})
+
+    def test_username_target(self):
+        self.assertEqual(self._groups("!smute @user 1d"),
+                         {"target": "@user", "dur": "1d", "reason": None})
+
+    def test_numeric_target_with_reason(self):
+        self.assertEqual(self._groups("!smute 12345 1d Причина"),
+                         {"target": "12345", "dur": "1d", "reason": "Причина"})
+
+    def test_cyrillic_duration(self):
+        """Длительность кириллицей: модераторы пишут «1д», не переключая раскладку."""
+        self.assertEqual(self._groups("!smute 1д")["dur"], "1д")
+
+    def test_minutes(self):
+        self.assertEqual(self._groups("!smute 30m")["dur"], "30m")
 
 
-def main() -> int:
-    print("=== _CMD_SMUTE ===")
-    for t in [
-        "!smute",
-        "!smute 1d",
-        "!smute 1d Причина",
-        "!smute @user 1d",
-        "!smute @user 1d Причина",
-        "!smute 12345 1d",
-        "!smute 1д",
-        "!smute 1д Причина",
-        "!smute 30m",
-    ]:
-        _show("SMUTE", _CMD_SMUTE, t)
+class TestSwarnSbanRegex(unittest.TestCase):
+    """`!swarn` / `!sban` — `[target] [reason]`, обе части опциональны."""
 
-    print("\n=== _CMD_SWARN ===")
-    for t in [
-        "!swarn",
-        "!swarn Причина",
-        "!swarn @user",
-        "!swarn @user Причина",
-        "!swarn 12345",
-        "!swarn 12345 Причина",
-    ]:
-        _show("SWARN", _CMD_SWARN, t)
+    def _check(self, pattern, text: str, target, reason):
+        m = pattern.match(text)
+        self.assertIsNotNone(m, f"не сматчилось: {text!r}")
+        self.assertEqual(m.group("target"), target, f"target у {text!r}")
+        self.assertEqual(m.group("reason"), reason, f"reason у {text!r}")
 
-    print("\n=== _CMD_SBAN ===")
-    for t in [
-        "!sban",
-        "!sban Причина",
-        "!sban @user",
-        "!sban @user Причина",
-        "!sban 12345",
-        "!sban 12345 Причина",
-    ]:
-        _show("SBAN", _CMD_SBAN, t)
+    def test_swarn_variants(self):
+        for text, target, reason in [
+            ("!swarn", None, None),
+            ("!swarn Причина", None, "Причина"),
+            ("!swarn @user", "@user", None),
+            ("!swarn @user Причина", "@user", "Причина"),
+            ("!swarn 12345", "12345", None),
+            ("!swarn 12345 Причина", "12345", "Причина"),
+        ]:
+            with self.subTest(text=text):
+                self._check(_CMD_SWARN, text, target, reason)
 
-    # Симулируем вызов _parse_duration(None)
-    print("\n=== _parse_duration(None) simulation ===")
-    try:
-        text = None
-        _ = text.strip()
-        print("  UNEXPECTED: no AttributeError raised")
-    except AttributeError as e:
-        print(f"  AttributeError raised as expected: {e}")
+    def test_sban_variants(self):
+        for text, target, reason in [
+            ("!sban", None, None),
+            ("!sban Причина", None, "Причина"),
+            ("!sban @user", "@user", None),
+            ("!sban @user Причина", "@user", "Причина"),
+            ("!sban 12345", "12345", None),
+            ("!sban 12345 Причина", "12345", "Причина"),
+        ]:
+            with self.subTest(text=text):
+                self._check(_CMD_SBAN, text, target, reason)
 
-    return 0
+    def test_target_alone_matches(self):
+        """Регресс v4.8.3: один только target не матчился, команда молчала."""
+        self.assertIsNotNone(_CMD_SWARN.match("!swarn @user"))
+        self.assertIsNotNone(_CMD_SBAN.match("!sban @user"))
+
+
+class TestCaseInsensitive(unittest.TestCase):
+
+    def test_uppercase_accepted(self):
+        """re.IGNORECASE: !SMUTE и !SBan должны матчиться."""
+        self.assertIsNotNone(_CMD_SMUTE.match("!SMUTE 1d"))
+        self.assertIsNotNone(_CMD_SBAN.match("!SBan @user"))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    unittest.main(verbosity=2)

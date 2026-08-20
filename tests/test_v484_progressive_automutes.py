@@ -57,10 +57,18 @@ def _ok(name: str, detail: str = "") -> None:
 
 
 def _fail(name: str, detail: str) -> None:
+    """Провал проверки с настоящим падением.
+
+    v4.10.1 (Task 18): раньше только печатал ✗ и увеличивал счётчик, а
+    sys.exit(1) по счётчику стоял в main() под `if __name__`. Под pytest
+    main() не вызывается — файл был зелёным независимо от результата.
+    Теперь бросает AssertionError, и провал виден в CI.
+    """
     global FAIL
     FAIL += 1
     ERRORS.append(f"{name}: {detail}")
     print(f"  ✗ {name} — {detail}")
+    raise AssertionError(f"{name} — {detail}")
 
 
 def _section(title: str) -> None:
@@ -322,11 +330,16 @@ def test_version_and_meta():
     _section("T15-T18: Версия, changelog, метаданные")
 
     # T15: APP_VERSION
+    # v4.10.1 (Task 18): было прибито к `== "v4.8.4"` — проверка устаревала
+    # на каждом релизе и с v4.9.0 просто падала. Смысл в том, что фича
+    # доехала до версии, где её добавили, поэтому сравниваем «не ниже».
     try:
         import web_app
-        assert web_app.APP_VERSION == "v4.8.4", \
-            f"APP_VERSION={web_app.APP_VERSION!r}, expected 'v4.8.4'"
-        _ok("T15: APP_VERSION = v4.8.4")
+
+        from _version import ver
+        assert ver(web_app.APP_VERSION) >= ver("v4.8.4"), \
+            f"APP_VERSION={web_app.APP_VERSION!r}, ожидалось >= v4.8.4"
+        _ok(f"T15: APP_VERSION = {web_app.APP_VERSION} (>= v4.8.4)")
     except Exception as e:
         _fail("T15: APP_VERSION", str(e))
 
@@ -375,6 +388,9 @@ def test_automute_paths():
     _section("T19-T20: Модификация путей автомьюта")
 
     bh_src = (WORK_DIR / "bot_handlers.py").read_text()
+    # v4.10.1 (Task 18): T20 смотрит в mod_commands.py — туда в v4.8.9/v4.8.10
+    # уехали ветки мод-команд из handle_group_command.
+    mc_src = (WORK_DIR / "mod_commands.py").read_text()
 
     # T19: Все 4 пути автомьюта содержат прогрессивную формулу
     try:
@@ -411,13 +427,17 @@ def test_automute_paths():
         # The !mute handler uses _parse_duration for the duration
         # It should NOT call _increment_automute_count
         # Find the !mute handler section
+        # v4.10.1 (Task 18): ветки мод-команд вынесены из handle_group_command
+        # в mod_commands.py (v4.8.9/v4.8.10), а секции переименованы с
+        # «# ── !mute» на «# ── cmd_mute». Грep по bot_handlers.py перестал
+        # что-либо находить, и проверка молча не выполнялась.
         mute_match = re.search(
-            r'# ── !mute .*?(?=\n    # ── !smute|\n    # ── !warn|\Z)',
-            bh_src, re.DOTALL,
+            r'# ── cmd_mute .*?(?=\n# ── cmd_smute|\n# ── cmd_warn|\Z)',
+            mc_src, re.DOTALL,
         )
         smute_match = re.search(
-            r'# ── !smute .*?(?=\n    # ── !warn|\n    # ── !ban|\Z)',
-            bh_src, re.DOTALL,
+            r'# ── cmd_smute .*?(?=\n# ── cmd_warn|\n# ── cmd_ban|\Z)',
+            mc_src, re.DOTALL,
         )
         assert mute_match, "!mute handler section not found"
         assert smute_match, "!smute handler section not found"

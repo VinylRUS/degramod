@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "4.10.0"  # держать в синхроне с APP_VERSION в web_app.py
+version = "4.10.1"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [

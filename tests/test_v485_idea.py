@@ -17,7 +17,7 @@ test_v485_idea.py — тесты v4.8.5 (идеи через !idea → GitHub Is
   T12: web/admin_settings.py — endpoints /admin/settings/github (GET/POST) + /admin/settings/github/test
   T13: admin_settings.html — раздел GitHub Projects присутствует
   T14: base.html — changelog v4.8.5
-  T15: requirements.txt — cryptography
+  T15: pyproject.toml — cryptography
   T16: db.py — seed singleton github_settings (id=1) в init_db
   T17: github_client.py — TestResult, IssueRef, GithubApiError датаклассы/исключения
   T18: bot_handlers.py — _is_modchat_chat функция существует
@@ -61,10 +61,18 @@ def _ok(name: str, detail: str = "") -> None:
 
 
 def _fail(name: str, detail: str) -> None:
+    """Провал проверки с настоящим падением.
+
+    v4.10.1 (Task 18): раньше только печатал ✗ и увеличивал счётчик, а
+    sys.exit(1) по счётчику стоял в main() под `if __name__`. Под pytest
+    main() не вызывается — файл был зелёным независимо от результата.
+    Теперь бросает AssertionError, и провал виден в CI.
+    """
     global FAIL
     FAIL += 1
     ERRORS.append(f"{name}: {detail}")
     print(f"  ✗ {name} — {detail}")
+    raise AssertionError(f"{name} — {detail}")
 
 
 def _section(title: str) -> None:
@@ -377,11 +385,20 @@ def test_web_app():
         # POST для test endpoint.
         assert "@router.post(\"/admin/settings/github/test\")" in wa_src, \
             "POST /admin/settings/github/test не зарегистрирован"
-        # Импорты из db.
-        assert "IdeaLog" in wa_src, "IdeaLog не импортирован в web/admin_settings.py"
+        # Импорты из db. GithubSettings/_encrypt_pat/_decrypt_pat нужны роутам
+        # GitHub-интеграции и лежат здесь же.
         assert "GithubSettings" in wa_src, "GithubSettings не импортирован в web/admin_settings.py"
         assert "_encrypt_pat" in wa_src, "_encrypt_pat не импортирован"
         assert "_decrypt_pat" in wa_src, "_decrypt_pat не импортирован"
+        # v4.10.1 (Task 18): IdeaLog отсюда убран. Проверка требовала импорта
+        # ORM-модели в web/admin_settings.py, но роут настроек читает таблицу
+        # idea_log сырым SQL (см. "FROM idea_log" в файле) — модель ему не
+        # нужна и никогда не была нужна. Пишет идеи bot_handlers.py, там
+        # модель и проверяем.
+        bh_src = (WORK_DIR / "bot_handlers.py").read_text()
+        assert "IdeaLog" in bh_src, "IdeaLog не используется в bot_handlers.py"
+        assert "idea_log" in wa_src, \
+            "web/admin_settings.py не читает таблицу idea_log"
         _ok("T12: Endpoints /admin/settings/github (GET/POST) + /test")
     except Exception as e:
         _fail("T12: Endpoints /admin/settings/github", str(e))
@@ -446,22 +463,29 @@ def test_base_html_changelog():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# T15: requirements.txt
+# T15: зависимость cryptography
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_requirements():
-    _section("T15: requirements.txt")
+    """cryptography объявлена в манифесте зависимостей.
+
+    v4.10.1 (Task 18): проверка читала requirements.txt, удалённый в v4.8.9
+    при переходе на uv (коммит 27ad8e9). Файла нет — проверка падала с
+    FileNotFoundError, но молча: _fail() только печатал. Источник переведён
+    на pyproject.toml, где зависимости и живут.
+    """
+    _section("T15: cryptography в pyproject.toml")
 
     try:
-        req_src = (WORK_DIR / "requirements.txt").read_text()
-        assert "cryptography" in req_src, "cryptography не найден в requirements.txt"
-        # Версия >= 42.0.0.
+        req_src = (WORK_DIR / "pyproject.toml").read_text()
+        assert "cryptography" in req_src, "cryptography не найдена в pyproject.toml"
+        # Версия >= 42.0.0 — Fernet с AES-128-CBC + HMAC-SHA256 для шифрования PAT.
         m = re.search(r"cryptography\s*>=\s*(\d+)", req_src)
         assert m, "cryptography без версии >= N"
         assert int(m.group(1)) >= 42, f"cryptography версия {m.group(1)} < 42"
-        _ok("T15: cryptography в requirements.txt")
+        _ok("T15: cryptography в pyproject.toml")
     except Exception as e:
-        _fail("T15: cryptography в requirements.txt", str(e))
+        _fail("T15: cryptography в pyproject.toml", str(e))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
