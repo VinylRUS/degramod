@@ -300,8 +300,57 @@ class TestInternalCandidates(unittest.TestCase):
         with patch.object(bothost_agent.asyncio, "open_connection", new=always_fail):
             url, report = asyncio.run(bothost_agent.diagnose_internal())
         self.assertIsNone(url)
-        self.assertEqual(len(report), len(bothost_agent._INTERNAL_CANDIDATES))
+        # Статические кандидаты покрыты все; к ним добавляется вычисленный
+        # шлюз собственной подсети, поэтому строк может быть больше.
+        static = {f"{h}:{p}" for h, p in bothost_agent._INTERNAL_CANDIDATES}
+        self.assertTrue(static.issubset({addr for addr, _ in report}))
         self.assertTrue(all("не резолвится" in reason for _, reason in report))
+
+
+class TestOwnNetwork(unittest.TestCase):
+    """Кандидаты выводятся из сети самого контейнера, а не только из констант.
+
+    v5.1.0 (fix-8): захардкоженный 172.17.0.1 — это шлюз ТОЛЬКО дефолтного
+    bridge. Bothost поднимает бота в своей сети, и её шлюз другой. Раз имя
+    `agent` не резолвится, шлюз собственной подсети — самый осмысленный
+    кандидат, и вычислить его можно из своего же адреса.
+    """
+
+    def setUp(self):
+        bothost_agent.reset_cache()
+        self.addCleanup(bothost_agent.reset_cache)
+
+    def test_gateway_derived_from_own_address(self):
+        with patch.object(bothost_agent, "_own_ip", return_value="10.42.7.19"):
+            self.assertIn(("10.42.7.1", 8000), bothost_agent._derived_candidates())
+
+    def test_no_candidates_without_own_address(self):
+        with patch.object(bothost_agent, "_own_ip", return_value=None):
+            self.assertEqual(bothost_agent._derived_candidates(), [])
+
+    def test_derived_gateway_appears_in_report(self):
+        import socket as _s
+
+        async def fail(*_a, **_kw):
+            raise _s.gaierror("Name or service not known")
+
+        with patch.object(bothost_agent, "_own_ip", return_value="10.42.7.19"), \
+                patch.object(bothost_agent.asyncio, "open_connection", new=fail):
+            _url, report = asyncio.run(bothost_agent.diagnose_internal())
+        self.assertIn("10.42.7.1:8000", [addr for addr, _ in report])
+
+    def test_no_duplicate_candidates(self):
+        """Свой шлюз может совпасть с константой — проверяем его один раз."""
+        import socket as _s
+
+        async def fail(*_a, **_kw):
+            raise _s.gaierror("nope")
+
+        with patch.object(bothost_agent, "_own_ip", return_value="172.17.0.9"), \
+                patch.object(bothost_agent.asyncio, "open_connection", new=fail):
+            _url, report = asyncio.run(bothost_agent.diagnose_internal())
+        addrs = [addr for addr, _ in report]
+        self.assertEqual(len(addrs), len(set(addrs)))
 
 
 class TestTokenSanitizing(_AgentCase):

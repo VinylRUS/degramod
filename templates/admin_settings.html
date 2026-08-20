@@ -112,6 +112,7 @@
         <tr><td style="color: var(--text-dim); padding: 4px 0;">URL</td><td>{{ agent_info.url or '— не задан (BOTHOST_AGENT_URL)' }}</td></tr>
         <tr><td style="color: var(--text-dim); padding: 4px 0;">Токен</td>
             <td>{% if agent_info.has_token %}<span style="color: var(--accent);">задан</span>{% else %}<span style="color: var(--text-dim);">нет BOT_API_TOKEN</span>{% endif %}</td></tr>
+        <tr><td style="color: var(--text-dim); padding: 4px 0;">Контейнер</td><td>{{ agent_info.container }}</td></tr>
         {% for addr, reason in agent_info.internal_report %}
         <tr><td style="color: var(--text-dim); padding: 4px 0;">{{ addr }}</td><td>{{ reason }}</td></tr>
         {% endfor %}

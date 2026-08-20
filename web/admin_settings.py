@@ -146,6 +146,9 @@ async def _agent_info() -> dict:
         # не резолвится / отвергнуто / таймаут. Заполняется resolve_agent_url,
         # поэтому читается строго после probe().
         "internal_report": bothost_agent.internal_report(),
+        # v5.1.0 (fix-8): имя и адрес контейнера — доказательство для
+        # поддержки хостинга, если ни один кандидат не отзовётся.
+        "container": bothost_agent.container_info(),
         "token_source": bothost_agent.token_source(),
         "token_shape": bothost_agent.token_shape(),
         # v5.1.0 (fix-5): перебор кандидатов запускается только при отказе

@@ -105,6 +105,44 @@ async def _can_connect(host: str, port: int) -> bool:
     return True
 
 
+def _own_ip() -> str | None:
+    """Адрес контейнера в его Docker-сети.
+
+    UDP-сокет с connect() не отправляет ни одного пакета — ядро лишь
+    выбирает исходящий интерфейс, поэтому вызов не блокирует event loop и
+    не требует, чтобы адрес назначения существовал.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("10.255.255.255", 1))
+        return sock.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _derived_candidates() -> list[tuple[str, int]]:
+    """Шлюз собственной подсети — самый осмысленный кандидат.
+
+    v5.1.0 (fix-8): константа 172.17.0.1 — шлюз только дефолтного bridge.
+    Bothost поднимает бота в своей сети, её шлюз другой, и вычислить его
+    можно ровно из своего адреса: x.y.z.1.
+    """
+    ip = _own_ip()
+    if not ip:
+        return []
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return []
+    return [(f"{parts[0]}.{parts[1]}.{parts[2]}.1", _INTERNAL_PORT)]
+
+
+def container_info() -> str:
+    """Имя и адрес контейнера — доказательство для поддержки хостинга."""
+    return f"{socket.gethostname()} / {_own_ip() or 'адрес неизвестен'}"
+
+
 async def _diagnose_one(host: str, port: int) -> tuple[bool, str]:
     """Проверяет один адрес и объясняет исход человеческими словами.
 
@@ -136,7 +174,12 @@ async def diagnose_internal() -> tuple[str | None, list[tuple[str, str]]]:
     """Перебирает внутренние адреса и возвращает первый рабочий плюс отчёт."""
     found: str | None = None
     report: list[tuple[str, str]] = []
-    for host, port in _INTERNAL_CANDIDATES:
+    seen: set[tuple[str, int]] = set()
+    candidates = [*_INTERNAL_CANDIDATES, *_derived_candidates()]
+    for host, port in candidates:
+        if (host, port) in seen:
+            continue
+        seen.add((host, port))
         reachable, reason = await _diagnose_one(host, port)
         report.append((f"{host}:{port}", reason))
         if reachable:
