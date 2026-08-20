@@ -118,7 +118,7 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v4.10.2"
+APP_VERSION = "v4.10.3"
 APP_RELEASE_DATE = "2026-08-17"
 
 # v4.8.11: служебный mod_id для действий встроенного su из веб-панели.
@@ -742,11 +742,17 @@ async def _fetch_and_save_avatar(bot, tg_user_id: int) -> bool:
         data = data.read()
     if not data:
         return False
-    # Сохраняем
-    try:
+    # Сохраняем. v4.10.3 (Task 6): запись в отдельном потоке — бот и
+    # веб-панель делят один event loop, и синхронный open() останавливал бы
+    # обработку сообщений во всех чатах на время записи. Тот же приём, что
+    # в v4.8.7 применили к sqlite3, VACUUM и shutil.copy2.
+    def _save_sync() -> None:
         os.makedirs(AVATARS_DIR, exist_ok=True)
         with open(_avatar_path(tg_user_id), "wb") as f:
             f.write(data)
+
+    try:
+        await asyncio.to_thread(_save_sync)
     except OSError as e:
         _req_logger.warning("avatar save failed for tg_user_id=%s: %s", tg_user_id, e)
         return False

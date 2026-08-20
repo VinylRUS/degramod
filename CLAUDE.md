@@ -228,10 +228,11 @@ ORM подставляет в SELECT все колонки модели и па�
 - **`asyncio.create_task` только через `_spawn_background_task`**
   (`bot_handlers.py:214`). Голый `create_task` без сохранения ссылки GC может
   собрать на середине. Инвариант сторожит `tests/test_v487_sanity.py` [9].
-- **Блокирующий `open()` в async-функциях** — `_fetch_and_save_avatar`
-  (`web_app.py`) и `_bot_info` (`web/admin_settings.py`). Остальное (`sqlite3`, `VACUUM`, `shutil.copy2`)
-  вынесено в `asyncio.to_thread` в v4.8.7, но `open()` тогда пропустили. Ruff
-  видит это как `ASYNC230`, замечания вынесены в `per-file-ignores` с пометкой.
+- **Блокирующий I/O в async — под запретом линтером.** `sqlite3`, `VACUUM`,
+  `shutil.copy2` (v4.8.7) и запись файлов (v4.10.3) вынесены в
+  `asyncio.to_thread`. Правило ruff `ASYNC230` включено без исключений:
+  бот и веб-панель делят один event loop, и синхронная операция в роуте
+  останавливает обработку сообщений во всех чатах.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
   `bot_handlers.py` и `modchat.py` — правь обе копии.
 - **Alembic есть, но выключен.** `migrations/` и `alembic.ini` в репозитории,

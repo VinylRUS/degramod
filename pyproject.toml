@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "4.10.2"  # держать в синхроне с APP_VERSION в web_app.py
+version = "4.10.3"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [
@@ -115,14 +115,11 @@ ignore = [
 # Это намеренно: logger инициализируется до импорта db, чтобы в случае ошибки
 # импорта db логгер уже был готов.
 # B904 — pre-existing raise без `from err` в _parse_int_field.
-# ASYNC230 — blocking open() в _fetch_and_save_avatar. Это долг из
-# той же серии, что чинил v4.8.7 (sqlite/VACUUM/copy2 вынесены в to_thread),
-# но open() тогда пропустили. Снимается в Task 6 плана стабилизации.
 # RUF023/RUF059 — несортированный __slots__ и неиспользуемая распакованная
 # переменная. Косметика, правится при следующей правке этих участков.
 "web_app.py" = [
     "C901", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "E402", "B904",
-    "ASYNC230", "RUF023", "RUF059",
+    "RUF023", "RUF059",
 ]
 # E402 — late import в конце модуля (строка 1143). Остаток от снятого в v4.8.9
 # хака sys.modules.setdefault("bot", ...) — импорт переехал, но вниз файла.
@@ -136,10 +133,6 @@ ignore = [
 # (тело перенесено дословно из web_app.py, где это же было в общем
 # RUF059-игноре модуля; Task 4, v4.9.0).
 "web/admin_cleanup.py" = ["RUF059"]
-# ASYNC230 — blocking open("/proc/self/status") в _bot_info. Долг из той же
-# серии, что чинил v4.8.7; переехал сюда вместе с хелпером в v4.9.0.
-# Снимается в Task 6 плана стабилизации.
-"web/admin_settings.py" = ["ASYNC230"]
 # B904 — pre-existing raise без `from err` в _parse_int (тело перенесено
 # дословно из web_app.py, где это же было в общем B904-игноре модуля;
 # Task 11, v4.9.0).
