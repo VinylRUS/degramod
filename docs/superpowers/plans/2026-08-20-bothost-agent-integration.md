@@ -92,7 +92,21 @@ API: чтение логов и статистики, ручной переза�
     #   Любой вызов ОБЯЗАН быть await-нутым.
   - `reset_cache() -> None`
   - `async probe() -> AgentResult`
-  - `async get_stats() -> AgentResult`
+  - `async get_stats(token: str | None = None) -> AgentResult`
+  - `async diagnose_internal() -> tuple[bool, str]` — доступен ли agent:8000
+    и почему нет (не резолвится / отвергнуто / таймаут)
+  - `async diagnose_tokens() -> list[tuple[str, str]]` — какую переменную с
+    ключом принимает агент; в отчёте ИМЕНА переменных, не значения
+  - `token_source() -> str | None`, `internal_reason() -> str | None`
+  - `TOKEN_ENV_NAMES` — порядок приоритета переменных с ключом
+
+  ВНИМАНИЕ по фактам прода (проверено 20.08.2026):
+    • `resolve_agent_url()` возвращает `str | None`. None = адреса нет;
+      публичного дефолта в коде НЕТ, не возвращай его.
+    • внутренний `agent:8000` недоступен — имя не резолвится;
+    • рабочий внешний адрес — `http://<нода>.bothost.ru`, задаётся
+      переменной `BOTHOST_AGENT_URL`;
+    • каждый запрос авторизуется `Authorization: Bearer <ключ>`.
   - `async get_logs(lines: int = 200) -> AgentResult`
   - `async restart_self() -> AgentResult`
 
