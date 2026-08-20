@@ -312,9 +312,27 @@ class TestAuthorization(_AgentCase):
         headers = session.request.call_args.kwargs["headers"]
         self.assertEqual(headers["Authorization"], "Bearer tok_secret_42")
 
+    def test_accepts_api_token_name_too(self):
+        """Имя переменной у Bothost встречается в двух вариантах.
+
+        v5.1.0 (fix-4): владелец называл её и API_TOKEN, и BOT_API_TOKEN.
+        Читать только одно имя — значит молча ходить без авторизации, если
+        на платформе задано другое. Приоритет у BOT_API_TOKEN как более
+        конкретного.
+        """
+        os.environ.pop("BOT_API_TOKEN", None)
+        os.environ["API_TOKEN"] = "tok_from_api_token"
+        self.addCleanup(lambda: os.environ.pop("API_TOKEN", None))
+        session = self._session()
+        with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
+            asyncio.run(bothost_agent.get_stats())
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer tok_from_api_token")
+
     def test_no_header_without_token(self):
         """Токена нет — заголовок не выдумываем, шлём запрос без него."""
         os.environ.pop("BOT_API_TOKEN", None)
+        os.environ.pop("API_TOKEN", None)
         session = self._session()
         with patch.object(bothost_agent.aiohttp, "ClientSession", return_value=session):
             asyncio.run(bothost_agent.get_stats())

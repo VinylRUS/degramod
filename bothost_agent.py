@@ -164,7 +164,9 @@ def _auth_headers() -> dict[str, str]:
     при переносе в спеку v5.1.0 пункт потерялся. Токена нет — заголовок
     не выдумываем: пусть агент ответит 401, это внятнее подделки.
     """
-    token = os.getenv("BOT_API_TOKEN") or ""
+    # v5.1.0 (fix-4): у платформы переменная встречается под двумя именами.
+    # Приоритет у более конкретного BOT_API_TOKEN.
+    token = os.getenv("BOT_API_TOKEN") or os.getenv("API_TOKEN") or ""
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
