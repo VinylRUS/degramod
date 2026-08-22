@@ -9,6 +9,12 @@ create_app(). Единая страница /admin/presets управляет т
 списками модерации: пресетами прав чата для day/night/sanitary (v4.6.0),
 word filter — ban words (v4.7.5) и link allowlist (v4.7.5).
 
+v5.1.0 (Task 8): + POST /admin/presets/bots/add и POST
+/admin/presets/bots/{wl_id}/delete — вайтлист ботов (`db.BotWhitelist`,
+Task 6), веб-паритет с командами /botallow, /botunallow, /botallowlist
+(Task 7). Структура скопирована с link allowlist: chat_id=0 = global,
+hard delete, тот же require_csrf_admin.
+
 Хелперы web_app (`_req_logger`, `APP_VERSION`, `APP_RELEASE_DATE`) берутся
 через модуль (`web_app._helper`), а не импортом имён: тесты патчат атрибуты
 модуля, и при `from web_app import ...` патч промахнулся бы мимо уже
@@ -27,10 +33,17 @@ import json
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import web_app
-from db import ChatSettings, LinkAllowlist, PermissionPreset, WordFilter, async_session
+from db import (
+    BotWhitelist,
+    ChatSettings,
+    LinkAllowlist,
+    PermissionPreset,
+    WordFilter,
+    async_session,
+)
 from web.deps import APP_VERSION, AuthUser, get_templates, require_admin, require_csrf_admin
 
 router = APIRouter()
@@ -80,6 +93,12 @@ async def admin_presets_page(
             .order_by(ChatSettings.title.asc())
         )).scalars().all()
 
+        # v5.1.0: Вайтлист ботов — паритет с /botallow, /botallowlist.
+        bot_whitelist = (await session.execute(
+            select(BotWhitelist)
+            .order_by(BotWhitelist.chat_id.asc(), BotWhitelist.bot_username.asc())
+        )).scalars().all()
+
     # Группируем по scope для UI.
     grouped = {"day": [], "night": [], "sanitary": []}
     for p in presets:
@@ -93,6 +112,7 @@ async def admin_presets_page(
             "presets_by_scope": grouped,
             "word_filters": words,
             "link_allowlist": links,
+            "bot_whitelist": bot_whitelist,
             "chats": chats,
             "flash": flash,
             "app_version": APP_VERSION,
@@ -636,4 +656,89 @@ async def admin_presets_links_delete(
     return RedirectResponse(
         url=f"/admin/presets?flash=Domain+removed:+{domain}",
         status_code=303,
+    )
+
+
+# ── v5.1.0: Вайтлист ботов (Task 8) ──────────────────────────────
+# Паритет с командами /botallow, /botunallow, /botallowlist (Task 7).
+# chat_id=0 — глобальный вайтлист. bot_id заполняется ботом оппортунистически
+# при первой встрече в message.via_bot — из веба его не задают.
+# ──────────────────────────────────────────────────────────────────
+@router.post("/admin/presets/bots/add")
+async def admin_presets_bots_add(
+    chat_id_str: str = Form("0"),
+    bot_username: str = Form(""),
+    note: str = Form(""),
+    _auth: AuthUser = Depends(require_csrf_admin),
+):
+    """v5.1.0: добавить бота в вайтлист via-bot фильтра.
+
+    chat_id_str = "0" означает global — паритет с link allowlist.
+    """
+    try:
+        chat_id_int = int((chat_id_str or "0").strip())
+    except ValueError:
+        return RedirectResponse(
+            url="/admin/presets?flash=Invalid+chat_id", status_code=303,
+        )
+
+    username = (bot_username or "").strip().lstrip("@").lower()
+    if not username:
+        return RedirectResponse(
+            url="/admin/presets?flash=Bot+username+required", status_code=303,
+        )
+
+    async with async_session() as session:
+        existing = (await session.execute(
+            select(BotWhitelist).where(
+                BotWhitelist.chat_id == chat_id_int,
+                func.lower(BotWhitelist.bot_username) == username,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            return RedirectResponse(
+                url=f"/admin/presets?flash=Bot+already+whitelisted:+{username}",
+                status_code=303,
+            )
+        session.add(BotWhitelist(
+            chat_id=chat_id_int,
+            bot_username=username,
+            note=(note or "").strip() or None,
+            added_by_mod_id=_auth.tg_user_id,
+        ))
+        await session.commit()
+        web_app._req_logger.info(
+            "bot_whitelist_add: chat_id=%d bot=%r by=%s",
+            chat_id_int, username, _auth.username,
+        )
+
+    return RedirectResponse(
+        url=f"/admin/presets?flash=Bot+whitelisted:+{username}", status_code=303,
+    )
+
+
+@router.post("/admin/presets/bots/{wl_id:int}/delete")
+async def admin_presets_bots_delete(
+    wl_id: int,
+    _auth: AuthUser = Depends(require_csrf_admin),
+):
+    """v5.1.0: убрать бота из вайтлиста (hard delete, как у link allowlist)."""
+    async with async_session() as session:
+        row = (await session.execute(
+            select(BotWhitelist).where(BotWhitelist.id == wl_id)
+        )).scalar_one_or_none()
+        if row is None:
+            return RedirectResponse(
+                url="/admin/presets?flash=Bot+not+found", status_code=303,
+            )
+        username = row.bot_username
+        await session.delete(row)
+        await session.commit()
+        web_app._req_logger.info(
+            "bot_whitelist_delete: id=%d bot=%r by=%s",
+            wl_id, username, _auth.username,
+        )
+
+    return RedirectResponse(
+        url=f"/admin/presets?flash=Bot+removed:+{username}", status_code=303,
     )
