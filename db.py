@@ -342,6 +342,11 @@ class ChatSettings(Base):
     mod_chat_id = Column(BigInteger, nullable=True)
     is_mod_chat = Column(Boolean, default=False, nullable=False)
 
+    # v5.1.0: ссылка на правила для команды /rules. Пусто → RULES_URL_DEFAULT.
+    # Бот мультичатовый, и у чатов со временем заводятся свои правила —
+    # колонка дешевле, чем миграция задним числом.
+    rules_url = Column(String, nullable=True)
+
 
 class PermissionPreset(Base):
     """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
@@ -1225,6 +1230,18 @@ async def init_db() -> None:
                 await conn.execute(text(
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
+
+    # ── v5.1.0: rules_url для команды /rules ─────────────────────────────
+    # До ЛЮБОГО ORM-запроса к chat_settings — иначе ORM подставляет в SELECT
+    # все колонки модели и падает на старой БД (так уже ломался старт бота
+    # в v4.8.5.4).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        if "rules_url" not in existing_cols:
+            await conn.exec_driver_sql(
+                "ALTER TABLE chat_settings ADD COLUMN rules_url VARCHAR"
+            )
 
     # ── v4.8.0: Новая таблица keyword_watch ────────────────────────────
     # Замена word_filters. См. модель KeywordWatch выше для деталей.

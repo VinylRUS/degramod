@@ -295,6 +295,14 @@
                     ℹ Via-bot filter выключен. Включите его кнопкой <code style="background: var(--bg); padding: 1px 4px; border-radius: 3px;">VIA</code> вверху карточки. Настройки сохранятся, но не активны.
                 </div>
                 {% endif %}
+                {# v5.1.0: ссылка на правила для команды /rules. Пусто → дефолт
+                   RULES_URL_DEFAULT (решается на чтении, в bot_handlers). #}
+                <label style="display:block; margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px dashed var(--border);">
+                    <span style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim);">Rules URL</span>
+                    <input type="text" name="rules_url" value="{{ c.rules_url or '' }}"
+                           placeholder="https://rules.degradach.ru/"
+                           style="width: 100%; padding: 6px 10px; margin-top: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                </label>
             </div>
         </details>
 

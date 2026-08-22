@@ -165,6 +165,8 @@ async def admin_chats_update(
     day_preset_id: str = Form(""),
     night_preset_id: str = Form(""),
     sanitary_preset_id: str = Form("__lockdown__"),
+    # v5.1.0: своя ссылка на правила для /rules. Пусто → RULES_URL_DEFAULT.
+    rules_url: str = Form(""),
     _auth: AuthUser = Depends(require_csrf_admin),
 ):
     """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -427,6 +429,8 @@ async def admin_chats_update(
         # через /toggle поле=via_bot_filter).
         cs.via_bot_rate_limit_seconds = vb_rl if vb_rl is not None else 300
         cs.via_bot_mute_minutes = vb_mm if vb_mm is not None else 10
+        # v5.1.0: пусто → дефолт из RULES_URL_DEFAULT (решается на чтении).
+        cs.rules_url = (rules_url or "").strip() or None
         cs.updated_at = datetime.now(timezone.utc)
         await session.commit()
 

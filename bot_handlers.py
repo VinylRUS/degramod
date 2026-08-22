@@ -4175,6 +4175,83 @@ async def handle_mywarns_dm(message: types.Message) -> None:
         logger.debug("mywarns: cannot reply in DM to user %s: %s", user_id, e)
 
 
+# ── v5.1.0: /rules ──────────────────────────────────────────────────────
+RULES_URL_DEFAULT = "https://rules.degradach.ru/"
+_RULES_COOLDOWN_SECONDS = 60
+_rules_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → ts
+
+
+def _resolve_rules_url(cs) -> str:
+    """Ссылка на правила для чата: настройка или дефолт.
+
+    Пустая строка и пробелы считаются «не задано» — админ мог очистить
+    поле в веб-панели, и это должно означать возврат к дефолту, а не
+    отправку пустой ссылки.
+    """
+    if cs is None:
+        return RULES_URL_DEFAULT
+    url = (getattr(cs, "rules_url", None) or "").strip()
+    return url or RULES_URL_DEFAULT
+
+
+class _RulesFilter(BaseFilter):
+    """v5.1.0: матчит /rules через реестр."""
+
+    async def __call__(self, message: types.Message) -> bool:
+        found = commands.resolve(message.text, commands.get_bot_username())
+        return found is not None and found[0].name == "rules"
+
+
+@router.message(F.chat.type.in_(["group", "supergroup"]), _RulesFilter())
+async def handle_rules_group(message: types.Message) -> None:
+    """/rules в группе — удаляет команду, отвечает ephemeral со ссылкой."""
+    if not message.from_user:
+        return
+
+    chat_id = message.chat.id
+    user = message.from_user
+
+    try:
+        await message.delete()
+    except TelegramAPIError as e:
+        logger.debug("rules: cannot delete command in chat %s: %s", chat_id, e)
+
+    now = time.time()
+    key = (user.id, chat_id)
+    if now - _rules_last_call.get(key, 0.0) < _RULES_COOLDOWN_SECONDS:
+        return
+    stale = [
+        k for k, ts in _rules_last_call.items()
+        if now - ts >= _RULES_COOLDOWN_SECONDS
+    ]
+    for k in stale:
+        del _rules_last_call[k]
+    _rules_last_call[key] = now
+
+    async with async_session() as session:
+        cs = await _get_chat_settings(session, chat_id)
+    url = _resolve_rules_url(cs)
+
+    await _send_ephemeral(
+        bot=message.bot,
+        chat_id=chat_id,
+        recipient=user,
+        text=f'📜 Правила чата: <a href="{html.escape(url, quote=True)}">{html.escape(url, quote=False)}</a>',
+    )
+
+
+@router.message(F.chat.type == "private", _RulesFilter())
+async def handle_rules_dm(message: types.Message) -> None:
+    """/rules в личке — обычный ответ с дефолтной ссылкой."""
+    try:
+        await tg_safe_call(
+            lambda: message.reply(f"📜 Правила: {RULES_URL_DEFAULT}", parse_mode=None),
+            label="rules_dm_reply",
+        )
+    except TelegramAPIError as e:
+        logger.debug("rules: cannot reply in DM: %s", e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Обработчики команд в ГРУППАХ
 # ═══════════════════════════════════════════════════════════════════════════
