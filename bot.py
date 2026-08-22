@@ -1369,27 +1369,52 @@ async def _publish_bot_commands(bot) -> None:
     AllGroupChats.
 
     Любая ошибка Telegram гасится: меню — не повод не стартовать.
+
+    v5.1.1: три вызова Telegram изолированы друг от друга. Раньше все три
+    жили под одним try/except — падение первого (например,
+    set_my_commands для группового скоупа) молча отменяло два оставшихся,
+    а в лог уходил один расплывчатый warning без указания, какой скоуп
+    не встал. Теперь каждый шаг обёрнут отдельно через _step: отказ
+    одного не мешает остальным выполниться, и в логе назван конкретный
+    шаг.
     """
-    try:
-        group_cmds = [
-            BotCommand(command=spec.name, description=spec.description)
-            for spec in commands_registry.GROUP_COMMANDS
-            if spec.in_menu
-        ]
-        dm_cmds = [
-            BotCommand(command=name, description=description)
-            for name, description in commands_registry.DM_MENU_COMMANDS
-        ]
-        await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
-        await bot.set_my_commands(dm_cmds, scope=BotCommandScopeAllPrivateChats())
-        # Default чистим: он служит фолбэком для скоупов, которые мы не задаём.
-        await bot.delete_my_commands()
-        logger.info(
-            "Bot commands published: %d in groups, %d in DM",
-            len(group_cmds), len(dm_cmds),
-        )
-    except Exception as e:
-        logger.warning("_publish_bot_commands failed: %s", e)
+
+    async def _step(label: str, factory) -> None:
+        """Выполняет один шаг публикации меню независимо от остальных.
+
+        factory — callable, возвращающий новую корутину при каждом
+        вызове (здесь вызывается один раз за шаг, но это тот же
+        контракт, что у tg_safe_call: переиспользовать корутину после
+        исключения нельзя).
+        """
+        try:
+            await factory()
+        except Exception as e:
+            logger.warning("_publish_bot_commands: шаг %s не выполнен: %s", label, e)
+
+    group_cmds = [
+        BotCommand(command=spec.name, description=spec.description)
+        for spec in commands_registry.GROUP_COMMANDS
+        if spec.in_menu
+    ]
+    dm_cmds = [
+        BotCommand(command=name, description=description)
+        for name, description in commands_registry.DM_MENU_COMMANDS
+    ]
+    await _step(
+        "групповой скоуп (AllGroupChats)",
+        lambda: bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats()),
+    )
+    await _step(
+        "личные чаты (AllPrivateChats)",
+        lambda: bot.set_my_commands(dm_cmds, scope=BotCommandScopeAllPrivateChats()),
+    )
+    # Default чистим: он служит фолбэком для скоупов, которые мы не задаём.
+    await _step("очистка default-скоупа", lambda: bot.delete_my_commands())
+    logger.info(
+        "Bot commands published: %d in groups, %d in DM",
+        len(group_cmds), len(dm_cmds),
+    )
 
 
 # ── Lifespan ────────────────────────────────────────────────────────────────

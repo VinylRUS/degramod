@@ -89,6 +89,41 @@ class TestFailureIsNonFatal(unittest.TestCase):
         asyncio.run(bot_module._publish_bot_commands(_BrokenBot()))
 
 
+class TestStepsAreIsolated(unittest.TestCase):
+    """Отказ одного шага публикации не должен отменять остальные.
+
+    До правки все три вызова (group scope, private scope, очистка
+    default) жили под одним try/except: падение первого молча съедало
+    два оставшихся. Ревью на Task 5 отметило это как Important-находку.
+    """
+
+    def test_first_step_failure_does_not_block_others(self):
+        import bot as bot_module
+
+        class _PartiallyBrokenBot:
+            """Падает только на групповом скоупе, остальное фиксирует."""
+
+            def __init__(self):
+                self.set_my_commands_calls = []
+                self.deleted = False
+
+            async def set_my_commands(self, commands_list, scope=None, **kw):
+                if type(scope).__name__ == "BotCommandScopeAllGroupChats":
+                    raise RuntimeError("Telegram недоступен")
+                self.set_my_commands_calls.append(type(scope).__name__)
+
+            async def delete_my_commands(self, scope=None, **kw):
+                self.deleted = True
+
+        b = _PartiallyBrokenBot()
+        asyncio.run(bot_module._publish_bot_commands(b))
+
+        self.assertEqual(b.set_my_commands_calls, ["BotCommandScopeAllPrivateChats"],
+                         "приватный скоуп должен опубликоваться, даже если групповой упал")
+        self.assertTrue(b.deleted,
+                        "очистка default-скоупа должна выполниться, даже если групповой упал")
+
+
 class TestStealthRemovedDeliberately(unittest.TestCase):
     def test_blanket_delete_my_commands_gone(self):
         with open(_P("bot.py")) as f:
