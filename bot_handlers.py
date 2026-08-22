@@ -3434,14 +3434,50 @@ async def _send_ephemeral(
 # понимают, что нарушитель наказан и за что. Пересланное сообщение нарушителя
 # НЕ прикладывается (оно остаётся только в репорт-чате как rich-превью).
 #
+# v5.1.0: формулировки переписаны по схеме «кто → что с ним сделали → по
+# причине», латинские кавычки заменены на русские «ёлочки» (было неграмотно —
+# предлог «за» вместо «по причине» и двойные кавычки в стиле `"2ч"`).
+# Построение текста вынесено в _build_punishment_notice — так его можно
+# тестировать без поднятия Telegram.
+#
 # Формат (HTML):
-#   ban:  Пользователь "<display_name>" забанен за "<reason>"
-#   warn: Пользователь "<display_name>" получил варн за "<reason>"
-#   mute: Пользователь "<display_name>" замутан за "<reason>" на "<duration>"
+#   ban:  Пользователь «<display_name>» был забанен по причине: «<reason>»
+#   warn: Пользователь «<display_name>» получил предупреждение по причине: «<reason>»
+#   mute: Пользователь «<display_name>» был заглушён на <duration> по причине: «<reason>»
 #
 # Все поля HTML-экранируются (display_name и reason могут содержать <>).
 # duration приходит уже отформатированным через _format_duration — его
 # тоже экранируем (он состоит только из цифр и букв, но для консистентности).
+def _build_punishment_notice(
+    action: str, display_name: str, reason: str | None, duration: int | None,
+) -> str | None:
+    """v5.1.0: текст публичного сообщения о наказании.
+
+    Единая схема «кто → что с ним сделали → по причине» и русские
+    «ёлочки». До v5.1.0 формулировки были разнобойные и неграмотные —
+    предлог «за» вместо «по причине», латинские двойные кавычки.
+
+    Возвращает None при неизвестном action — вызывающий код логирует.
+    """
+    name_safe = html.escape(display_name, quote=False)
+    reason_safe = html.escape(reason, quote=False) if reason else ""
+
+    if action == "ban":
+        return f"Пользователь «<b>{name_safe}</b>» был забанен по причине: «<i>{reason_safe}</i>»"
+    if action == "warn":
+        return (
+            f"Пользователь «<b>{name_safe}</b>» получил предупреждение "
+            f"по причине: «<i>{reason_safe}</i>»"
+        )
+    if action == "mute":
+        dur_safe = html.escape(_format_duration(duration) if duration else "", quote=False)
+        return (
+            f"Пользователь «<b>{name_safe}</b>» был заглушён на <b>{dur_safe}</b> "
+            f"по причине: «<i>{reason_safe}</i>»"
+        )
+    return None
+
+
 async def _send_public_punishment_notice(
     *,
     bot: types.Bot,
@@ -3461,22 +3497,10 @@ async def _send_public_punishment_notice(
                    (на уровне regex). Для mute — тоже обязательна.
     :param duration: длительность мьюта в секундах (только для action='mute').
     """
-    display_name = _user_display_name(target)
-    name_safe = html.escape(display_name, quote=False)
-    reason_safe = html.escape(reason, quote=False) if reason else ""
-
-    if action == "ban":
-        text = f'Пользователь "<b>{name_safe}</b>" забанен за "<i>{reason_safe}</i>"'
-    elif action == "warn":
-        text = f'Пользователь "<b>{name_safe}</b>" получил варн за "<i>{reason_safe}</i>"'
-    elif action == "mute":
-        dur_str = _format_duration(duration) if duration else ""
-        dur_safe = html.escape(dur_str, quote=False)
-        text = (
-            f'Пользователь "<b>{name_safe}</b>" замутан за "<i>{reason_safe}</i>" '
-            f'на "<b>{dur_safe}</b>"'
-        )
-    else:
+    text = _build_punishment_notice(
+        action, _user_display_name(target), reason, duration,
+    )
+    if text is None:
         logger.warning("_send_public_punishment_notice: unknown action=%r", action)
         return
 
@@ -8274,9 +8298,11 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
             gap_sec, rate_limit, auto_count, new_count,
         )
         # ── v4.8.1: публичное сообщение в чат (фиксированный текст) ───
-        # Формат: «Пользователь "<display_name>" задолбал срать в чат
-        # и был замутан на "<duration>"». Без указания причины — она
-        # техническая (rate-limit details) и чату неинтересна.
+        # v5.1.0: формулировка переписана — «Пользователь «<display_name>»
+        # слишком много срал ботами и был заглушён на <duration>». Запятой
+        # перед «и» нет намеренно: одно подлежащее, два однородных
+        # сказуемых. Без указания причины — она техническая (rate-limit
+        # details) и чату неинтересна.
         try:
             display_name = _user_display_name(fu)
             name_safe = html.escape(display_name, quote=False)
@@ -8284,8 +8310,8 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
             await message.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f'Пользователь "<b>{name_safe}</b>" задолбал срать в чат '
-                    f'и был замутан на "<b>{dur_safe}</b>"'
+                    f'Пользователь «<b>{name_safe}</b>» слишком много срал '
+                    f'ботами и был заглушён на <b>{dur_safe}</b>'
                 ),
                 parse_mode="HTML",
             )

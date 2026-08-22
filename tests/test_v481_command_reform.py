@@ -263,7 +263,9 @@ class TestPublicPunishmentNoticeHelper(unittest.TestCase):
             action="warn", reason="флуд",
         ))
         kwargs = bot.send_message.call_args.kwargs
-        self.assertIn("получил варн", kwargs["text"])
+        # v5.1.0: формулировка переписана — «получил предупреждение»
+        # вместо «получил варн».
+        self.assertIn("получил предупреждение", kwargs["text"])
         self.assertIn("флуд", kwargs["text"])
 
     def test_28_public_notice_mute_text(self):
@@ -277,15 +279,16 @@ class TestPublicPunishmentNoticeHelper(unittest.TestCase):
             action="mute", reason="флуд", duration=3600,
         ))
         kwargs = bot.send_message.call_args.kwargs
-        self.assertIn("замутан", kwargs["text"])
+        # v5.1.0: формулировка переписана — «был заглушён» вместо «замутан».
+        self.assertIn("заглушён", kwargs["text"])
         self.assertIn("флуд", kwargs["text"])
         self.assertIn("1ч", kwargs["text"])
 
     @unittest.skip(
-        "_send_public_punishment_notice обрабатывает только ban/warn/mute; action='via_filter' в него не заложен. Публичное сообщение via-фильтра формируется на месте в _check_via_bot_filter (bot_handlers.py:7860) — текст тот же, путь другой"
+        "_send_public_punishment_notice обрабатывает только ban/warn/mute; action='via_filter' в него не заложен. Публичное сообщение via-фильтра формируется на месте в _check_via_bot_filter (bot_handlers.py:7860) — своим фиксированным текстом, не через _build_punishment_notice (v5.1.0)"
     )
     def test_29_public_notice_via_filter_text(self):
-        """Текст для via-фильтра — фиксированная фраза 'задолбал срать в чат'."""
+        """Текст для via-фильтра — фиксированная фраза 'слишком много срал ботами'."""
         user = _FakeUser(first_name="Нарушитель")
         bot = MagicMock()
         bot.send_message = AsyncMock()
@@ -295,8 +298,8 @@ class TestPublicPunishmentNoticeHelper(unittest.TestCase):
             action="via_filter", reason=None, duration=600,
         ))
         kwargs = bot.send_message.call_args.kwargs
-        self.assertIn("задолбал срать в чат", kwargs["text"])
-        self.assertIn("замутан", kwargs["text"])
+        self.assertIn("слишком много срал ботами", kwargs["text"])
+        self.assertIn("заглушён", kwargs["text"])
         self.assertIn("10м", kwargs["text"])
 
     def test_30_public_notice_unknown_action_no_crash(self):
