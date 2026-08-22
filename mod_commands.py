@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -41,13 +42,6 @@ from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 from bot_handlers import (
-    _CMD_BAN,
-    _CMD_MUTE,
-    _CMD_SBAN,
-    _CMD_SMUTE,
-    _CMD_SWARN,
-    _CMD_UNWARN,
-    _CMD_WARN,
     _EPHEMERAL_DELETE_SEM,
     ADMIN_IDS,
     _add_banned_sticker_pack,
@@ -91,8 +85,9 @@ logger = logging.getLogger("shadow_logger")
 class ModContext:
     """Общий state для всех мод-команд.
 
-    Заполняется dispatcher'ом (handle_group_command) в шапке после парсинга
-    команды и резолва target. Передаётся в cmd_X функции.
+    Заполняется dispatcher'ом (handle_group_command) в шапке после резолва
+    команды через commands.resolve и резолва target. Передаётся в cmd_X
+    функции.
 
     Поля:
       chat_id: ID чата, где идёт модерация.
@@ -100,6 +95,10 @@ class ModContext:
       target: User — цель наказания (резолвится из reply/@username/TGID).
       target_content: содержимое сообщения нарушителя (для _save_punishment).
       text: полный текст команды (message.text or message.caption).
+      match: re.Match — результат commands.resolve(text, ...) для этой же
+        команды. cmd_X читают из него именованные группы (reason/dur/count)
+        вместо повторного re.match — диспетчер уже сматчил текст один раз,
+        дублировать незачем.
     """
 
     chat_id: int
@@ -107,6 +106,7 @@ class ModContext:
     target: types.User
     target_content: str | None
     text: str
+    match: re.Match
 
 
 # ── cmd_ban ─────────────────────────────────────────────────────────────────
@@ -117,6 +117,12 @@ async def cmd_ban(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4411-4535) в v4.8.9
     как proof-of-concept декомпозиции. См. mod_commands.py docstring.
+
+    v5.1.0: раньше не вызывалась вообще — dispatcher (v4.8.10) индексировал
+    команды по фиксированному списку _cmd_handlers_in_order, в который "ban"
+    не попал. is_punitive_cmd резолвил цель и удалял сообщение модератора,
+    но тело бана не выполнялось. Новый dispatcher диспетчерит по
+    commands.PUNITIVE/COMMANDS напрямую — баг ушёл вместе со списком.
 
     Логика:
       1. Снимает snapshot прав нарушителя (для возможного restore при unban).
@@ -129,12 +135,7 @@ async def cmd_ban(message: types.Message, ctx: ModContext) -> None:
       7. Публичное сообщение в чат (_send_public_punishment_notice).
       8. Удаляет сообщение нарушителя (если был reply).
     """
-    m = _CMD_BAN.match(ctx.text)
-    if m is None:
-        # Не !ban — не должно происходить, dispatcher вызвал не ту функцию.
-        logger.warning("cmd_ban called with non-ban command: %s", ctx.text[:50])
-        return
-    reason = m.group("reason")
+    reason = ctx.match.group("reason")
 
     chat_id = ctx.chat_id
     mod = ctx.mod
@@ -266,9 +267,7 @@ async def cmd_mute(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4091-4175) в v4.8.10.
     """
-    m = _CMD_MUTE.match(ctx.text)
-    if m is None:
-        return
+    m = ctx.match
     dur_str = m.group("dur")
     reason = m.group("reason")
     chat_id = ctx.chat_id
@@ -352,9 +351,7 @@ async def cmd_smute(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4184-4289) в v4.8.10.
     """
-    m = _CMD_SMUTE.match(ctx.text)
-    if m is None:
-        return
+    m = ctx.match
     dur_str = m.group("dur")
     chat_id = ctx.chat_id
     mod = ctx.mod
@@ -461,10 +458,7 @@ async def cmd_warn(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4295-4343) в v4.8.10.
     """
-    m = _CMD_WARN.match(ctx.text)
-    if m is None:
-        return
-    reason = m.group("reason")
+    reason = ctx.match.group("reason")
     chat_id = ctx.chat_id
     mod = ctx.mod
     target = ctx.target
@@ -512,10 +506,7 @@ async def cmd_swarn(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4350-4404) в v4.8.10.
     """
-    m = _CMD_SWARN.match(ctx.text)
-    if m is None:
-        return
-    reason = m.group("reason") or "(без причины)"
+    reason = ctx.match.group("reason") or "(без причины)"
     chat_id = ctx.chat_id
     mod = ctx.mod
     target = ctx.target
@@ -576,10 +567,7 @@ async def cmd_sban(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4431-4547) в v4.8.10.
     """
-    m = _CMD_SBAN.match(ctx.text)
-    if m is None:
-        return
-    reason = m.group("reason") or "(без причины)"
+    reason = ctx.match.group("reason") or "(без причины)"
     chat_id = ctx.chat_id
     mod = ctx.mod
     target = ctx.target
@@ -820,10 +808,7 @@ async def cmd_unwarn(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4687-4735) в v4.8.10.
     """
-    m = _CMD_UNWARN.match(ctx.text)
-    if m is None:
-        return
-    n_str = m.group(1)
+    n_str = ctx.match.group("count")
     n = int(n_str) if n_str else 1
     if n < 1:
         n = 1

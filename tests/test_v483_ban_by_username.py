@@ -33,130 +33,108 @@ sys.path.insert(0, _V483_WORK)
 
 
 class TestRegexPatterns(unittest.TestCase):
-    """Проверка regex-паттернов для 6 команд с target-группой."""
+    """Проверка regex-паттернов для 6 команд с target-группой.
+
+    v5.1.0: паттерны переехали в реестр commands.py — резолвим через
+    commands.resolve, как это делает production-диспетчер, вместо прямого
+    re.match() по удалённым _CMD_* константам bot_handlers.
+    """
 
     def setUp(self):
-        # Импортируем модуль bot_handlers — нужны только константы _CMD_*.
-        # Если импорт падает из-за aiogram — используем прямое чтение regex'ов.
-        try:
-            import bot_handlers as bh  # type: ignore
-            self._CMD_BAN = bh._CMD_BAN
-            self._CMD_SBAN = bh._CMD_SBAN
-            self._CMD_WARN = bh._CMD_WARN
-            self._CMD_SWARN = bh._CMD_SWARN
-            self._CMD_MUTE = bh._CMD_MUTE
-            self._CMD_SMUTE = bh._CMD_SMUTE
-        except ImportError:
-            self.skipTest("aiogram not installed — skip regex import test")
+        import commands
+        self._resolve = lambda text: commands.resolve(text, None)
 
     def test_ban_with_username_target(self):
         """!ban @username reason → target=@username, reason=reason."""
-        m = self._CMD_BAN.match("!ban @narushitel Дурачок")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!ban @narushitel Дурачок")
         self.assertEqual(m.group("target"), "@narushitel")
         self.assertEqual(m.group("reason"), "Дурачок")
 
     def test_ban_with_tgid_target(self):
         """!ban 12345678 reason → target='12345678', reason=reason."""
-        m = self._CMD_BAN.match("!ban 12345678 Дурачок")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!ban 12345678 Дурачок")
         self.assertEqual(m.group("target"), "12345678")
         self.assertEqual(m.group("reason"), "Дурачок")
 
     def test_ban_without_target_only_reason(self):
         """!ban reason (без target) → target=None, reason=reason (для reply)."""
-        m = self._CMD_BAN.match("!ban Дурачок")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!ban Дурачок")
         self.assertIsNone(m.group("target"))
         self.assertEqual(m.group("reason"), "Дурачок")
 
     def test_ban_no_args_no_match(self):
-        """!ban без аргументов → regex не матчит (причина обязательна)."""
-        m = self._CMD_BAN.match("!ban")
-        self.assertIsNone(m)
+        """!ban без аргументов → не резолвится (причина обязательна)."""
+        self.assertIsNone(self._resolve("!ban"))
 
     def test_ban_only_target_no_reason_no_match(self):
-        """!ban @username без причины → regex не матчит (причина обязательна)."""
-        m = self._CMD_BAN.match("!ban @username")
-        self.assertIsNone(m)
+        """!ban @username без причины → не резолвится (причина обязательна)."""
+        self.assertIsNone(self._resolve("!ban @username"))
 
     def test_sban_with_username_target(self):
         """!sban @username reason → target, reason."""
-        m = self._CMD_SBAN.match("!sban @narushitel Дурка")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!sban @narushitel Дурка")
         self.assertEqual(m.group("target"), "@narushitel")
         self.assertEqual(m.group("reason"), "Дурка")
 
     def test_sban_only_target_no_reason_ok(self):
         """!sban @username без причины → OK (тихая команда, причина опц.)."""
-        m = self._CMD_SBAN.match("!sban @username")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!sban @username")
         self.assertEqual(m.group("target"), "@username")
         # reason может быть None
         self.assertFalse(m.group("reason"))
 
     def test_sban_no_args_ok(self):
         """!sban без аргументов → OK (если есть reply)."""
-        m = self._CMD_SBAN.match("!sban")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!sban")
         self.assertIsNone(m.group("target"))
         self.assertFalse(m.group("reason"))
 
     def test_warn_with_tgid_target(self):
         """!warn 12345678 reason → target, reason."""
-        m = self._CMD_WARN.match("!warn 12345678 Спам")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!warn 12345678 Спам")
         self.assertEqual(m.group("target"), "12345678")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_swarn_with_username_target(self):
-        m = self._CMD_SWARN.match("!swarn @user Причина")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!swarn @user Причина")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("reason"), "Причина")
 
     def test_swarn_no_args_ok(self):
-        m = self._CMD_SWARN.match("!swarn")
-        self.assertIsNotNone(m)
+        self.assertIsNotNone(self._resolve("!swarn"))
 
     def test_mute_with_target(self):
         """!mute @user 1h reason → target, dur, reason."""
-        m = self._CMD_MUTE.match("!mute @user 1h Спам")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!mute @user 1h Спам")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_mute_without_target(self):
         """!mute 1h reason (без target) → target=None, dur, reason."""
-        m = self._CMD_MUTE.match("!mute 1h Спам")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!mute 1h Спам")
         self.assertIsNone(m.group("target"))
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_mute_no_target_no_dur_no_match(self):
-        m = self._CMD_MUTE.match("!mute")
-        self.assertIsNone(m)
+        self.assertIsNone(self._resolve("!mute"))
 
     def test_smute_with_target(self):
-        m = self._CMD_SMUTE.match("!smute @user 1h Причина")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!smute @user 1h Причина")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "Причина")
 
     def test_smute_only_target_dur(self):
         """!smute @user 1h (без причины) → OK (тихая)."""
-        m = self._CMD_SMUTE.match("!smute @user 1h")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!smute @user 1h")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("dur"), "1h")
         self.assertFalse(m.group("reason"))
 
     def test_smute_no_args_ok(self):
-        m = self._CMD_SMUTE.match("!smute")
-        self.assertIsNotNone(m)
+        self.assertIsNotNone(self._resolve("!smute"))
 
 
 class TestResolvePunishmentTarget(unittest.TestCase):
@@ -343,7 +321,10 @@ class TestResolvePunishmentTarget(unittest.TestCase):
 
 
 class TestModerationCommandFilterWithCaption(unittest.TestCase):
-    """Проверка что _ModerationCommandFilter пропускает caption-команды."""
+    """Проверка что _KnownCommandFilter пропускает caption-команды.
+
+    v5.1.0: _ModerationCommandFilter переименован в _KnownCommandFilter.
+    """
 
     def setUp(self):
         try:
@@ -354,7 +335,7 @@ class TestModerationCommandFilterWithCaption(unittest.TestCase):
 
     def test_filter_text_command(self):
         """text содержит команду → filter возвращает True."""
-        f = self.bh._ModerationCommandFilter()
+        f = self.bh._KnownCommandFilter()
         msg = MagicMock()
         msg.text = "!ban @user reason"
         msg.caption = None
@@ -363,7 +344,7 @@ class TestModerationCommandFilterWithCaption(unittest.TestCase):
 
     def test_filter_caption_command(self):
         """caption содержит команду, text=None → filter возвращает True (v4.8.3)."""
-        f = self.bh._ModerationCommandFilter()
+        f = self.bh._KnownCommandFilter()
         msg = MagicMock()
         msg.text = None
         msg.caption = "!ban @user reason"
@@ -372,7 +353,7 @@ class TestModerationCommandFilterWithCaption(unittest.TestCase):
 
     def test_filter_no_text_no_caption(self):
         """Ни text, ни caption не содержат команду → False."""
-        f = self.bh._ModerationCommandFilter()
+        f = self.bh._KnownCommandFilter()
         msg = MagicMock()
         msg.text = None
         msg.caption = None
@@ -381,7 +362,7 @@ class TestModerationCommandFilterWithCaption(unittest.TestCase):
 
     def test_filter_text_not_command(self):
         """text — обычное сообщение, не команда → False."""
-        f = self.bh._ModerationCommandFilter()
+        f = self.bh._KnownCommandFilter()
         msg = MagicMock()
         msg.text = "Привет всем!"
         msg.caption = None

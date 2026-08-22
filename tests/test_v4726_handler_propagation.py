@@ -17,17 +17,21 @@ Fix: added _AlarmCommandFilter and _ModerationCommandFilter (BaseFilter
 subclasses) that ONLY match when text is actually a command. Now non-command
 messages fall through to handle_content_filters.
 
+v5.1.0: _ModerationCommandFilter renamed to _KnownCommandFilter (reads the
+commands.py registry instead of a local regex cascade) — tests 3/5/7/9
+updated to the new name, same guarantee.
+
 Tests:
   Structural (AST):
     1. APP_VERSION >= v4.7.26
     2. _AlarmCommandFilter class defined
-    3. _ModerationCommandFilter class defined
-    4. _AlarmCommandFilter uses _CMD_ALARM regex (case-insensitive)
-    5. _ModerationCommandFilter uses _is_moderation_command
+    3. _KnownCommandFilter class defined
+    4. _AlarmCommandFilter uses commands.resolve
+    5. _KnownCommandFilter uses commands.resolve
     6. handle_alarm_command decorated with _AlarmCommandFilter
-    7. handle_group_command decorated with _ModerationCommandFilter
+    7. handle_group_command decorated with _KnownCommandFilter
     8. handle_alarm_command filter does NOT have only F.chat.type.in_
-    9. handle_group_command filter has _ModerationCommandFilter (not just reply)
+    9. handle_group_command filter has _KnownCommandFilter (not just reply)
    10. Changelog in base.html contains v4.7.26
    11. Changelog mentions propagation / "не работали"
 
@@ -91,44 +95,43 @@ class TestV4726HandlerPropagation(unittest.TestCase):
         self.assertEqual(len(classes), 1,
                          "_AlarmCommandFilter class should be defined exactly once")
 
-    # ── 3. _ModerationCommandFilter class defined ──────────────────────────
+    # ── 3. _KnownCommandFilter class defined ────────────────────────────────
     def test_03_moderation_command_filter_class_defined(self):
-        """_ModerationCommandFilter class is defined in bot_handlers.py."""
+        """v5.1.0: _ModerationCommandFilter переименован в _KnownCommandFilter."""
         classes = [
             node for node in self.tree.body
-            if isinstance(node, ast.ClassDef) and node.name == "_ModerationCommandFilter"
+            if isinstance(node, ast.ClassDef) and node.name == "_KnownCommandFilter"
         ]
         self.assertEqual(len(classes), 1,
-                         "_ModerationCommandFilter class should be defined exactly once")
+                         "_KnownCommandFilter class should be defined exactly once")
 
-    # ── 4. _AlarmCommandFilter uses _CMD_ALARM ─────────────────────────────
+    # ── 4. _AlarmCommandFilter uses commands.resolve ───────────────────────
     def test_04_alarm_filter_uses_cmd_alarm_regex(self):
-        """_AlarmCommandFilter.__call__ uses _CMD_ALARM.match()."""
+        """v5.1.0: _AlarmCommandFilter.__call__ резолвит команду через реестр
+        commands.py вместо локальной копии _CMD_ALARM."""
         # Find the class and inspect its __call__ method.
         for node in ast.walk(self.tree):
             if (isinstance(node, ast.ClassDef) and node.name == "_AlarmCommandFilter"):
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "__call__":
                         body_src = ast.unparse(item)
-                        self.assertIn("_CMD_ALARM", body_src,
-                                      "_AlarmCommandFilter should use _CMD_ALARM")
-                        self.assertIn(".match(", body_src,
-                                      "_AlarmCommandFilter should call .match()")
+                        self.assertIn("commands.resolve", body_src,
+                                      "_AlarmCommandFilter should use commands.resolve")
                         return
         self.fail("_AlarmCommandFilter.__call__ not found")
 
-    # ── 5. _ModerationCommandFilter uses _is_moderation_command ────────────
+    # ── 5. _KnownCommandFilter uses _is_known_command/commands.resolve ─────
     def test_05_moderation_filter_uses_helper(self):
-        """_ModerationCommandFilter.__call__ uses _is_moderation_command()."""
+        """v5.1.0: _KnownCommandFilter.__call__ спрашивает реестр команд."""
         for node in ast.walk(self.tree):
-            if (isinstance(node, ast.ClassDef) and node.name == "_ModerationCommandFilter"):
+            if (isinstance(node, ast.ClassDef) and node.name == "_KnownCommandFilter"):
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == "__call__":
                         body_src = ast.unparse(item)
-                        self.assertIn("_is_moderation_command", body_src,
-                                      "_ModerationCommandFilter should use _is_moderation_command")
+                        self.assertIn("commands.resolve", body_src,
+                                      "_KnownCommandFilter should use commands.resolve")
                         return
-        self.fail("_ModerationCommandFilter.__call__ not found")
+        self.fail("_KnownCommandFilter.__call__ not found")
 
     # ── 6. handle_alarm_command decorated with _AlarmCommandFilter ─────────
     def test_06_alarm_handler_uses_filter(self):
@@ -151,9 +154,9 @@ class TestV4726HandlerPropagation(unittest.TestCase):
                         return
         self.fail("handle_alarm_command should have _AlarmCommandFilter() in decorator")
 
-    # ── 7. handle_group_command decorated with _ModerationCommandFilter ────
+    # ── 7. handle_group_command decorated with _KnownCommandFilter ─────────
     def test_07_group_handler_uses_filter(self):
-        """handle_group_command has _ModerationCommandFilter in its decorator."""
+        """v5.1.0: handle_group_command has _KnownCommandFilter in its decorator."""
         func = None
         for node in self.tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "handle_group_command":
@@ -164,11 +167,11 @@ class TestV4726HandlerPropagation(unittest.TestCase):
             if isinstance(dec, ast.Call):
                 for arg in dec.args:
                     if isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name):
-                        if arg.func.id == "_ModerationCommandFilter":
+                        if arg.func.id == "_KnownCommandFilter":
                             return
-                    if isinstance(arg, ast.Name) and arg.id == "_ModerationCommandFilter":
+                    if isinstance(arg, ast.Name) and arg.id == "_KnownCommandFilter":
                         return
-        self.fail("handle_group_command should have _ModerationCommandFilter() in decorator")
+        self.fail("handle_group_command should have _KnownCommandFilter() in decorator")
 
     # ── 8. handle_alarm_command filter is NOT just F.chat.type ─────────────
     def test_08_alarm_handler_filter_is_specific(self):
@@ -195,9 +198,9 @@ class TestV4726HandlerPropagation(unittest.TestCase):
             f"_AlarmCommandFilter), got {len(all_args)}",
         )
 
-    # ── 9. handle_group_command filter has _ModerationCommandFilter ────────
+    # ── 9. handle_group_command filter has _KnownCommandFilter ─────────────
     def test_09_group_handler_has_filter_beyond_reply(self):
-        """handle_group_command has _ModerationCommandFilter (not just reply)."""
+        """v5.1.0: handle_group_command has _KnownCommandFilter (not just reply)."""
         func = None
         for node in self.tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "handle_group_command":
@@ -209,9 +212,10 @@ class TestV4726HandlerPropagation(unittest.TestCase):
             if isinstance(dec, ast.Call):
                 all_args.extend(dec.args)
         # Раньше фильтров было три: тип чата + F.reply_to_message +
-        # _ModerationCommandFilter. В v4.8.3 требование reply убрали из
-        # декоратора — цель команды можно указать через @username или TGID
-        # (см. docstring handle_group_command). Осталось два, и это верно.
+        # _ModerationCommandFilter (v5.1.0: _KnownCommandFilter). В v4.8.3
+        # требование reply убрали из декоратора — цель команды можно указать
+        # через @username или TGID (см. docstring handle_group_command).
+        # Осталось два, и это верно.
         #
         # Проверяем то, ради чего тест написан (v4.7.26): фильтр команд стоит
         # именно в декораторе, иначе handler перехватывает чужие сообщения и
@@ -222,8 +226,8 @@ class TestV4726HandlerPropagation(unittest.TestCase):
             if isinstance(d, _ast.Call) and isinstance(d.func, _ast.Name)
         }
         self.assertIn(
-            "_ModerationCommandFilter", names,
-            f"handle_group_command must filter by _ModerationCommandFilter "
+            "_KnownCommandFilter", names,
+            f"handle_group_command must filter by _KnownCommandFilter "
             f"in the decorator, got args: {names}",
         )
         self.assertGreaterEqual(

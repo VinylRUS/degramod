@@ -12,6 +12,11 @@ v4.10.1 (Task 18): файл был диагностическим скрипто
 поэтому теперь regex импортируются из `bot_handlers` — проверяется рабочий
 код, а не его слепок.
 
+v5.1.0 (Task 2): паттерны переехали в `commands.py` и потеряли якорь «^!» —
+теперь матчат нормализованную строку («smute 1d», не «!smute 1d»). Импорт
+переведён на `commands.spec_by_name(...)`, а матчинг — через
+`commands.resolve(text, None)`, как это делает production-диспетчер.
+
 Что фиксируем:
   • у всех трёх команд target и reason опциональны и распознаются порознь;
   • `!smute` принимает длительность и латиницей, и кириллицей (`1d`, `1д`);
@@ -31,15 +36,21 @@ os.environ.setdefault("ADMIN_IDS", "1")
 
 sys.path.insert(0, _P())
 
-from bot_handlers import _CMD_SBAN, _CMD_SMUTE, _CMD_SWARN  # noqa: E402
+import commands  # noqa: E402
+
+
+def _resolve(text: str):
+    return commands.resolve(text, None)
 
 
 class TestSmuteRegex(unittest.TestCase):
     """`!smute [target] <duration> [reason]`."""
 
     def _groups(self, text: str) -> dict:
-        m = _CMD_SMUTE.match(text)
-        self.assertIsNotNone(m, f"не сматчилось: {text!r}")
+        found = _resolve(text)
+        self.assertIsNotNone(found, f"не сматчилось: {text!r}")
+        spec, m = found
+        self.assertEqual(spec.name, "smute")
         return m.groupdict()
 
     def test_bare_command_matches_with_empty_groups(self):
@@ -78,9 +89,11 @@ class TestSmuteRegex(unittest.TestCase):
 class TestSwarnSbanRegex(unittest.TestCase):
     """`!swarn` / `!sban` — `[target] [reason]`, обе части опциональны."""
 
-    def _check(self, pattern, text: str, target, reason):
-        m = pattern.match(text)
-        self.assertIsNotNone(m, f"не сматчилось: {text!r}")
+    def _check(self, cmd_name: str, text: str, target, reason):
+        found = _resolve(text)
+        self.assertIsNotNone(found, f"не сматчилось: {text!r}")
+        spec, m = found
+        self.assertEqual(spec.name, cmd_name, f"команда у {text!r}")
         self.assertEqual(m.group("target"), target, f"target у {text!r}")
         self.assertEqual(m.group("reason"), reason, f"reason у {text!r}")
 
@@ -94,7 +107,7 @@ class TestSwarnSbanRegex(unittest.TestCase):
             ("!swarn 12345 Причина", "12345", "Причина"),
         ]:
             with self.subTest(text=text):
-                self._check(_CMD_SWARN, text, target, reason)
+                self._check("swarn", text, target, reason)
 
     def test_sban_variants(self):
         for text, target, reason in [
@@ -106,20 +119,20 @@ class TestSwarnSbanRegex(unittest.TestCase):
             ("!sban 12345 Причина", "12345", "Причина"),
         ]:
             with self.subTest(text=text):
-                self._check(_CMD_SBAN, text, target, reason)
+                self._check("sban", text, target, reason)
 
     def test_target_alone_matches(self):
         """Регресс v4.8.3: один только target не матчился, команда молчала."""
-        self.assertIsNotNone(_CMD_SWARN.match("!swarn @user"))
-        self.assertIsNotNone(_CMD_SBAN.match("!sban @user"))
+        self.assertIsNotNone(_resolve("!swarn @user"))
+        self.assertIsNotNone(_resolve("!sban @user"))
 
 
 class TestCaseInsensitive(unittest.TestCase):
 
     def test_uppercase_accepted(self):
         """re.IGNORECASE: !SMUTE и !SBan должны матчиться."""
-        self.assertIsNotNone(_CMD_SMUTE.match("!SMUTE 1d"))
-        self.assertIsNotNone(_CMD_SBAN.match("!SBan @user"))
+        self.assertIsNotNone(_resolve("!SMUTE 1d"))
+        self.assertIsNotNone(_resolve("!SBan @user"))
 
 
 if __name__ == "__main__":

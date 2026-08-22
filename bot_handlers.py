@@ -142,6 +142,7 @@ from aiogram.types import (
 )
 from sqlalchemy import desc, func, select
 
+import commands
 from db import (
     AutomuteCounter,
     BannedStickerPack,
@@ -495,115 +496,19 @@ def _mute_permissions() -> types.ChatPermissions:
 
 
 # ── Команды в группах ──────────────────────────────────────────────────────
-# v4.8.1: реформа команд ban/warn/mute.
-#   • Громкие (!ban/!warn/!mute) — причина ОБЯЗАТЕЛЬНА. После: публичное
-#     сообщение в чат + отчёт в репорт-чат (без ephemeral модератору).
-#   • Тихие (!sban/!swarn/!smute) — причина НЕОБЯЗАТЕЛЬНА. После: ephemeral
-#     модератору (и ephemeral нарушителю для !swarn) + отчёт в репорт-чат.
-#     Поведение совпадает с v4.8.0 !ban/!warn/!mute.
-#
-# v4.8.3: расширение способов указания цели наказания.
-#   • Раньше все команды работали ТОЛЬКО по reply на сообщение нарушителя.
-#   • Теперь можно указать цель первым аргументом: @username или TGID.
-#   • Reply остаётся приоритетным: если есть reply — цель из аргумента игнорируется.
-#   • Скриншот: модератор может приложить фото к команде (caption содержит !ban ...).
-#
-# Группа target: (?P<target>@\w+|\d+) — @username (начинается с @) или TGID (только цифры).
-# Если target не указан — команда требует reply (для !ban/!warn/!mute) или
-# работает по reply если он есть (для !sban/!swarn/!smute — иначе target=None,
-# что приведёт к ошибке резолва в _resolve_punishment_target).
-_CMD_MUTE = re.compile(
-    r"^!mute\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)\s+(?P<reason>.+)$",
-    re.IGNORECASE,
-)  # dur + reason обязательны; target опционален (если нет — нужен reply).
-_CMD_WARN = re.compile(
-    r"^!warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
-    re.IGNORECASE,
-)  # reason обязательна; target опционален.
-# v4.8.6: добавлен negative lookahead (?!@\w+$|\d+$) в reason — иначе
-# `!warn @username` (без причины) матчило reason="@username" и бан влетал
-# на reply-target с некорректной причиной. Теперь такой ввод не матчится
-# → handler вернёт "укажите причину".
-_CMD_BAN = re.compile(
-    r"^!ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
-    re.IGNORECASE,
-)  # reason обязательна; target опционален.
-# v4.8.6: аналогичный фикс как для _CMD_WARN (см. выше).
-# v4.8.1: тихие команды (stealth). s = silent/stealth.
-# v4.8.3.1 HOTFIX: regex переосмыслен — _CMD_SWARN/_CMD_SBAN в v4.8.3 не матчили
-#   `!swarn Причина` (bare reason без @username/TGID), потому что внутренняя
-#   группа `(?P<reason>.+)` требовала свой собственный `\s+`, но он уже был
-#   съеден внешней `\s+`. Исправлено: target и reason — два независимых
-#   optional-блока на верхнем уровне, каждый со своим `\s+`. Это позволяет
-#   матчить все варианты: `!swarn`, `!swarn Причина`, `!swarn @user`,
-#   `!swarn @user Причина`, `!swarn 12345`, `!swarn 12345 Причина`.
-# v4.8.3.1 HOTFIX: _CMD_SMUTE в v4.8.3 делал всё тело опциональным, поэтому
-#   `!smute` без длительности матчило (dur=None), а handler звал
-#   `_parse_duration(None)` → AttributeError. Regex оставлен как есть
-#   (dur внутри опциональной группы), но handler теперь явно проверяет
-#   `dur is None` и отправляет ephemeral с подсказкой формата.
-_CMD_SMUTE = re.compile(
-    r"^!smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
-    re.IGNORECASE,
-)  # dur обяз. ЕСЛИ есть аргументы; reason опц.; target опц.
-_CMD_SWARN = re.compile(
-    r"^!swarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
-    re.IGNORECASE,
-)  # reason опциональна; target опционален; любой из них может быть один.
-_CMD_SBAN = re.compile(
-    r"^!sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
-    re.IGNORECASE,
-)  # reason опциональна; target опционален; любой из них может быть один.
-_CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
-_CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
-_CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
-_CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
-_CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
-# v4.8.4: !resetmc — сброс счётчика автомьютов (прогрессивные муты).
-# Цель: reply на сообщение, ИЛИ !resetmc @username, ИЛИ !resetmc <tgid>.
-# Доступ: только SU/Admin (как !resetwarns).
-_CMD_RESETMC = re.compile(
-    r"^!resetmc(?:\s+(?P<target>@\w+|\d+))?\s*$",
-    re.IGNORECASE,
-)
-# v4.7.20: !alarm on [duration] / !alarm off
-# Длительность: опциональная, форматы "1ч" / "1h" / "30м" / "30m" / "2д" / "2d".
-# Если не указана — alarm активен до ручного !alarm off.
-# Примеры: "!alarm on", "!alarm on 1ч", "!alarm on 2h", "!alarm off"
-_CMD_ALARM = re.compile(
-    r"^!alarm\s+(on|off|вкл|выкл)"           # on/off (или русские алиасы)
-    r"(?:\s+(\d+)\s*(ч|h|м|m|д|d))?"         # опциональная длительность
-    r"\s*$",
-    re.IGNORECASE,
-)
+# v5.1.0: паттерны команд переехали в commands.py — единственный источник
+# истины (реестр GROUP_COMMANDS). История правок regex'ов (v4.8.1 реформа
+# ban/warn/mute, v4.8.3 target-аргумент, v4.8.3.1 hotfix swarn/sban/smute,
+# v4.8.6 negative lookahead в reason, v4.8.4 resetmc, v4.7.20 alarm) — там же,
+# рядом с соответствующими паттернами.
+def _is_known_command(text: str) -> bool:
+    """v5.1.0: True, если текст — команда этого бота.
 
-
-# ── Список всех команд модерации (для ранней проверки, что текст вообще ────
-#    является командой, ДО удаления сообщения модератора). v4.4.8 FIX.
-# v4.8.1: добавлены тихие команды !sban/!swarn/!smute.
-# v4.8.4: добавлена команда !resetmc (сброс счётчика автомьютов).
-_ALL_MOD_COMMANDS: tuple[re.Pattern, ...] = (
-    _CMD_MUTE, _CMD_WARN, _CMD_BAN,
-    _CMD_SMUTE, _CMD_SWARN, _CMD_SBAN,
-    _CMD_UNMUTE, _CMD_UNBAN, _CMD_UNWARN,
-    _CMD_WARNS, _CMD_RESETWARNS, _CMD_RESETMC,
-    _CMD_ALARM,
-)
-
-
-def _is_moderation_command(text: str) -> bool:
-    """Возвращает True, если текст — это одна из модераторских команд бота.
-
-    Используется как ранняя guard-проверка в handle_group_command, чтобы
-    бот не удалял обычные ответы модератора в чате (только сообщения с командой).
+    Раньше проверка звалась _is_moderation_command и знала только про
+    модераторские команды на «!». Теперь спрашивает реестр, поэтому
+    ловит и публичные /mywarns и /rules, и оба префикса.
     """
-    # Быстрый short-circuit: команды начинаются с '!'. Если не начинается —
-    # точно не команда, не трогаем сообщение.
-    stripped = text.lstrip()
-    if not stripped.startswith("!"):
-        return False
-    # Точное соответствие одному из зарегистрированных паттернов.
-    return any(p.match(stripped) for p in _ALL_MOD_COMMANDS)
+    return commands.resolve(text, commands.get_bot_username()) is not None
 
 
 # ── v4.7.26: Custom-фильтры для команд — исправляют баг с propagation ──────
@@ -616,39 +521,56 @@ def _is_moderation_command(text: str) -> bool:
 # перехватывал ВСЕ group messages (даже без !alarm).
 # Фикс: фильтр должен матчить ТОЛЬКО когда текст реально является командой.
 # Тогда не-команды проваливаются к следующему handler'у.
-class _ModerationCommandFilter(BaseFilter):
-    """v4.7.26: матчит только сообщения, содержащие модераторскую команду.
+class _KnownCommandFilter(BaseFilter):
+    """v5.1.0: матчит любую известную команду бота, независимо от прав.
 
-    Проверяет text на соответствие любому из _ALL_MOD_COMMANDS паттернов.
-    Используется в handle_group_command чтобы НЕ перехватывать обычные
-    reply-сообщения (тогда они проваливаются в handle_content_filters
-    для word/link/via_bot проверки).
+    Раньше (_ModerationCommandFilter) фильтр знал только мод-команды, а
+    отсутствие прав обрабатывалось молчаливым return в хендлере — команда
+    обычного юзера так и оставалась висеть в чате без ответа. Теперь
+    фильтр пропускает команду внутрь всегда, а хендлер решает, выполнить
+    её или отказать.
 
-    v4.8.3: если message.text пустой — проверяем message.caption.
-    Это позволяет модератору отправить фото (скриншот нарушения) с
-    командой в caption (например «!ban @user Дурачок» под фото).
+    Незнакомые команды (/roll соседнего бота) реестром не резолвятся,
+    сюда не попадают и проваливаются дальше — в handle_content_filters.
+
+    /alarm сюда намеренно НЕ попадает: у него отдельный хендлер
+    (handle_alarm_command, ниже) со своей логикой — команда без reply,
+    применяется ко всему чату, а не к цели. В aiogram 3.x первый матчащий
+    фильтр останавливает propagation, поэтому если бы этот фильтр пропускал
+    /alarm, handle_alarm_command никогда бы не вызвался (см. комментарий
+    v4.7.26 выше — именно про это).
+
+    v4.8.3: если message.text пустой — проверяем message.caption
+    (команда может быть подписью к скриншоту нарушения).
     """
 
     async def __call__(self, message: types.Message) -> bool:
         text = message.text or message.caption
         if not text:
             return False
-        return _is_moderation_command(text)
+        found = commands.resolve(text, commands.get_bot_username())
+        if found is None:
+            return False
+        spec, _match = found
+        return spec.name != "alarm"
 
 
 class _AlarmCommandFilter(BaseFilter):
-    """v4.7.26: матчит только сообщения вида '!alarm on|off|вкл|выкл ...'.
+    """v5.1.0: матчит только команду /alarm (и алиас !alarm) из реестра.
 
-    Используется в handle_alarm_command чтобы НЕ перехватывать обычные
-    текстовые сообщения (тогда они проваливаются в handle_content_filters
-    для word/link/via_bot проверки).
+    Раньше сверялась с локальной копией _CMD_ALARM — теперь резолвит текст
+    через commands.resolve и проверяет имя команды, как и остальной
+    диспетчер. Используется в handle_alarm_command, чтобы НЕ перехватывать
+    обычные текстовые сообщения (тогда они проваливаются в
+    handle_content_filters для word/link/via_bot проверки).
     """
 
     async def __call__(self, message: types.Message) -> bool:
         text = message.text
         if not text:
             return False
-        return bool(_CMD_ALARM.match(text))
+        found = commands.resolve(text, commands.get_bot_username())
+        return found is not None and found[0].name == "alarm"
 
 
 # ── v4.4.8: middleware для полной блокировки disabled-чатов ──────────────
@@ -3992,6 +3914,50 @@ def _mywarns_prune_stale(now: float) -> None:
         del _mywarns_last_call[key]
 
 
+# ── v5.1.0: кулдаун ephemeral-отказа «нет прав» ─────────────────────────
+# Без него участник, долбящий /ban, заставляет бота слать по ephemeral на
+# каждое нажатие и упереться во flood control уже на уровне всего бота.
+# Сама команда удаляется всегда — гасится только повторный ответ.
+_DENIED_COOLDOWN_SECONDS = 60
+_denied_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
+
+
+def _denied_prune_stale(now: float) -> None:
+    """Чистит протухшие записи кулдауна отказов."""
+    stale = [
+        key for key, ts in _denied_last_call.items()
+        if now - ts >= _DENIED_COOLDOWN_SECONDS
+    ]
+    for key in stale:
+        del _denied_last_call[key]
+
+
+async def _send_access_denied(
+    message: types.Message, chat_id: int, user: types.User,
+) -> None:
+    """v5.1.0: ephemeral «нет прав» с кулдауном на (user_id, chat_id).
+
+    Ошибки отправки глушит _send_ephemeral — если юзер ограничил
+    ephemeral-сообщения, показать ему всё равно нечего.
+    """
+    now = time.time()
+    key = (user.id, chat_id)
+    last = _denied_last_call.get(key, 0.0)
+    if now - last < _DENIED_COOLDOWN_SECONDS:
+        logger.debug(
+            "access denied (cooldown): user %s in chat %s", user.id, chat_id,
+        )
+        return
+    _denied_prune_stale(now)
+    _denied_last_call[key] = now
+    await _send_ephemeral(
+        bot=message.bot,
+        chat_id=chat_id,
+        recipient=user,
+        text="❌ У вас нет прав на эту команду.",
+    )
+
+
 async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> str | None:
     """Форматирует сводку варнов юзера для конкретного чата.
 
@@ -4166,72 +4132,81 @@ async def handle_mywarns_dm(message: types.Message) -> None:
 
 @router.message(
     F.chat.type.in_(["group", "supergroup"]),
-    _ModerationCommandFilter(),
+    _KnownCommandFilter(),
 )
 async def handle_group_command(message: types.Message) -> None:
-    """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах.
+    """Обрабатывает mute, warn, ban, unmute, unban, unwarn и т.д. в группах.
 
-    v4.7.26: фильтр _ModerationCommandFilter теперь стоит в декораторе —
+    v4.7.26: фильтр (тогда _ModerationCommandFilter) стоит в декораторе —
     handler вызывается ТОЛЬКО когда сообщение является командой. Раньше
     handler перехватывал все reply-сообщения и return'ил без обработки,
     что в aiogram 3.x останавливает propagation → handle_content_filters
     (word/link/via_bot filter) не вызывался для reply-сообщений.
 
     v4.8.3: убрано требование F.reply_to_message из декоратора — теперь
-    команды !ban/!sban/!warn/!swarn/!mute/!smute можно отправлять БЕЗ reply,
+    команды ban/sban/warn/swarn/mute/smute можно отправлять БЕЗ reply,
     указав цель первым аргументом (@username или TGID). Команды снятия
-    (!unban/!unmute/!unwarn) по-прежнему требуют reply — проверка внутри.
+    (unban/unmute/unwarn) по-прежнему требуют reply — проверка внутри.
     Также: команда может быть в message.caption (если модератор приложил
-    скриншот нарушения) — _ModerationCommandFilter это учитывает.
+    скриншот нарушения) — _KnownCommandFilter это учитывает.
+
+    v5.1.0: диспетчер переведён с каскада _CMD_*.match() на реестр
+    commands.py (_KnownCommandFilter заменил _ModerationCommandFilter).
+    Публичные команды (mywarns/rules, Access.USER) сюда попадают, но не
+    обрабатываются — их обслуживают отдельные хендлеры. Участник без прав
+    на мод-команду больше не игнорируется молча: команда удаляется и
+    отправляется ephemeral-отказ (_send_access_denied).
     """
     # v4.8.3: команда может быть в message.text ИЛИ message.caption
     # (если модератор приложил скриншот нарушения).
     text = message.text or message.caption
     if not text:
         return
-    # ── v4.4.8 FIX: не трогаем сообщения модератора, если это не команда ──
-    # Раньше бот удалял ЛЮБОЙ ответ модератора в чате (т.к. удаление шло
-    # ДО проверки на соответствие команде). Теперь сначала проверяем, что
-    # текст реально является одной из модераторских команд — и только тогда
-    # удаляем. Обычные ответы модератора больше не исчезают.
-    # v4.7.26: проверка _is_moderation_command уже в фильтре — но оставляем
-    # как defensive guard (вдруг filter изменят).
-    if not _is_moderation_command(text):
+
+    found = commands.resolve(text, commands.get_bot_username())
+    if found is None:
+        # Defensive guard: фильтр уже проверил, но вдруг его поменяют.
+        return
+    spec, cmd_match = found
+
+    # Публичные команды обслуживают собственные хендлеры (/mywarns, /rules).
+    if spec.access == commands.Access.USER:
         return
 
-    # Проверяем, что отправитель — админ
     chat_id = message.chat.id
-    async with async_session() as session:
-        is_adm = await _is_admin(session, chat_id, message.from_user.id)
-    if not is_adm:
-        return
-
     mod = message.from_user
 
-    # ── v4.8.3: резолв цели наказания ──────────────────────────────────
-    # Команды снятия (!unmute/!unban/!unwarn/!warns/!resetwarns) — работают
+    # ── v5.1.0: отказ вместо тишины ────────────────────────────────────
+    # Раньше здесь стоял «if not is_adm: return»: команда обычного юзера
+    # оставалась висеть в чате, и он не понимал, сработала она или нет.
+    # Теперь команда удаляется в любом случае, а при отсутствии прав
+    # уходит ephemeral (с кулдауном — см. _send_access_denied).
+    async with async_session() as session:
+        is_adm = await _is_admin(session, chat_id, mod.id)
+    if not is_adm:
+        try:
+            await message.delete()
+        except TelegramAPIError as e:
+            logger.debug(
+                "denied command: cannot delete message in chat %s: %s", chat_id, e,
+            )
+        await _send_access_denied(message, chat_id, mod)
+        return
+
+    # ── Резолв цели наказания ──────────────────────────────────────────
+    # Команды снятия (unmute/unban/unwarn/warns/resetwarns) — работают
     # ТОЛЬКО по reply. Если reply нет — отказываем.
-    # Наказательные команды (!ban/!sban/!warn/!swarn/!mute/!smute) —
+    # Наказательные команды (ban/sban/warn/swarn/mute/smute) —
     # резолвятся через _resolve_punishment_target (reply → @username → TGID).
-    # v4.8.4: !resetmc — тоже резолвится через _resolve_punishment_target
+    # v4.8.4: resetmc — тоже резолвится через _resolve_punishment_target
     # (reply → @username → TGID), но это не наказательная команда
-    # (сброс счётчика, не мьют/варн/бан).Self/friendly-fire checks не применяются.
-    is_punitive_cmd = bool(
-        _CMD_MUTE.match(text) or _CMD_WARN.match(text) or _CMD_BAN.match(text)
-        or _CMD_SMUTE.match(text) or _CMD_SWARN.match(text) or _CMD_SBAN.match(text)
-    )
-    is_resetmc_cmd = bool(_CMD_RESETMC.match(text))
+    # (сброс счётчика, не мьют/варн/бан). Self/friendly-fire checks не применяются.
+    is_punitive_cmd = spec.name in commands.PUNITIVE
+    is_resetmc_cmd = spec.name == "resetmc"
 
     if is_punitive_cmd or is_resetmc_cmd:
-        # Парсим target из команды (если есть) — для передачи в хелпер.
-        # Берём первый matching паттерн и достаём target-группу.
-        cmd_target_str: str | None = None
-        for pat in (_CMD_BAN, _CMD_SBAN, _CMD_WARN, _CMD_SWARN,
-                    _CMD_MUTE, _CMD_SMUTE, _CMD_RESETMC):
-            m_pat = pat.match(text)
-            if m_pat and m_pat.groupdict().get("target"):
-                cmd_target_str = m_pat.group("target")
-                break
+        # Цель — из именованной группы target, если она есть в матче.
+        cmd_target_str: str | None = cmd_match.groupdict().get("target")
 
         target, target_err = await _resolve_punishment_target(
             message, cmd_target_str, chat_id,
@@ -4324,16 +4299,17 @@ async def handle_group_command(message: types.Message) -> None:
             logger.warning("Не удалось удалить сообщение модератора %s в чате %s",
                            mod.id, chat_id)
 
-    # ── v4.8.10: 11 команд вынесены в mod_commands.py ──────────────────────
-    # Раньше тут были inline-блоки для !mute, !smute, !warn, !swarn, !sban,
-    # !unmute, !unban, !unwarn, !warns, !resetwarns, !resetmc — суммарно
-    # ~850 строк. Теперь все они в mod_commands.COMMANDS dict, и handle_group_command
-    # просто вызывает нужную функцию по имени команды.
-    # cmd_ban уже был вынесен в v4.8.9 — он тоже в COMMANDS.
+    # ── v4.8.10/v5.1.0: 12 команд вынесены в mod_commands.py ────────────────
+    # Раньше тут были inline-блоки для каждой команды — суммарно ~850 строк.
+    # Теперь они живут в mod_commands.COMMANDS dict, и handle_group_command
+    # просто вызывает нужную функцию по имени команды из реестра commands.py.
     #
-    # Порядок проверок сохранён: бан-команды первыми, потом мьют/варн, потом
-    # команды снятия/информации. Это важно для regex-приоритета (например,
-    # !ban матчится раньше !bansticker, если бы он был мод-командой).
+    # v5.1.0: диспетч по каскаду .match() заменён на прямой lookup по
+    # spec.name. Заодно чинит найденный при рефакторинге баг: cmd_ban не
+    # входил в старый _cmd_handlers_in_order — !ban резолвил цель и удалял
+    # сообщение модератора (is_punitive_cmd его учитывал), но до тела
+    # cmd_ban дело не доходило, бан не выполнялся. commands.resolve уже
+    # отдал нам и spec, и match — повторно матчить текст не нужно.
     from mod_commands import COMMANDS as _MOD_COMMANDS
     from mod_commands import ModContext as _ModContext
 
@@ -4343,50 +4319,12 @@ async def handle_group_command(message: types.Message) -> None:
         target=target,
         target_content=target_content,
         text=text,
+        match=cmd_match,
     )
 
-    # Проверяем команды в порядке объявления в handle_group_command (важно для regex).
-    # Каждая cmd_X сама проверяет свой regex через ctx.text и возвращает None если не матчит.
-    _cmd_handlers_in_order = [
-        _MOD_COMMANDS["mute"],
-        _MOD_COMMANDS["smute"],
-        _MOD_COMMANDS["warn"],
-        _MOD_COMMANDS["swarn"],
-        _MOD_COMMANDS["sban"],
-        _MOD_COMMANDS["unmute"],
-        _MOD_COMMANDS["unban"],
-        _MOD_COMMANDS["unwarn"],
-        _MOD_COMMANDS["warns"],
-        _MOD_COMMANDS["resetwarns"],
-        _MOD_COMMANDS["resetmc"],
-    ]
-    for _handler in _cmd_handlers_in_order:
-        _matched_before = _handler.__name__.replace("cmd_", "")
-        # Каждая cmd_X внутри себя делает regex-проверку и возвращает None если не матчит.
-        # Если сматчилась — выполняет команду и return'ит (внутри функции).
-        # Но мы не видим return из функции здесь. Поэтому проверяем regex здесь
-        # и вызываем только если матчит.
-        _cmd_regex_map = {
-            "mute": _CMD_MUTE,
-            "smute": _CMD_SMUTE,
-            "warn": _CMD_WARN,
-            "swarn": _CMD_SWARN,
-            "sban": _CMD_SBAN,
-            "unmute": _CMD_UNMUTE,
-            "unban": _CMD_UNBAN,
-            "unwarn": _CMD_UNWARN,
-            "warns": _CMD_WARNS,
-            "resetwarns": _CMD_RESETWARNS,
-            "resetmc": _CMD_RESETMC,
-        }
-        _regex = _cmd_regex_map.get(_matched_before)
-        if _regex and _regex.match(text):
-            await _handler(message, _ctx)
-            return
-
-    # Ни одна команда не сматчилась — это не мод-команда.
-    # (filter _ModerationCommandFilter в декораторе уже должен был отсечь,
-    # но это defensive guard для случая если filter изменят.)
+    _handler = _MOD_COMMANDS.get(spec.name)
+    if _handler is not None:
+        await _handler(message, _ctx)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4398,12 +4336,12 @@ async def handle_group_command(message: types.Message) -> None:
     _AlarmCommandFilter(),
 )
 async def handle_alarm_command(message: types.Message) -> None:
-    """!alarm on [duration] / !alarm off — экстренная блокировка медиа в чате.
+    """alarm on [duration] / alarm off — экстренная блокировка медиа в чате.
 
     Доступ: любой модератор (ChatAdmin или ADMIN_IDS). Не требует reply
     на сообщение нарушителя — это "режимная" команда, применяется ко всему чату.
 
-    Поведение !alarm on:
+    Поведение alarm on:
       • Если чат в night mode → отказ (DM модератору: "сейчас ночной режим,
         alarm избыточен"). Ночной режим сам по себе ограничивает права.
       • Если alarm уже активен → обновляем alarm_active_until (продлеваем
@@ -4411,31 +4349,34 @@ async def handle_alarm_command(message: types.Message) -> None:
       • Иначе: snapshot текущих прав → применяем alarm_permissions + slow_mode 30s
       • Логируем, отправляем подтверждение в DM модератору
 
-    Поведение !alarm off:
+    Поведение alarm off:
       • Если alarm не активен → DM: "Alarm не активен"
       • Иначе: восстанавливаем права (через _deactivate_alarm) → DM: "Alarm снят"
 
-    Стелс: обычные юзеры (не модераторы) полностью игнорируются — бот
-    не отвечает им в чате, не шлёт DM, не удаляет их сообщение. Только
-    модераторы получают DM-подтверждение.
-
     v4.7.26: фильтр _AlarmCommandFilter теперь стоит в декораторе —
-    handler вызывается ТОЛЬКО когда сообщение является !alarm командой.
-    Раньше handler перехватывал ВСЕ group messages (даже не !alarm) и
+    handler вызывается ТОЛЬКО когда сообщение является alarm-командой.
+    Раньше handler перехватывал ВСЕ group messages (даже не alarm) и
     return'ил, что в aiogram 3.x останавливает propagation →
     handle_content_filters (word/link/via_bot filter) не вызывался.
+
+    v5.1.0: команда резолвится через commands.resolve (реестр), а не через
+    локальную копию _CMD_ALARM — именованные группы state/amount/unit.
+    Юзер без прав больше не получает стелс-тишину: команда удаляется и
+    уходит ephemeral-отказ через _send_access_denied, как у остальных
+    мод-команд (раньше alarm была единственным исключением).
     """
     text = message.text
     # text не None — гарантировано _AlarmCommandFilter'ом.
 
-    m = _CMD_ALARM.match(text)
-    if not m:
+    found = commands.resolve(text, commands.get_bot_username())
+    if found is None or found[0].name != "alarm":
         return  # Defensive — filter уже это проверил, но на всякий случай.
+    _spec, m = found
 
     # Парсим аргументы
-    action_raw = m.group(1).lower()
-    duration_value = m.group(2)
-    duration_unit = m.group(3)
+    action_raw = m.group("state").lower()
+    duration_value = m.group("amount")
+    duration_unit = m.group("unit")
 
     is_on = action_raw in ("on", "вкл")
     is_off = action_raw in ("off", "выкл")
@@ -4446,11 +4387,21 @@ async def handle_alarm_command(message: types.Message) -> None:
     mod = message.from_user
 
     # ── Проверка прав: только модераторы (ChatAdmin в БД или ADMIN_IDS env) ──
-    # Стелс: если пишет не модератор — полностью игнорируем (return).
+    # v5.1.0: раньше здесь стоял стелс-возврат (тишина для юзера без прав) —
+    # единственная мод-команда с таким поведением. Приведено к общему
+    # поведению: удаление + ephemeral-отказ (см. docstring выше).
     async with async_session() as session:
         is_adm = await _is_admin(session, chat_id, mod.id)
     if not is_adm:
-        return  # Молча игнорируем — стелс
+        try:
+            await message.delete()
+        except TelegramAPIError as e:
+            logger.debug(
+                "denied alarm command: cannot delete message in chat %s: %s",
+                chat_id, e,
+            )
+        await _send_access_denied(message, chat_id, mod)
+        return
 
     # ── Удаляем сообщение модератора с командой (если auto_delete_commands) ──
     async with async_session() as session:

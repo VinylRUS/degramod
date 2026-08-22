@@ -719,13 +719,20 @@ class TestVersionDisplay(unittest.TestCase):
 class TestPaidUnbanRemoved(unittest.TestCase):
 
     def test_paidunban_command_not_in_all_mod_commands(self):
-        """!paidunban не должен быть в списке команд модерации."""
-        for cmd in bot_handlers._ALL_MOD_COMMANDS:
-            self.assertNotIn("paidunban", cmd.pattern)
+        """!paidunban не должен быть в списке команд модерации.
+
+        v5.1.0: _ALL_MOD_COMMANDS переехал в реестр commands.GROUP_COMMANDS —
+        проверяем там же.
+        """
+        import commands
+        for spec in commands.GROUP_COMMANDS:
+            self.assertNotIn("paidunban", spec.pattern.pattern)
 
     def test_paidunban_regex_does_not_exist(self):
-        """_CMD_PAIDUNBAN не должен существовать."""
+        """_CMD_PAIDUNBAN не должен существовать (ни в bot_handlers, ни в реестре)."""
+        import commands
         self.assertFalse(hasattr(bot_handlers, "_CMD_PAIDUNBAN"))
+        self.assertIsNone(commands.spec_by_name("paidunban"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

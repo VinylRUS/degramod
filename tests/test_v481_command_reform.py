@@ -80,13 +80,17 @@ def _extract_func_body(src: str, func_name: str) -> str | None:
 
 
 class TestRegexPatterns(unittest.TestCase):
-    """Проверка regex-паттернов команд."""
+    """Проверка regex-паттернов команд.
+
+    v5.1.0: паттерны переехали в реестр commands.py — резолвим через
+    commands.resolve, как это делает production-диспетчер, вместо прямого
+    re.match() по удалённым _CMD_* константам bot_handlers.
+    """
 
     def setUp(self):
-        # Импортируем модуль чтобы получить конкретные паттерны
         os.environ.setdefault("BOT_TOKEN", "123456789:AAEhBP0av28zZc-WSxGyJzkvJm5abc1234")
-        import bot_handlers
-        self.bot_handlers = bot_handlers
+        import commands
+        self._resolve = lambda text: commands.resolve(text, None)
 
     # v4.8.3 добавила командам опциональную группу target (@username или TGID)
     # ПЕРЕД причиной, поэтому позиционные m.group(1)/group(2) теперь указывают
@@ -94,103 +98,96 @@ class TestRegexPatterns(unittest.TestCase):
     # они не зависят от порядка и переживут следующее расширение синтаксиса.
     def test_01_CMD_BAN_requires_reason(self):
         """!ban требует причину (громкая команда)."""
-        m = self.bot_handlers._CMD_BAN.match("!ban спам")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!ban спам")
         self.assertEqual(m.group("reason"), "спам")
 
     def test_02_CMD_BAN_no_reason_does_not_match(self):
         """!ban без причины не матчится."""
-        self.assertIsNone(self.bot_handlers._CMD_BAN.match("!ban"))
-        self.assertIsNone(self.bot_handlers._CMD_BAN.match("!ban "))
+        self.assertIsNone(self._resolve("!ban"))
+        self.assertIsNone(self._resolve("!ban "))
 
     def test_03_CMD_WARN_requires_reason(self):
         """!warn требует причину."""
-        m = self.bot_handlers._CMD_WARN.match("!warn нарушение")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!warn нарушение")
         self.assertEqual(m.group("reason"), "нарушение")
 
     def test_04_CMD_WARN_no_reason_does_not_match(self):
         """!warn без причины не матчится."""
-        self.assertIsNone(self.bot_handlers._CMD_WARN.match("!warn"))
+        self.assertIsNone(self._resolve("!warn"))
 
     def test_05_CMD_MUTE_requires_duration_and_reason(self):
         """!mute требует длительность И причину (v4.8.1 — причина обязательна)."""
-        m = self.bot_handlers._CMD_MUTE.match("!mute 1h флуд")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!mute 1h флуд")
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "флуд")
 
     def test_06_CMD_MUTE_no_reason_does_not_match(self):
         """!mute без причины не матчится (изменение v4.8.1)."""
-        self.assertIsNone(self.bot_handlers._CMD_MUTE.match("!mute 1h"))
-        self.assertIsNone(self.bot_handlers._CMD_MUTE.match("!mute 1h "))
+        self.assertIsNone(self._resolve("!mute 1h"))
+        self.assertIsNone(self._resolve("!mute 1h "))
 
     def test_07_CMD_SBAN_optional_reason(self):
         """!sban — причина необязательна (тихая команда)."""
         # С причиной
-        m = self.bot_handlers._CMD_SBAN.match("!sban спам")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!sban спам")
         self.assertEqual(m.group("reason"), "спам")
         # Без причины
-        m = self.bot_handlers._CMD_SBAN.match("!sban")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!sban")
         self.assertIsNone(m.group("reason"))
 
     def test_08_CMD_SWARN_optional_reason(self):
         """!swarn — причина необязательна."""
-        m = self.bot_handlers._CMD_SWARN.match("!swarn нарушение")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!swarn нарушение")
         self.assertEqual(m.group("reason"), "нарушение")
         # Без причины
-        m = self.bot_handlers._CMD_SWARN.match("!swarn")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!swarn")
         self.assertIsNone(m.group("reason"))
 
     def test_09_CMD_SMUTE_duration_required_reason_optional(self):
         """!smute — длительность обязательна, причина необязательна."""
         # С причиной
-        m = self.bot_handlers._CMD_SMUTE.match("!smute 1h флуд")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!smute 1h флуд")
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "флуд")
         # Без причины
-        m = self.bot_handlers._CMD_SMUTE.match("!smute 1h")
-        self.assertIsNotNone(m)
+        _spec, m = self._resolve("!smute 1h")
         self.assertEqual(m.group("dur"), "1h")
         self.assertIsNone(m.group("reason"))
 
 
 class TestAllModCommandsIncludesSilent(unittest.TestCase):
-    """_ALL_MOD_COMMANDS включает тихие команды."""
+    """commands.GROUP_COMMANDS включает тихие команды."""
 
     def setUp(self):
         os.environ.setdefault("BOT_TOKEN", "123456789:AAEhBP0av28zZc-WSxGyJzkvJm5abc1234")
         import bot_handlers
+        import commands
         self.bot_handlers = bot_handlers
+        self.commands = commands
 
     def test_10_all_mod_commands_has_smute(self):
-        self.assertIn(self.bot_handlers._CMD_SMUTE, self.bot_handlers._ALL_MOD_COMMANDS)
+        self.assertIsNotNone(self.commands.spec_by_name("smute"))
 
     def test_11_all_mod_commands_has_swarn(self):
-        self.assertIn(self.bot_handlers._CMD_SWARN, self.bot_handlers._ALL_MOD_COMMANDS)
+        self.assertIsNotNone(self.commands.spec_by_name("swarn"))
 
     def test_12_all_mod_commands_has_sban(self):
-        self.assertIn(self.bot_handlers._CMD_SBAN, self.bot_handlers._ALL_MOD_COMMANDS)
+        self.assertIsNotNone(self.commands.spec_by_name("sban"))
 
     def test_13_is_moderation_command_recognizes_silent(self):
-        """_is_moderation_command распознаёт тихие команды."""
-        self.assertTrue(self.bot_handlers._is_moderation_command("!smute 1h"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!swarn"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!sban"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!sban cause"))
+        """_is_known_command распознаёт тихие команды (v5.1.0: замена _is_moderation_command)."""
+        self.assertTrue(self.bot_handlers._is_known_command("!smute 1h"))
+        self.assertTrue(self.bot_handlers._is_known_command("!swarn"))
+        self.assertTrue(self.bot_handlers._is_known_command("!sban"))
+        self.assertTrue(self.bot_handlers._is_known_command("!sban cause"))
 
     def test_14_is_moderation_command_still_recognizes_loud(self):
-        """_is_moderation_command всё ещё распознаёт громкие команды."""
-        self.assertTrue(self.bot_handlers._is_moderation_command("!mute 1h cause"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!warn cause"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!ban cause"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!unmute"))
-        self.assertTrue(self.bot_handlers._is_moderation_command("!alarm on"))
+        """_is_known_command всё ещё распознаёт громкие команды."""
+        self.assertTrue(self.bot_handlers._is_known_command("!mute 1h cause"))
+        self.assertTrue(self.bot_handlers._is_known_command("!warn cause"))
+        self.assertTrue(self.bot_handlers._is_known_command("!ban cause"))
+        self.assertTrue(self.bot_handlers._is_known_command("!unmute"))
+        self.assertTrue(self.bot_handlers._is_known_command("!alarm on"))
 
 
 class _FakeUser:
@@ -317,36 +314,41 @@ class TestPublicPunishmentNoticeHelper(unittest.TestCase):
 
 
 class TestHandleGroupCommandBranches(unittest.TestCase):
-    """Проверка ветвей !ban/!warn/!mute/!s* в handle_group_command."""
+    """Проверка ветвей !ban/!warn/!mute/!s* в handle_group_command.
+
+    v5.1.0: диспетчер больше не матчит по _CMD_*.match(text) — команды
+    резолвятся один раз через commands.resolve, а ветки живут как отдельные
+    cmd_X функции в mod_commands.py. Маркеры обновлены на имена функций.
+    """
 
     def test_40_handle_group_command_has_ban_branch_with_public_notice(self):
         """Ветвь !ban содержит _send_public_punishment_notice."""
         body = _dispatch_src()
         self.assertIsNotNone(body)
-        self.assertIn("_CMD_BAN.match(text)", body)
+        self.assertIn("async def cmd_ban(", body)
         self.assertIn("_send_public_punishment_notice", body)
 
     def test_41_handle_group_command_has_warn_branch_with_public_notice(self):
         """Ветвь !warn содержит _send_public_punishment_notice."""
         body = _dispatch_src()
         self.assertIsNotNone(body)
-        self.assertIn("_CMD_WARN.match(text)", body)
+        self.assertIn("async def cmd_warn(", body)
         self.assertIn("_send_public_punishment_notice", body)
 
     def test_42_handle_group_command_has_mute_branch_with_public_notice(self):
         """Ветвь !mute содержит _send_public_punishment_notice."""
         body = _dispatch_src()
         self.assertIsNotNone(body)
-        self.assertIn("_CMD_MUTE.match(text)", body)
+        self.assertIn("async def cmd_mute(", body)
         self.assertIn("_send_public_punishment_notice", body)
 
     def test_43_handle_group_command_has_silent_branches(self):
         """Все три тихие команды присутствуют в handle_group_command."""
         body = _dispatch_src()
         self.assertIsNotNone(body)
-        self.assertIn("_CMD_SBAN.match(text)", body)
-        self.assertIn("_CMD_SWARN.match(text)", body)
-        self.assertIn("_CMD_SMUTE.match(text)", body)
+        self.assertIn("async def cmd_sban(", body)
+        self.assertIn("async def cmd_swarn(", body)
+        self.assertIn("async def cmd_smute(", body)
 
     def test_44_silent_branches_use_send_ephemeral(self):
         """Тихие ветви используют _send_ephemeral для модератора."""
@@ -375,12 +377,19 @@ class TestHandleGroupCommandBranches(unittest.TestCase):
                                 "_add_banned_sticker_pack must be in both !ban and !sban")
 
     def test_47_is_punitive_cmd_includes_silent_commands(self):
-        """is_punitive_cmd в handle_group_command включает тихие команды."""
+        """is_punitive_cmd в handle_group_command включает тихие команды.
+
+        v5.1.0: is_punitive_cmd больше не каскад .match() — единая проверка
+        `spec.name in commands.PUNITIVE`. Гарантия «smute/swarn/sban
+        punitive» теперь закодирована в самом реестре commands.PUNITIVE.
+        """
         body = _dispatch_src()
         self.assertIsNotNone(body)
-        self.assertIn("_CMD_SMUTE.match(text)", body)
-        self.assertIn("_CMD_SWARN.match(text)", body)
-        self.assertIn("_CMD_SBAN.match(text)", body)
+        self.assertIn("spec.name in commands.PUNITIVE", body)
+        import commands
+        self.assertIn("smute", commands.PUNITIVE)
+        self.assertIn("swarn", commands.PUNITIVE)
+        self.assertIn("sban", commands.PUNITIVE)
 
 
 class TestViaFilterPublicNotice(unittest.TestCase):

@@ -66,90 +66,94 @@ import os
 os.environ.setdefault("BOT_TOKEN", "123456789:AAEhBP0av28-bot-test-token-fake")
 
 from bot_handlers import (
-    _CMD_ALARM,
     _alarm_permissions,
     _parse_alarm_duration,
     _format_alarm_duration,
     _ALARM_SLOW_MODE_DELAY,
-    _ALL_MOD_COMMANDS,
 )
 from aiogram import types
 
+# v5.1.0: _CMD_ALARM/_ALL_MOD_COMMANDS переехали в реестр commands.py —
+# паттерн больше не якорится на "!" и матчит нормализованную строку
+# (без префикса). commands.resolve делает нормализацию сама, поэтому тесты
+# ниже гоняют через неё — так же, как это делает production-код.
+import commands  # noqa: E402
+
+
+def _resolve(text: str):
+    return commands.resolve(text, None)
+
 
 class TestV4720bAlarmRegex(unittest.TestCase):
-    """Парсинг команды !alarm через regex."""
+    """Парсинг команды !alarm через commands.resolve (реестр v5.1.0)."""
 
     def test_01_alarm_on_simple(self):
-        m = _CMD_ALARM.match("!alarm on")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "on")
-        self.assertIsNone(m.group(2))  # duration value
-        self.assertIsNone(m.group(3))  # duration unit
+        spec, m = _resolve("!alarm on")
+        self.assertEqual(spec.name, "alarm")
+        self.assertEqual(m.group("state").lower(), "on")
+        self.assertIsNone(m.group("amount"))
+        self.assertIsNone(m.group("unit"))
 
     def test_02_alarm_off_simple(self):
-        m = _CMD_ALARM.match("!alarm off")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "off")
+        spec, m = _resolve("!alarm off")
+        self.assertEqual(spec.name, "alarm")
+        self.assertEqual(m.group("state").lower(), "off")
 
     def test_03_alarm_on_with_duration_hours_ru(self):
-        m = _CMD_ALARM.match("!alarm on 1ч")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "on")
-        self.assertEqual(m.group(2), "1")
-        self.assertEqual(m.group(3).lower(), "ч")
+        spec, m = _resolve("!alarm on 1ч")
+        self.assertEqual(m.group("state").lower(), "on")
+        self.assertEqual(m.group("amount"), "1")
+        self.assertEqual(m.group("unit").lower(), "ч")
 
     def test_04_alarm_on_with_duration_hours_en(self):
-        m = _CMD_ALARM.match("!alarm on 2h")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(2), "2")
-        self.assertEqual(m.group(3).lower(), "h")
+        spec, m = _resolve("!alarm on 2h")
+        self.assertEqual(m.group("amount"), "2")
+        self.assertEqual(m.group("unit").lower(), "h")
 
     def test_05_alarm_on_with_duration_minutes_ru(self):
-        m = _CMD_ALARM.match("!alarm on 30м")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(2), "30")
-        self.assertEqual(m.group(3).lower(), "м")
+        spec, m = _resolve("!alarm on 30м")
+        self.assertEqual(m.group("amount"), "30")
+        self.assertEqual(m.group("unit").lower(), "м")
 
     def test_06_alarm_on_with_duration_minutes_en(self):
-        m = _CMD_ALARM.match("!alarm on 45m")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(2), "45")
-        self.assertEqual(m.group(3).lower(), "m")
+        spec, m = _resolve("!alarm on 45m")
+        self.assertEqual(m.group("amount"), "45")
+        self.assertEqual(m.group("unit").lower(), "m")
 
     def test_07_alarm_on_with_duration_days(self):
-        m = _CMD_ALARM.match("!alarm on 2д")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(2), "2")
-        self.assertEqual(m.group(3).lower(), "д")
+        spec, m = _resolve("!alarm on 2д")
+        self.assertEqual(m.group("amount"), "2")
+        self.assertEqual(m.group("unit").lower(), "д")
 
     def test_08_alarm_case_insensitive(self):
-        m = _CMD_ALARM.match("!ALARM ON 1H")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "on")
+        spec, m = _resolve("!ALARM ON 1H")
+        self.assertEqual(m.group("state").lower(), "on")
 
     def test_09_alarm_russian_aliases(self):
-        m = _CMD_ALARM.match("!alarm вкл")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "вкл")
+        spec, m = _resolve("!alarm вкл")
+        self.assertEqual(m.group("state").lower(), "вкл")
 
-        m = _CMD_ALARM.match("!alarm выкл")
-        self.assertIsNotNone(m)
-        self.assertEqual(m.group(1).lower(), "выкл")
+        spec, m = _resolve("!alarm выкл")
+        self.assertEqual(m.group("state").lower(), "выкл")
 
     def test_10_alarm_no_match_random_text(self):
-        """Не-команды не должны матчиться."""
+        """Тексты, не резолвящиеся в /alarm, не должны матчиться."""
         for text in ["", "hello", "!warn reason", "!mute 1h", "alarm on", "!alarmon"]:
-            self.assertIsNone(_CMD_ALARM.match(text), f"Не должен матчиться: {text!r}")
+            found = _resolve(text)
+            self.assertTrue(
+                found is None or found[0].name != "alarm",
+                f"Не должен резолвиться в alarm: {text!r}",
+            )
 
     def test_11_alarm_no_duration_unit(self):
         """!alarm on 30 без единицы — не должно парситься."""
-        m = _CMD_ALARM.match("!alarm on 30")
+        found = _resolve("!alarm on 30")
         # По regex — number без unit не матчится (опциональная группа требует unit)
-        self.assertIsNone(m)
+        self.assertIsNone(found)
 
     def test_12_ALARM_in_ALL_MOD_COMMANDS(self):
-        """_CMD_ALARM должен быть в _ALL_MOD_COMMANDS."""
-        self.assertIn(_CMD_ALARM, _ALL_MOD_COMMANDS)
+        """alarm должен быть зарегистрирован в commands.GROUP_COMMANDS."""
+        self.assertIsNotNone(commands.spec_by_name("alarm"))
 
 
 class TestV4720bAlarmPermissions(unittest.TestCase):

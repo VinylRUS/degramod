@@ -247,10 +247,13 @@ async def test_functional():
 def test_regex_and_help():
     _section("T11-T14: Regex и help-текст")
 
-    # T11: _CMD_RESETMC regex
+    # T11: resetmc regex (v5.1.0: паттерн переехал в commands.py)
     try:
-        import bot_handlers
-        pat = bot_handlers._CMD_RESETMC
+        import commands
+
+        def _resolve(text):
+            return commands.resolve(text, None)
+
         # All valid variants
         valid = [
             "!resetmc",
@@ -261,7 +264,9 @@ def test_regex_and_help():
             "!resetmc   ",
         ]
         for v in valid:
-            assert pat.match(v), f"should match: {v!r}"
+            found = _resolve(v)
+            assert found is not None and found[0].name == "resetmc", \
+                f"should match: {v!r}"
         # Invalid
         invalid = [
             "!resetmc @user extra args",
@@ -270,31 +275,34 @@ def test_regex_and_help():
             "!reset",
         ]
         for v in invalid:
-            assert not pat.match(v), f"should NOT match: {v!r}"
+            found = _resolve(v)
+            assert found is None or found[0].name != "resetmc", \
+                f"should NOT match: {v!r}"
         # Target group extraction
-        m = pat.match("!resetmc @spammer")
+        _spec, m = _resolve("!resetmc @spammer")
         assert m.group("target") == "@spammer", f"target=@spammer, got {m.group('target')}"
-        m = pat.match("!resetmc 12345")
+        _spec, m = _resolve("!resetmc 12345")
         assert m.group("target") == "12345", f"target=12345, got {m.group('target')}"
-        m = pat.match("!resetmc")
+        _spec, m = _resolve("!resetmc")
         assert m.group("target") is None, f"target=None, got {m.group('target')}"
-        _ok("T11: _CMD_RESETMC regex (6 valid, 4 invalid, target extraction)")
+        _ok("T11: resetmc regex (6 valid, 4 invalid, target extraction)")
     except Exception as e:
-        _fail("T11: _CMD_RESETMC regex", str(e))
+        _fail("T11: resetmc regex", str(e))
 
-    # T12: _CMD_RESETMC in _ALL_MOD_COMMANDS
+    # T12: resetmc в реестре commands.py
     try:
         import bot_handlers
-        assert bot_handlers._CMD_RESETMC in bot_handlers._ALL_MOD_COMMANDS, \
-            "_CMD_RESETMC не в _ALL_MOD_COMMANDS"
-        # Also check _is_moderation_command
-        assert bot_handlers._is_moderation_command("!resetmc"), \
-            "_is_moderation_command('!resetmc') = False"
-        assert bot_handlers._is_moderation_command("!resetmc @user"), \
-            "_is_moderation_command('!resetmc @user') = False"
-        _ok("T12: _CMD_RESETMC в _ALL_MOD_COMMANDS + _is_moderation_command")
+        import commands
+        assert commands.spec_by_name("resetmc") is not None, \
+            "resetmc не в commands.GROUP_COMMANDS"
+        # Also check _is_known_command (v5.1.0: заменил _is_moderation_command)
+        assert bot_handlers._is_known_command("!resetmc"), \
+            "_is_known_command('!resetmc') = False"
+        assert bot_handlers._is_known_command("!resetmc @user"), \
+            "_is_known_command('!resetmc @user') = False"
+        _ok("T12: resetmc в реестре + _is_known_command")
     except Exception as e:
-        _fail("T12: _CMD_RESETMC в _ALL_MOD_COMMANDS", str(e))
+        _fail("T12: resetmc в реестре", str(e))
 
     # T13: !resetmc в полном help
     try:

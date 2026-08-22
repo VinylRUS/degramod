@@ -52,42 +52,84 @@ class CommandSpec:
 
 # ── Паттерны ────────────────────────────────────────────────────────────
 # Скопированы из bot_handlers.py без изменений, кроме якоря: «^!mute» → «^mute».
-# Комментарии о причинах их нынешней формы (v4.8.3.1, v4.8.6) остались в
-# bot_handlers.py рядом с историей правок.
-
+#
+# v5.1.0 (Task 2): паттерны и их история правок физически перенесены сюда —
+# раньше жили в bot_handlers.py:515-578. Комментарии ниже воспроизводят
+# оригинальные (v4.8.1, v4.8.3, v4.8.3.1, v4.8.4, v4.8.6, v4.7.20).
+#
+# v4.8.1: реформа команд ban/warn/mute.
+#   • Громкие (ban/warn/mute) — причина ОБЯЗАТЕЛЬНА. После: публичное
+#     сообщение в чат + отчёт в репорт-чат (без ephemeral модератору).
+#   • Тихие (sban/swarn/smute) — причина НЕОБЯЗАТЕЛЬНА. После: ephemeral
+#     модератору (и ephemeral нарушителю для swarn) + отчёт в репорт-чат.
+#
+# v4.8.3: расширение способов указания цели наказания.
+#   • Раньше все команды работали ТОЛЬКО по reply на сообщение нарушителя.
+#   • Теперь можно указать цель первым аргументом: @username или TGID.
+#   • Reply остаётся приоритетным: если есть reply — цель из аргумента игнорируется.
+#   • Скриншот: модератор может приложить фото к команде (caption содержит команду).
+#
+# Группа target: (?P<target>@\w+|\d+) — @username (начинается с @) или TGID (только цифры).
+# Если target не указан — команда требует reply (для ban/warn/mute) или
+# работает по reply если он есть (для sban/swarn/smute — иначе target=None,
+# что приведёт к ошибке резолва в _resolve_punishment_target).
 _P_MUTE = re.compile(
     r"^mute\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)\s+(?P<reason>.+)$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # dur + reason обязательны; target опционален (если нет — нужен reply).
 _P_WARN = re.compile(
     r"^warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # reason обязательна; target опционален.
+# v4.8.6: добавлен negative lookahead (?!@\w+$|\d+$) в reason — иначе
+# «warn @username» (без причины) матчило reason="@username" и бан влетал
+# на reply-target с некорректной причиной. Теперь такой ввод не матчится
+# → handler вернёт "укажите причину".
 _P_BAN = re.compile(
     r"^ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # reason обязательна; target опционален. v4.8.6: тот же фикс, что у _P_WARN.
+# v4.8.1: тихие команды (stealth). s = silent/stealth.
+# v4.8.3.1 HOTFIX: regex переосмыслен — _P_SWARN/_P_SBAN в v4.8.3 не матчили
+#   «swarn Причина» (bare reason без @username/TGID), потому что внутренняя
+#   группа (?P<reason>.+) требовала свой собственный \s+, но он уже был
+#   съеден внешней \s+. Исправлено: target и reason — два независимых
+#   optional-блока на верхнем уровне, каждый со своим \s+. Это позволяет
+#   матчить все варианты: «swarn», «swarn Причина», «swarn @user»,
+#   «swarn @user Причина», «swarn 12345», «swarn 12345 Причина».
+# v4.8.3.1 HOTFIX: _P_SMUTE в v4.8.3 делал всё тело опциональным, поэтому
+#   «smute» без длительности матчило (dur=None), а handler звал
+#   _parse_duration(None) → AttributeError. Regex оставлен как есть (dur
+#   внутри опциональной группы), но handler явно проверяет dur is None и
+#   отправляет ephemeral с подсказкой формата.
 _P_SMUTE = re.compile(
     r"^smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # dur обяз. ЕСЛИ есть аргументы; reason опц.; target опц.
 _P_SWARN = re.compile(
     r"^swarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # reason опциональна; target опционален; любой из них может быть один.
 _P_SBAN = re.compile(
     r"^sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
     re.IGNORECASE | re.DOTALL,
-)
+)  # reason опциональна; target опционален; любой из них может быть один.
 _P_UNMUTE = re.compile(r"^unmute\s*$", re.IGNORECASE)
 _P_UNBAN = re.compile(r"^unban\s*$", re.IGNORECASE)
 _P_UNWARN = re.compile(r"^unwarn(?:\s+(?P<count>\d+))?\s*$", re.IGNORECASE)
 _P_WARNS = re.compile(r"^warns\s*$", re.IGNORECASE)
 _P_RESETWARNS = re.compile(r"^resetwarns\s*$", re.IGNORECASE)
+# v4.8.4: resetmc — сброс счётчика автомьютов (прогрессивные муты).
+# Цель: reply на сообщение, ИЛИ resetmc @username, ИЛИ resetmc <tgid>.
+# Доступ: только SU/Admin (как resetwarns).
 _P_RESETMC = re.compile(
     r"^resetmc(?:\s+(?P<target>@\w+|\d+))?\s*$",
     re.IGNORECASE,
 )
+# v4.7.20: alarm on [duration] / alarm off
+# Длительность: опциональная, форматы "1ч" / "1h" / "30м" / "30m" / "2д" / "2d".
+# Если не указана — alarm активен до ручного alarm off.
+# Примеры: "alarm on", "alarm on 1ч", "alarm on 2h", "alarm off"
 _P_ALARM = re.compile(
     r"^alarm\s+(?P<state>on|off|вкл|выкл)"
     r"(?:\s+(?P<amount>\d+)\s*(?P<unit>ч|h|м|m|д|d))?"

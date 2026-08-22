@@ -62,6 +62,14 @@ def _import_bh():
     return bot_handlers
 
 
+def _resolve(text: str):
+    """v5.1.0: паттерны переехали в commands.py — резолвим через реестр,
+    как это делает production-диспетчер, вместо прямого re.match() по
+    удалённым _CMD_* константам bot_handlers."""
+    import commands
+    return commands.resolve(text, None)
+
+
 # ============================================================================
 # КЛАСС 1: Регрессия regex-паттернов (главная цель hotfix'а).
 # ============================================================================
@@ -77,8 +85,8 @@ class TestRegexHotfix(unittest.TestCase):
     # ── !swarn: все варианты ─────────────────────────────────────────────
     def test_swarn_no_args_ok(self):
         """`!swarn` (без аргументов, с reply) → MATCH, target=None, reason=None."""
-        m = self.bh._CMD_SWARN.match("!swarn")
-        self.assertIsNotNone(m, "!swarn должно матчиться (для reply-based swarn)")
+        spec, m = _resolve("!swarn")
+        self.assertEqual(spec.name, "swarn", "!swarn должно матчиться (для reply-based swarn)")
         self.assertIsNone(m.group("target"))
         self.assertIsNone(m.group("reason"))
 
@@ -88,67 +96,61 @@ class TestRegexHotfix(unittest.TestCase):
         ГЛАВНЫЙ РЕГРЕСС-КЕЙС: в v4.8.3 этот вариант НЕ матчило, из-за чего
         !swarn с reason, но без target, полностью ломался.
         """
-        m = self.bh._CMD_SWARN.match("!swarn Спам ссылками")
-        self.assertIsNotNone(m, "REGRESSION: !swarn <reason> должно матчиться в v4.8.3.1")
+        found = _resolve("!swarn Спам ссылками")
+        self.assertIsNotNone(found, "REGRESSION: !swarn <reason> должно матчиться в v4.8.3.1")
+        _spec, m = found
         self.assertIsNone(m.group("target"))
         self.assertEqual(m.group("reason"), "Спам ссылками")
 
     def test_swarn_only_target_ok(self):
         """`!swarn @user` (без причины) → MATCH, target='@user', reason=None."""
-        m = self.bh._CMD_SWARN.match("!swarn @narushitel")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!swarn @narushitel")
         self.assertEqual(m.group("target"), "@narushitel")
         self.assertIsNone(m.group("reason"))
 
     def test_swarn_target_and_reason_ok(self):
         """`!swarn @user Причина` → MATCH, target, reason."""
-        m = self.bh._CMD_SWARN.match("!swarn @narushitel Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!swarn @narushitel Спам")
         self.assertEqual(m.group("target"), "@narushitel")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_swarn_tgid_target_ok(self):
         """`!swarn 12345 Причина` → MATCH, target='12345', reason."""
-        m = self.bh._CMD_SWARN.match("!swarn 12345678 Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!swarn 12345678 Спам")
         self.assertEqual(m.group("target"), "12345678")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_swarn_tgid_only_ok(self):
         """`!swarn 12345` → MATCH, target='12345', reason=None."""
-        m = self.bh._CMD_SWARN.match("!swarn 12345678")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!swarn 12345678")
         self.assertEqual(m.group("target"), "12345678")
         self.assertIsNone(m.group("reason"))
 
     def test_swarn_cyrillic_reason_ok(self):
         """`!swarn Русская причина` → MATCH, reason с пробелами и кириллицей."""
-        m = self.bh._CMD_SWARN.match("!swarn Спам ссылкой на канал")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!swarn Спам ссылкой на канал")
         self.assertEqual(m.group("reason"), "Спам ссылкой на канал")
 
     # ── !sban: те же варианты (regex идентичен по структуре) ────────────
     def test_sban_no_args_ok(self):
-        m = self.bh._CMD_SBAN.match("!sban")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!sban")
         self.assertIsNone(m.group("target"))
         self.assertIsNone(m.group("reason"))
 
     def test_sban_bare_reason_ok_HOTFIX(self):
         """`!sban Причина` → MATCH. ГЛАВНЫЙ РЕГРЕСС-КЕЙС (баг v4.8.3, но менее заметный)."""
-        m = self.bh._CMD_SBAN.match("!sban Реклама")
-        self.assertIsNotNone(m, "REGRESSION: !sban <reason> должно матчиться в v4.8.3.1")
+        found = _resolve("!sban Реклама")
+        self.assertIsNotNone(found, "REGRESSION: !sban <reason> должно матчиться в v4.8.3.1")
+        _spec, m = found
         self.assertIsNone(m.group("target"))
         self.assertEqual(m.group("reason"), "Реклама")
 
     def test_sban_only_target_ok(self):
-        m = self.bh._CMD_SBAN.match("!sban @user")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!sban @user")
         self.assertEqual(m.group("target"), "@user")
 
     def test_sban_target_and_reason_ok(self):
-        m = self.bh._CMD_SBAN.match("!sban @user Причина")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!sban @user Причина")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("reason"), "Причина")
 
@@ -160,45 +162,43 @@ class TestRegexHotfix(unittest.TestCase):
         _parse_duration(None) и падал. В v4.8.3.1 regex оставлен как есть,
         но handler делает явный None-check.
         """
-        m = self.bh._CMD_SMUTE.match("!smute")
-        self.assertIsNotNone(m, "!smute должно матчиться (regex позволяет)")
+        found = _resolve("!smute")
+        self.assertIsNotNone(found, "!smute должно матчиться (regex позволяет)")
+        _spec, m = found
         self.assertIsNone(m.group("dur"))
         self.assertIsNone(m.group("target"))
         self.assertIsNone(m.group("reason"))
 
     def test_smute_with_dur_ok(self):
         """`!smute 1d` (с reply, без причины) → MATCH, dur='1d'."""
-        m = self.bh._CMD_SMUTE.match("!smute 1d")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!smute 1d")
         self.assertEqual(m.group("dur"), "1d")
         self.assertIsNone(m.group("reason"))
 
     def test_smute_dur_and_reason_ok(self):
         """`!smute 1d Причина` → MATCH, dur, reason."""
-        m = self.bh._CMD_SMUTE.match("!smute 1d Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!smute 1d Спам")
         self.assertEqual(m.group("dur"), "1d")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_smute_target_dur_reason_ok(self):
         """`!smute @user 1d Причина` → MATCH, target, dur, reason."""
-        m = self.bh._CMD_SMUTE.match("!smute @user 1d Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!smute @user 1d Спам")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("dur"), "1d")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_smute_cyrillic_dur_ok(self):
         """`!smute 1д` (кириллическая единица) → MATCH, dur='1д'."""
-        m = self.bh._CMD_SMUTE.match("!smute 1д 30м")
-        self.assertIsNotNone(m)
+        found = _resolve("!smute 1д 30м")
+        self.assertIsNotNone(found)
         # В режиме "1д 30м" regex возьмёт только первое "1д" как dur,
         # а "30м" останется висеть — и матч провалится. Проверяем это.
         # Если хотим комбинированные длительности — нужно расширять regex.
         # Но базовый `!smute 1д` должен работать.
-        m2 = self.bh._CMD_SMUTE.match("!smute 1д")
-        self.assertIsNotNone(m2)
-        self.assertEqual(m2.group("dur"), "1д")
+        found2 = _resolve("!smute 1д")
+        self.assertIsNotNone(found2)
+        self.assertEqual(found2[1].group("dur"), "1д")
 
     def test_smute_bare_reason_no_match(self):
         """`!smute Причина` (без длительности) → NO MATCH.
@@ -207,22 +207,26 @@ class TestRegexHotfix(unittest.TestCase):
         подсказку только если напишет ровно `!smute` (без аргументов вообще)
         — тогда regex матчит с dur=None, и handler отправит ephemeral.
         Если же модератор написал `!smute Причина` (со словом, не являющимся
-        длительностью) — regex не матчит, _is_moderation_command возвращает
+        длительностью) — regex не матчит, _is_known_command возвращает
         False, и сообщение трактуется как обычный reply модератора.
         """
-        m = self.bh._CMD_SMUTE.match("!smute Причина")
-        self.assertIsNone(m, "!smute <reason без dur> не должно матчиться")
+        self.assertIsNone(_resolve("!smute Причина"),
+                          "!smute <reason без dur> не должно матчиться")
 
 
 # ============================================================================
 # КЛАСС 2: _is_moderation_command — ранняя guard-проверка.
 # ============================================================================
 class TestIsModerationCommandHotfix(unittest.TestCase):
-    """Проверка что _is_moderation_command распознаёт новые варианты вызова.
+    """Проверка что _is_known_command распознаёт новые варианты вызова.
 
     В v4.8.3 `!swarn Причина` НЕ распознавалось как команда (regex не матчит),
     поэтому сообщение модератора трактовалось как обычный reply и бот его
     игнорировал. В v4.8.3.1 это исправлено.
+
+    v5.1.0: _is_moderation_command переименован в _is_known_command и теперь
+    спрашивает реестр commands.py вместо локального каскада regex — семантика
+    для мод-команд не изменилась.
     """
 
     def setUp(self):
@@ -234,31 +238,31 @@ class TestIsModerationCommandHotfix(unittest.TestCase):
     def test_swarn_bare_reason_recognized_HOTFIX(self):
         """`!swarn Спам` теперь распознаётся как модераторская команда."""
         self.assertTrue(
-            self.bh._is_moderation_command("!swarn Спам"),
+            self.bh._is_known_command("!swarn Спам"),
             "REGRESSION: !swarn <reason> должно распознаваться как команда"
         )
 
     def test_sban_bare_reason_recognized_HOTFIX(self):
         """`!sban Реклама` теперь распознаётся."""
-        self.assertTrue(self.bh._is_moderation_command("!sban Реклама"))
+        self.assertTrue(self.bh._is_known_command("!sban Реклама"))
 
     def test_swarn_no_args_recognized(self):
         """`!swarn` (без аргументов) распознаётся (работало и в v4.8.3)."""
-        self.assertTrue(self.bh._is_moderation_command("!swarn"))
+        self.assertTrue(self.bh._is_known_command("!swarn"))
 
     def test_smute_no_args_recognized(self):
         """`!smute` (без аргументов) распознаётся."""
-        self.assertTrue(self.bh._is_moderation_command("!smute"))
+        self.assertTrue(self.bh._is_known_command("!smute"))
 
     def test_smute_with_dur_recognized(self):
         """`!smute 1d` распознаётся."""
-        self.assertTrue(self.bh._is_moderation_command("!smute 1d"))
+        self.assertTrue(self.bh._is_known_command("!smute 1d"))
 
     def test_non_command_not_recognized(self):
         """Обычный текст не распознаётся как команда."""
-        self.assertFalse(self.bh._is_moderation_command("Привет всем!"))
-        self.assertFalse(self.bh._is_moderation_command(""))
-        self.assertFalse(self.bh._is_moderation_command("Ответ модератора"))
+        self.assertFalse(self.bh._is_known_command("Привет всем!"))
+        self.assertFalse(self.bh._is_known_command(""))
+        self.assertFalse(self.bh._is_known_command("Ответ модератора"))
 
 
 # ============================================================================
@@ -707,7 +711,7 @@ class TestLoudCommandsNotRegressed(unittest.TestCase):
     """Проверка что громкие !ban/!warn/!mute продолжают работать как раньше.
 
     v4.8.3.1 не трогает их regex-ы, но проверяем что наш hotfix не сломал
-    косвенно dispatch (например, через _ALL_MOD_COMMANDS).
+    косвенно dispatch (например, через реестр commands.GROUP_COMMANDS).
     """
 
     def setUp(self):
@@ -717,35 +721,34 @@ class TestLoudCommandsNotRegressed(unittest.TestCase):
             self.skipTest(f"aiogram/dependencies not installed: {e}")
 
     def test_ban_with_target_and_reason_ok(self):
-        m = self.bh._CMD_BAN.match("!ban @user Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!ban @user Спам")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_ban_only_reason_ok(self):
-        m = self.bh._CMD_BAN.match("!ban Спам")
-        self.assertIsNotNone(m)
+        found = _resolve("!ban Спам")
+        self.assertIsNotNone(found)
+        _spec, m = found
         # target может быть None (regex его не матчит — нет @ или цифр)
         # и reason = "Спам"
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_warn_with_target_ok(self):
-        m = self.bh._CMD_WARN.match("!warn @user Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!warn @user Спам")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_mute_with_target_ok(self):
-        m = self.bh._CMD_MUTE.match("!mute @user 1h Спам")
-        self.assertIsNotNone(m)
+        _spec, m = _resolve("!mute @user 1h Спам")
         self.assertEqual(m.group("target"), "@user")
         self.assertEqual(m.group("dur"), "1h")
         self.assertEqual(m.group("reason"), "Спам")
 
     def test_all_mod_commands_includes_silent(self):
-        """_ALL_MOD_COMMANDS включает все 6 punish-команд + un* + alarm."""
+        """commands.GROUP_COMMANDS включает все 6 punish-команд + un* + alarm."""
+        import commands
         # Простая проверка: хотя бы 6 punish-паттернов + остальные
-        self.assertGreaterEqual(len(self.bh._ALL_MOD_COMMANDS), 9)
+        self.assertGreaterEqual(len(commands.GROUP_COMMANDS), 9)
 
 
 if __name__ == "__main__":
