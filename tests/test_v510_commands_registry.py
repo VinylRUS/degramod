@@ -134,6 +134,25 @@ class TestRegistryShape(unittest.TestCase):
             with self.subTest(command=spec.name):
                 self.assertTrue(spec.description.strip())
 
+    def test_dm_menu_commands_shape(self):
+        # v5.1.0: состав меню личных чатов не должен разъезжаться
+        dm_names = {name for name, _desc in commands.DM_MENU_COMMANDS}
+        # 1. Состав ровно {start, help, mywarns, rules}
+        self.assertEqual(dm_names, {"start", "help", "mywarns", "rules"},
+                         "DM_MENU_COMMANDS должна содержать ровно start, help, mywarns, rules")
+        # 2. Не должно быть административных команд
+        forbidden = {"bansticker", "setkeywords", "linkallow", "setmodchat"}
+        self.assertTrue(dm_names.isdisjoint(forbidden),
+                        f"DM_MENU_COMMANDS содержит административные команды: {dm_names & forbidden}")
+        # 3. Каждая запись — пара из двух непустых строк
+        self.assertEqual(len(commands.DM_MENU_COMMANDS), len(dm_names),
+                         "DM_MENU_COMMANDS содержит дубли имён")
+        for name, desc in commands.DM_MENU_COMMANDS:
+            self.assertIsInstance(name, str, f"{name} — не строка")
+            self.assertIsInstance(desc, str, f"описание {name} — не строка")
+            self.assertTrue(name.strip(), f"имя команды пусто: {name!r}")
+            self.assertTrue(desc.strip(), f"описание команды {name} пусто: {desc!r}")
+
 
 class TestBotUsernameGlobal(unittest.TestCase):
     def test_set_and_get(self):
