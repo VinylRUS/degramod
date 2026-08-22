@@ -142,6 +142,88 @@ class TestFilterBehavior(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestBotIdBackfill(unittest.IsolatedAsyncioTestCase):
+    """v5.1.0: bot_id проставляется оппортунистически при первом матче по
+    username — иначе колонка вечно NULL и матч по id (переживающий смену
+    username) никогда не срабатывает.
+    """
+
+    async def asyncSetUp(self):
+        await init_db()
+        async with async_session() as s:
+            for row in (await s.execute(select(BotWhitelist))).scalars().all():
+                await s.delete(row)
+            cs = (await s.execute(
+                select(ChatSettings).where(ChatSettings.chat_id == FILTER_CHAT)
+            )).scalar_one_or_none()
+            if cs is None:
+                cs = ChatSettings(chat_id=FILTER_CHAT)
+                s.add(cs)
+            cs.via_bot_filter_enabled = True
+            cs.via_bot_rate_limit_seconds = 300
+            cs.via_bot_mute_minutes = 10
+            await s.commit()
+        bot_handlers._via_bot_rate_limit.clear()
+
+    @staticmethod
+    def _make_message(user_id: int, bot_id: int, bot_username: str):
+        return SimpleNamespace(
+            via_bot=SimpleNamespace(id=bot_id, username=bot_username),
+            from_user=SimpleNamespace(id=user_id),
+        )
+
+    async def test_bot_id_recorded_on_first_username_match(self):
+        async with async_session() as s:
+            s.add(BotWhitelist(chat_id=0, bot_username="gif"))
+            await s.commit()
+
+        message = self._make_message(user_id=301, bot_id=777, bot_username="gif")
+        blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+        self.assertFalse(blocked)
+
+        async with async_session() as s:
+            row = (await s.execute(
+                select(BotWhitelist).where(BotWhitelist.bot_username == "gif")
+            )).scalar_one_or_none()
+            self.assertEqual(row.bot_id, 777)
+
+    async def test_second_pass_does_not_break(self):
+        async with async_session() as s:
+            s.add(BotWhitelist(chat_id=0, bot_username="gif"))
+            await s.commit()
+
+        message = self._make_message(user_id=302, bot_id=778, bot_username="gif")
+        await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+        # второй прогон — bot_id уже заполнен, UPDATE не должен ничего сломать
+        blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+        self.assertFalse(blocked)
+
+        async with async_session() as s:
+            rows = (await s.execute(
+                select(BotWhitelist).where(BotWhitelist.bot_username == "gif")
+            )).scalars().all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].bot_id, 778)
+
+    async def test_survives_username_rename_after_backfill(self):
+        # Заполненный bot_id (как будто уже был backfill раньше) должен
+        # продолжать матчиться, даже когда бот сменил username и старая
+        # запись в вайтлисте больше не совпадает по имени.
+        async with async_session() as s:
+            s.add(BotWhitelist(chat_id=0, bot_username="oldname", bot_id=999))
+            await s.commit()
+
+        message = self._make_message(user_id=303, bot_id=999, bot_username="newname")
+        blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+        self.assertFalse(blocked, "бот остаётся в вайтлисте после смены username")
+
+        key = (FILTER_CHAT, 303, 999)
+        self.assertNotIn(
+            key, bot_handlers._via_bot_rate_limit,
+            "матч по bot_id — белый бот всё ещё не занимает слот кулдауна",
+        )
+
+
 class TestFilterIntegration(unittest.TestCase):
     def test_check_runs_before_rate_limit(self):
         # Дешёвая структурная страховка поверх поведенческого теста выше:

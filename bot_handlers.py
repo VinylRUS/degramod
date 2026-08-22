@@ -140,7 +140,7 @@ from aiogram.types import (
     RichTextSpoiler,
     RichTextUrl,
 )
-from sqlalchemy import desc, func, or_, select
+from sqlalchemy import desc, func, or_, select, update
 
 import commands
 from db import (
@@ -5490,6 +5490,140 @@ async def cmd_linkallowlist(message: types.Message) -> None:
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
+# ── v5.1.0: управление вайтлистом ботов из личных сообщений ─────────────
+# Паритет с /linkallow: доступ только у ADMIN_IDS, скоуп задаётся первым
+# аргументом — «global» либо chat_id.
+
+
+def _parse_whitelist_scope(arg: str) -> int | None:
+    """«global» → 0, число → chat_id, мусор → None."""
+    value = (arg or "").strip().lower()
+    if value == "global":
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _normalize_bot_username(arg: str) -> str:
+    """Приводит «@GifBot» к «gifbot»."""
+    return (arg or "").strip().lstrip("@").lower()
+
+
+@router.message(F.chat.type == "private", Command("botallow"))
+async def cmd_botallow(message: types.Message) -> None:
+    """v5.1.0: /botallow <chat_id|global> <@bot> — добавить бота в вайтлист."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /botallow chat_id|global <@bot>\n"
+            "💡 Пример: /botallow global @gif\n"
+            "    /botallow -1001234567890 @vid",
+            parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    username = _normalize_bot_username(parts[2])
+    if not username:
+        await message.reply("❌ Укажите @username бота", parse_mode=None)
+        return
+
+    async with async_session() as session:
+        existing = (await session.execute(
+            select(BotWhitelist).where(
+                BotWhitelist.chat_id == chat_id,
+                func.lower(BotWhitelist.bot_username) == username,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            await message.reply(f"⚠️ @{username} уже в вайтлисте", parse_mode=None)
+            return
+        session.add(BotWhitelist(
+            chat_id=chat_id,
+            bot_username=username,
+            added_by_mod_id=message.from_user.id,
+        ))
+        await session.commit()
+
+    scope_str = "глобально" if chat_id == 0 else f"в чате {chat_id}"
+    await message.reply(f"✅ @{username} добавлен в вайтлист {scope_str}", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("botunallow"))
+async def cmd_botunallow(message: types.Message) -> None:
+    """v5.1.0: /botunallow <chat_id|global> <@bot> — убрать бота из вайтлиста."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /botunallow chat_id|global <@bot>", parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    username = _normalize_bot_username(parts[2])
+    async with async_session() as session:
+        row = (await session.execute(
+            select(BotWhitelist).where(
+                BotWhitelist.chat_id == chat_id,
+                func.lower(BotWhitelist.bot_username) == username,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            await message.reply(f"⚠️ @{username} не найден в вайтлисте", parse_mode=None)
+            return
+        await session.delete(row)
+        await session.commit()
+
+    await message.reply(f"✅ @{username} убран из вайтлиста", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("botallowlist"))
+async def cmd_botallowlist(message: types.Message) -> None:
+    """v5.1.0: /botallowlist [chat_id|global] — показать вайтлист."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+
+    stmt = select(BotWhitelist).order_by(
+        BotWhitelist.chat_id.asc(), BotWhitelist.bot_username.asc(),
+    )
+    if len(parts) > 1:
+        chat_id = _parse_whitelist_scope(parts[1])
+        if chat_id is None:
+            await message.reply(
+                "❌ chat_id должен быть числом или 'global'", parse_mode=None,
+            )
+            return
+        stmt = stmt.where(BotWhitelist.chat_id == chat_id)
+
+    async with async_session() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+
+    if not rows:
+        await message.reply("📋 Вайтлист ботов пуст", parse_mode=None)
+        return
+
+    lines = ["📋 Вайтлист ботов:"]
+    for row in rows:
+        scope = "global" if row.chat_id == 0 else str(row.chat_id)
+        lines.append(f"• @{row.bot_username} — {scope}")
+    await message.reply("\n".join(lines), parse_mode=None)
+
+
 # ── v4.8.0: Keyword-watch + Modchat команды ─────────────────────────────────
 # !setkeywords word1,word2,word3 — полная замена списка (SU-only).
 # !addkeyword «фраза» [--ban-night] — добавить фразу (SU-only).
@@ -7984,6 +8118,33 @@ async def _is_bot_whitelisted(
     return row is not None
 
 
+async def _backfill_whitelist_bot_id(
+    session, chat_id: int, bot_username: str, bot_id: int,
+) -> None:
+    """v5.1.0: оппортунистически проставляет bot_id строке вайтлиста.
+
+    До этого метода bot_id никто не писал — колонка всегда была NULL,
+    а ветка матча по bot_id в `_is_bot_whitelisted` (`NULL == bot_id`)
+    никогда не срабатывала. Как только бот встретился по username и его
+    числовой id известен — фиксируем его в строке, у которой bot_id ещё
+    не заполнен, чтобы дальше матч пережил смену username.
+
+    Пишем только пока bot_id IS NULL — один раз на бота, дальше UPDATE
+    затрагивает 0 строк и безопасно ничего не делает.
+    """
+    username = (bot_username or "").lower().lstrip("@")
+    if not username or not bot_id:
+        return
+    await session.execute(
+        update(BotWhitelist).where(
+            BotWhitelist.chat_id.in_((0, chat_id)),
+            func.lower(BotWhitelist.bot_username) == username,
+            BotWhitelist.bot_id.is_(None),
+        ).values(bot_id=bot_id)
+    )
+    await session.commit()
+
+
 async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
     """v4.7.24: Via-bot rate-limit filter.
 
@@ -8029,6 +8190,17 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
                     "Via-bot filter: @%s whitelisted in chat %s — skip",
                     (vb.username or "unknown"), chat_id,
                 )
+                # v5.1.0: оппортунистическая запись bot_id — не должна
+                # ронять обработку сообщения, даже если UPDATE не прошёл:
+                # белый бот обязан остаться белым в любом случае.
+                try:
+                    await _backfill_whitelist_bot_id(
+                        session, chat_id, vb.username or "", vb.id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Via-bot filter: backfill bot_id failed: %s (не критично)", e,
+                    )
                 return False
     except Exception as e:
         logger.warning("Via-bot filter: DB error: %s (fail-open)", e)
