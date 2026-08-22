@@ -1206,8 +1206,8 @@ async def _resolve_punishment_target(
         return None, (
             "❌ Не указана цель. Используйте reply на сообщение нарушителя, "
             "либо укажите @username или TGID первым аргументом.\n"
-            "Пример: <code>!ban @username Причина</code> или "
-            "<code>!ban 12345678 Причина</code>"
+            "Пример: <code>/ban @username Причина</code> или "
+            "<code>/ban 12345678 Причина</code>"
         )
 
     # 2. @username
@@ -4239,7 +4239,11 @@ async def handle_rules_group(message: types.Message) -> None:
     try:
         await message.delete()
     except TelegramAPIError as e:
-        logger.debug("rules: cannot delete command in chat %s: %s", chat_id, e)
+        # v5.1.0 (фикс финального ревью): было debug — незавершённое удаление
+        # оставляет команду висеть в чате, а удаление ровно для этого и
+        # существует. warning, не error: у бота может не быть прав, это
+        # ожидаемая эксплуатационная ситуация, а не баг.
+        logger.warning("rules: cannot delete command in chat %s: %s", chat_id, e)
 
     now = time.time()
     key = (user.id, chat_id)
@@ -4480,6 +4484,14 @@ async def handle_group_command(message: types.Message) -> None:
     _handler = _MOD_COMMANDS.get(spec.name)
     if _handler is not None:
         await _handler(message, _ctx)
+    else:
+        # v5.1.0: команда прошла реестр commands.py и все проверки прав,
+        # но забыта в mod_commands.COMMANDS — сообщение модератора уже
+        # удалено выше, а наказание не выполнится. Раньше эта же связка
+        # "реестр не совпадает с реальным диспетчером" молча теряла !ban
+        # и !alarm (см. changelog v5.1.0); это state "кода не существует",
+        # а не рантайм-сбой, поэтому error, а не warning.
+        logger.error("dispatch: нет обработчика для команды %r", spec.name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4644,7 +4656,7 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    "🌙 Сейчас активен ночной режим — !alarm включить нельзя.\n"
+                    "🌙 Сейчас активен ночной режим — /alarm включить нельзя.\n"
                     "Ночной режим уже ограничивает права чата (медиа отключены, "
                     "slow_mode активен). Alarm будет избыточен.\n"
                     "Дождитесь окончания ночного режима или отключите его."
@@ -4661,7 +4673,7 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    "🚫 Сейчас активен санитарный день — !alarm включить нельзя.\n"
+                    "🚫 Сейчас активен санитарный день — /alarm включить нельзя.\n"
                     "Санитарный день уже ограничивает права чата (полный локдаун). "
                     "Alarm будет избыточен."
                 ),
@@ -4736,7 +4748,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                     text=(
                         f"⏱ Alarm уже был активен — auto-off отключён.\n"
                         f"• Предыдущий alarm включил: {prev_mod_display}\n"
-                        f"• Теперь alarm будет активен до ручного !alarm off."
+                        f"• Теперь alarm будет активен до ручного /alarm off."
                     ),
                 )
                 # v4.8.0: продление с пустой длительностью (auto-off отключён) —
@@ -4839,7 +4851,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                 f"• Медиа отключены (только текст)\n"
                 f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n"
                 f"• Auto-off: {cs.alarm_active_until.isoformat() if cs.alarm_active_until else 'N/A'}\n\n"
-                f"Снять раньше: !alarm off"
+                f"Снять раньше: /alarm off"
             ),
         )
     else:
@@ -4849,7 +4861,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                 f"🚨 Alarm включён в чате (без авто-отключения).\n"
                 f"• Медиа отключены (только текст)\n"
                 f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n\n"
-                f"Снять: !alarm off"
+                f"Снять: /alarm off"
             ),
         )
 
@@ -5599,6 +5611,13 @@ async def cmd_botunallow(message: types.Message) -> None:
         return
 
     username = _normalize_bot_username(parts[2])
+    # v5.1.0: тот же guard, что у cmd_botallow — его тут не было, и
+    # «/botunallow global @» отвечал «⚠️ @ не найден в вайтлисте» вместо
+    # понятной ошибки формата.
+    if not username:
+        await message.reply("❌ Укажите @username бота", parse_mode=None)
+        return
+
     async with async_session() as session:
         row = (await session.execute(
             select(BotWhitelist).where(
@@ -5676,7 +5695,7 @@ async def cmd_setkeywords(message: types.Message) -> None:
         parts_str = parts_str[len("!setkeywords"):].strip()
     if not parts_str:
         await message.reply(
-            "📋 Формат: !setkeywords word1, word2, \"фраза с пробелом\" [--ban-night]\n"
+            "📋 Формат: /setkeywords word1, word2, \"фраза с пробелом\" [--ban-night]\n"
             "Полная замена списка keyword-watch фраз. Старые фразы будут удалены.",
             parse_mode=None,
         )
@@ -5736,7 +5755,7 @@ async def cmd_addkeyword(message: types.Message) -> None:
         parts_str = parts_str[len("!addkeyword"):].strip()
     if not parts_str:
         await message.reply(
-            "📋 Формат: !addkeyword \"фраза\" [--ban-night]\n"
+            "📋 Формат: /addkeyword \"фраза\" [--ban-night]\n"
             "Добавляет фразу в keyword-watch список.",
             parse_mode=None,
         )
@@ -5801,7 +5820,7 @@ async def cmd_delkeyword(message: types.Message) -> None:
     elif parts_str.startswith("!delkeyword"):
         parts_str = parts_str[len("!delkeyword"):].strip()
     if not parts_str:
-        await message.reply("📋 Формат: !delkeyword \"фраза\"", parse_mode=None)
+        await message.reply("📋 Формат: /delkeyword \"фраза\"", parse_mode=None)
         return
     if (parts_str.startswith('"') and parts_str.endswith('"')) or (parts_str.startswith("'") and parts_str.endswith("'")):
         parts_str = parts_str[1:-1]
@@ -5871,7 +5890,7 @@ async def cmd_setmodchat(message: types.Message) -> None:
     parts = (message.text or "").split()
     if len(parts) < 2:
         await message.reply(
-            "📋 Формат: !setmodchat <chat_id>\n"
+            "📋 Формат: /setmodchat <chat_id>\n"
             "0 = сбросить modchat.",
             parse_mode=None,
         )
@@ -6361,7 +6380,7 @@ async def cmd_idea_dm(message: types.Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.reply(
-            "💡 Формат: !idea <текст идеи>\n"
+            "💡 Формат: /idea <текст идеи>\n"
             f"Максимум {_IDEA_MAX_LEN} символов.",
             parse_mode=None,
         )
@@ -6404,7 +6423,7 @@ async def cmd_idea_modchat(message: types.Message) -> None:
         # В modchat можно подсказать формат — тут только свои.
         try:
             await message.reply(
-                f"💡 Формат: !idea <текст идеи> (макс. {_IDEA_MAX_LEN} символов)",
+                f"💡 Формат: /idea <текст идеи> (макс. {_IDEA_MAX_LEN} символов)",
                 parse_mode=None,
             )
         except TelegramAPIError as e:
@@ -7415,6 +7434,7 @@ def _build_help_full_rich() -> InputRichMessage:
 
     Структура:
       1. H1 заголовок + Divider
+      1.5. Публичные команды (mywarns, rules) — раскрыто, v5.1.0
       2. Громкие команды (3 шт) — раскрыто
       3. Тихие команды (3 шт) — раскрыто
       4. Снятие наказаний / Прочее (6 шт) — раскрыто
@@ -7440,6 +7460,15 @@ def _build_help_full_rich() -> InputRichMessage:
         text="Дедушка Вобжак — список команд", size=1,
     ))
     blocks.append(InputRichBlockDivider())
+
+    # 1.5. Публичные команды (доступны всем участникам) — из реестра, v5.1.0.
+    # v5.1.0 (фикс финального ревью): mywarns/rules — главная пользовательская
+    # фича релиза, но /help их не перечислял. Access.USER, доступны без
+    # прав модератора.
+    blocks.extend(_help_section(
+        "Публичные (доступны всем участникам)",
+        [_help_row("mywarns"), _help_row("rules")],
+    ))
 
     # 2. Громкие команды (раскрыто) — из реестра, v5.1.0
     blocks.extend(_help_section(
@@ -7565,6 +7594,8 @@ def _build_help_moderator_rich() -> InputRichMessage:
     """Сокращённая версия /help для moderator — через Rich Message.
 
     Только то, что модератор может использовать:
+      • Публичные (/mywarns, /rules) — v5.1.0, финальное ревью: модератор
+        тоже участник чата и интересуется своими варнами
       • Громкие команды (/mute, /warn, /ban)
       • Тихие команды (/smute, /swarn, /sban)
       • Снятие наказаний / Прочее (/unmute, /unban, /unwarn, /warns, /alarm)
@@ -7598,6 +7629,13 @@ def _build_help_moderator_rich() -> InputRichMessage:
         text="Дедушка Вобжак — команды модератора", size=1,
     ))
     blocks.append(InputRichBlockDivider())
+
+    # Публичные команды — модератор тоже участник чата и тоже получает
+    # варны, поэтому /mywarns ему пригождается не меньше, чем остальным.
+    blocks.extend(_help_section(
+        "Публичные (доступны всем участникам)",
+        [_help_row("mywarns"), _help_row("rules")],
+    ))
 
     # Громкие команды — из реестра, v5.1.0
     blocks.extend(_help_section(
@@ -8167,11 +8205,20 @@ async def handle_sticker_message(message: types.Message) -> None:
 
 async def _is_bot_whitelisted(
     session, chat_id: int, bot_username: str, bot_id: int,
-) -> bool:
-    """v5.1.0: True, если бот в вайтлисте для этого чата или глобально.
+) -> BotWhitelist | None:
+    """v5.1.0: строка вайтлиста, матчащая этого бота в этом чате или
+    глобально — либо None, если он не в вайтлисте.
 
     Матч по username (регистронезависимо) ИЛИ по bot_id — username бота
     можно сменить, числовой id нет.
+
+    v5.1.0 (фикс финального ревью, находка 3): раньше отдавала bool,
+    выбрасывая уже прочитанную строку. Вызывающий код (_check_via_bot_filter)
+    из-за этого не мог понять, нужен ли бэкфилл bot_id, не читая её заново —
+    и просто гонял безусловный UPDATE+commit на каждое сообщение от белого
+    бота, включая случаи, когда bot_id уже заполнен. Теперь строка
+    возвращается целиком: решение «нужен ли бэкфилл» принимается без
+    лишнего похода в БД.
     """
     username = (bot_username or "").lower().lstrip("@")
     row = (await session.execute(
@@ -8183,7 +8230,7 @@ async def _is_bot_whitelisted(
             ),
         ).limit(1)
     )).scalar_one_or_none()
-    return row is not None
+    return row
 
 
 async def _backfill_whitelist_bot_id(
@@ -8197,8 +8244,15 @@ async def _backfill_whitelist_bot_id(
     числовой id известен — фиксируем его в строке, у которой bot_id ещё
     не заполнен, чтобы дальше матч пережил смену username.
 
-    Пишем только пока bot_id IS NULL — один раз на бота, дальше UPDATE
-    затрагивает 0 строк и безопасно ничего не делает.
+    v5.1.0 (фикс финального ревью, находка 3): раньше вызывалась безусловно
+    на каждое сообщение от белого бота — UPDATE ... WHERE bot_id IS NULL
+    бил в ноль строк и всё равно коммитил пишущую транзакцию SQLite на
+    каждое сообщение, если строка уже заполнена или бот сматчился только
+    по bot_id (username с тех пор сменился — WHERE по username такую
+    строку никогда не найдёт). Теперь вызывающий код (_check_via_bot_filter)
+    вызывает эту функцию только когда `row.bot_id is None and
+    row.bot_username == username` — то есть ровно один раз на бота,
+    а не «один раз ИЛИ никогда, но коммит всегда».
     """
     username = (bot_username or "").lower().lstrip("@")
     if not username or not bot_id:
@@ -8251,24 +8305,40 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
             # v5.1.0: вайтлист проверяется ДО rate-limit и timestamp не
             # пишется — белый бот не занимает слот кулдауна, иначе он
             # подставил бы под автомьют следующего отправителя.
-            if await _is_bot_whitelisted(
+            whitelist_row = await _is_bot_whitelisted(
                 session, chat_id, vb.username or "", vb.id,
-            ):
+            )
+            if whitelist_row is not None:
                 logger.debug(
                     "Via-bot filter: @%s whitelisted in chat %s — skip",
                     (vb.username or "unknown"), chat_id,
                 )
-                # v5.1.0: оппортунистическая запись bot_id — не должна
-                # ронять обработку сообщения, даже если UPDATE не прошёл:
-                # белый бот обязан остаться белым в любом случае.
-                try:
-                    await _backfill_whitelist_bot_id(
-                        session, chat_id, vb.username or "", vb.id,
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Via-bot filter: backfill bot_id failed: %s (не критично)", e,
-                    )
+                # v5.1.0 (фикс финального ревью, находка 3): бэкфилл теперь
+                # вызывается, только когда строка реально нуждается в нём —
+                # bot_id ещё не проставлен И матч произошёл именно по этому
+                # username (а не по bot_id, когда username с тех пор
+                # сменился — WHERE бэкфилла по username такую строку не
+                # найдёт никогда, и раньше это означало холостой UPDATE+
+                # commit на каждое сообщение вместо разового). Раньше вызов
+                # был безусловным — пишущая транзакция SQLite на общем
+                # event loop бралась на каждое сообщение от белого бота,
+                # даже когда совпадало 0 строк.
+                username_norm = (vb.username or "").lower().lstrip("@")
+                needs_backfill = (
+                    whitelist_row.bot_id is None
+                    and (whitelist_row.bot_username or "").lower() == username_norm
+                )
+                if needs_backfill:
+                    # Не должна ронять обработку сообщения, даже если UPDATE
+                    # не прошёл: белый бот обязан остаться белым в любом случае.
+                    try:
+                        await _backfill_whitelist_bot_id(
+                            session, chat_id, vb.username or "", vb.id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Via-bot filter: backfill bot_id failed: %s (не критично)", e,
+                        )
                 return False
     except Exception as e:
         logger.warning("Via-bot filter: DB error: %s (fail-open)", e)

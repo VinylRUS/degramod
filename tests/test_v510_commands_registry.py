@@ -12,6 +12,7 @@ import unittest
 sys.path.insert(0, _P())
 
 import commands  # noqa: E402
+import mod_commands  # noqa: E402
 
 
 class TestStripPrefix(unittest.TestCase):
@@ -152,6 +153,30 @@ class TestRegistryShape(unittest.TestCase):
             self.assertIsInstance(desc, str, f"описание {name} — не строка")
             self.assertTrue(name.strip(), f"имя команды пусто: {name!r}")
             self.assertTrue(desc.strip(), f"описание команды {name} пусто: {desc!r}")
+
+
+class TestDispatchTableMatchesRegistry(unittest.TestCase):
+    """Находка 1 финального ревью (a24bae8): реестр и диспетчер связаны
+    только фактом, не тестом. handle_group_command берёт обработчик из
+    mod_commands.COMMANDS по имени команды, зарезолвленной из
+    commands.GROUP_COMMANDS (bot_handlers.py, диспетч в конце
+    handle_group_command). Команда, добавленная в реестр с Access.MOD/ADMIN
+    и забытая в COMMANDS, пройдёт фильтр и проверку прав — но сообщение
+    модератора к этому моменту уже удалено (auto_delete_commands), а
+    наказание не выполнится: ни действия, ни лога, ни ответа. Это ровно тот
+    баг прода (!ban/!alarm), ради которого затевался релиз v5.1.0.
+
+    alarm легитимно исключён: у него отдельный хендлер (handle_alarm_command
+    через _AlarmCommandFilter), _KnownCommandFilter его не матчит, и в
+    mod_commands.COMMANDS ему не место.
+    """
+
+    def test_mod_admin_commands_have_dispatch_handler(self):
+        registry_names = {
+            s.name for s in commands.GROUP_COMMANDS
+            if s.access != commands.Access.USER
+        } - {"alarm"}
+        self.assertEqual(registry_names, set(mod_commands.COMMANDS))
 
 
 class TestBotUsernameGlobal(unittest.TestCase):

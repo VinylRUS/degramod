@@ -162,6 +162,23 @@ class TestBotUnallow(unittest.IsolatedAsyncioTestCase):
             )).scalar_one_or_none()
             self.assertIsNotNone(row)
 
+    async def test_bare_at_sign_rejected_with_format_error(self):
+        """Фикс финального ревью: раньше «/botunallow global @» отвечал
+        «⚠️ @ не найден в вайтлисте» вместо понятной ошибки формата —
+        _normalize_bot_username("@") даёт пустую строку, и без guard'а
+        (который есть у cmd_botallow, но отсутствовал у cmd_botunallow)
+        код шёл прямиком к поиску по пустому username.
+        """
+        msg = _make_dm_message("/botunallow global @")
+        await bot_handlers.cmd_botunallow(msg)
+        reply_text = msg.reply.call_args[0][0]
+        self.assertIn("Укажите", reply_text)
+        self.assertNotIn("не найден", reply_text)
+        # Существующая запись @gif не пострадала.
+        async with async_session() as s:
+            rows = (await s.execute(select(BotWhitelist))).scalars().all()
+            self.assertEqual(len(rows), 1)
+
 
 class TestBotAllowList(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

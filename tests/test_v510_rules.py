@@ -6,6 +6,10 @@ from _paths import _P  # noqa: E402
 import os
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from aiogram.exceptions import TelegramAPIError
 
 os.environ.setdefault("BOT_TOKEN", "test:test")
 os.environ["ADMIN_IDS"] = "111"
@@ -15,7 +19,7 @@ os.environ["DB_PATH"] = "/tmp/degramod_v510_rules.db"
 sys.path.insert(0, _P())
 
 import bot_handlers  # noqa: E402
-from db import ChatSettings  # noqa: E402
+from db import ChatSettings, init_db  # noqa: E402
 
 
 class _FakeSettings:
@@ -73,6 +77,39 @@ class TestModelAndMigration(unittest.TestCase):
 
     def test_default_constant(self):
         self.assertEqual(bot_handlers.RULES_URL_DEFAULT, "https://rules.degradach.ru/")
+
+
+class TestFailedDeleteLoggedAsWarning(unittest.IsolatedAsyncioTestCase):
+    """Фикс финального ревью: неудачное удаление команды /rules в группе
+    логировалось как debug — запрос остаётся висеть в чате, а удаление
+    команды ровно для этого и существует. Теперь warning.
+    """
+
+    async def asyncSetUp(self):
+        await init_db()
+        bot_handlers._rules_last_call.clear()
+
+    async def asyncTearDown(self):
+        bot_handlers._rules_last_call.clear()
+
+    async def test_delete_failure_logs_warning_not_debug(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=777, username="u", first_name="U", last_name=""),
+            chat=SimpleNamespace(id=-100999),
+            delete=AsyncMock(side_effect=TelegramAPIError(method=None, message="forbidden")),
+            bot=AsyncMock(),
+        )
+        with patch.object(bot_handlers, "_send_ephemeral", AsyncMock()), \
+             patch.object(bot_handlers.logger, "warning") as mock_warning, \
+             patch.object(bot_handlers.logger, "debug") as mock_debug:
+            await bot_handlers.handle_rules_group(message)
+
+        self.assertTrue(mock_warning.called,
+                        "неудачное удаление команды должно логироваться как warning")
+        debug_calls = [c for c in mock_debug.call_args_list
+                       if c.args and "cannot delete" in str(c.args[0])]
+        self.assertEqual(debug_calls, [],
+                         "неудачное удаление больше не должно логироваться как debug")
 
 
 if __name__ == "__main__":

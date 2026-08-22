@@ -364,9 +364,9 @@ async def cmd_smute(message: types.Message, ctx: ModContext) -> None:
                 bot=message.bot, chat_id=chat_id, recipient=mod,
                 text=(
                     "❌ Не указана длительность мьюта.\n"
-                    "💡 Формат: <code>!smute 1d [причина]</code>, "
-                    "<code>!smute @user 2h Причина</code>, "
-                    "<code>!smute 30m</code>.\n"
+                    "💡 Формат: <code>/smute 1d [причина]</code>, "
+                    "<code>/smute @user 2h Причина</code>, "
+                    "<code>/smute 30m</code>.\n"
                     "Поддерживаемые единицы: <b>м/m</b> (минуты), "
                     "<b>ч/h</b> (часы), <b>д/d</b> (дни). "
                     "Комбинированные: <code>1d12h30m</code>."
@@ -753,7 +753,7 @@ async def cmd_unmute(message: types.Message, ctx: ModContext) -> None:
 
     await _send_audit_to_report(
         bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-        action_label="мьют", detail="команда !unmute",
+        action_label="мьют", detail="команда /unmute",
     )
 
 
@@ -796,7 +796,7 @@ async def cmd_unban(message: types.Message, ctx: ModContext) -> None:
 
     await _send_audit_to_report(
         bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-        action_label="бан", detail="команда !unban",
+        action_label="бан", detail="команда /unban",
     )
 
 
@@ -849,7 +849,7 @@ async def cmd_unwarn(message: types.Message, ctx: ModContext) -> None:
 
     await _send_audit_to_report(
         bot=message.bot, chat_id=chat_id, mod=mod, target=target,
-        action_label="варн(а/ов)", detail="команда !unwarn",
+        action_label="варн(а/ов)", detail="команда /unwarn",
         count=revoked_count,
     )
 
@@ -935,8 +935,8 @@ async def cmd_resetwarns(message: types.Message, ctx: ModContext) -> None:
             await _send_ephemeral(
                 bot=message.bot, chat_id=chat_id, recipient=mod,
                 text=(
-                    "❌ !resetwarns доступен только SU/Admin. "
-                    "Используйте !unwarn N для снятия отдельных варнов."
+                    "❌ /resetwarns доступен только SU/Admin. "
+                    "Используйте /unwarn N для снятия отдельных варнов."
                 ),
             )
         except Exception:
@@ -990,7 +990,7 @@ async def cmd_resetwarns(message: types.Message, ctx: ModContext) -> None:
         await _send_audit_to_report(
             bot=message.bot, chat_id=chat_id, mod=mod, target=target,
             action_label="варн(а/ов) — полный сброс",
-            detail="команда !resetwarns",
+            detail="команда /resetwarns",
             count=total_reset,
         )
 
@@ -1020,7 +1020,7 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
             await _send_ephemeral(
                 bot=message.bot, chat_id=chat_id, recipient=mod,
                 text=(
-                    "❌ !resetmc доступен только SU/Admin. "
+                    "❌ /resetmc доступен только SU/Admin. "
                     "Сброс счётчика автомьютов — привилегия администратора."
                 ),
             )
@@ -1056,7 +1056,7 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
     await _send_audit_to_report(
         bot=message.bot, chat_id=chat_id, mod=mod, target=target,
         action_label="счётчик автомьютов — сброс",
-        detail=f"команда !resetmc (было {old_count})",
+        detail=f"команда /resetmc (было {old_count})",
         count=old_count,
     )
 

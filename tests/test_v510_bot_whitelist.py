@@ -7,6 +7,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("BOT_TOKEN", "test:test")
 os.environ["ADMIN_IDS"] = "111"
@@ -205,17 +206,41 @@ class TestBotIdBackfill(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].bot_id, 778)
 
+    async def test_already_filled_bot_id_skips_backfill_call(self):
+        """Фикс финального ревью (находка 3): раньше _backfill_whitelist_bot_id
+        вызывалась безусловно на каждое сообщение от белого бота — холостой
+        UPDATE+commit даже когда bot_id уже проставлен. Теперь вызывающий код
+        сам решает по уже прочитанной строке, и при заполненном bot_id
+        функция вообще не вызывается.
+        """
+        async with async_session() as s:
+            s.add(BotWhitelist(chat_id=0, bot_username="gif", bot_id=999))
+            await s.commit()
+
+        message = self._make_message(user_id=304, bot_id=999, bot_username="gif")
+        with patch.object(bot_handlers, "_backfill_whitelist_bot_id") as mock_backfill:
+            blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+
+        self.assertFalse(blocked)
+        mock_backfill.assert_not_called()
+
     async def test_survives_username_rename_after_backfill(self):
         # Заполненный bot_id (как будто уже был backfill раньше) должен
         # продолжать матчиться, даже когда бот сменил username и старая
-        # запись в вайтлисте больше не совпадает по имени.
+        # запись в вайтлисте больше не совпадает по имени. Второй сценарий
+        # находки 3: WHERE бэкфилла по username такую строку никогда не
+        # находит (username поменялся) — раньше это означало холостой
+        # UPDATE+commit на КАЖДОЕ сообщение; теперь функция вообще не
+        # вызывается, раз bot_id уже заполнен.
         async with async_session() as s:
             s.add(BotWhitelist(chat_id=0, bot_username="oldname", bot_id=999))
             await s.commit()
 
         message = self._make_message(user_id=303, bot_id=999, bot_username="newname")
-        blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
+        with patch.object(bot_handlers, "_backfill_whitelist_bot_id") as mock_backfill:
+            blocked = await bot_handlers._check_via_bot_filter(message, FILTER_CHAT)
         self.assertFalse(blocked, "бот остаётся в вайтлисте после смены username")
+        mock_backfill.assert_not_called()
 
         key = (FILTER_CHAT, 303, 999)
         self.assertNotIn(

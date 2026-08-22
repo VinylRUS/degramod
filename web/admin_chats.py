@@ -219,6 +219,17 @@ async def admin_chats_update(
             status_code=303,
         )
 
+    # v5.1.0 (фикс финального ревью): валидация rules_url. Без неё кривое
+    # значение (без схемы, случайный текст) сохранялось молча — Telegram
+    # отвергал ссылку при отправке, _send_ephemeral глушил ошибку, и /rules
+    # тихо переставал работать без единого объяснения в интерфейсе.
+    rules_url_stripped = (rules_url or "").strip()
+    if rules_url_stripped and not rules_url_stripped.startswith(("http://", "https://")):
+        return RedirectResponse(
+            url="/admin/chats?flash=rules_url+must+start+with+http%3A%2F%2F+or+https%3A%2F%2F",
+            status_code=303,
+        )
+
     # v4.5.2: валидация HH:MM для night mode
     _hhmm_re = _re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
     nm_start = (night_mode_start or "").strip()
@@ -430,7 +441,7 @@ async def admin_chats_update(
         cs.via_bot_rate_limit_seconds = vb_rl if vb_rl is not None else 300
         cs.via_bot_mute_minutes = vb_mm if vb_mm is not None else 10
         # v5.1.0: пусто → дефолт из RULES_URL_DEFAULT (решается на чтении).
-        cs.rules_url = (rules_url or "").strip() or None
+        cs.rules_url = rules_url_stripped or None
         cs.updated_at = datetime.now(timezone.utc)
         await session.commit()
 

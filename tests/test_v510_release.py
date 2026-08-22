@@ -74,13 +74,14 @@ class TestHelpFromRegistry(unittest.TestCase):
             return re.search(rf"/{re.escape(name)}\b", text) is not None
 
         for spec in commands.GROUP_COMMANDS:
-            if spec.access == commands.Access.USER:
-                continue  # mywarns/rules — публичные, законно вне мод-справки
             self.assertTrue(
                 _has_command(full_json, spec.name),
                 f"/{spec.name} отсутствует в отрендеренном full help",
             )
-            if spec.access == commands.Access.MOD:
+            # v5.1.0 (фикс финального ревью): /mywarns и /rules — Access.USER,
+            # но теперь входят и в мод-справку тоже (модератор — тоже
+            # участник чата), поэтому проверяем их наравне с MOD-командами.
+            if spec.access in (commands.Access.MOD, commands.Access.USER):
                 self.assertTrue(
                     _has_command(mod_json, spec.name),
                     f"/{spec.name} отсутствует в отрендеренном moderator help",
