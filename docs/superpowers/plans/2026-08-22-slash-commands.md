@@ -41,7 +41,7 @@
   - `class Access(StrEnum)` со значениями `USER`/`MOD`/`ADMIN`
   - `@dataclass(frozen=True) class CommandSpec` с полями `name: str`, `pattern: re.Pattern`, `args_hint: str`, `description: str`, `access: Access`, `in_menu: bool`
   - `GROUP_COMMANDS: tuple[CommandSpec, ...]`
-  - `DM_MENU_COMMANDS: tuple[CommandSpec, ...]`
+  - `DM_MENU_COMMANDS: tuple[tuple[str, str], ...]` — пары (имя, описание)
   - `PUNITIVE: frozenset[str]`
   - `strip_prefix(text: str | None, bot_username: str | None) -> str | None`
   - `resolve(text: str | None, bot_username: str | None) -> tuple[CommandSpec, re.Match] | None`

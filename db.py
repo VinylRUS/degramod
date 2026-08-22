@@ -23,6 +23,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     event,
     select,
     text,
@@ -342,6 +343,11 @@ class ChatSettings(Base):
     mod_chat_id = Column(BigInteger, nullable=True)
     is_mod_chat = Column(Boolean, default=False, nullable=False)
 
+    # v5.1.0: ссылка на правила для команды /rules. Пусто → RULES_URL_DEFAULT.
+    # Бот мультичатовый, и у чатов со временем заводятся свои правила —
+    # колонка дешевле, чем миграция задним числом.
+    rules_url = Column(String, nullable=True)
+
 
 class PermissionPreset(Base):
     """v4.6.0: Глобальные пресеты прав для day / night / sanitary режимов.
@@ -454,6 +460,32 @@ class KeywordWatch(Base):
     created_by = Column(BigInteger, nullable=True)            # mod_id создателя
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True, nullable=False)
+
+
+class BotWhitelist(Base):
+    """v5.1.0: боты, на которых не действует via-bot кулдаун и автомьют.
+
+    Калька с LinkAllowlist: chat_id=0 означает «во всех чатах», конкретный
+    chat_id — только в этом чате.
+
+    bot_id заполняется оппортунистически, когда бот впервые встречается в
+    message.via_bot: username сменить можно, числовой id — нет. Матч идёт
+    по username ИЛИ по известному bot_id.
+    """
+
+    __tablename__ = "bot_whitelist"
+
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger, nullable=False, default=0)  # 0 = global
+    bot_username = Column(String, nullable=False)            # lower, без «@»
+    bot_id = Column(BigInteger, nullable=True)
+    note = Column(String, nullable=True)
+    added_by_mod_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "bot_username", name="uq_bot_whitelist_chat_bot"),
+    )
 
 
 class LinkAllowlist(Base):
@@ -1225,6 +1257,35 @@ async def init_db() -> None:
                 await conn.execute(text(
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
+
+    # ── v5.1.0: rules_url для команды /rules ─────────────────────────────
+    # До ЛЮБОГО ORM-запроса к chat_settings — иначе ORM подставляет в SELECT
+    # все колонки модели и падает на старой БД (так уже ломался старт бота
+    # в v4.8.5.4).
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        if "rules_url" not in existing_cols:
+            await conn.exec_driver_sql(
+                "ALTER TABLE chat_settings ADD COLUMN rules_url VARCHAR"
+            )
+
+    # ── v5.1.0: Новая таблица bot_whitelist (обход via-bot фильтра) ─────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    # До ЛЮБОГО ORM-запроса к bot_whitelist — иначе ORM подставляет в SELECT
+    # все колонки модели и падает на старой БД (см. v4.8.5.4).
+    async with engine.begin() as conn:
+        await conn.exec_driver_sql(
+            "CREATE TABLE IF NOT EXISTS bot_whitelist ("
+            "id INTEGER PRIMARY KEY, "
+            "chat_id BIGINT NOT NULL DEFAULT 0, "
+            "bot_username VARCHAR NOT NULL, "
+            "bot_id BIGINT, "
+            "note VARCHAR, "
+            "added_by_mod_id BIGINT, "
+            "created_at DATETIME, "
+            "UNIQUE (chat_id, bot_username))"
+        )
 
     # ── v4.8.0: Новая таблица keyword_watch ────────────────────────────
     # Замена word_filters. См. модель KeywordWatch выше для деталей.

@@ -77,12 +77,12 @@ def _read(path: str) -> str:
 def _find_cmd_section(source: str, cmd_marker: str) -> tuple[int, int]:
     """Находит секцию команды по маркеру.
 
-    Маркер должен быть уникальным для реальной обработки команды, например:
-      'm = _CMD_MUTE.match(text)'  — для !mute/!warn/!ban
-      'if _CMD_UNMUTE.match(text)' — для !unmute/!unban/!unwarn/!warns/!resetwarns
+    v5.1.0: маркеры регекс-строк (`_CMD_MUTE.match(...)`) исчезли вместе с
+    паттернами — они переехали в commands.py, а cmd_X в mod_commands.py
+    читают уже готовый матч из ctx.match. Маркер теперь — граница функции
+    (`async def cmd_mute(`), а конец секции — начало следующей cmd_X.
 
     Возвращает (start, end) — индексы начала и конца секции.
-    Конец = следующая секция команды (маркер '# ── !') ИЛИ конец функции.
     """
     markers = cmd_marker if isinstance(cmd_marker, (list, tuple)) else [cmd_marker]
     start = -1
@@ -93,29 +93,30 @@ def _find_cmd_section(source: str, cmd_marker: str) -> tuple[int, int]:
             break
     if start < 0:
         return (-1, -1)
-    # Ищем следующий "# ── !" маркер после start
-    next_cmd = source.find("# ── !", start + len(cmd_marker))
+    # Ищем начало следующей cmd_X функции после start.
+    next_cmd = source.find("async def cmd_", start + len(cmd_marker))
     if next_cmd < 0:
         next_cmd = len(source)
     return (start, next_cmd)
 
 
-# Маркеры для каждой команды.
+# Маркеры для каждой команды — граница функции в mod_commands.py.
 #
 # v4.8.9/v4.8.10: handle_group_command разобрали, ветки команд уехали в
-# mod_commands.py, и текст сообщения там берётся из контекста (ctx.text)
-# вместо локальной переменной text. Поэтому для каждой команды держим оба
-# написания и ищем по обоим модулям — тест проверяет наличие и порядок
-# операций, а не то, в каком файле они лежат.
+# mod_commands.py. v5.1.0: раньше маркером была строка регекс-матча внутри
+# cmd_X (`m = _CMD_MUTE.match(ctx.text)`), но паттерны переехали в
+# commands.py и такой строки больше нет нигде — маркер сменён на границу
+# самой функции, что даёт даже более точный и устойчивый к изменениям
+# внутри тела разрез.
 MARKERS = {
-    "mute":      ["m = _CMD_MUTE.match(ctx.text)", "m = _CMD_MUTE.match(text)"],
-    "warn":      ["m = _CMD_WARN.match(ctx.text)", "m = _CMD_WARN.match(text)"],
-    "ban":       ["m = _CMD_BAN.match(ctx.text)", "m = _CMD_BAN.match(text)"],
-    "unmute":    ["if _CMD_UNMUTE.match(ctx.text):", "if _CMD_UNMUTE.match(text):"],
-    "unban":     ["if _CMD_UNBAN.match(ctx.text):", "if _CMD_UNBAN.match(text):"],
-    "unwarn":    ["m = _CMD_UNWARN.match(ctx.text)", "m = _CMD_UNWARN.match(text)"],
-    "warns":     ["if _CMD_WARNS.match(ctx.text):", "if _CMD_WARNS.match(text):"],
-    "resetwarns": ["if _CMD_RESETWARNS.match(ctx.text):", "if _CMD_RESETWARNS.match(text):"],
+    "mute":       ["async def cmd_mute("],
+    "warn":       ["async def cmd_warn("],
+    "ban":        ["async def cmd_ban("],
+    "unmute":     ["async def cmd_unmute("],
+    "unban":      ["async def cmd_unban("],
+    "unwarn":     ["async def cmd_unwarn("],
+    "warns":      ["async def cmd_warns("],
+    "resetwarns": ["async def cmd_resetwarns("],
 }
 
 

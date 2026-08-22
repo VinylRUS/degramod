@@ -284,9 +284,15 @@ class TestV4720aEphemeralFix(unittest.TestCase):
         self.assertIn("async def _check_warn_threshold(", src)
 
     def test_20_warn_command_handler_present(self):
-        """Обработчик !warn команды должен остаться."""
-        src = _read_handlers()
-        self.assertIn("_CMD_WARN", src)
+        """Обработчик !warn команды должен остаться.
+
+        v5.1.0: _CMD_WARN переехал в реестр commands.py (cmd_warn в
+        mod_commands.py больше не держит собственную копию паттерна).
+        """
+        import commands
+        self.assertIsNotNone(commands.spec_by_name("warn"))
+        mod_commands_src = (Path(_P()) / "mod_commands.py").read_text(encoding="utf-8")
+        self.assertIn("async def cmd_warn(", mod_commands_src)
 
 
 if __name__ == "__main__":

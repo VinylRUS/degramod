@@ -165,6 +165,8 @@ async def admin_chats_update(
     day_preset_id: str = Form(""),
     night_preset_id: str = Form(""),
     sanitary_preset_id: str = Form("__lockdown__"),
+    # v5.1.0: своя ссылка на правила для /rules. Пусто → RULES_URL_DEFAULT.
+    rules_url: str = Form(""),
     _auth: AuthUser = Depends(require_csrf_admin),
 ):
     """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -214,6 +216,17 @@ async def admin_chats_update(
     if link_filter_action not in ("delete", "warn", "mute", "ban"):
         return RedirectResponse(
             url="/admin/chats?flash=Invalid+link_filter_action",
+            status_code=303,
+        )
+
+    # v5.1.0 (фикс финального ревью): валидация rules_url. Без неё кривое
+    # значение (без схемы, случайный текст) сохранялось молча — Telegram
+    # отвергал ссылку при отправке, _send_ephemeral глушил ошибку, и /rules
+    # тихо переставал работать без единого объяснения в интерфейсе.
+    rules_url_stripped = (rules_url or "").strip()
+    if rules_url_stripped and not rules_url_stripped.startswith(("http://", "https://")):
+        return RedirectResponse(
+            url="/admin/chats?flash=rules_url+must+start+with+http%3A%2F%2F+or+https%3A%2F%2F",
             status_code=303,
         )
 
@@ -427,6 +440,8 @@ async def admin_chats_update(
         # через /toggle поле=via_bot_filter).
         cs.via_bot_rate_limit_seconds = vb_rl if vb_rl is not None else 300
         cs.via_bot_mute_minutes = vb_mm if vb_mm is not None else 10
+        # v5.1.0: пусто → дефолт из RULES_URL_DEFAULT (решается на чтении).
+        cs.rules_url = rules_url_stripped or None
         cs.updated_at = datetime.now(timezone.utc)
         await session.commit()
 

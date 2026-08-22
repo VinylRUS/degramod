@@ -153,13 +153,18 @@ class TestMywarnsFormatting(_MywarnsTestCase):
         self.assertIsNone(result)
 
     async def test_counts_active_warns(self):
-        """Сводка содержит число активных варнов."""
+        """Сводка содержит число активных варнов.
+
+        v5.1.0: чат ещё не имеет явных настроек — _get_chat_settings создаёт
+        ChatSettings с дефолтами модели (warns_to_mute=3, warns_to_ban=5,
+        см. db.py). При total=2 ближайший порог — мьют.
+        """
         await _add_warn()
         await _add_warn()
         async with async_session() as s:
             result = await bot_handlers._format_user_warns_for_chat(s, _USER_ID, _CHAT_ID)
         self.assertIsNotNone(result)
-        self.assertIn("Варнов: 2", result)
+        self.assertEqual(result.split("\n")[0], "2/3 (до заглушения)")
 
     async def test_summary_groups_by_chat_title(self):
         """Сводка для лички группирует варны по названиям чатов."""
@@ -270,12 +275,15 @@ class TestMywarnsEphemeralDelivery(_MywarnsTestCase):
         )
 
     async def test_answer_contains_warn_count(self):
-        """В тексте — количество активных варнов."""
+        """В тексте — прогресс по количеству варнов до ближайшего дефолтного порога."""
         await _add_warn()
         msg = _make_group_message()
         await bot_handlers.handle_mywarns_group(msg)
 
-        self.assertIn("Варнов: 1", msg.bot.send_message.await_args.kwargs["text"])
+        self.assertIn(
+            "Ваши варны в этом чате: 1/3 (до заглушения)",
+            msg.bot.send_message.await_args.kwargs["text"],
+        )
 
     async def test_empty_case_is_ephemeral_too(self):
         """«Нет варнов» тоже адресное, а не публичное.
@@ -290,7 +298,7 @@ class TestMywarnsEphemeralDelivery(_MywarnsTestCase):
         kwargs = msg.bot.send_message.await_args.kwargs
         self.assertEqual(kwargs["chat_id"], _CHAT_ID)
         self.assertEqual(kwargs.get("receiver_user_id"), _USER_ID)
-        self.assertIn("нет активных варнов", kwargs["text"])
+        self.assertIn("нет варнов", kwargs["text"])
 
     async def test_autodelete_is_scheduled(self):
         """Авто-удаление планируется: ephemeral в Telegram сам не исчезает."""

@@ -7,10 +7,13 @@ v4.8.3.2 — тесты нового Rich Message /help.
   T2. _build_help_moderator_rich() возвращает валидный InputRichMessage
   T3. Полная версия содержит все ожидаемые команды (громкие, тихие, снятие)
   T4. Сокращённая версия НЕ содержит команды только-для-админов
-       (!resetwarns, !alarm, /nightmode, /sanitary, /warndecay, /settings,
+       (/resetwarns, /nightmode, /sanitary, /warndecay, /settings,
         /sethashtag, /setreport, /warns_mute, /warns_ban, /mute_duration,
         /addadmin, /deladmin, /bansticker, /liststickers, /delsticker,
         /linkfilter, /linkallow, /linkallowlist, /cas)
+       (v5.1.0, фикс round 2: /alarm убрана из этого списка — она
+        Access.MOD, не admin-only, и с этого фикса присутствует в
+        moderator help)
   T5. Полная версия содержит 5 Details-блоков (настройки, фильтры, ночной,
        санитарные, прочее)
   T6. Сокращённая версия НЕ содержит Details-блоков
@@ -190,20 +193,22 @@ def test_t2_moderator_first_block_h1():
 
 
 # ── T3: полная версия содержит все ожидаемые команд ──
+# v5.1.0: команды в /help переехали с «!» на «/» (реформа реестра
+# commands.py) — список ожидаемых команд обновлён вслед за этим.
 
 EXPECTED_FULL_COMMANDS = [
-    "!mute",
-    "!warn",
-    "!ban",
-    "!smute",
-    "!swarn",
-    "!sban",
-    "!unmute",
-    "!unban",
-    "!unwarn",
-    "!warns",
-    "!resetwarns",
-    "!alarm",
+    "/mute",
+    "/warn",
+    "/ban",
+    "/smute",
+    "/swarn",
+    "/sban",
+    "/unmute",
+    "/unban",
+    "/unwarn",
+    "/warns",
+    "/resetwarns",
+    "/alarm",
     "/settings",
     "/sethashtag",
     "/setreport",
@@ -233,10 +238,14 @@ def test_t3_full_contains_all_commands():
 
 
 # ── T4: сокращённая версия НЕ содержит команды только-для-админов ──
+# v5.1.0 (фикс round 2, ревью Task 10): /alarm убрана из этого списка —
+# она Access.MOD (handle_alarm_command пускает любого модератора), а не
+# admin-only. До фикса moderator help ошибочно её прятала; теперь /alarm
+# в moderator help есть (см. MODERATOR_ALLOWED_COMMANDS ниже), и держать
+# её здесь означало бы требовать регрессию.
 
 ADMIN_ONLY_COMMANDS = [
-    "!resetwarns",
-    "!alarm",
+    "/resetwarns",
     "/settings",
     "/sethashtag",
     "/setreport",
@@ -257,8 +266,10 @@ ADMIN_ONLY_COMMANDS = [
     "/warndecay",
 ]
 
-MODERATOR_ALLOWED_COMMANDS = ["!mute", "!warn", "!ban", "!smute", "!swarn", "!sban",
-                              "!unmute", "!unban", "!unwarn", "!warns"]
+# v5.1.0 (фикс round 2, ревью Task 10): /alarm добавлена — теперь тоже
+# разрешена и показывается модератору (см. правку ADMIN_ONLY_COMMANDS выше).
+MODERATOR_ALLOWED_COMMANDS = ["/mute", "/warn", "/ban", "/smute", "/swarn", "/sban",
+                              "/unmute", "/unban", "/unwarn", "/warns", "/alarm"]
 
 
 def test_t4_moderator_excludes_admin_only_commands():
@@ -484,7 +495,7 @@ async def test_t12_moderator_gets_moderator():
     rich = call_kwargs.get("rich_message")
     text = _collect_text(rich)
     assert "/nightmode" not in text, "Moderator НЕ должен видеть /nightmode"
-    assert "!mute" in text, "Moderator должен видеть !mute"
+    assert "/mute" in text, "Moderator должен видеть /mute"
 
 
 async def test_t13_deactivated_webuser_no_send():
@@ -518,7 +529,7 @@ async def test_t14_admin_role_gets_full():
     rich = call_kwargs.get("rich_message")
     text = _collect_text(rich)
     assert "/nightmode" in text, "admin должен видеть /nightmode (полная версия)"
-    assert "!alarm" in text, "admin должен видеть !alarm"
+    assert "/alarm" in text, "admin должен видеть /alarm"
 
 
 async def test_t15_su_role_gets_full():

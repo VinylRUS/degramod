@@ -34,7 +34,14 @@ import uvicorn
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+)
 from sqlalchemy import select
+
+import commands as commands_registry
 
 # v4.8.0: унифицированная логика режимов чата (snapshot/restore/apply).
 # Используется в _enter_night_mode, _enter_sanitary_day, _restore_day_state.
@@ -1341,6 +1348,75 @@ async def _verify_env_chats():
             disabled_count, len(_CHAT_HASHTAGS),
         )
 
+async def _publish_bot_commands(bot) -> None:
+    """v5.1.0: публикует меню команд по скоупам.
+
+    До v5.1.0 здесь стоял безусловный delete_my_commands() — бот прятал
+    меню целиком (стелс). Теперь наружу выходят ровно две публичные
+    команды, /mywarns и /rules.
+
+    Мод-команды не публикуются нигде. Скоуп AllChatAdministrators у
+    Telegram означает настоящих админов чата, а _is_admin
+    (bot_handlers.py) Telegram не спрашивает вовсе — он смотрит ADMIN_IDS,
+    WebUser и chat_admins. Админов чата в этой инсталляции заметно больше,
+    чем модераторов в БД, поэтому такой скоуп рекламировал бы /ban строго
+    более широкому кругу, чем тот, кому команда разрешена.
+
+    AllChatAdministrators при этом не задаётся вовсе, а не задаётся
+    пустым: скоупы Telegram не складываются, более узкий замещает более
+    широкий целиком, и пустой админский скоуп отобрал бы у админов
+    /mywarns и /rules. Не задавая его, мы позволяем им унаследовать
+    AllGroupChats.
+
+    Любая ошибка Telegram гасится: меню — не повод не стартовать.
+
+    v5.1.0: три вызова Telegram изолированы друг от друга. Раньше все три
+    жили под одним try/except — падение первого (например,
+    set_my_commands для группового скоупа) молча отменяло два оставшихся,
+    а в лог уходил один расплывчатый warning без указания, какой скоуп
+    не встал. Теперь каждый шаг обёрнут отдельно через _step: отказ
+    одного не мешает остальным выполниться, и в логе назван конкретный
+    шаг.
+    """
+
+    async def _step(label: str, factory) -> None:
+        """Выполняет один шаг публикации меню независимо от остальных.
+
+        factory — callable, возвращающий новую корутину при каждом
+        вызове (здесь вызывается один раз за шаг, но это тот же
+        контракт, что у tg_safe_call: переиспользовать корутину после
+        исключения нельзя).
+        """
+        try:
+            await factory()
+        except Exception as e:
+            logger.warning("_publish_bot_commands: шаг %s не выполнен: %s", label, e)
+
+    group_cmds = [
+        BotCommand(command=spec.name, description=spec.description)
+        for spec in commands_registry.GROUP_COMMANDS
+        if spec.in_menu
+    ]
+    dm_cmds = [
+        BotCommand(command=name, description=description)
+        for name, description in commands_registry.DM_MENU_COMMANDS
+    ]
+    await _step(
+        "групповой скоуп (AllGroupChats)",
+        lambda: bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats()),
+    )
+    await _step(
+        "личные чаты (AllPrivateChats)",
+        lambda: bot.set_my_commands(dm_cmds, scope=BotCommandScopeAllPrivateChats()),
+    )
+    # Default чистим: он служит фолбэком для скоупов, которые мы не задаём.
+    await _step("очистка default-скоупа", lambda: bot.delete_my_commands())
+    logger.info(
+        "Bot commands published: %d in groups, %d in DM",
+        len(group_cmds), len(dm_cmds),
+    )
+
+
 # ── Lifespan ────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app):
@@ -1365,12 +1441,16 @@ async def lifespan(app):
     # апдейте из них (env принудительно создавал chat_settings).
     await _verify_env_chats()
 
-    # Убираем команды из меню (стелс)
+    # v5.1.0: меню команд вместо безусловной очистки (см. _publish_bot_commands).
+    # Username нужен фильтрам, чтобы отличать /ban@degradach_bot от
+    # /ban@other_bot — ставим до публикации меню.
     try:
-        await bot.delete_my_commands()
-        logger.info("Bot commands cleared (stealth mode)")
+        me = await bot.me()
+        commands_registry.set_bot_username(me.username)
+        logger.info("Bot username: @%s", me.username)
     except Exception as e:
-        logger.warning("delete_my_commands failed: %s", e)
+        logger.warning("cannot resolve bot username: %s", e)
+    await _publish_bot_commands(bot)
 
     # ── Проверяем глобальный default репорт-чат из DB (chat_id=0) ──
     try:

@@ -140,11 +140,13 @@ from aiogram.types import (
     RichTextSpoiler,
     RichTextUrl,
 )
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select, update
 
+import commands
 from db import (
     AutomuteCounter,
     BannedStickerPack,
+    BotWhitelist,
     ChatAdmin,
     ChatSettings,
     GithubSettings,
@@ -495,115 +497,19 @@ def _mute_permissions() -> types.ChatPermissions:
 
 
 # ── Команды в группах ──────────────────────────────────────────────────────
-# v4.8.1: реформа команд ban/warn/mute.
-#   • Громкие (!ban/!warn/!mute) — причина ОБЯЗАТЕЛЬНА. После: публичное
-#     сообщение в чат + отчёт в репорт-чат (без ephemeral модератору).
-#   • Тихие (!sban/!swarn/!smute) — причина НЕОБЯЗАТЕЛЬНА. После: ephemeral
-#     модератору (и ephemeral нарушителю для !swarn) + отчёт в репорт-чат.
-#     Поведение совпадает с v4.8.0 !ban/!warn/!mute.
-#
-# v4.8.3: расширение способов указания цели наказания.
-#   • Раньше все команды работали ТОЛЬКО по reply на сообщение нарушителя.
-#   • Теперь можно указать цель первым аргументом: @username или TGID.
-#   • Reply остаётся приоритетным: если есть reply — цель из аргумента игнорируется.
-#   • Скриншот: модератор может приложить фото к команде (caption содержит !ban ...).
-#
-# Группа target: (?P<target>@\w+|\d+) — @username (начинается с @) или TGID (только цифры).
-# Если target не указан — команда требует reply (для !ban/!warn/!mute) или
-# работает по reply если он есть (для !sban/!swarn/!smute — иначе target=None,
-# что приведёт к ошибке резолва в _resolve_punishment_target).
-_CMD_MUTE = re.compile(
-    r"^!mute\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)\s+(?P<reason>.+)$",
-    re.IGNORECASE,
-)  # dur + reason обязательны; target опционален (если нет — нужен reply).
-_CMD_WARN = re.compile(
-    r"^!warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
-    re.IGNORECASE,
-)  # reason обязательна; target опционален.
-# v4.8.6: добавлен negative lookahead (?!@\w+$|\d+$) в reason — иначе
-# `!warn @username` (без причины) матчило reason="@username" и бан влетал
-# на reply-target с некорректной причиной. Теперь такой ввод не матчится
-# → handler вернёт "укажите причину".
-_CMD_BAN = re.compile(
-    r"^!ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
-    re.IGNORECASE,
-)  # reason обязательна; target опционален.
-# v4.8.6: аналогичный фикс как для _CMD_WARN (см. выше).
-# v4.8.1: тихие команды (stealth). s = silent/stealth.
-# v4.8.3.1 HOTFIX: regex переосмыслен — _CMD_SWARN/_CMD_SBAN в v4.8.3 не матчили
-#   `!swarn Причина` (bare reason без @username/TGID), потому что внутренняя
-#   группа `(?P<reason>.+)` требовала свой собственный `\s+`, но он уже был
-#   съеден внешней `\s+`. Исправлено: target и reason — два независимых
-#   optional-блока на верхнем уровне, каждый со своим `\s+`. Это позволяет
-#   матчить все варианты: `!swarn`, `!swarn Причина`, `!swarn @user`,
-#   `!swarn @user Причина`, `!swarn 12345`, `!swarn 12345 Причина`.
-# v4.8.3.1 HOTFIX: _CMD_SMUTE в v4.8.3 делал всё тело опциональным, поэтому
-#   `!smute` без длительности матчило (dur=None), а handler звал
-#   `_parse_duration(None)` → AttributeError. Regex оставлен как есть
-#   (dur внутри опциональной группы), но handler теперь явно проверяет
-#   `dur is None` и отправляет ephemeral с подсказкой формата.
-_CMD_SMUTE = re.compile(
-    r"^!smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
-    re.IGNORECASE,
-)  # dur обяз. ЕСЛИ есть аргументы; reason опц.; target опц.
-_CMD_SWARN = re.compile(
-    r"^!swarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
-    re.IGNORECASE,
-)  # reason опциональна; target опционален; любой из них может быть один.
-_CMD_SBAN = re.compile(
-    r"^!sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
-    re.IGNORECASE,
-)  # reason опциональна; target опционален; любой из них может быть один.
-_CMD_UNMUTE = re.compile(r"^!unmute\s*$", re.IGNORECASE)
-_CMD_UNBAN = re.compile(r"^!unban\s*$", re.IGNORECASE)
-_CMD_UNWARN = re.compile(r"^!unwarn(?:\s+(\d+))?\s*$", re.IGNORECASE)
-_CMD_WARNS = re.compile(r"^!warns\s*$", re.IGNORECASE)
-_CMD_RESETWARNS = re.compile(r"^!resetwarns\s*$", re.IGNORECASE)
-# v4.8.4: !resetmc — сброс счётчика автомьютов (прогрессивные муты).
-# Цель: reply на сообщение, ИЛИ !resetmc @username, ИЛИ !resetmc <tgid>.
-# Доступ: только SU/Admin (как !resetwarns).
-_CMD_RESETMC = re.compile(
-    r"^!resetmc(?:\s+(?P<target>@\w+|\d+))?\s*$",
-    re.IGNORECASE,
-)
-# v4.7.20: !alarm on [duration] / !alarm off
-# Длительность: опциональная, форматы "1ч" / "1h" / "30м" / "30m" / "2д" / "2d".
-# Если не указана — alarm активен до ручного !alarm off.
-# Примеры: "!alarm on", "!alarm on 1ч", "!alarm on 2h", "!alarm off"
-_CMD_ALARM = re.compile(
-    r"^!alarm\s+(on|off|вкл|выкл)"           # on/off (или русские алиасы)
-    r"(?:\s+(\d+)\s*(ч|h|м|m|д|d))?"         # опциональная длительность
-    r"\s*$",
-    re.IGNORECASE,
-)
+# v5.1.0: паттерны команд переехали в commands.py — единственный источник
+# истины (реестр GROUP_COMMANDS). История правок regex'ов (v4.8.1 реформа
+# ban/warn/mute, v4.8.3 target-аргумент, v4.8.3.1 hotfix swarn/sban/smute,
+# v4.8.6 negative lookahead в reason, v4.8.4 resetmc, v4.7.20 alarm) — там же,
+# рядом с соответствующими паттернами.
+def _is_known_command(text: str) -> bool:
+    """v5.1.0: True, если текст — команда этого бота.
 
-
-# ── Список всех команд модерации (для ранней проверки, что текст вообще ────
-#    является командой, ДО удаления сообщения модератора). v4.4.8 FIX.
-# v4.8.1: добавлены тихие команды !sban/!swarn/!smute.
-# v4.8.4: добавлена команда !resetmc (сброс счётчика автомьютов).
-_ALL_MOD_COMMANDS: tuple[re.Pattern, ...] = (
-    _CMD_MUTE, _CMD_WARN, _CMD_BAN,
-    _CMD_SMUTE, _CMD_SWARN, _CMD_SBAN,
-    _CMD_UNMUTE, _CMD_UNBAN, _CMD_UNWARN,
-    _CMD_WARNS, _CMD_RESETWARNS, _CMD_RESETMC,
-    _CMD_ALARM,
-)
-
-
-def _is_moderation_command(text: str) -> bool:
-    """Возвращает True, если текст — это одна из модераторских команд бота.
-
-    Используется как ранняя guard-проверка в handle_group_command, чтобы
-    бот не удалял обычные ответы модератора в чате (только сообщения с командой).
+    Раньше проверка звалась _is_moderation_command и знала только про
+    модераторские команды на «!». Теперь спрашивает реестр, поэтому
+    ловит и публичные /mywarns и /rules, и оба префикса.
     """
-    # Быстрый short-circuit: команды начинаются с '!'. Если не начинается —
-    # точно не команда, не трогаем сообщение.
-    stripped = text.lstrip()
-    if not stripped.startswith("!"):
-        return False
-    # Точное соответствие одному из зарегистрированных паттернов.
-    return any(p.match(stripped) for p in _ALL_MOD_COMMANDS)
+    return commands.resolve(text, commands.get_bot_username()) is not None
 
 
 # ── v4.7.26: Custom-фильтры для команд — исправляют баг с propagation ──────
@@ -616,39 +522,74 @@ def _is_moderation_command(text: str) -> bool:
 # перехватывал ВСЕ group messages (даже без !alarm).
 # Фикс: фильтр должен матчить ТОЛЬКО когда текст реально является командой.
 # Тогда не-команды проваливаются к следующему handler'у.
-class _ModerationCommandFilter(BaseFilter):
-    """v4.7.26: матчит только сообщения, содержащие модераторскую команду.
+class _KnownCommandFilter(BaseFilter):
+    """v5.1.0: матчит команды, которые реально обрабатывает handle_group_command.
 
-    Проверяет text на соответствие любому из _ALL_MOD_COMMANDS паттернов.
-    Используется в handle_group_command чтобы НЕ перехватывать обычные
-    reply-сообщения (тогда они проваливаются в handle_content_filters
-    для word/link/via_bot проверки).
+    Раньше (_ModerationCommandFilter) фильтр знал только мод-команды, а
+    отсутствие прав обрабатывалось молчаливым return в хендлере — команда
+    обычного юзера так и оставалась висеть в чате без ответа. Теперь
+    фильтр пропускает мод/админ-команду внутрь всегда, а хендлер решает,
+    выполнить её или отказать.
 
-    v4.8.3: если message.text пустой — проверяем message.caption.
-    Это позволяет модератору отправить фото (скриншот нарушения) с
-    командой в caption (например «!ban @user Дурачок» под фото).
+    Область матчинга — по `spec.access`, а НЕ «всё, что есть в реестре»:
+    Access.USER (mywarns, rules — и что бы Task 4 ни добавила следом)
+    сюда не попадает, потому что у них собственные хендлеры. /alarm тоже
+    исключён явно — у него отдельный хендлер (handle_alarm_command, ниже)
+    со своей логикой (команда без reply, применяется ко всему чату).
+
+    Почему по access, а не порядком регистрации в файле: в aiogram 3.x
+    первый матчащий фильтр останавливает propagation. Если бы этот фильтр
+    матчил ВСЁ известное реестру, судьба команды зависела бы от того, где
+    в файле на 8.5k строк объявлен её собственный хендлер — выше
+    handle_group_command или ниже. Это уже дважды стреляло в проде на
+    ДРУГОМ, но однотипном классе бага: !ban выпадал из ручного списка
+    диспетчера и молчал, !alarm перехватывался handle_group_command,
+    зарегистрированным выше handle_alarm_command, и терял свою логику.
+    Оба чинились этим переходом на реестр (Task 2) — область фильтра
+    делает правильный исход не зависящим от порядка строк в файле.
+
+    Незнакомые команды (/roll соседнего бота) реестром не резолвятся,
+    сюда не попадают и проваливаются дальше — в handle_content_filters.
+
+    v4.8.3: если message.text пустой — проверяем message.caption
+    (команда может быть подписью к скриншоту нарушения).
     """
 
     async def __call__(self, message: types.Message) -> bool:
         text = message.text or message.caption
         if not text:
             return False
-        return _is_moderation_command(text)
+        found = commands.resolve(text, commands.get_bot_username())
+        if found is None:
+            return False
+        spec, _match = found
+        return spec.access != commands.Access.USER and spec.name != "alarm"
 
 
 class _AlarmCommandFilter(BaseFilter):
-    """v4.7.26: матчит только сообщения вида '!alarm on|off|вкл|выкл ...'.
+    """v5.1.0: матчит только команду /alarm (и алиас !alarm) из реестра.
 
-    Используется в handle_alarm_command чтобы НЕ перехватывать обычные
-    текстовые сообщения (тогда они проваливаются в handle_content_filters
-    для word/link/via_bot проверки).
+    Раньше сверялась с локальной копией _CMD_ALARM — теперь резолвит текст
+    через commands.resolve и проверяет имя команды, как и остальной
+    диспетчер. Используется в handle_alarm_command, чтобы НЕ перехватывать
+    обычные текстовые сообщения (тогда они проваливаются в
+    handle_content_filters для word/link/via_bot проверки).
     """
 
     async def __call__(self, message: types.Message) -> bool:
         text = message.text
         if not text:
             return False
-        return bool(_CMD_ALARM.match(text))
+        found = commands.resolve(text, commands.get_bot_username())
+        return found is not None and found[0].name == "alarm"
+
+
+class _MywarnsFilter(BaseFilter):
+    """v5.1.0: матчит /mywarns (и legacy !mywarns) через реестр."""
+
+    async def __call__(self, message: types.Message) -> bool:
+        found = commands.resolve(message.text, commands.get_bot_username())
+        return found is not None and found[0].name == "mywarns"
 
 
 # ── v4.4.8: middleware для полной блокировки disabled-чатов ──────────────
@@ -1265,8 +1206,8 @@ async def _resolve_punishment_target(
         return None, (
             "❌ Не указана цель. Используйте reply на сообщение нарушителя, "
             "либо укажите @username или TGID первым аргументом.\n"
-            "Пример: <code>!ban @username Причина</code> или "
-            "<code>!ban 12345678 Причина</code>"
+            "Пример: <code>/ban @username Причина</code> или "
+            "<code>/ban 12345678 Причина</code>"
         )
 
     # 2. @username
@@ -3493,14 +3434,50 @@ async def _send_ephemeral(
 # понимают, что нарушитель наказан и за что. Пересланное сообщение нарушителя
 # НЕ прикладывается (оно остаётся только в репорт-чате как rich-превью).
 #
+# v5.1.0: формулировки переписаны по схеме «кто → что с ним сделали → по
+# причине», латинские кавычки заменены на русские «ёлочки» (было неграмотно —
+# предлог «за» вместо «по причине» и двойные кавычки в стиле `"2ч"`).
+# Построение текста вынесено в _build_punishment_notice — так его можно
+# тестировать без поднятия Telegram.
+#
 # Формат (HTML):
-#   ban:  Пользователь "<display_name>" забанен за "<reason>"
-#   warn: Пользователь "<display_name>" получил варн за "<reason>"
-#   mute: Пользователь "<display_name>" замутан за "<reason>" на "<duration>"
+#   ban:  Пользователь «<display_name>» был забанен по причине: «<reason>»
+#   warn: Пользователь «<display_name>» получил предупреждение по причине: «<reason>»
+#   mute: Пользователь «<display_name>» был заглушён на <duration> по причине: «<reason>»
 #
 # Все поля HTML-экранируются (display_name и reason могут содержать <>).
 # duration приходит уже отформатированным через _format_duration — его
 # тоже экранируем (он состоит только из цифр и букв, но для консистентности).
+def _build_punishment_notice(
+    action: str, display_name: str, reason: str | None, duration: int | None,
+) -> str | None:
+    """v5.1.0: текст публичного сообщения о наказании.
+
+    Единая схема «кто → что с ним сделали → по причине» и русские
+    «ёлочки». До v5.1.0 формулировки были разнобойные и неграмотные —
+    предлог «за» вместо «по причине», латинские двойные кавычки.
+
+    Возвращает None при неизвестном action — вызывающий код логирует.
+    """
+    name_safe = html.escape(display_name, quote=False)
+    reason_safe = html.escape(reason, quote=False) if reason else ""
+
+    if action == "ban":
+        return f"Пользователь «<b>{name_safe}</b>» был забанен по причине: «<i>{reason_safe}</i>»"
+    if action == "warn":
+        return (
+            f"Пользователь «<b>{name_safe}</b>» получил предупреждение "
+            f"по причине: «<i>{reason_safe}</i>»"
+        )
+    if action == "mute":
+        dur_safe = html.escape(_format_duration(duration) if duration else "", quote=False)
+        return (
+            f"Пользователь «<b>{name_safe}</b>» был заглушён на <b>{dur_safe}</b> "
+            f"по причине: «<i>{reason_safe}</i>»"
+        )
+    return None
+
+
 async def _send_public_punishment_notice(
     *,
     bot: types.Bot,
@@ -3520,22 +3497,10 @@ async def _send_public_punishment_notice(
                    (на уровне regex). Для mute — тоже обязательна.
     :param duration: длительность мьюта в секундах (только для action='mute').
     """
-    display_name = _user_display_name(target)
-    name_safe = html.escape(display_name, quote=False)
-    reason_safe = html.escape(reason, quote=False) if reason else ""
-
-    if action == "ban":
-        text = f'Пользователь "<b>{name_safe}</b>" забанен за "<i>{reason_safe}</i>"'
-    elif action == "warn":
-        text = f'Пользователь "<b>{name_safe}</b>" получил варн за "<i>{reason_safe}</i>"'
-    elif action == "mute":
-        dur_str = _format_duration(duration) if duration else ""
-        dur_safe = html.escape(dur_str, quote=False)
-        text = (
-            f'Пользователь "<b>{name_safe}</b>" замутан за "<i>{reason_safe}</i>" '
-            f'на "<b>{dur_safe}</b>"'
-        )
-    else:
+    text = _build_punishment_notice(
+        action, _user_display_name(target), reason, duration,
+    )
+    if text is None:
         logger.warning("_send_public_punishment_notice: unknown action=%r", action)
         return
 
@@ -3955,7 +3920,6 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 #
 # Таймаут: per-user per-chat, 5 минут, silent (молча игнорирует при превышении).
 
-_CMD_MYWARNS = re.compile(r"^!mywarns\s*$", re.IGNORECASE)
 _MYWARNS_TIMEOUT_SECONDS = 300  # 5 минут
 _mywarns_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
 
@@ -3992,18 +3956,96 @@ def _mywarns_prune_stale(now: float) -> None:
         del _mywarns_last_call[key]
 
 
+# ── v5.1.0: кулдаун ephemeral-отказа «нет прав» ─────────────────────────
+# Без него участник, долбящий /ban, заставляет бота слать по ephemeral на
+# каждое нажатие и упереться во flood control уже на уровне всего бота.
+# Сама команда удаляется всегда — гасится только повторный ответ.
+_DENIED_COOLDOWN_SECONDS = 60
+_denied_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
+
+
+def _denied_prune_stale(now: float) -> None:
+    """Чистит протухшие записи кулдауна отказов."""
+    stale = [
+        key for key, ts in _denied_last_call.items()
+        if now - ts >= _DENIED_COOLDOWN_SECONDS
+    ]
+    for key in stale:
+        del _denied_last_call[key]
+
+
+async def _send_access_denied(
+    message: types.Message, chat_id: int, user: types.User,
+) -> None:
+    """v5.1.0: ephemeral «нет прав» с кулдауном на (user_id, chat_id).
+
+    Ошибки отправки глушит _send_ephemeral — если юзер ограничил
+    ephemeral-сообщения, показать ему всё равно нечего.
+    """
+    now = time.time()
+    key = (user.id, chat_id)
+    last = _denied_last_call.get(key, 0.0)
+    if now - last < _DENIED_COOLDOWN_SECONDS:
+        logger.debug(
+            "access denied (cooldown): user %s in chat %s", user.id, chat_id,
+        )
+        return
+    _denied_prune_stale(now)
+    _denied_last_call[key] = now
+    await _send_ephemeral(
+        bot=message.bot,
+        chat_id=chat_id,
+        recipient=user,
+        text="❌ У вас нет прав на эту команду.",
+    )
+
+
+def _format_warn_progress(
+    total: int, warns_to_mute: int | None, warns_to_ban: int | None,
+) -> str:
+    """v5.1.0: «2/3 (до заглушения)» — прогресс до ближайшего порога.
+
+    Пороги независимы, 0 и None означают «выключен». Берём наименьший
+    включённый порог строго больше текущего счётчика. При равных порогах
+    показываем бан: в _check_warn_threshold он проверяется первым.
+
+    Если ни один включённый порог не превышает счётчик (порог понизили или
+    выключили задним числом) — возвращаем голое число, потому что дробь в
+    этой ситуации соврала бы.
+
+    Величина честная: наказание срабатывает по total >= N, после чего
+    варны гасятся через consumed_by_action и _count_warns их не считает.
+    """
+    candidates: list[tuple[int, str]] = []
+    # Бан первым в списке — при равенстве порогов min() возьмёт его.
+    if warns_to_ban and warns_to_ban > total:
+        candidates.append((warns_to_ban, "до бана"))
+    if warns_to_mute and warns_to_mute > total:
+        candidates.append((warns_to_mute, "до заглушения"))
+    if not candidates:
+        return str(total)
+    threshold, label = min(candidates, key=lambda c: c[0])
+    return f"{total}/{threshold} ({label})"
+
+
 async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> str | None:
     """Форматирует сводку варнов юзера для конкретного чата.
 
     Возвращает None если варнов нет. Иначе строку вида:
-      «• Варнов: 2
-        • Последний: 12 авг 2026, 15:30»
+      «2/3 (до заглушения)
+       • Последний варн: 12 авг 2026, 15:30»
+
+    v5.1.0: добавлен прогресс до ближайшего порога — см. _format_warn_progress.
     """
     total = await _count_warns(session, user_id, chat_id)
     if total == 0:
         return None
 
-    # Последний варн (для даты)
+    cs = await _get_chat_settings(session, chat_id)
+    progress = _format_warn_progress(
+        total, cs.warns_to_mute if cs else 0, cs.warns_to_ban if cs else 0,
+    )
+
     last_warn = (await session.execute(
         select(Punishment)
         .where(
@@ -4017,10 +4059,10 @@ async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> st
         .limit(1)
     )).scalar_one_or_none()
 
-    lines = [f"• Варнов: {total}"]
+    lines = [progress]
     if last_warn and last_warn.created_at:
         # v4.8.11: русский месяц вместо strftime("%b") — см. _format_msk_date_ru.
-        lines.append(f"• Последний: {_format_msk_date_ru(last_warn.created_at)}")
+        lines.append(f"• Последний варн: {_format_msk_date_ru(last_warn.created_at)}")
 
     return "\n".join(lines)
 
@@ -4060,16 +4102,15 @@ async def _format_user_warns_summary(session, user_id: int) -> str:
     return "\n".join(parts)
 
 
-@router.message(F.chat.type.in_(["group", "supergroup"]), F.text.regexp(r"^!mywarns\s*$"))
+@router.message(F.chat.type.in_(["group", "supergroup"]), _MywarnsFilter())
 async def handle_mywarns_group(message: types.Message) -> None:
-    """!mywarns в группе — удаляет команду, отвечает ephemeral с варнами в этом чате.
+    """/mywarns (и legacy !mywarns) в группе — удаляет команду, отвечает ephemeral с варнами в этом чате.
 
     v4.8.10 (бонус): доступна всем юзерам. Per-user per-chat timeout 5 мин, silent.
     v4.9.0: ответ ephemeral'ом вместо DM — см. комментарий в шапке блока.
+    v5.1.0: матчинг переехал на _MywarnsFilter (реестр commands.py).
     """
     if not message.from_user or not message.text:
-        return
-    if not _CMD_MYWARNS.match(message.text):
         return
 
     user_id = message.from_user.id
@@ -4105,9 +4146,9 @@ async def handle_mywarns_group(message: types.Message) -> None:
         warn_info = await _format_user_warns_for_chat(session, user_id, chat_id)
 
     if warn_info is None:
-        text = "✅ У вас нет активных варнов в этом чате."
+        text = "✅ У вас нет варнов в этом чате."
     else:
-        text = f"📊 Ваши варны в этом чате:\n{warn_info}"
+        text = f"📊 Ваши варны в этом чате: {warn_info}"
 
     # v4.9.0: ephemeral в тот же чат вместо DM.
     #
@@ -4123,15 +4164,14 @@ async def handle_mywarns_group(message: types.Message) -> None:
     )
 
 
-@router.message(F.chat.type == "private", F.text.regexp(r"^!mywarns\s*$"))
+@router.message(F.chat.type == "private", _MywarnsFilter())
 async def handle_mywarns_dm(message: types.Message) -> None:
-    """!mywarns в DM — отвечает напрямую, сводка по всем чатам.
+    """/mywarns (и legacy !mywarns) в DM — отвечает напрямую, сводка по всем чатам.
 
     v4.8.10 (бонус): доступна всем юзерам. Per-user timeout 5 мин (per-chat=DM chat id), silent.
+    v5.1.0: матчинг переехал на _MywarnsFilter (реестр commands.py).
     """
     if not message.from_user or not message.text:
-        return
-    if not _CMD_MYWARNS.match(message.text):
         return
 
     user_id = message.from_user.id
@@ -4160,78 +4200,172 @@ async def handle_mywarns_dm(message: types.Message) -> None:
         logger.debug("mywarns: cannot reply in DM to user %s: %s", user_id, e)
 
 
+# ── v5.1.0: /rules ──────────────────────────────────────────────────────
+RULES_URL_DEFAULT = "https://rules.degradach.ru/"
+_RULES_COOLDOWN_SECONDS = 60
+_rules_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → ts
+
+
+def _resolve_rules_url(cs) -> str:
+    """Ссылка на правила для чата: настройка или дефолт.
+
+    Пустая строка и пробелы считаются «не задано» — админ мог очистить
+    поле в веб-панели, и это должно означать возврат к дефолту, а не
+    отправку пустой ссылки.
+    """
+    if cs is None:
+        return RULES_URL_DEFAULT
+    url = (getattr(cs, "rules_url", None) or "").strip()
+    return url or RULES_URL_DEFAULT
+
+
+class _RulesFilter(BaseFilter):
+    """v5.1.0: матчит /rules через реестр."""
+
+    async def __call__(self, message: types.Message) -> bool:
+        found = commands.resolve(message.text, commands.get_bot_username())
+        return found is not None and found[0].name == "rules"
+
+
+@router.message(F.chat.type.in_(["group", "supergroup"]), _RulesFilter())
+async def handle_rules_group(message: types.Message) -> None:
+    """/rules в группе — удаляет команду, отвечает ephemeral со ссылкой."""
+    if not message.from_user:
+        return
+
+    chat_id = message.chat.id
+    user = message.from_user
+
+    try:
+        await message.delete()
+    except TelegramAPIError as e:
+        # v5.1.0 (фикс финального ревью): было debug — незавершённое удаление
+        # оставляет команду висеть в чате, а удаление ровно для этого и
+        # существует. warning, не error: у бота может не быть прав, это
+        # ожидаемая эксплуатационная ситуация, а не баг.
+        logger.warning("rules: cannot delete command in chat %s: %s", chat_id, e)
+
+    now = time.time()
+    key = (user.id, chat_id)
+    if now - _rules_last_call.get(key, 0.0) < _RULES_COOLDOWN_SECONDS:
+        return
+    stale = [
+        k for k, ts in _rules_last_call.items()
+        if now - ts >= _RULES_COOLDOWN_SECONDS
+    ]
+    for k in stale:
+        del _rules_last_call[k]
+    _rules_last_call[key] = now
+
+    async with async_session() as session:
+        cs = await _get_chat_settings(session, chat_id)
+    url = _resolve_rules_url(cs)
+
+    await _send_ephemeral(
+        bot=message.bot,
+        chat_id=chat_id,
+        recipient=user,
+        text=f'📜 Правила чата: <a href="{html.escape(url, quote=True)}">{html.escape(url, quote=False)}</a>',
+    )
+
+
+@router.message(F.chat.type == "private", _RulesFilter())
+async def handle_rules_dm(message: types.Message) -> None:
+    """/rules в личке — обычный ответ с дефолтной ссылкой."""
+    try:
+        await tg_safe_call(
+            lambda: message.reply(f"📜 Правила: {RULES_URL_DEFAULT}", parse_mode=None),
+            label="rules_dm_reply",
+        )
+    except TelegramAPIError as e:
+        logger.debug("rules: cannot reply in DM: %s", e)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Обработчики команд в ГРУППАХ
 # ═══════════════════════════════════════════════════════════════════════════
 
 @router.message(
     F.chat.type.in_(["group", "supergroup"]),
-    _ModerationCommandFilter(),
+    _KnownCommandFilter(),
 )
 async def handle_group_command(message: types.Message) -> None:
-    """Обрабатывает !mute, !warn, !ban, !unmute, !unban, !unwarn в группах.
+    """Обрабатывает mute, warn, ban, unmute, unban, unwarn и т.д. в группах.
 
-    v4.7.26: фильтр _ModerationCommandFilter теперь стоит в декораторе —
+    v4.7.26: фильтр (тогда _ModerationCommandFilter) стоит в декораторе —
     handler вызывается ТОЛЬКО когда сообщение является командой. Раньше
     handler перехватывал все reply-сообщения и return'ил без обработки,
     что в aiogram 3.x останавливает propagation → handle_content_filters
     (word/link/via_bot filter) не вызывался для reply-сообщений.
 
     v4.8.3: убрано требование F.reply_to_message из декоратора — теперь
-    команды !ban/!sban/!warn/!swarn/!mute/!smute можно отправлять БЕЗ reply,
+    команды ban/sban/warn/swarn/mute/smute можно отправлять БЕЗ reply,
     указав цель первым аргументом (@username или TGID). Команды снятия
-    (!unban/!unmute/!unwarn) по-прежнему требуют reply — проверка внутри.
+    (unban/unmute/unwarn) по-прежнему требуют reply — проверка внутри.
     Также: команда может быть в message.caption (если модератор приложил
-    скриншот нарушения) — _ModerationCommandFilter это учитывает.
+    скриншот нарушения) — _KnownCommandFilter это учитывает.
+
+    v5.1.0: диспетчер переведён с каскада _CMD_*.match() на реестр
+    commands.py (_KnownCommandFilter заменил _ModerationCommandFilter).
+    Публичные команды (mywarns/rules, Access.USER) сюда больше не попадают —
+    _KnownCommandFilter матчит только Access.MOD/ADMIN (см. его docstring),
+    их обслуживают отдельные хендлеры независимо от порядка регистрации в
+    файле. Участник без прав на мод-команду больше не игнорируется молча:
+    команда удаляется и отправляется ephemeral-отказ (_send_access_denied).
     """
     # v4.8.3: команда может быть в message.text ИЛИ message.caption
     # (если модератор приложил скриншот нарушения).
     text = message.text or message.caption
     if not text:
         return
-    # ── v4.4.8 FIX: не трогаем сообщения модератора, если это не команда ──
-    # Раньше бот удалял ЛЮБОЙ ответ модератора в чате (т.к. удаление шло
-    # ДО проверки на соответствие команде). Теперь сначала проверяем, что
-    # текст реально является одной из модераторских команд — и только тогда
-    # удаляем. Обычные ответы модератора больше не исчезают.
-    # v4.7.26: проверка _is_moderation_command уже в фильтре — но оставляем
-    # как defensive guard (вдруг filter изменят).
-    if not _is_moderation_command(text):
+
+    found = commands.resolve(text, commands.get_bot_username())
+    if found is None:
+        # Defensive guard: фильтр уже проверил, но вдруг его поменяют.
+        return
+    spec, cmd_match = found
+
+    # Defensive guard: _KnownCommandFilter уже не пропускает Access.USER
+    # (mywarns, rules — см. его docstring), поэтому эта ветка недостижима
+    # штатно. Оставлена на случай, если фильтр когда-нибудь расширят —
+    # тогда это упадёт сюда как явный no-op, а не как молчаливый стелс.
+    if spec.access == commands.Access.USER:
         return
 
-    # Проверяем, что отправитель — админ
     chat_id = message.chat.id
-    async with async_session() as session:
-        is_adm = await _is_admin(session, chat_id, message.from_user.id)
-    if not is_adm:
-        return
-
     mod = message.from_user
 
-    # ── v4.8.3: резолв цели наказания ──────────────────────────────────
-    # Команды снятия (!unmute/!unban/!unwarn/!warns/!resetwarns) — работают
+    # ── v5.1.0: отказ вместо тишины ────────────────────────────────────
+    # Раньше здесь стоял «if not is_adm: return»: команда обычного юзера
+    # оставалась висеть в чате, и он не понимал, сработала она или нет.
+    # Теперь команда удаляется в любом случае, а при отсутствии прав
+    # уходит ephemeral (с кулдауном — см. _send_access_denied).
+    async with async_session() as session:
+        is_adm = await _is_admin(session, chat_id, mod.id)
+    if not is_adm:
+        try:
+            await message.delete()
+        except TelegramAPIError as e:
+            logger.debug(
+                "denied command: cannot delete message in chat %s: %s", chat_id, e,
+            )
+        await _send_access_denied(message, chat_id, mod)
+        return
+
+    # ── Резолв цели наказания ──────────────────────────────────────────
+    # Команды снятия (unmute/unban/unwarn/warns/resetwarns) — работают
     # ТОЛЬКО по reply. Если reply нет — отказываем.
-    # Наказательные команды (!ban/!sban/!warn/!swarn/!mute/!smute) —
+    # Наказательные команды (ban/sban/warn/swarn/mute/smute) —
     # резолвятся через _resolve_punishment_target (reply → @username → TGID).
-    # v4.8.4: !resetmc — тоже резолвится через _resolve_punishment_target
+    # v4.8.4: resetmc — тоже резолвится через _resolve_punishment_target
     # (reply → @username → TGID), но это не наказательная команда
-    # (сброс счётчика, не мьют/варн/бан).Self/friendly-fire checks не применяются.
-    is_punitive_cmd = bool(
-        _CMD_MUTE.match(text) or _CMD_WARN.match(text) or _CMD_BAN.match(text)
-        or _CMD_SMUTE.match(text) or _CMD_SWARN.match(text) or _CMD_SBAN.match(text)
-    )
-    is_resetmc_cmd = bool(_CMD_RESETMC.match(text))
+    # (сброс счётчика, не мьют/варн/бан). Self/friendly-fire checks не применяются.
+    is_punitive_cmd = spec.name in commands.PUNITIVE
+    is_resetmc_cmd = spec.name == "resetmc"
 
     if is_punitive_cmd or is_resetmc_cmd:
-        # Парсим target из команды (если есть) — для передачи в хелпер.
-        # Берём первый matching паттерн и достаём target-группу.
-        cmd_target_str: str | None = None
-        for pat in (_CMD_BAN, _CMD_SBAN, _CMD_WARN, _CMD_SWARN,
-                    _CMD_MUTE, _CMD_SMUTE, _CMD_RESETMC):
-            m_pat = pat.match(text)
-            if m_pat and m_pat.groupdict().get("target"):
-                cmd_target_str = m_pat.group("target")
-                break
+        # Цель — из именованной группы target, если она есть в матче.
+        cmd_target_str: str | None = cmd_match.groupdict().get("target")
 
         target, target_err = await _resolve_punishment_target(
             message, cmd_target_str, chat_id,
@@ -4324,16 +4458,17 @@ async def handle_group_command(message: types.Message) -> None:
             logger.warning("Не удалось удалить сообщение модератора %s в чате %s",
                            mod.id, chat_id)
 
-    # ── v4.8.10: 11 команд вынесены в mod_commands.py ──────────────────────
-    # Раньше тут были inline-блоки для !mute, !smute, !warn, !swarn, !sban,
-    # !unmute, !unban, !unwarn, !warns, !resetwarns, !resetmc — суммарно
-    # ~850 строк. Теперь все они в mod_commands.COMMANDS dict, и handle_group_command
-    # просто вызывает нужную функцию по имени команды.
-    # cmd_ban уже был вынесен в v4.8.9 — он тоже в COMMANDS.
+    # ── v4.8.10/v5.1.0: 12 команд вынесены в mod_commands.py ────────────────
+    # Раньше тут были inline-блоки для каждой команды — суммарно ~850 строк.
+    # Теперь они живут в mod_commands.COMMANDS dict, и handle_group_command
+    # просто вызывает нужную функцию по имени команды из реестра commands.py.
     #
-    # Порядок проверок сохранён: бан-команды первыми, потом мьют/варн, потом
-    # команды снятия/информации. Это важно для regex-приоритета (например,
-    # !ban матчится раньше !bansticker, если бы он был мод-командой).
+    # v5.1.0: диспетч по каскаду .match() заменён на прямой lookup по
+    # spec.name. Заодно чинит найденный при рефакторинге баг: cmd_ban не
+    # входил в старый _cmd_handlers_in_order — !ban резолвил цель и удалял
+    # сообщение модератора (is_punitive_cmd его учитывал), но до тела
+    # cmd_ban дело не доходило, бан не выполнялся. commands.resolve уже
+    # отдал нам и spec, и match — повторно матчить текст не нужно.
     from mod_commands import COMMANDS as _MOD_COMMANDS
     from mod_commands import ModContext as _ModContext
 
@@ -4343,50 +4478,20 @@ async def handle_group_command(message: types.Message) -> None:
         target=target,
         target_content=target_content,
         text=text,
+        match=cmd_match,
     )
 
-    # Проверяем команды в порядке объявления в handle_group_command (важно для regex).
-    # Каждая cmd_X сама проверяет свой regex через ctx.text и возвращает None если не матчит.
-    _cmd_handlers_in_order = [
-        _MOD_COMMANDS["mute"],
-        _MOD_COMMANDS["smute"],
-        _MOD_COMMANDS["warn"],
-        _MOD_COMMANDS["swarn"],
-        _MOD_COMMANDS["sban"],
-        _MOD_COMMANDS["unmute"],
-        _MOD_COMMANDS["unban"],
-        _MOD_COMMANDS["unwarn"],
-        _MOD_COMMANDS["warns"],
-        _MOD_COMMANDS["resetwarns"],
-        _MOD_COMMANDS["resetmc"],
-    ]
-    for _handler in _cmd_handlers_in_order:
-        _matched_before = _handler.__name__.replace("cmd_", "")
-        # Каждая cmd_X внутри себя делает regex-проверку и возвращает None если не матчит.
-        # Если сматчилась — выполняет команду и return'ит (внутри функции).
-        # Но мы не видим return из функции здесь. Поэтому проверяем regex здесь
-        # и вызываем только если матчит.
-        _cmd_regex_map = {
-            "mute": _CMD_MUTE,
-            "smute": _CMD_SMUTE,
-            "warn": _CMD_WARN,
-            "swarn": _CMD_SWARN,
-            "sban": _CMD_SBAN,
-            "unmute": _CMD_UNMUTE,
-            "unban": _CMD_UNBAN,
-            "unwarn": _CMD_UNWARN,
-            "warns": _CMD_WARNS,
-            "resetwarns": _CMD_RESETWARNS,
-            "resetmc": _CMD_RESETMC,
-        }
-        _regex = _cmd_regex_map.get(_matched_before)
-        if _regex and _regex.match(text):
-            await _handler(message, _ctx)
-            return
-
-    # Ни одна команда не сматчилась — это не мод-команда.
-    # (filter _ModerationCommandFilter в декораторе уже должен был отсечь,
-    # но это defensive guard для случая если filter изменят.)
+    _handler = _MOD_COMMANDS.get(spec.name)
+    if _handler is not None:
+        await _handler(message, _ctx)
+    else:
+        # v5.1.0: команда прошла реестр commands.py и все проверки прав,
+        # но забыта в mod_commands.COMMANDS — сообщение модератора уже
+        # удалено выше, а наказание не выполнится. Раньше эта же связка
+        # "реестр не совпадает с реальным диспетчером" молча теряла !ban
+        # и !alarm (см. changelog v5.1.0); это state "кода не существует",
+        # а не рантайм-сбой, поэтому error, а не warning.
+        logger.error("dispatch: нет обработчика для команды %r", spec.name)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4398,12 +4503,12 @@ async def handle_group_command(message: types.Message) -> None:
     _AlarmCommandFilter(),
 )
 async def handle_alarm_command(message: types.Message) -> None:
-    """!alarm on [duration] / !alarm off — экстренная блокировка медиа в чате.
+    """alarm on [duration] / alarm off — экстренная блокировка медиа в чате.
 
     Доступ: любой модератор (ChatAdmin или ADMIN_IDS). Не требует reply
     на сообщение нарушителя — это "режимная" команда, применяется ко всему чату.
 
-    Поведение !alarm on:
+    Поведение alarm on:
       • Если чат в night mode → отказ (DM модератору: "сейчас ночной режим,
         alarm избыточен"). Ночной режим сам по себе ограничивает права.
       • Если alarm уже активен → обновляем alarm_active_until (продлеваем
@@ -4411,31 +4516,34 @@ async def handle_alarm_command(message: types.Message) -> None:
       • Иначе: snapshot текущих прав → применяем alarm_permissions + slow_mode 30s
       • Логируем, отправляем подтверждение в DM модератору
 
-    Поведение !alarm off:
+    Поведение alarm off:
       • Если alarm не активен → DM: "Alarm не активен"
       • Иначе: восстанавливаем права (через _deactivate_alarm) → DM: "Alarm снят"
 
-    Стелс: обычные юзеры (не модераторы) полностью игнорируются — бот
-    не отвечает им в чате, не шлёт DM, не удаляет их сообщение. Только
-    модераторы получают DM-подтверждение.
-
     v4.7.26: фильтр _AlarmCommandFilter теперь стоит в декораторе —
-    handler вызывается ТОЛЬКО когда сообщение является !alarm командой.
-    Раньше handler перехватывал ВСЕ group messages (даже не !alarm) и
+    handler вызывается ТОЛЬКО когда сообщение является alarm-командой.
+    Раньше handler перехватывал ВСЕ group messages (даже не alarm) и
     return'ил, что в aiogram 3.x останавливает propagation →
     handle_content_filters (word/link/via_bot filter) не вызывался.
+
+    v5.1.0: команда резолвится через commands.resolve (реестр), а не через
+    локальную копию _CMD_ALARM — именованные группы state/amount/unit.
+    Юзер без прав больше не получает стелс-тишину: команда удаляется и
+    уходит ephemeral-отказ через _send_access_denied, как у остальных
+    мод-команд (раньше alarm была единственным исключением).
     """
     text = message.text
     # text не None — гарантировано _AlarmCommandFilter'ом.
 
-    m = _CMD_ALARM.match(text)
-    if not m:
+    found = commands.resolve(text, commands.get_bot_username())
+    if found is None or found[0].name != "alarm":
         return  # Defensive — filter уже это проверил, но на всякий случай.
+    _spec, m = found
 
     # Парсим аргументы
-    action_raw = m.group(1).lower()
-    duration_value = m.group(2)
-    duration_unit = m.group(3)
+    action_raw = m.group("state").lower()
+    duration_value = m.group("amount")
+    duration_unit = m.group("unit")
 
     is_on = action_raw in ("on", "вкл")
     is_off = action_raw in ("off", "выкл")
@@ -4446,11 +4554,21 @@ async def handle_alarm_command(message: types.Message) -> None:
     mod = message.from_user
 
     # ── Проверка прав: только модераторы (ChatAdmin в БД или ADMIN_IDS env) ──
-    # Стелс: если пишет не модератор — полностью игнорируем (return).
+    # v5.1.0: раньше здесь стоял стелс-возврат (тишина для юзера без прав) —
+    # единственная мод-команда с таким поведением. Приведено к общему
+    # поведению: удаление + ephemeral-отказ (см. docstring выше).
     async with async_session() as session:
         is_adm = await _is_admin(session, chat_id, mod.id)
     if not is_adm:
-        return  # Молча игнорируем — стелс
+        try:
+            await message.delete()
+        except TelegramAPIError as e:
+            logger.debug(
+                "denied alarm command: cannot delete message in chat %s: %s",
+                chat_id, e,
+            )
+        await _send_access_denied(message, chat_id, mod)
+        return
 
     # ── Удаляем сообщение модератора с командой (если auto_delete_commands) ──
     async with async_session() as session:
@@ -4538,7 +4656,7 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    "🌙 Сейчас активен ночной режим — !alarm включить нельзя.\n"
+                    "🌙 Сейчас активен ночной режим — /alarm включить нельзя.\n"
                     "Ночной режим уже ограничивает права чата (медиа отключены, "
                     "slow_mode активен). Alarm будет избыточен.\n"
                     "Дождитесь окончания ночного режима или отключите его."
@@ -4555,7 +4673,7 @@ async def handle_alarm_command(message: types.Message) -> None:
             await _send_alarm_dm(
                 bot=message.bot, user_id=mod.id,
                 text=(
-                    "🚫 Сейчас активен санитарный день — !alarm включить нельзя.\n"
+                    "🚫 Сейчас активен санитарный день — /alarm включить нельзя.\n"
                     "Санитарный день уже ограничивает права чата (полный локдаун). "
                     "Alarm будет избыточен."
                 ),
@@ -4630,7 +4748,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                     text=(
                         f"⏱ Alarm уже был активен — auto-off отключён.\n"
                         f"• Предыдущий alarm включил: {prev_mod_display}\n"
-                        f"• Теперь alarm будет активен до ручного !alarm off."
+                        f"• Теперь alarm будет активен до ручного /alarm off."
                     ),
                 )
                 # v4.8.0: продление с пустой длительностью (auto-off отключён) —
@@ -4733,7 +4851,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                 f"• Медиа отключены (только текст)\n"
                 f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n"
                 f"• Auto-off: {cs.alarm_active_until.isoformat() if cs.alarm_active_until else 'N/A'}\n\n"
-                f"Снять раньше: !alarm off"
+                f"Снять раньше: /alarm off"
             ),
         )
     else:
@@ -4743,7 +4861,7 @@ async def handle_alarm_command(message: types.Message) -> None:
                 f"🚨 Alarm включён в чате (без авто-отключения).\n"
                 f"• Медиа отключены (только текст)\n"
                 f"• Slow mode: {_ALARM_SLOW_MODE_DELAY} сек\n\n"
-                f"Снять: !alarm off"
+                f"Снять: /alarm off"
             ),
         )
 
@@ -5408,6 +5526,147 @@ async def cmd_linkallowlist(message: types.Message) -> None:
     await message.reply("\n".join(lines), parse_mode="HTML")
 
 
+# ── v5.1.0: управление вайтлистом ботов из личных сообщений ─────────────
+# Паритет с /linkallow: доступ только у ADMIN_IDS, скоуп задаётся первым
+# аргументом — «global» либо chat_id.
+
+
+def _parse_whitelist_scope(arg: str) -> int | None:
+    """«global» → 0, число → chat_id, мусор → None."""
+    value = (arg or "").strip().lower()
+    if value == "global":
+        return 0
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _normalize_bot_username(arg: str) -> str:
+    """Приводит «@GifBot» к «gifbot»."""
+    return (arg or "").strip().lstrip("@").lower()
+
+
+@router.message(F.chat.type == "private", Command("botallow"))
+async def cmd_botallow(message: types.Message) -> None:
+    """v5.1.0: /botallow <chat_id|global> <@bot> — добавить бота в вайтлист."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /botallow chat_id|global <@bot>\n"
+            "💡 Пример: /botallow global @gif\n"
+            "    /botallow -1001234567890 @vid",
+            parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    username = _normalize_bot_username(parts[2])
+    if not username:
+        await message.reply("❌ Укажите @username бота", parse_mode=None)
+        return
+
+    async with async_session() as session:
+        existing = (await session.execute(
+            select(BotWhitelist).where(
+                BotWhitelist.chat_id == chat_id,
+                func.lower(BotWhitelist.bot_username) == username,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            await message.reply(f"⚠️ @{username} уже в вайтлисте", parse_mode=None)
+            return
+        session.add(BotWhitelist(
+            chat_id=chat_id,
+            bot_username=username,
+            added_by_mod_id=message.from_user.id,
+        ))
+        await session.commit()
+
+    scope_str = "глобально" if chat_id == 0 else f"в чате {chat_id}"
+    await message.reply(f"✅ @{username} добавлен в вайтлист {scope_str}", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("botunallow"))
+async def cmd_botunallow(message: types.Message) -> None:
+    """v5.1.0: /botunallow <chat_id|global> <@bot> — убрать бота из вайтлиста."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /botunallow chat_id|global <@bot>", parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    username = _normalize_bot_username(parts[2])
+    # v5.1.0: тот же guard, что у cmd_botallow — его тут не было, и
+    # «/botunallow global @» отвечал «⚠️ @ не найден в вайтлисте» вместо
+    # понятной ошибки формата.
+    if not username:
+        await message.reply("❌ Укажите @username бота", parse_mode=None)
+        return
+
+    async with async_session() as session:
+        row = (await session.execute(
+            select(BotWhitelist).where(
+                BotWhitelist.chat_id == chat_id,
+                func.lower(BotWhitelist.bot_username) == username,
+            )
+        )).scalar_one_or_none()
+        if row is None:
+            await message.reply(f"⚠️ @{username} не найден в вайтлисте", parse_mode=None)
+            return
+        await session.delete(row)
+        await session.commit()
+
+    await message.reply(f"✅ @{username} убран из вайтлиста", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("botallowlist"))
+async def cmd_botallowlist(message: types.Message) -> None:
+    """v5.1.0: /botallowlist [chat_id|global] — показать вайтлист."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+
+    stmt = select(BotWhitelist).order_by(
+        BotWhitelist.chat_id.asc(), BotWhitelist.bot_username.asc(),
+    )
+    if len(parts) > 1:
+        chat_id = _parse_whitelist_scope(parts[1])
+        if chat_id is None:
+            await message.reply(
+                "❌ chat_id должен быть числом или 'global'", parse_mode=None,
+            )
+            return
+        stmt = stmt.where(BotWhitelist.chat_id == chat_id)
+
+    async with async_session() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+
+    if not rows:
+        await message.reply("📋 Вайтлист ботов пуст", parse_mode=None)
+        return
+
+    lines = ["📋 Вайтлист ботов:"]
+    for row in rows:
+        scope = "global" if row.chat_id == 0 else str(row.chat_id)
+        lines.append(f"• @{row.bot_username} — {scope}")
+    await message.reply("\n".join(lines), parse_mode=None)
+
+
 # ── v4.8.0: Keyword-watch + Modchat команды ─────────────────────────────────
 # !setkeywords word1,word2,word3 — полная замена списка (SU-only).
 # !addkeyword «фраза» [--ban-night] — добавить фразу (SU-only).
@@ -5436,7 +5695,7 @@ async def cmd_setkeywords(message: types.Message) -> None:
         parts_str = parts_str[len("!setkeywords"):].strip()
     if not parts_str:
         await message.reply(
-            "📋 Формат: !setkeywords word1, word2, \"фраза с пробелом\" [--ban-night]\n"
+            "📋 Формат: /setkeywords word1, word2, \"фраза с пробелом\" [--ban-night]\n"
             "Полная замена списка keyword-watch фраз. Старые фразы будут удалены.",
             parse_mode=None,
         )
@@ -5496,7 +5755,7 @@ async def cmd_addkeyword(message: types.Message) -> None:
         parts_str = parts_str[len("!addkeyword"):].strip()
     if not parts_str:
         await message.reply(
-            "📋 Формат: !addkeyword \"фраза\" [--ban-night]\n"
+            "📋 Формат: /addkeyword \"фраза\" [--ban-night]\n"
             "Добавляет фразу в keyword-watch список.",
             parse_mode=None,
         )
@@ -5561,7 +5820,7 @@ async def cmd_delkeyword(message: types.Message) -> None:
     elif parts_str.startswith("!delkeyword"):
         parts_str = parts_str[len("!delkeyword"):].strip()
     if not parts_str:
-        await message.reply("📋 Формат: !delkeyword \"фраза\"", parse_mode=None)
+        await message.reply("📋 Формат: /delkeyword \"фраза\"", parse_mode=None)
         return
     if (parts_str.startswith('"') and parts_str.endswith('"')) or (parts_str.startswith("'") and parts_str.endswith("'")):
         parts_str = parts_str[1:-1]
@@ -5631,7 +5890,7 @@ async def cmd_setmodchat(message: types.Message) -> None:
     parts = (message.text or "").split()
     if len(parts) < 2:
         await message.reply(
-            "📋 Формат: !setmodchat <chat_id>\n"
+            "📋 Формат: /setmodchat <chat_id>\n"
             "0 = сбросить modchat.",
             parse_mode=None,
         )
@@ -6121,7 +6380,7 @@ async def cmd_idea_dm(message: types.Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.reply(
-            "💡 Формат: !idea <текст идеи>\n"
+            "💡 Формат: /idea <текст идеи>\n"
             f"Максимум {_IDEA_MAX_LEN} символов.",
             parse_mode=None,
         )
@@ -6164,7 +6423,7 @@ async def cmd_idea_modchat(message: types.Message) -> None:
         # В modchat можно подсказать формат — тут только свои.
         try:
             await message.reply(
-                f"💡 Формат: !idea <текст идеи> (макс. {_IDEA_MAX_LEN} символов)",
+                f"💡 Формат: /idea <текст идеи> (макс. {_IDEA_MAX_LEN} символов)",
                 parse_mode=None,
             )
         except TelegramAPIError as e:
@@ -7065,6 +7324,46 @@ async def cmd_sanitary(message: types.Message) -> None:
 # чистые функции, возвращающие InputRichMessage. cmd_help() выбирает по
 # роли и вызывает bot.send_rich_message. Без fallback на HTML (риск что
 # Rich Message не поддерживается — принят; Telegram clients обновлены).
+#
+# v5.1.0: список команд в обоих блоках /help был продублирован построчно
+# (строки ~7408 и ~7559 в версии до реформы) и разошёлся с реестром
+# _ALL_MOD_COMMANDS ещё до него. Теперь единственный источник — реестр
+# commands.GROUP_COMMANDS: _help_rows() отдаёт все строки плоским списком,
+# _help_row() достаёт одну по имени команды для секций, сгруппированных
+# по смыслу (громкие/тихие/снятие). Префикс «!» нигде не рекламируется —
+# он остаётся тихим алиасом (см. commands.py).
+
+
+def _help_rows() -> list[tuple[str, str]]:
+    """v5.1.0: строки справки из реестра команд.
+
+    До v5.1.0 список команд был продублирован в двух блоках /help и в
+    _ALL_MOD_COMMANDS. Копии разошлись. Теперь источник один —
+    commands.GROUP_COMMANDS.
+
+    Префикс «!» намеренно не упоминается: он остаётся рабочим алиасом,
+    но не рекламируется.
+    """
+    rows: list[tuple[str, str]] = []
+    for spec in commands.GROUP_COMMANDS:
+        label = f"/{spec.name}"
+        if spec.args_hint:
+            label = f"{label} {spec.args_hint}"
+        rows.append((label, spec.description))
+    return rows
+
+
+def _help_row(name: str) -> tuple[str, str]:
+    """Одна строка справки по имени команды (см. _help_rows).
+
+    Нужна секциям /help, которые группируют команды по смыслу
+    (громкие/тихие/снятие) — сами данные всё равно из реестра.
+    """
+    for label, description in _help_rows():
+        if label.split()[0].lstrip("/") == name:
+            return label, description
+    raise KeyError(name)
+
 
 def _help_code(text: str) -> RichTextCode:
     """Шорткат для inline-моноширинного кода в List-пунктах."""
@@ -7135,6 +7434,7 @@ def _build_help_full_rich() -> InputRichMessage:
 
     Структура:
       1. H1 заголовок + Divider
+      1.5. Публичные команды (mywarns, rules) — раскрыто, v5.1.0
       2. Громкие команды (3 шт) — раскрыто
       3. Тихие команды (3 шт) — раскрыто
       4. Снятие наказаний / Прочее (6 шт) — раскрыто
@@ -7161,37 +7461,41 @@ def _build_help_full_rich() -> InputRichMessage:
     ))
     blocks.append(InputRichBlockDivider())
 
-    # 2. Громкие команды (раскрыто)
+    # 1.5. Публичные команды (доступны всем участникам) — из реестра, v5.1.0.
+    # v5.1.0 (фикс финального ревью): mywarns/rules — главная пользовательская
+    # фича релиза, но /help их не перечислял. Access.USER, доступны без
+    # прав модератора.
+    blocks.extend(_help_section(
+        "Публичные (доступны всем участникам)",
+        [_help_row("mywarns"), _help_row("rules")],
+    ))
+
+    # 2. Громкие команды (раскрыто) — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Громкие команды (reply на нарушителя)",
-        [
-            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
-            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
-            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
-        ],
+        [_help_row("mute"), _help_row("warn"), _help_row("ban")],
     ))
 
-    # 3. Тихие команды (раскрыто)
+    # 3. Тихие команды (раскрыто) — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Тихие команды (стелс, ephemeral модератору)",
-        [
-            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
-            ("!swarn [причина]", "варн. Нарушитель видит причину"),
-            ("!sban [причина]", "бан без публичного сообщения"),
-        ],
+        [_help_row("smute"), _help_row("swarn"), _help_row("sban")],
     ))
 
-    # 4. Снятие наказаний / Прочее (раскрыто)
+    # 4. Снятие наказаний / Прочее (раскрыто) — из реестра, v5.1.0.
+    # idea — отдельный хендлер с двойным префиксом (см. cmd_idea выше по
+    # файлу), в реестр не входит, добавляется вручную.
     blocks.extend(_help_section(
         "Снятие наказаний / Прочее",
         [
-            ("!unmute / !unban", "снять ограничения (reply)"),
-            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
-            ("!warns", "показать активные варны (в личку)"),
-            ("!resetwarns", "обнулить варны (только админы)"),
-            ("!resetmc [@user|tgid]", "обнулить счётчик автомьютов (только админы)"),
-            ("!alarm on [длит] / !alarm off", "режим тревоги (усиленные ограничения)"),
-            ("!idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
+            _help_row("unmute"),
+            _help_row("unban"),
+            _help_row("unwarn"),
+            _help_row("warns"),
+            _help_row("resetwarns"),
+            _help_row("resetmc"),
+            _help_row("alarm"),
+            ("/idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
         ],
     ))
 
@@ -7227,11 +7531,11 @@ def _build_help_full_rich() -> InputRichMessage:
             " удалён в v4.8.1 — используйте KeywordWatch через веб-панель ",
             RichTextUrl(text="/admin/keywords", url=f"{web_url}/admin/keywords"),
             " или групповые команды ",
-            RichTextCode(text="!addkeyword"),
+            RichTextCode(text="/addkeyword"),
             " / ",
-            RichTextCode(text="!delkeyword"),
+            RichTextCode(text="/delkeyword"),
             " / ",
-            RichTextCode(text="!listkeywords"),
+            RichTextCode(text="/listkeywords"),
             ".",
         ],
     ))
@@ -7290,12 +7594,26 @@ def _build_help_moderator_rich() -> InputRichMessage:
     """Сокращённая версия /help для moderator — через Rich Message.
 
     Только то, что модератор может использовать:
-      • Громкие команды (!mute, !warn, !ban)
-      • Тихие команды (!smute, !swarn, !sban)
-      • Снятие наказаний (!unmute, !unban, !unwarn, !warns)
-    Без !resetwarns (только админы) и !alarm (только админы).
+      • Публичные (/mywarns, /rules) — v5.1.0, финальное ревью: модератор
+        тоже участник чата и интересуется своими варнами
+      • Громкие команды (/mute, /warn, /ban)
+      • Тихие команды (/smute, /swarn, /sban)
+      • Снятие наказаний / Прочее (/unmute, /unban, /unwarn, /warns, /alarm)
+    Без /resetwarns и /resetmc — они реально admin-only (доп. проверка роли
+    живёт в обработчике, см. commands.py).
     Без всех Details-блоков настроек — модератор не может их вызывать.
     Footer: веб-ссылка + версия + «Логин и пароль выдаёт SU».
+
+    v5.1.0: строки — из реестра commands.GROUP_COMMANDS через _help_row().
+
+    v5.1.0 (фикс round 2, ревью Task 10): /alarm раньше была исключена
+    отсюда с пометкой «только админы» — неверно. handle_alarm_command
+    пускает любого модератора (та же проверка _is_admin, что у /ban и
+    /mute), в commands.py она Access.MOD. До этого релиза !alarm вообще
+    не работала — расхождение справки с кодом было не видно. Теперь
+    команда ожила, и справка обязана её показывать: скрывать рабочую
+    команду от тех, кому положено ей пользоваться, — не защита, а вред
+    (единственная экстренная команда в наборе).
     """
     try:
         from web_app import APP_VERSION
@@ -7312,41 +7630,45 @@ def _build_help_moderator_rich() -> InputRichMessage:
     ))
     blocks.append(InputRichBlockDivider())
 
-    # Громкие команды
+    # Публичные команды — модератор тоже участник чата и тоже получает
+    # варны, поэтому /mywarns ему пригождается не меньше, чем остальным.
+    blocks.extend(_help_section(
+        "Публичные (доступны всем участникам)",
+        [_help_row("mywarns"), _help_row("rules")],
+    ))
+
+    # Громкие команды — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Громкие команды (reply на нарушителя)",
-        [
-            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
-            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
-            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
-        ],
+        [_help_row("mute"), _help_row("warn"), _help_row("ban")],
     ))
 
-    # Тихие команды
+    # Тихие команды — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Тихие команды (стелс, ephemeral модератору)",
-        [
-            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
-            ("!swarn [причина]", "варн. Нарушитель видит причину"),
-            ("!sban [причина]", "бан без публичного сообщения"),
-        ],
+        [_help_row("smute"), _help_row("swarn"), _help_row("sban")],
     ))
 
-    # Снятие наказаний
+    # Снятие наказаний / Прочее — из реестра, v5.1.0. alarm добавлена в
+    # фиксе round 2 (ревью Task 10): раньше считалась admin-only ошибочно
+    # (см. докстринг функции выше) — код пускает любого модератора.
     blocks.extend(_help_section(
-        "Снятие наказаний",
+        "Снятие наказаний / Прочее",
         [
-            ("!unmute / !unban", "снять ограничения (reply)"),
-            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
-            ("!warns", "показать активные варны (в личку)"),
+            _help_row("unmute"),
+            _help_row("unban"),
+            _help_row("unwarn"),
+            _help_row("warns"),
+            _help_row("alarm"),
         ],
     ))
 
-    # Идеи
+    # Идеи. idea — отдельный хендлер, в реестр не входит, добавляется
+    # вручную (см. _build_help_full_rich).
     blocks.extend(_help_section(
         "Предложить идею",
         [
-            ("!idea <текст>", "отправить идею в GitHub Issue (только ЛС/modchat, до 200 символов)"),
+            ("/idea <текст>", "отправить идею в GitHub Issue (только ЛС/modchat, до 200 символов)"),
         ],
     ))
 
@@ -7881,6 +8203,70 @@ async def handle_sticker_message(message: types.Message) -> None:
         return
 
 
+async def _is_bot_whitelisted(
+    session, chat_id: int, bot_username: str, bot_id: int,
+) -> BotWhitelist | None:
+    """v5.1.0: строка вайтлиста, матчащая этого бота в этом чате или
+    глобально — либо None, если он не в вайтлисте.
+
+    Матч по username (регистронезависимо) ИЛИ по bot_id — username бота
+    можно сменить, числовой id нет.
+
+    v5.1.0 (фикс финального ревью, находка 3): раньше отдавала bool,
+    выбрасывая уже прочитанную строку. Вызывающий код (_check_via_bot_filter)
+    из-за этого не мог понять, нужен ли бэкфилл bot_id, не читая её заново —
+    и просто гонял безусловный UPDATE+commit на каждое сообщение от белого
+    бота, включая случаи, когда bot_id уже заполнен. Теперь строка
+    возвращается целиком: решение «нужен ли бэкфилл» принимается без
+    лишнего похода в БД.
+    """
+    username = (bot_username or "").lower().lstrip("@")
+    row = (await session.execute(
+        select(BotWhitelist).where(
+            BotWhitelist.chat_id.in_((0, chat_id)),
+            or_(
+                func.lower(BotWhitelist.bot_username) == username,
+                BotWhitelist.bot_id == bot_id,
+            ),
+        ).limit(1)
+    )).scalar_one_or_none()
+    return row
+
+
+async def _backfill_whitelist_bot_id(
+    session, chat_id: int, bot_username: str, bot_id: int,
+) -> None:
+    """v5.1.0: оппортунистически проставляет bot_id строке вайтлиста.
+
+    До этого метода bot_id никто не писал — колонка всегда была NULL,
+    а ветка матча по bot_id в `_is_bot_whitelisted` (`NULL == bot_id`)
+    никогда не срабатывала. Как только бот встретился по username и его
+    числовой id известен — фиксируем его в строке, у которой bot_id ещё
+    не заполнен, чтобы дальше матч пережил смену username.
+
+    v5.1.0 (фикс финального ревью, находка 3): раньше вызывалась безусловно
+    на каждое сообщение от белого бота — UPDATE ... WHERE bot_id IS NULL
+    бил в ноль строк и всё равно коммитил пишущую транзакцию SQLite на
+    каждое сообщение, если строка уже заполнена или бот сматчился только
+    по bot_id (username с тех пор сменился — WHERE по username такую
+    строку никогда не найдёт). Теперь вызывающий код (_check_via_bot_filter)
+    вызывает эту функцию только когда `row.bot_id is None and
+    row.bot_username == username` — то есть ровно один раз на бота,
+    а не «один раз ИЛИ никогда, но коммит всегда».
+    """
+    username = (bot_username or "").lower().lstrip("@")
+    if not username or not bot_id:
+        return
+    await session.execute(
+        update(BotWhitelist).where(
+            BotWhitelist.chat_id.in_((0, chat_id)),
+            func.lower(BotWhitelist.bot_username) == username,
+            BotWhitelist.bot_id.is_(None),
+        ).values(bot_id=bot_id)
+    )
+    await session.commit()
+
+
 async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
     """v4.7.24: Via-bot rate-limit filter.
 
@@ -7916,6 +8302,44 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
                 return False
             rate_limit = settings.via_bot_rate_limit_seconds or 300
             mute_min = settings.via_bot_mute_minutes or 10
+            # v5.1.0: вайтлист проверяется ДО rate-limit и timestamp не
+            # пишется — белый бот не занимает слот кулдауна, иначе он
+            # подставил бы под автомьют следующего отправителя.
+            whitelist_row = await _is_bot_whitelisted(
+                session, chat_id, vb.username or "", vb.id,
+            )
+            if whitelist_row is not None:
+                logger.debug(
+                    "Via-bot filter: @%s whitelisted in chat %s — skip",
+                    (vb.username or "unknown"), chat_id,
+                )
+                # v5.1.0 (фикс финального ревью, находка 3): бэкфилл теперь
+                # вызывается, только когда строка реально нуждается в нём —
+                # bot_id ещё не проставлен И матч произошёл именно по этому
+                # username (а не по bot_id, когда username с тех пор
+                # сменился — WHERE бэкфилла по username такую строку не
+                # найдёт никогда, и раньше это означало холостой UPDATE+
+                # commit на каждое сообщение вместо разового). Раньше вызов
+                # был безусловным — пишущая транзакция SQLite на общем
+                # event loop бралась на каждое сообщение от белого бота,
+                # даже когда совпадало 0 строк.
+                username_norm = (vb.username or "").lower().lstrip("@")
+                needs_backfill = (
+                    whitelist_row.bot_id is None
+                    and (whitelist_row.bot_username or "").lower() == username_norm
+                )
+                if needs_backfill:
+                    # Не должна ронять обработку сообщения, даже если UPDATE
+                    # не прошёл: белый бот обязан остаться белым в любом случае.
+                    try:
+                        await _backfill_whitelist_bot_id(
+                            session, chat_id, vb.username or "", vb.id,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Via-bot filter: backfill bot_id failed: %s (не критично)", e,
+                        )
+                return False
     except Exception as e:
         logger.warning("Via-bot filter: DB error: %s (fail-open)", e)
         return False
@@ -7988,9 +8412,11 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
             gap_sec, rate_limit, auto_count, new_count,
         )
         # ── v4.8.1: публичное сообщение в чат (фиксированный текст) ───
-        # Формат: «Пользователь "<display_name>" задолбал срать в чат
-        # и был замутан на "<duration>"». Без указания причины — она
-        # техническая (rate-limit details) и чату неинтересна.
+        # v5.1.0: формулировка переписана — «Пользователь «<display_name>»
+        # слишком много срал ботами и был заглушён на <duration>». Запятой
+        # перед «и» нет намеренно: одно подлежащее, два однородных
+        # сказуемых. Без указания причины — она техническая (rate-limit
+        # details) и чату неинтересна.
         try:
             display_name = _user_display_name(fu)
             name_safe = html.escape(display_name, quote=False)
@@ -7998,8 +8424,8 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
             await message.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f'Пользователь "<b>{name_safe}</b>" задолбал срать в чат '
-                    f'и был замутан на "<b>{dur_safe}</b>"'
+                    f'Пользователь «<b>{name_safe}</b>» слишком много срал '
+                    f'ботами и был заглушён на <b>{dur_safe}</b>'
                 ),
                 parse_mode="HTML",
             )
