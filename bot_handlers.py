@@ -583,6 +583,14 @@ class _AlarmCommandFilter(BaseFilter):
         return found is not None and found[0].name == "alarm"
 
 
+class _MywarnsFilter(BaseFilter):
+    """v5.1.0: матчит /mywarns (и legacy !mywarns) через реестр."""
+
+    async def __call__(self, message: types.Message) -> bool:
+        found = commands.resolve(message.text, commands.get_bot_username())
+        return found is not None and found[0].name == "mywarns"
+
+
 # ── v4.4.8: middleware для полной блокировки disabled-чатов ──────────────
 # Когда в /admin/chats ставят метку Disable (is_enabled=False), бот должен
 # ПЕРЕСТАТЬ ВОСПРИНИМАТЬ ВООБЩЕ ВСЁ в этом чате: ни команды модераторов,
@@ -3887,7 +3895,6 @@ def _get_message_content_desc(msg: types.Message) -> str | None:
 #
 # Таймаут: per-user per-chat, 5 минут, silent (молча игнорирует при превышении).
 
-_CMD_MYWARNS = re.compile(r"^!mywarns\s*$", re.IGNORECASE)
 _MYWARNS_TIMEOUT_SECONDS = 300  # 5 минут
 _mywarns_last_call: dict[tuple[int, int], float] = {}  # (user_id, chat_id) → timestamp
 
@@ -3968,18 +3975,52 @@ async def _send_access_denied(
     )
 
 
+def _format_warn_progress(
+    total: int, warns_to_mute: int | None, warns_to_ban: int | None,
+) -> str:
+    """v5.1.0: «2/3 (до заглушения)» — прогресс до ближайшего порога.
+
+    Пороги независимы, 0 и None означают «выключен». Берём наименьший
+    включённый порог строго больше текущего счётчика. При равных порогах
+    показываем бан: в _check_warn_threshold он проверяется первым.
+
+    Если ни один включённый порог не превышает счётчик (порог понизили или
+    выключили задним числом) — возвращаем голое число, потому что дробь в
+    этой ситуации соврала бы.
+
+    Величина честная: наказание срабатывает по total >= N, после чего
+    варны гасятся через consumed_by_action и _count_warns их не считает.
+    """
+    candidates: list[tuple[int, str]] = []
+    # Бан первым в списке — при равенстве порогов min() возьмёт его.
+    if warns_to_ban and warns_to_ban > total:
+        candidates.append((warns_to_ban, "до бана"))
+    if warns_to_mute and warns_to_mute > total:
+        candidates.append((warns_to_mute, "до заглушения"))
+    if not candidates:
+        return str(total)
+    threshold, label = min(candidates, key=lambda c: c[0])
+    return f"{total}/{threshold} ({label})"
+
+
 async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> str | None:
     """Форматирует сводку варнов юзера для конкретного чата.
 
     Возвращает None если варнов нет. Иначе строку вида:
-      «• Варнов: 2
-        • Последний: 12 авг 2026, 15:30»
+      «2/3 (до заглушения)
+       • Последний варн: 12 авг 2026, 15:30»
+
+    v5.1.0: добавлен прогресс до ближайшего порога — см. _format_warn_progress.
     """
     total = await _count_warns(session, user_id, chat_id)
     if total == 0:
         return None
 
-    # Последний варн (для даты)
+    cs = await _get_chat_settings(session, chat_id)
+    progress = _format_warn_progress(
+        total, cs.warns_to_mute if cs else 0, cs.warns_to_ban if cs else 0,
+    )
+
     last_warn = (await session.execute(
         select(Punishment)
         .where(
@@ -3993,10 +4034,10 @@ async def _format_user_warns_for_chat(session, user_id: int, chat_id: int) -> st
         .limit(1)
     )).scalar_one_or_none()
 
-    lines = [f"• Варнов: {total}"]
+    lines = [progress]
     if last_warn and last_warn.created_at:
         # v4.8.11: русский месяц вместо strftime("%b") — см. _format_msk_date_ru.
-        lines.append(f"• Последний: {_format_msk_date_ru(last_warn.created_at)}")
+        lines.append(f"• Последний варн: {_format_msk_date_ru(last_warn.created_at)}")
 
     return "\n".join(lines)
 
@@ -4036,16 +4077,15 @@ async def _format_user_warns_summary(session, user_id: int) -> str:
     return "\n".join(parts)
 
 
-@router.message(F.chat.type.in_(["group", "supergroup"]), F.text.regexp(r"^!mywarns\s*$"))
+@router.message(F.chat.type.in_(["group", "supergroup"]), _MywarnsFilter())
 async def handle_mywarns_group(message: types.Message) -> None:
-    """!mywarns в группе — удаляет команду, отвечает ephemeral с варнами в этом чате.
+    """/mywarns (и legacy !mywarns) в группе — удаляет команду, отвечает ephemeral с варнами в этом чате.
 
     v4.8.10 (бонус): доступна всем юзерам. Per-user per-chat timeout 5 мин, silent.
     v4.9.0: ответ ephemeral'ом вместо DM — см. комментарий в шапке блока.
+    v5.1.0: матчинг переехал на _MywarnsFilter (реестр commands.py).
     """
     if not message.from_user or not message.text:
-        return
-    if not _CMD_MYWARNS.match(message.text):
         return
 
     user_id = message.from_user.id
@@ -4081,9 +4121,9 @@ async def handle_mywarns_group(message: types.Message) -> None:
         warn_info = await _format_user_warns_for_chat(session, user_id, chat_id)
 
     if warn_info is None:
-        text = "✅ У вас нет активных варнов в этом чате."
+        text = "✅ У вас нет варнов в этом чате."
     else:
-        text = f"📊 Ваши варны в этом чате:\n{warn_info}"
+        text = f"📊 Ваши варны в этом чате: {warn_info}"
 
     # v4.9.0: ephemeral в тот же чат вместо DM.
     #
@@ -4099,15 +4139,14 @@ async def handle_mywarns_group(message: types.Message) -> None:
     )
 
 
-@router.message(F.chat.type == "private", F.text.regexp(r"^!mywarns\s*$"))
+@router.message(F.chat.type == "private", _MywarnsFilter())
 async def handle_mywarns_dm(message: types.Message) -> None:
-    """!mywarns в DM — отвечает напрямую, сводка по всем чатам.
+    """/mywarns (и legacy !mywarns) в DM — отвечает напрямую, сводка по всем чатам.
 
     v4.8.10 (бонус): доступна всем юзерам. Per-user timeout 5 мин (per-chat=DM chat id), silent.
+    v5.1.0: матчинг переехал на _MywarnsFilter (реестр commands.py).
     """
     if not message.from_user or not message.text:
-        return
-    if not _CMD_MYWARNS.match(message.text):
         return
 
     user_id = message.from_user.id
