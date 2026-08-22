@@ -1,0 +1,222 @@
+"""Реестр команд бота — единственный источник истины (v5.1.0).
+
+До v5.1.0 список команд жил в трёх местах: _ALL_MOD_COMMANDS в
+bot_handlers.py и два блока /help (строки 7168 и 7319). Копии успели
+разойтись. Теперь команда описывается здесь один раз, а диспетчер, меню
+Telegram и тексты /help выводятся из этого описания.
+
+Модуль намеренно не зависит ни от aiogram, ни от БД: это делает его
+тестируемым напрямую, без поднятия бота.
+
+Нормализация префикса. Исторически команды жили на «!», сейчас основной
+префикс — «/» (общая конвенция Telegram). «!» остаётся рабочим алиасом, но
+нигде не документируется и не показывается в меню. Вместо того чтобы
+править якорь в пятнадцати паттернах, префикс и суффикс «@botusername»
+срезаются один раз в strip_prefix, а паттерны матчат уже нормализованную
+строку: «ban @vasya Скам» вместо «!ban @vasya Скам».
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class Access(StrEnum):
+    """Уровень доступа, необходимый для команды."""
+
+    USER = "user"    # доступно всем участникам чата
+    MOD = "mod"      # проверяется через _is_admin()
+    ADMIN = "admin"  # дополнительно требует роль su/admin
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    """Описание одной команды.
+
+    :param name: имя без префикса («ban»)
+    :param pattern: regex по нормализованной строке (без «^!»)
+    :param args_hint: аргументы для текста справки («<длит> <причина>»)
+    :param description: одна строка для /help и меню Telegram
+    :param access: минимальный уровень доступа
+    :param in_menu: публиковать ли в меню команд Telegram
+    """
+
+    name: str
+    pattern: re.Pattern
+    args_hint: str
+    description: str
+    access: Access
+    in_menu: bool = False
+
+
+# ── Паттерны ────────────────────────────────────────────────────────────
+# Скопированы из bot_handlers.py без изменений, кроме якоря: «^!mute» → «^mute».
+# Комментарии о причинах их нынешней формы (v4.8.3.1, v4.8.6) остались в
+# bot_handlers.py рядом с историей правок.
+
+_P_MUTE = re.compile(
+    r"^mute\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)\s+(?P<reason>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_WARN = re.compile(
+    r"^warn\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_BAN = re.compile(
+    r"^ban\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<reason>(?!@\w+$|\d+$).+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_SMUTE = re.compile(
+    r"^smute(?:\s+(?:(?P<target>@\w+|\d+)\s+)?(?P<dur>\d+[a-zа-я]+)(?:\s+(?P<reason>.+))?)?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_SWARN = re.compile(
+    r"^swarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_SBAN = re.compile(
+    r"^sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_UNMUTE = re.compile(r"^unmute\s*$", re.IGNORECASE)
+_P_UNBAN = re.compile(r"^unban\s*$", re.IGNORECASE)
+_P_UNWARN = re.compile(r"^unwarn(?:\s+(?P<count>\d+))?\s*$", re.IGNORECASE)
+_P_WARNS = re.compile(r"^warns\s*$", re.IGNORECASE)
+_P_RESETWARNS = re.compile(r"^resetwarns\s*$", re.IGNORECASE)
+_P_RESETMC = re.compile(
+    r"^resetmc(?:\s+(?P<target>@\w+|\d+))?\s*$",
+    re.IGNORECASE,
+)
+_P_ALARM = re.compile(
+    r"^alarm\s+(?P<state>on|off|вкл|выкл)"
+    r"(?:\s+(?P<amount>\d+)\s*(?P<unit>ч|h|м|m|д|d))?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+_P_MYWARNS = re.compile(r"^mywarns\s*$", re.IGNORECASE)
+_P_RULES = re.compile(r"^rules\s*$", re.IGNORECASE)
+
+
+# ── Реестр групповых команд ─────────────────────────────────────────────
+GROUP_COMMANDS: tuple[CommandSpec, ...] = (
+    # Публичные — единственные, что попадают в меню Telegram.
+    CommandSpec("mywarns", _P_MYWARNS, "", "показать свои варны", Access.USER, in_menu=True),
+    CommandSpec("rules", _P_RULES, "", "ссылка на правила чата", Access.USER, in_menu=True),
+    # Громкие мод-команды.
+    CommandSpec("mute", _P_MUTE, "<длит> <причина>",
+                "мьют. Длительность: 1d2h, 30м, 2h", Access.MOD),
+    CommandSpec("warn", _P_WARN, "<причина>",
+                "варн (1 поинт). Сообщение нарушителя удаляется", Access.MOD),
+    CommandSpec("ban", _P_BAN, "<причина>",
+                "бан. Если reply на стикер — пак автодобавляется", Access.MOD),
+    # Тихие (stealth).
+    CommandSpec("smute", _P_SMUTE, "<длит> [причина]",
+                "мьют без публичного сообщения", Access.MOD),
+    CommandSpec("swarn", _P_SWARN, "[причина]",
+                "варн. Нарушитель видит причину", Access.MOD),
+    CommandSpec("sban", _P_SBAN, "[причина]",
+                "бан без публичного сообщения", Access.MOD),
+    # Снятие ограничений.
+    CommandSpec("unmute", _P_UNMUTE, "", "снять мьют (reply)", Access.MOD),
+    CommandSpec("unban", _P_UNBAN, "", "снять бан (reply)", Access.MOD),
+    CommandSpec("unwarn", _P_UNWARN, "[N]",
+                "снять N последних варнов (по умолчанию 1)", Access.MOD),
+    CommandSpec("warns", _P_WARNS, "", "показать активные варны цели", Access.MOD),
+    # Только su/admin — доп. проверка роли живёт в обработчике.
+    CommandSpec("resetwarns", _P_RESETWARNS, "", "обнулить варны", Access.ADMIN),
+    CommandSpec("resetmc", _P_RESETMC, "[@user|tgid]",
+                "обнулить счётчик автомьютов", Access.ADMIN),
+    # Режим тревоги.
+    CommandSpec("alarm", _P_ALARM, "on [длит] | off",
+                "режим тревоги (усиленные ограничения)", Access.MOD),
+)
+
+# Команды, применяющие наказание. На них в диспетчере навешаны проверки
+# self-harm и friendly-fire, и для них цель резолвится через
+# _resolve_punishment_target.
+PUNITIVE: frozenset[str] = frozenset({"ban", "warn", "mute", "sban", "swarn", "smute"})
+
+# Публикуются в меню личных чатов. Административные DM-команды
+# (/bansticker, /setkeywords, /linkallow и ещё около двадцати) сюда
+# намеренно не входят: AllPrivateChats видят все, кто написал боту, и
+# публикация вывесила бы наружу всю админскую поверхность.
+DM_MENU_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("start", "привязать учётную запись"),
+    ("help", "справка по командам"),
+    ("mywarns", "показать свои варны"),
+    ("rules", "ссылка на правила"),
+)
+
+
+# ── Имя бота ────────────────────────────────────────────────────────────
+# Нужно, чтобы отличить «/ban@degradach_bot» от «/ban@other_bot». Ставится
+# один раз при старте из lifespan; фильтры синхронные и сами await'ить
+# bot.me() не могут.
+_bot_username: str | None = None
+
+
+def set_bot_username(username: str | None) -> None:
+    """Запоминает username бота (без «@»). Вызывается из lifespan."""
+    global _bot_username
+    _bot_username = username
+
+
+def get_bot_username() -> str | None:
+    """Username бота, либо None если ещё не установлен."""
+    return _bot_username
+
+
+_HEAD = re.compile(
+    r"^([!/])([A-Za-z0-9_]+)(?:@([A-Za-z0-9_]+))?(.*)$",
+    re.DOTALL,
+)
+
+
+def strip_prefix(text: str | None, bot_username: str | None) -> str | None:
+    """Срезает префикс команды и «@botusername».
+
+    Возвращает нормализованную строку («ban @vasya Скам») либо None, если
+    текст не является командой этого бота.
+
+    Команда, явно адресованная другому боту («/ban@other_bot»), отбрасывается.
+    Если собственный username ещё не известен, явная адресация тоже
+    отбрасывается — перехватывать чужие команды хуже, чем пропустить свою;
+    команда без «@» при этом продолжает работать.
+    """
+    if not text:
+        return None
+    m = _HEAD.match(text.lstrip())
+    if m is None:
+        return None
+    _prefix, name, at_username, rest = m.groups()
+    if at_username is not None:
+        if not bot_username or at_username.lower() != bot_username.lower():
+            return None
+    return f"{name}{rest}"
+
+
+def resolve(
+    text: str | None, bot_username: str | None,
+) -> tuple[CommandSpec, re.Match] | None:
+    """Находит команду в тексте.
+
+    Возвращает пару (спека, match) — match нужен вызывающему коду ради
+    именованных групп target/dur/reason. None, если это не наша команда.
+    """
+    normalized = strip_prefix(text, bot_username)
+    if normalized is None:
+        return None
+    for spec in GROUP_COMMANDS:
+        m = spec.pattern.match(normalized)
+        if m is not None:
+            return spec, m
+    return None
+
+
+def spec_by_name(name: str) -> CommandSpec | None:
+    """Спека по имени команды, либо None."""
+    for spec in GROUP_COMMANDS:
+        if spec.name == name:
+            return spec
+    return None
