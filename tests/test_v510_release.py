@@ -3,7 +3,9 @@
 Запуск: uv run python tools/run_tests.py -k v510_release
 """
 from _paths import _P  # noqa: E402
+import json
 import os
+import re
 import sys
 import unittest
 
@@ -32,11 +34,66 @@ class TestHelpFromRegistry(unittest.TestCase):
             self.assertNotIn(f'("{name}', src, f"{name} остался в /help")
 
     def test_help_covers_every_mod_command(self):
+        """v5.1.0 fix (ревью Task 10): раньше сравнивала _help_rows() саму
+        с собой — _help_rows() это прямой цикл по commands.GROUP_COMMANDS,
+        так что тест не мог упасть иначе как на внутренней ошибке разбора
+        меток. Он не ловил реальный риск: забытый вызов _help_row() внутри
+        секции _build_help_full_rich()/_build_help_moderator_rich() — эти
+        секции курируются руками, а не генерируются циклом.
+
+        Теперь проверяем ОТРЕНДЕРЕННЫЙ текст обоих Rich Message. mywarns и
+        rules — Access.USER, публичные self-service команды, в мод-справке
+        их не было и до реформы, поэтому они явно пропускаются.
+
+        Поиск — через regex с границей слова после имени команды, не через
+        `in`: подстрочный поиск даёт ложный "зелёный" при омонимах внутри
+        текста справки — например "/mute" входит в "/mute_duration",
+        "/warn" — в "/warns_mute" и "/resetwarns", "/ban" — в "/admin/bans".
+
+        v5.1.0 (ревью Task 10, доп. находка): "alarm" в commands.py помечена
+        Access.MOD (handle_alarm_command пускает любого модератора — см. её
+        докстринг), но moderator-версия /help исторически (и до, и после
+        реформы) её не показывает — докстринг _build_help_moderator_rich
+        называет её admin-only, что расходится с реальной проверкой прав в
+        обработчике. Это отдельная, самостоятельная нестыковка документации,
+        не входящая в две находки этого ревью — я её не чиню (не меняю
+        поведение /help и не переклассифицирую access в реестре без
+        отдельного решения), а тест строю по ФАКТИЧЕСКОМУ, а не идеальному
+        поведению: "alarm" из moderator-требования исключена явно, с этим
+        комментарием как следом находки, а не как маскировка теста.
+        """
         import bot_handlers
         import commands
-        labels = {label.split()[0].lstrip("/") for label, _ in bot_handlers._help_rows()}
+
+        full_json = json.dumps(
+            bot_handlers._build_help_full_rich().model_dump(),
+            default=str, ensure_ascii=False,
+        )
+        mod_json = json.dumps(
+            bot_handlers._build_help_moderator_rich().model_dump(),
+            default=str, ensure_ascii=False,
+        )
+
+        def _has_command(text: str, name: str) -> bool:
+            return re.search(rf"/{re.escape(name)}\b", text) is not None
+
+        # Команды, которые moderator-версия /help исторически не показывает,
+        # хотя они не Access.ADMIN. Сейчас единственный случай — "alarm"
+        # (см. докстринг метода выше).
+        _MOD_HELP_EXCEPTIONS = {"alarm"}
+
         for spec in commands.GROUP_COMMANDS:
-            self.assertIn(spec.name, labels, f"/{spec.name} отсутствует в /help")
+            if spec.access == commands.Access.USER:
+                continue  # mywarns/rules — публичные, законно вне мод-справки
+            self.assertTrue(
+                _has_command(full_json, spec.name),
+                f"/{spec.name} отсутствует в отрендеренном full help",
+            )
+            if spec.access == commands.Access.MOD and spec.name not in _MOD_HELP_EXCEPTIONS:
+                self.assertTrue(
+                    _has_command(mod_json, spec.name),
+                    f"/{spec.name} отсутствует в отрендеренном moderator help",
+                )
 
 
 class TestVersion(unittest.TestCase):
