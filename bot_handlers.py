@@ -7305,6 +7305,46 @@ async def cmd_sanitary(message: types.Message) -> None:
 # чистые функции, возвращающие InputRichMessage. cmd_help() выбирает по
 # роли и вызывает bot.send_rich_message. Без fallback на HTML (риск что
 # Rich Message не поддерживается — принят; Telegram clients обновлены).
+#
+# v5.1.0: список команд в обоих блоках /help был продублирован построчно
+# (строки ~7408 и ~7559 в версии до реформы) и разошёлся с реестром
+# _ALL_MOD_COMMANDS ещё до него. Теперь единственный источник — реестр
+# commands.GROUP_COMMANDS: _help_rows() отдаёт все строки плоским списком,
+# _help_row() достаёт одну по имени команды для секций, сгруппированных
+# по смыслу (громкие/тихие/снятие). Префикс «!» нигде не рекламируется —
+# он остаётся тихим алиасом (см. commands.py).
+
+
+def _help_rows() -> list[tuple[str, str]]:
+    """v5.1.0: строки справки из реестра команд.
+
+    До v5.1.0 список команд был продублирован в двух блоках /help и в
+    _ALL_MOD_COMMANDS. Копии разошлись. Теперь источник один —
+    commands.GROUP_COMMANDS.
+
+    Префикс «!» намеренно не упоминается: он остаётся рабочим алиасом,
+    но не рекламируется.
+    """
+    rows: list[tuple[str, str]] = []
+    for spec in commands.GROUP_COMMANDS:
+        label = f"/{spec.name}"
+        if spec.args_hint:
+            label = f"{label} {spec.args_hint}"
+        rows.append((label, spec.description))
+    return rows
+
+
+def _help_row(name: str) -> tuple[str, str]:
+    """Одна строка справки по имени команды (см. _help_rows).
+
+    Нужна секциям /help, которые группируют команды по смыслу
+    (громкие/тихие/снятие) — сами данные всё равно из реестра.
+    """
+    for label, description in _help_rows():
+        if label.split()[0].lstrip("/") == name:
+            return label, description
+    raise KeyError(name)
+
 
 def _help_code(text: str) -> RichTextCode:
     """Шорткат для inline-моноширинного кода в List-пунктах."""
@@ -7401,37 +7441,32 @@ def _build_help_full_rich() -> InputRichMessage:
     ))
     blocks.append(InputRichBlockDivider())
 
-    # 2. Громкие команды (раскрыто)
+    # 2. Громкие команды (раскрыто) — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Громкие команды (reply на нарушителя)",
-        [
-            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
-            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
-            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
-        ],
+        [_help_row("mute"), _help_row("warn"), _help_row("ban")],
     ))
 
-    # 3. Тихие команды (раскрыто)
+    # 3. Тихие команды (раскрыто) — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Тихие команды (стелс, ephemeral модератору)",
-        [
-            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
-            ("!swarn [причина]", "варн. Нарушитель видит причину"),
-            ("!sban [причина]", "бан без публичного сообщения"),
-        ],
+        [_help_row("smute"), _help_row("swarn"), _help_row("sban")],
     ))
 
-    # 4. Снятие наказаний / Прочее (раскрыто)
+    # 4. Снятие наказаний / Прочее (раскрыто) — из реестра, v5.1.0.
+    # idea — отдельный хендлер с двойным префиксом (см. cmd_idea выше по
+    # файлу), в реестр не входит, добавляется вручную.
     blocks.extend(_help_section(
         "Снятие наказаний / Прочее",
         [
-            ("!unmute / !unban", "снять ограничения (reply)"),
-            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
-            ("!warns", "показать активные варны (в личку)"),
-            ("!resetwarns", "обнулить варны (только админы)"),
-            ("!resetmc [@user|tgid]", "обнулить счётчик автомьютов (только админы)"),
-            ("!alarm on [длит] / !alarm off", "режим тревоги (усиленные ограничения)"),
-            ("!idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
+            _help_row("unmute"),
+            _help_row("unban"),
+            _help_row("unwarn"),
+            _help_row("warns"),
+            _help_row("resetwarns"),
+            _help_row("resetmc"),
+            _help_row("alarm"),
+            ("/idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
         ],
     ))
 
@@ -7530,12 +7565,14 @@ def _build_help_moderator_rich() -> InputRichMessage:
     """Сокращённая версия /help для moderator — через Rich Message.
 
     Только то, что модератор может использовать:
-      • Громкие команды (!mute, !warn, !ban)
-      • Тихие команды (!smute, !swarn, !sban)
-      • Снятие наказаний (!unmute, !unban, !unwarn, !warns)
-    Без !resetwarns (только админы) и !alarm (только админы).
+      • Громкие команды (/mute, /warn, /ban)
+      • Тихие команды (/smute, /swarn, /sban)
+      • Снятие наказаний (/unmute, /unban, /unwarn, /warns)
+    Без /resetwarns (только админы) и /alarm (только админы).
     Без всех Details-блоков настроек — модератор не может их вызывать.
     Footer: веб-ссылка + версия + «Логин и пароль выдаёт SU».
+
+    v5.1.0: строки — из реестра commands.GROUP_COMMANDS через _help_row().
     """
     try:
         from web_app import APP_VERSION
@@ -7552,41 +7589,30 @@ def _build_help_moderator_rich() -> InputRichMessage:
     ))
     blocks.append(InputRichBlockDivider())
 
-    # Громкие команды
+    # Громкие команды — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Громкие команды (reply на нарушителя)",
-        [
-            ("!mute <длит> <причина>", "мьют. Длительность: 1d2h, 30м, 2h"),
-            ("!warn <причина>", "варн (1 поинт). Сообщение нарушителя удаляется"),
-            ("!ban <причина>", "бан. Если reply на стикер — пак автодобавляется"),
-        ],
+        [_help_row("mute"), _help_row("warn"), _help_row("ban")],
     ))
 
-    # Тихие команды
+    # Тихие команды — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Тихие команды (стелс, ephemeral модератору)",
-        [
-            ("!smute <длит> [причина]", "мьют без публичного сообщения"),
-            ("!swarn [причина]", "варн. Нарушитель видит причину"),
-            ("!sban [причина]", "бан без публичного сообщения"),
-        ],
+        [_help_row("smute"), _help_row("swarn"), _help_row("sban")],
     ))
 
-    # Снятие наказаний
+    # Снятие наказаний — из реестра, v5.1.0
     blocks.extend(_help_section(
         "Снятие наказаний",
-        [
-            ("!unmute / !unban", "снять ограничения (reply)"),
-            ("!unwarn [N]", "снять N последних варнов (по умолчанию 1)"),
-            ("!warns", "показать активные варны (в личку)"),
-        ],
+        [_help_row("unmute"), _help_row("unban"), _help_row("unwarn"), _help_row("warns")],
     ))
 
-    # Идеи
+    # Идеи. idea — отдельный хендлер, в реестр не входит, добавляется
+    # вручную (см. _build_help_full_rich).
     blocks.extend(_help_section(
         "Предложить идею",
         [
-            ("!idea <текст>", "отправить идею в GitHub Issue (только ЛС/modchat, до 200 символов)"),
+            ("/idea <текст>", "отправить идею в GitHub Issue (только ЛС/modchat, до 200 символов)"),
         ],
     ))
 

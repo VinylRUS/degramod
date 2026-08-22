@@ -304,30 +304,31 @@ def test_regex_and_help():
     except Exception as e:
         _fail("T12: resetmc в реестре", str(e))
 
-    # T13: !resetmc в полном help
+    # T13: /resetmc в полном help
+    # v5.1.0: /help генерируется из реестра, команды теперь на «/».
     try:
         rm = bot_handlers._build_help_full_rich()
         # Convert to string for checking
         import json
         rm_json = json.dumps(rm.model_dump(), default=str, ensure_ascii=False)
-        assert "!resetmc" in rm_json, "!resetmc не найден в полном help"
+        assert "/resetmc" in rm_json, "/resetmc не найден в полном help"
         assert "обнулить счётчик автомьютов" in rm_json.lower() or \
                "счётчик автомьютов" in rm_json.lower(), \
-               "описание !resetmc не найдено"
-        _ok("T13: !resetmc в полном help")
+               "описание /resetmc не найдено"
+        _ok("T13: /resetmc в полном help")
     except Exception as e:
-        _fail("T13: !resetmc в полном help", str(e))
+        _fail("T13: /resetmc в полном help", str(e))
 
-    # T14: !resetmc НЕ в moderator help
+    # T14: /resetmc НЕ в moderator help
     try:
         rm = bot_handlers._build_help_moderator_rich()
         import json
         rm_json = json.dumps(rm.model_dump(), default=str, ensure_ascii=False)
-        assert "!resetmc" not in rm_json, \
-            "!resetmc НЕ должен быть в moderator help (admin-only)"
-        _ok("T14: !resetmc НЕ в moderator help (admin-only)")
+        assert "/resetmc" not in rm_json, \
+            "/resetmc НЕ должен быть в moderator help (admin-only)"
+        _ok("T14: /resetmc НЕ в moderator help (admin-only)")
     except Exception as e:
-        _fail("T14: !resetmc НЕ в moderator help", str(e))
+        _fail("T14: /resetmc НЕ в moderator help", str(e))
 
 
 # ═══════════════════════════════════════════════════════════════════════════

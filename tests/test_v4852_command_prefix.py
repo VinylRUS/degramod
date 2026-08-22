@@ -255,17 +255,18 @@ def test_09_syntax():
             check(f"T9: {fname} syntax OK", False, str(e))
 
 
-# ── T10: проверка, что !idea через regex тоже ловит ────────────────────
+# ── T10: проверка, что idea документирована в help ──────────────────────
 def test_10_idea_command_pattern_in_help():
-    """В help тексте (Rich Message builders) !idea должна быть задокументирована
-    как 'idea' (через ! или / — оба валидны, но help показывает !)."""
+    """В help тексте (Rich Message builders) idea документирована как
+    '/idea' — оба префикса («!» и «/») валидны на входе, но help с v5.1.0
+    рекламирует только «/» (см. commands.py, «!» — тихий алиас)."""
     src = (V485_DIR / "bot_handlers.py").read_text(encoding="utf-8")
-    # Ищем что-то вроде ("!idea <текст>", "описание") в tuples help-билдеров.
-    if re.search(r'["\']!idea\b', src):
-        check("T10: help references '!idea' string", True)
+    # Ищем что-то вроде ("/idea <текст>", "описание") в tuples help-билдеров.
+    if re.search(r'["\']/idea\b', src):
+        check("T10: help references '/idea' string", True)
     else:
-        check("T10: help references '!idea' string", False,
-              "no '!idea' string found")
+        check("T10: help references '/idea' string", False,
+              "no '/idea' string found")
 
 
 # ── Запуск ──────────────────────────────────────────────────────────────

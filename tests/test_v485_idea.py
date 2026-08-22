@@ -12,7 +12,7 @@ test_v485_idea.py — тесты v4.8.5 (идеи через !idea → GitHub Is
   T7:  bot_handlers.py — обработчики cmd_idea_dm, cmd_idea_modchat
   T8:  bot_handlers.py — _IDEA_MAX_LEN = 200
   T9:  bot_handlers.py — стелс: _resolve_sender_web_user возвращает None для постороннего
-  T10: bot_handlers.py — /help (full и moderator) содержит !idea
+  T10: bot_handlers.py — /help (full и moderator) содержит /idea
   T11: web_app.py — APP_VERSION начинается с v4.8.5
   T12: web/admin_settings.py — endpoints /admin/settings/github (GET/POST) + /admin/settings/github/test
   T13: admin_settings.html — раздел GitHub Projects присутствует
@@ -265,7 +265,11 @@ def test_bot_handlers():
     except Exception as e:
         _fail("T9: стелс — посторонний получает None", str(e))
 
-    # T10: /help содержит !idea (full + moderator)
+    # T10: /help содержит /idea (full + moderator)
+    # v5.1.0: /help генерируется из реестра команд и рекламирует только
+    # «/», «!» остаётся тихим алиасом (см. commands.py). idea — отдельный
+    # хендлер, не входящий в реестр, поэтому в текстах help заменена
+    # вручную на "/idea".
     try:
         bh_src = (WORK_DIR / "bot_handlers.py").read_text()
         # Точно выделяем тело каждой функции (от "def _build_help_full_rich"
@@ -293,13 +297,13 @@ def test_bot_handlers():
         mod_body = _extract_func_body(bh_src, "_build_help_moderator_rich")
         assert full_body, "не удалось извлечь тело _build_help_full_rich"
         assert mod_body, "не удалось извлечь тело _build_help_moderator_rich"
-        assert "!idea" in full_body, "!idea отсутствует в full help"
-        assert "!idea" in mod_body, "!idea отсутствует в moderator help"
+        assert "/idea" in full_body, "/idea отсутствует в full help"
+        assert "/idea" in mod_body, "/idea отсутствует в moderator help"
         # Описание содержит упоминание GitHub.
-        assert "GitHub" in full_body, "GitHub не упомянут в full help для !idea"
-        _ok("T10: !idea в /help (full + moderator)")
+        assert "GitHub" in full_body, "GitHub не упомянут в full help для /idea"
+        _ok("T10: /idea в /help (full + moderator)")
     except Exception as e:
-        _fail("T10: !idea в /help", str(e))
+        _fail("T10: /idea в /help", str(e))
 
     # T18: _is_modchat_chat функция
     try:

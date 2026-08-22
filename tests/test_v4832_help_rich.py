@@ -190,20 +190,22 @@ def test_t2_moderator_first_block_h1():
 
 
 # ── T3: полная версия содержит все ожидаемые команд ──
+# v5.1.0: команды в /help переехали с «!» на «/» (реформа реестра
+# commands.py) — список ожидаемых команд обновлён вслед за этим.
 
 EXPECTED_FULL_COMMANDS = [
-    "!mute",
-    "!warn",
-    "!ban",
-    "!smute",
-    "!swarn",
-    "!sban",
-    "!unmute",
-    "!unban",
-    "!unwarn",
-    "!warns",
-    "!resetwarns",
-    "!alarm",
+    "/mute",
+    "/warn",
+    "/ban",
+    "/smute",
+    "/swarn",
+    "/sban",
+    "/unmute",
+    "/unban",
+    "/unwarn",
+    "/warns",
+    "/resetwarns",
+    "/alarm",
     "/settings",
     "/sethashtag",
     "/setreport",
@@ -235,8 +237,8 @@ def test_t3_full_contains_all_commands():
 # ── T4: сокращённая версия НЕ содержит команды только-для-админов ──
 
 ADMIN_ONLY_COMMANDS = [
-    "!resetwarns",
-    "!alarm",
+    "/resetwarns",
+    "/alarm",
     "/settings",
     "/sethashtag",
     "/setreport",
@@ -257,8 +259,8 @@ ADMIN_ONLY_COMMANDS = [
     "/warndecay",
 ]
 
-MODERATOR_ALLOWED_COMMANDS = ["!mute", "!warn", "!ban", "!smute", "!swarn", "!sban",
-                              "!unmute", "!unban", "!unwarn", "!warns"]
+MODERATOR_ALLOWED_COMMANDS = ["/mute", "/warn", "/ban", "/smute", "/swarn", "/sban",
+                              "/unmute", "/unban", "/unwarn", "/warns"]
 
 
 def test_t4_moderator_excludes_admin_only_commands():
@@ -484,7 +486,7 @@ async def test_t12_moderator_gets_moderator():
     rich = call_kwargs.get("rich_message")
     text = _collect_text(rich)
     assert "/nightmode" not in text, "Moderator НЕ должен видеть /nightmode"
-    assert "!mute" in text, "Moderator должен видеть !mute"
+    assert "/mute" in text, "Moderator должен видеть /mute"
 
 
 async def test_t13_deactivated_webuser_no_send():
@@ -518,7 +520,7 @@ async def test_t14_admin_role_gets_full():
     rich = call_kwargs.get("rich_message")
     text = _collect_text(rich)
     assert "/nightmode" in text, "admin должен видеть /nightmode (полная версия)"
-    assert "!alarm" in text, "admin должен видеть !alarm"
+    assert "/alarm" in text, "admin должен видеть /alarm"
 
 
 async def test_t15_su_role_gets_full():
