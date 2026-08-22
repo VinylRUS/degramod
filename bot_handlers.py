@@ -140,12 +140,13 @@ from aiogram.types import (
     RichTextSpoiler,
     RichTextUrl,
 )
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 
 import commands
 from db import (
     AutomuteCounter,
     BannedStickerPack,
+    BotWhitelist,
     ChatAdmin,
     ChatSettings,
     GithubSettings,
@@ -7962,6 +7963,27 @@ async def handle_sticker_message(message: types.Message) -> None:
         return
 
 
+async def _is_bot_whitelisted(
+    session, chat_id: int, bot_username: str, bot_id: int,
+) -> bool:
+    """v5.1.0: True, если бот в вайтлисте для этого чата или глобально.
+
+    Матч по username (регистронезависимо) ИЛИ по bot_id — username бота
+    можно сменить, числовой id нет.
+    """
+    username = (bot_username or "").lower().lstrip("@")
+    row = (await session.execute(
+        select(BotWhitelist).where(
+            BotWhitelist.chat_id.in_((0, chat_id)),
+            or_(
+                func.lower(BotWhitelist.bot_username) == username,
+                BotWhitelist.bot_id == bot_id,
+            ),
+        ).limit(1)
+    )).scalar_one_or_none()
+    return row is not None
+
+
 async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
     """v4.7.24: Via-bot rate-limit filter.
 
@@ -7997,6 +8019,17 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
                 return False
             rate_limit = settings.via_bot_rate_limit_seconds or 300
             mute_min = settings.via_bot_mute_minutes or 10
+            # v5.1.0: вайтлист проверяется ДО rate-limit и timestamp не
+            # пишется — белый бот не занимает слот кулдауна, иначе он
+            # подставил бы под автомьют следующего отправителя.
+            if await _is_bot_whitelisted(
+                session, chat_id, vb.username or "", vb.id,
+            ):
+                logger.debug(
+                    "Via-bot filter: @%s whitelisted in chat %s — skip",
+                    (vb.username or "unknown"), chat_id,
+                )
+                return False
     except Exception as e:
         logger.warning("Via-bot filter: DB error: %s (fail-open)", e)
         return False
