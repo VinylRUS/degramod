@@ -7567,12 +7567,22 @@ def _build_help_moderator_rich() -> InputRichMessage:
     Только то, что модератор может использовать:
       • Громкие команды (/mute, /warn, /ban)
       • Тихие команды (/smute, /swarn, /sban)
-      • Снятие наказаний (/unmute, /unban, /unwarn, /warns)
-    Без /resetwarns (только админы) и /alarm (только админы).
+      • Снятие наказаний / Прочее (/unmute, /unban, /unwarn, /warns, /alarm)
+    Без /resetwarns и /resetmc — они реально admin-only (доп. проверка роли
+    живёт в обработчике, см. commands.py).
     Без всех Details-блоков настроек — модератор не может их вызывать.
     Footer: веб-ссылка + версия + «Логин и пароль выдаёт SU».
 
     v5.1.0: строки — из реестра commands.GROUP_COMMANDS через _help_row().
+
+    v5.1.0 (фикс round 2, ревью Task 10): /alarm раньше была исключена
+    отсюда с пометкой «только админы» — неверно. handle_alarm_command
+    пускает любого модератора (та же проверка _is_admin, что у /ban и
+    /mute), в commands.py она Access.MOD. До этого релиза !alarm вообще
+    не работала — расхождение справки с кодом было не видно. Теперь
+    команда ожила, и справка обязана её показывать: скрывать рабочую
+    команду от тех, кому положено ей пользоваться, — не защита, а вред
+    (единственная экстренная команда в наборе).
     """
     try:
         from web_app import APP_VERSION
@@ -7601,10 +7611,18 @@ def _build_help_moderator_rich() -> InputRichMessage:
         [_help_row("smute"), _help_row("swarn"), _help_row("sban")],
     ))
 
-    # Снятие наказаний — из реестра, v5.1.0
+    # Снятие наказаний / Прочее — из реестра, v5.1.0. alarm добавлена в
+    # фиксе round 2 (ревью Task 10): раньше считалась admin-only ошибочно
+    # (см. докстринг функции выше) — код пускает любого модератора.
     blocks.extend(_help_section(
-        "Снятие наказаний",
-        [_help_row("unmute"), _help_row("unban"), _help_row("unwarn"), _help_row("warns")],
+        "Снятие наказаний / Прочее",
+        [
+            _help_row("unmute"),
+            _help_row("unban"),
+            _help_row("unwarn"),
+            _help_row("warns"),
+            _help_row("alarm"),
+        ],
     ))
 
     # Идеи. idea — отдельный хендлер, в реестр не входит, добавляется

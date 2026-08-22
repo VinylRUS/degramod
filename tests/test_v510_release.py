@@ -50,17 +50,13 @@ class TestHelpFromRegistry(unittest.TestCase):
         текста справки — например "/mute" входит в "/mute_duration",
         "/warn" — в "/warns_mute" и "/resetwarns", "/ban" — в "/admin/bans".
 
-        v5.1.0 (ревью Task 10, доп. находка): "alarm" в commands.py помечена
-        Access.MOD (handle_alarm_command пускает любого модератора — см. её
-        докстринг), но moderator-версия /help исторически (и до, и после
-        реформы) её не показывает — докстринг _build_help_moderator_rich
-        называет её admin-only, что расходится с реальной проверкой прав в
-        обработчике. Это отдельная, самостоятельная нестыковка документации,
-        не входящая в две находки этого ревью — я её не чиню (не меняю
-        поведение /help и не переклассифицирую access в реестре без
-        отдельного решения), а тест строю по ФАКТИЧЕСКОМУ, а не идеальному
-        поведению: "alarm" из moderator-требования исключена явно, с этим
-        комментарием как следом находки, а не как маскировка теста.
+        v5.1.0 (фикс round 2, ревью Task 10): раньше здесь было исключение
+        для "alarm" — moderator-версия /help не показывала её, хотя она
+        Access.MOD и handle_alarm_command пускает любого модератора (та же
+        проверка, что у /ban и /mute). Расхождение было в справке, не в
+        коде/реестре — починено добавлением /alarm в
+        _build_help_moderator_rich(). Требование теперь единое для всех
+        MOD-команд, без исключений.
         """
         import bot_handlers
         import commands
@@ -77,11 +73,6 @@ class TestHelpFromRegistry(unittest.TestCase):
         def _has_command(text: str, name: str) -> bool:
             return re.search(rf"/{re.escape(name)}\b", text) is not None
 
-        # Команды, которые moderator-версия /help исторически не показывает,
-        # хотя они не Access.ADMIN. Сейчас единственный случай — "alarm"
-        # (см. докстринг метода выше).
-        _MOD_HELP_EXCEPTIONS = {"alarm"}
-
         for spec in commands.GROUP_COMMANDS:
             if spec.access == commands.Access.USER:
                 continue  # mywarns/rules — публичные, законно вне мод-справки
@@ -89,7 +80,7 @@ class TestHelpFromRegistry(unittest.TestCase):
                 _has_command(full_json, spec.name),
                 f"/{spec.name} отсутствует в отрендеренном full help",
             )
-            if spec.access == commands.Access.MOD and spec.name not in _MOD_HELP_EXCEPTIONS:
+            if spec.access == commands.Access.MOD:
                 self.assertTrue(
                     _has_command(mod_json, spec.name),
                     f"/{spec.name} отсутствует в отрендеренном moderator help",
