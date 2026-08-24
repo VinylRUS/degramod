@@ -80,6 +80,8 @@ from bot_handlers import (
     _get_report_chat_id,
     _night_mode_in_window,
     _parse_night_mode_permissions,
+    # v5.2.0: TTL-чистка снимков «в ответ на» (таблица reply_contexts).
+    _purge_reply_contexts,
     is_sanitary_day_today,
     parse_sanitary_days_json,
     send_latency_alert_to_su,
@@ -182,6 +184,11 @@ async def _start_polling():
 # night mode может работать как обычно.
 
 
+# v5.2.0: как часто чистить reply_contexts. Час — снимки живут 30 дней,
+# точность до часа тут ничего не решает, а лишние DELETE не нужны.
+_REPLY_CONTEXT_PURGE_INTERVAL_SECONDS: int = 3600
+
+
 async def _night_mode_loop():
     """Background loop: раз в минуту проверяет ночной режим для всех чатов.
 
@@ -202,6 +209,28 @@ async def _night_mode_loop():
         except Exception as e:
             logger.error("Alarm/sanitary/night mode tick error: %s", e)
         await asyncio.sleep(60)
+
+
+async def _reply_context_purge_loop():
+    """Background loop: раз в час чистит reply_contexts от снимков старше TTL.
+
+    v5.2.0. Отдельной таской, а не тиком внутри _night_mode_loop: там
+    инвариант порядка (alarm → sanitary → night), и DELETE по таблице,
+    которая растёт быстрее всех остальных, задержал бы снятие режимов чата —
+    права в чате «залипли» бы до следующего круга.
+    """
+    # Первую чистку не делаем сразу на старте: рестарт бота бывает частым,
+    # а работа тут одинаковая независимо от того, ждали мы час или нет.
+    await asyncio.sleep(_REPLY_CONTEXT_PURGE_INTERVAL_SECONDS)
+    logger.info("Reply context purge task started (interval=1h)")
+    while True:
+        try:
+            deleted = await _purge_reply_contexts()
+            if deleted:
+                logger.info("Reply context purge: удалено %d снимков", deleted)
+        except Exception as e:
+            logger.error("Reply context purge error: %s", e)
+        await asyncio.sleep(_REPLY_CONTEXT_PURGE_INTERVAL_SECONDS)
 
 
 async def _health_probe_loop():
@@ -1532,6 +1561,11 @@ async def lifespan(app):
             health_task = tg.create_task(
                 _health_probe_loop(), name="health_probe_loop",
             )
+            # v5.2.0: TTL-чистка снимков «в ответ на» — тоже отдельной
+            # таской, по той же причине, что и пробник здоровья.
+            purge_task = tg.create_task(
+                _reply_context_purge_loop(), name="reply_context_purge_loop",
+            )
             # Long polling — только если вебхук не установлен.
             if use_polling:
                 polling_task = tg.create_task(
@@ -1549,7 +1583,7 @@ async def lifespan(app):
             # v4.10.2: health_task обязан быть в списке. Забыть его —
             # значит подвесить shutdown: TaskGroup ждёт завершения всех
             # задач, а бесконечный while True сам не выйдет.
-            bg_tasks = [night_task, health_task]
+            bg_tasks = [night_task, health_task, purge_task]
             if polling_task is not None:
                 bg_tasks.append(polling_task)
             for t in bg_tasks:

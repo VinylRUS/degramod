@@ -38,7 +38,7 @@ docker run --env-file .env -p 3000:3000 -v ./data:/app/data degramod
 ### Тесты
 
 ```bash
-uv run python tools/run_tests.py          # вся сюита, 67 файлов
+uv run python tools/run_tests.py          # вся сюита, 87 файлов
 uv run python tools/run_tests.py -k alarm # подмножество по имени файла
 uv run pytest tests/test_v487_sanity.py -q  # один файл
 ```
@@ -51,7 +51,7 @@ uv run pytest tests/test_v487_sanity.py -q  # один файл
 процесс. `pytest tests` напрямую покажет 3 ошибки сбора — это ожидаемо.
 
 `tests/known_failing.txt` — список временно отложенных файлов. Сейчас **пуст**:
-все 67 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
+все 87 файлов зелёные. Пока файл в списке, его падение не роняет сборку, но как
 только он начинает проходить, раннер требует убрать строку.
 
 Около 40 тестов помечены `@unittest.skip` — это проверки удалённых фич
@@ -130,6 +130,9 @@ _exit_night_mode = get_exit_night_mode()
   + `Depends`, не через замыкание. Декомпозиция завершена в v4.10.0.
 - `app_state.py` — service locator, заменивший хак с `sys.modules`.
 - `db.py` (1.6k) — модели SQLAlchemy + `init_db()`.
+- `commands.py` — реестр команд (v5.1.0): паттерны, права, тексты /help.
+  Единственный источник истины; диспетчер, меню Telegram и справка выводятся
+  из него. Здесь же `unwarn_args` — разбор двусмысленного «/unwarn N».
 - `chat_modes.py` — snapshot/restore/apply прав чата (v4.8.0) и
   `_alarm_auto_off_tick` (переехал сюда из `bot.py` в v4.8.9).
 - `modchat.py` — отправка в модчат, keyword-watch, rate-limit алармов.
@@ -157,6 +160,37 @@ _exit_night_mode = get_exit_night_mode()
 Восстановление дневных прав — четырёхуровневый fallback:
 `day_permissions` пресет → сохранённый snapshot → системный пресет `Day default`
 → хардкод `_DAY_DEFAULT_HARDCODED` (продублирован в `bot.py` и `chat_modes.py`).
+
+### Контекст «в ответ на» (v5.2.0)
+
+Отчёт о наказании показывает не только сообщение нарушителя, но и то, на
+что он отвечал. Прочитать это из апдейта нельзя: **Bot API не вкладывает
+reply второго уровня** — `message.reply_to_message.reply_to_message` всегда
+пусто, а запросить сообщение по id задним числом Bot API не даёт.
+
+Поэтому родитель снимается в момент прихода сообщения-ответа
+(`_ReplyContextMiddleware`, outer, регистрируется **после**
+`_DisabledChatMiddleware`) и кладётся в таблицу `reply_contexts`. Читает
+снимок `_resolve_reply_context(message)`: сначала живой
+`reply_to_message` (так его видят автоматические наказания в момент
+обработки), затем БД, иначе `None`.
+
+Что важно помнить:
+
+- Снимок **копирует** содержимое родителя, а не ссылается на него: перечитать
+  его позже неоткуда, а к моменту отчёта оно может быть удалено. `file_id`
+  не протухает, поэтому фото/видео встраивается в отчёт по ссылке.
+- Стикер родителя inline **не** показывается — `_build_sticker_block`
+  требует целый `types.Sticker` (скачивание + конвертация), а не file_id.
+  Вместо него в цитате идёт описание «🎭 [Стикер: 😀]».
+- `reply_context` резолвится **один раз на команду** в `handle_group_command`
+  и живёт в `ModContext`. Не резолвь его заново в каждом `_send_report`.
+- Инвариант сторожат два теста: `TestAllReportCallsPassContext` (каждый
+  вызов `_send_report` обязан прокинуть `reply_context`) и
+  `TestPurgeLoopWiring` (фоновая TTL-чистка в `bot.py` обязана быть и в
+  TaskGroup, и в `bg_tasks` — иначе `while True` подвесит shutdown).
+- Для сообщений, отправленных до выката, контекста нет. Таблица заполняется
+  только вперёд, TTL 30 дней (`_purge_reply_contexts`, тик раз в час).
 
 ### Права доступа
 
@@ -233,6 +267,20 @@ ORM подставляет в SELECT все колонки модели и па�
   `asyncio.to_thread`. Правило ruff `ASYNC230` включено без исключений:
   бот и веб-панель делят один event loop, и синхронная операция в роуте
   останавливает обработку сообщений во всех чатах.
+- **Цель команды резолвится одним `_resolve_punishment_target`** — и для
+  наказаний, и для снятия (v5.2.0; до этого снятие требовало reply и не
+  умело в `@username`/TGID). Разница только в строгости: для
+  `commands.LENIENT_TARGET` (unmute/unban/unwarn/warns/resetwarns) идёт
+  `require_membership=False`, потому что забаненного в чате уже нет и
+  `get_chat_member` для него закономерно падает. Для наказаний строгая
+  проверка остаётся: банить того, кого в чате нет, бессмысленно.
+- **`importlib` в тестах: `sys.modules[spec.name] = mod` до `exec_module`.**
+  В `bot_handlers.py` включён `from __future__ import annotations`, поэтому
+  все аннотации — строки, и `dataclasses` при разборе поля лезет в
+  `sys.modules[cls.__module__]`. Модуль, собранный через `module_from_spec`
+  и не зарегистрированный, роняет импорт с `AttributeError: 'NoneType'
+  object has no attribute '__dict__'`. Так уже сломались два теста при
+  добавлении первого `@dataclass` в `bot_handlers.py`.
 - Хелперы `_user_mention_html` и `_get_chat_settings` продублированы в
   `bot_handlers.py` и `modchat.py` — правь обе копии.
 - **Alembic включён на проде с 20.08.2026.** До этого прод работал через

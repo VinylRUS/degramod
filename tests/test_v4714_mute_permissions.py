@@ -62,6 +62,12 @@ spec_bh = importlib.util.spec_from_file_location(
 # bot_handlers импортирует много всего; используем exec
 import aiogram  # noqa: F401  — нужен для bot_handlers
 bh = importlib.util.module_from_spec(spec_bh)
+# v5.2.0: модуль обязан попасть в sys.modules ДО exec_module — это
+# документированный порядок importlib. Без него dataclasses не может
+# разобрать строковые аннотации (в bot_handlers включён
+# `from __future__ import annotations`, там все аннотации — строки)
+# и падает с AttributeError на None.__dict__.
+sys.modules[spec_bh.name] = bh
 spec_bh.loader.exec_module(bh)
 
 BOT_HANDLERS_PY = os.path.join(PROJECT_DIR, "bot_handlers.py")

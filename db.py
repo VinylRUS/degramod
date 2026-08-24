@@ -773,6 +773,55 @@ class IdeaLog(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 
+# ── v5.2.0: Контекст реплаев (на что отвечал наказанный) ──────────────────
+class ReplyContext(Base):
+    """v5.2.0: снимок сообщения, на которое отвечал автор ``message_id``.
+
+    Зачем таблица, а не чтение из апдейта. Bot API не вкладывает reply
+    второго уровня: «Note that the Message object in this field will not
+    contain further reply_to_message fields even if it itself is a reply».
+    Когда модератор отвечает «/ban» на сообщение нарушителя, бот получает
+    сообщение нарушителя с пустым ``reply_to_message`` — и не знает, кому
+    тот отвечал. Достать сообщение по id задним числом Bot API тоже не
+    даёт. Единственный момент, когда родитель виден — приход самого
+    сообщения-реплая, поэтому снимок делается там
+    (``_ReplyContextMiddleware``) и живёт здесь.
+
+    PK (chat_id, message_id) — сообщение-реплай, то есть будущая цель
+    наказания. Пишутся только реплаи (~треть трафика), не все сообщения.
+
+    Содержимое родителя копируется, а не ссылается: перечитать его позже
+    неоткуда, а к моменту отчёта оно может быть уже удалено. ``file_id``
+    Telegram не протухает, поэтому медиа встраивается в отчёт по ссылке.
+
+    Строки старше ``_REPLY_CONTEXT_TTL_DAYS`` удаляет
+    ``_purge_reply_contexts`` (почасовой тик в bot.py).
+    """
+    __tablename__ = "reply_contexts"
+    # TTL-чистка ходит по created_at — без индекса это full scan таблицы,
+    # которая растёт быстрее всех остальных в базе.
+    __table_args__ = (
+        Index("ix_reply_contexts_created_at", "created_at"),
+    )
+
+    chat_id = Column(BigInteger, primary_key=True)
+    message_id = Column(BigInteger, primary_key=True)   # сообщение-реплай
+    parent_message_id = Column(BigInteger, nullable=False)
+    # Автор родителя — либо пользователь, либо канал (пост в чате обсуждений).
+    parent_user_id = Column(BigInteger, nullable=True)
+    parent_username = Column(String(255), nullable=True)
+    parent_first_name = Column(String(255), nullable=True)
+    parent_last_name = Column(String(255), nullable=True)
+    parent_sender_chat_id = Column(BigInteger, nullable=True)
+    parent_sender_chat_title = Column(String(255), nullable=True)
+    # Текст/подпись родителя; если их нет — описание вида «🖼 [Фото]».
+    parent_text = Column(Text, nullable=True)
+    parent_media_type = Column(String(16), nullable=True)   # photo/video/...
+    parent_file_id = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        nullable=False)
+
+
 # ── v4.8.5: Настройки GitHub Projects интеграции ──────────────────────────
 class GithubSettings(Base):
     """v4.8.5: Настройки подключения к GitHub для `!idea` → Issues.
@@ -1348,6 +1397,35 @@ async def init_db() -> None:
         """))
         # v4.8.9: индексы ix_idea_log_* создаются через Index() в
         # __table_args__ модели IdeaLog (Base.metadata.create_all).
+
+    # ── v5.2.0: Новая таблица reply_contexts (контекст «в ответ на») ───────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    # PK (chat_id, message_id) — одна запись на сообщение-реплай.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS reply_contexts (
+                chat_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                parent_message_id BIGINT NOT NULL,
+                parent_user_id BIGINT NULL,
+                parent_username VARCHAR(255) NULL,
+                parent_first_name VARCHAR(255) NULL,
+                parent_last_name VARCHAR(255) NULL,
+                parent_sender_chat_id BIGINT NULL,
+                parent_sender_chat_title VARCHAR(255) NULL,
+                parent_text TEXT NULL,
+                parent_media_type VARCHAR(16) NULL,
+                parent_file_id VARCHAR(512) NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, message_id)
+            )
+        """))
+        # TTL-чистка ходит по created_at — без индекса это full scan
+        # таблицы, которая растёт быстрее всех остальных в базе.
+        await conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_reply_contexts_created_at "
+            "ON reply_contexts (created_at)"
+        ))
 
     # ── v4.8.5: Новая таблица github_settings (singleton для PAT и репо) ───
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.

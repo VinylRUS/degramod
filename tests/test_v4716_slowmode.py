@@ -83,6 +83,10 @@ spec_bh = importlib.util.spec_from_file_location(
     "bot_handlers", os.path.join(PROJECT_DIR, "bot_handlers.py")
 )
 bh = importlib.util.module_from_spec(spec_bh)
+# v5.2.0: модуль обязан попасть в sys.modules ДО exec_module — это
+# документированный порядок importlib. Без него dataclasses не может
+# разобрать строковые аннотации и падает с AttributeError.
+sys.modules[spec_bh.name] = bh
 spec_bh.loader.exec_module(bh)
 
 # Импортируем bot для проверки _enter_night_mode / _restore_day_state / SetChatSlowModeDelay
@@ -90,6 +94,7 @@ spec_bot = importlib.util.spec_from_file_location(
     "bot_module", os.path.join(PROJECT_DIR, "bot.py")
 )
 bot_module = importlib.util.module_from_spec(spec_bot)
+sys.modules[spec_bot.name] = bot_module
 spec_bot.loader.exec_module(bot_module)
 
 BOT_PY = os.path.join(PROJECT_DIR, "bot.py")

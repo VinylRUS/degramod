@@ -114,11 +114,28 @@ _P_SBAN = re.compile(
     r"^sban(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<reason>.+))?$",
     re.IGNORECASE | re.DOTALL,
 )  # reason опциональна; target опционален; любой из них может быть один.
-_P_UNMUTE = re.compile(r"^unmute\s*$", re.IGNORECASE)
-_P_UNBAN = re.compile(r"^unban\s*$", re.IGNORECASE)
-_P_UNWARN = re.compile(r"^unwarn(?:\s+(?P<count>\d+))?\s*$", re.IGNORECASE)
-_P_WARNS = re.compile(r"^warns\s*$", re.IGNORECASE)
-_P_RESETWARNS = re.compile(r"^resetwarns\s*$", re.IGNORECASE)
+# v5.2.0: команды снятия тоже получили опциональную группу target.
+#   • Раньше они матчили только голое имя («^unban\s*$») и потому работали
+#     исключительно по reply. Для /unban это была не мелочь, а тупик:
+#     забаненного нет в чате, реплаить не на что — снять бан из Telegram
+#     было нельзя вообще, только через веб-панель.
+#   • Форма та же, что у наказательных команд (@username или TGID), чтобы
+#     не заводить второй синтаксис: /unban @vasya, /unban 123456789.
+#   • Reply остаётся приоритетнее аргумента — см. _resolve_punishment_target.
+_P_UNMUTE = re.compile(r"^unmute(?:\s+(?P<target>@\w+|\d+))?\s*$", re.IGNORECASE)
+_P_UNBAN = re.compile(r"^unban(?:\s+(?P<target>@\w+|\d+))?\s*$", re.IGNORECASE)
+# У unwarn есть собственный числовой аргумент — количество варнов, и «3»
+# одинаково подходит под TGID и под счётчик. Паттерн обе группы просто
+# собирает, а разводит их unwarn_args() по наличию reply (см. её docstring).
+_P_UNWARN = re.compile(
+    r"^unwarn(?:\s+(?P<target>@\w+|\d+))?(?:\s+(?P<count>\d+))?\s*$",
+    re.IGNORECASE,
+)
+_P_WARNS = re.compile(r"^warns(?:\s+(?P<target>@\w+|\d+))?\s*$", re.IGNORECASE)
+_P_RESETWARNS = re.compile(
+    r"^resetwarns(?:\s+(?P<target>@\w+|\d+))?\s*$",
+    re.IGNORECASE,
+)
 # v4.8.4: resetmc — сброс счётчика автомьютов (прогрессивные муты).
 # Цель: reply на сообщение, ИЛИ resetmc @username, ИЛИ resetmc <tgid>.
 # Доступ: только SU/Admin (как resetwarns).
@@ -160,13 +177,17 @@ GROUP_COMMANDS: tuple[CommandSpec, ...] = (
     CommandSpec("sban", _P_SBAN, "[причина]",
                 "бан без публичного сообщения", Access.MOD),
     # Снятие ограничений.
-    CommandSpec("unmute", _P_UNMUTE, "", "снять мьют (reply)", Access.MOD),
-    CommandSpec("unban", _P_UNBAN, "", "снять бан (reply)", Access.MOD),
-    CommandSpec("unwarn", _P_UNWARN, "[N]",
+    CommandSpec("unmute", _P_UNMUTE, "[@user|tgid]",
+                "снять мьют. Цель: reply, @user или TGID", Access.MOD),
+    CommandSpec("unban", _P_UNBAN, "[@user|tgid]",
+                "снять бан. Цель: reply, @user или TGID", Access.MOD),
+    CommandSpec("unwarn", _P_UNWARN, "[@user|tgid] [N]",
                 "снять N последних варнов (по умолчанию 1)", Access.MOD),
-    CommandSpec("warns", _P_WARNS, "", "показать активные варны цели", Access.MOD),
+    CommandSpec("warns", _P_WARNS, "[@user|tgid]",
+                "показать активные варны цели", Access.MOD),
     # Только su/admin — доп. проверка роли живёт в обработчике.
-    CommandSpec("resetwarns", _P_RESETWARNS, "", "обнулить варны", Access.ADMIN),
+    CommandSpec("resetwarns", _P_RESETWARNS, "[@user|tgid]",
+                "обнулить варны", Access.ADMIN),
     CommandSpec("resetmc", _P_RESETMC, "[@user|tgid]",
                 "обнулить счётчик автомьютов", Access.ADMIN),
     # Режим тревоги.
@@ -178,6 +199,47 @@ GROUP_COMMANDS: tuple[CommandSpec, ...] = (
 # self-harm и friendly-fire, и для них цель резолвится через
 # _resolve_punishment_target.
 PUNITIVE: frozenset[str] = frozenset({"ban", "warn", "mute", "sban", "swarn", "smute"})
+
+# v5.2.0: команды снятия. Их цель резолвится мягко
+# (_resolve_punishment_target(require_membership=False)): забаненного или
+# вышедшего юзера в чате уже нет, и строгая проверка через get_chat_member
+# отвергала бы ровно тот случай, ради которого команда и вызывается.
+LENIENT_TARGET: frozenset[str] = frozenset(
+    {"unmute", "unban", "unwarn", "warns", "resetwarns"}
+)
+
+
+def unwarn_args(match: re.Match, has_reply: bool) -> tuple[str | None, int]:
+    """Разводит два числовых смысла в «/unwarn N» — цель и количество.
+
+    Паттерн отдаёт две опциональные группы, но «/unwarn 3» матчится в
+    target="3", count=None: одинокое число одинаково похоже и на TGID, и
+    на счётчик варнов. Разводит их наличие reply:
+
+      reply + «/unwarn»           → (None, 1)
+      reply + «/unwarn 3»         → (None, 3)          число = счётчик
+      «/unwarn @vasya»            → ("@vasya", 1)
+      «/unwarn @vasya 3»          → ("@vasya", 3)
+      «/unwarn 123456789»         → ("123456789", 1)   число = TGID
+      «/unwarn 123456789 3»       → ("123456789", 3)
+
+    «/unwarn 3» без reply трактуется как TGID 3: резолв провалится и
+    модератор получит внятную ошибку. Обратный выбор (считать это тремя
+    варнами) снимал бы варны неизвестно с кого молча.
+
+    Возвращает (target_str, count); count всегда ≥ 1.
+    """
+    raw_target = match.groupdict().get("target")
+    raw_count = match.groupdict().get("count")
+
+    if raw_count is not None:
+        target, count = raw_target, int(raw_count)
+    elif has_reply and raw_target is not None and raw_target.isdigit():
+        target, count = None, int(raw_target)
+    else:
+        target, count = raw_target, 1
+
+    return target, max(count, 1)
 
 # Публикуются в меню личных чатов. Административные DM-команды
 # (/bansticker, /setkeywords, /linkallow и ещё около двадцати) сюда

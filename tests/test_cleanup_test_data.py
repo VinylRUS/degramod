@@ -87,6 +87,22 @@ CREATE TABLE web_users (
     role VARCHAR(16) NOT NULL DEFAULT 'admin'
 );
 CREATE UNIQUE INDEX ix_web_users_tg_user_id ON web_users (tg_user_id) WHERE tg_user_id IS NOT NULL;
+CREATE TABLE reply_contexts (
+    chat_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    parent_message_id BIGINT NOT NULL,
+    parent_user_id BIGINT NULL,
+    parent_username VARCHAR(255) NULL,
+    parent_first_name VARCHAR(255) NULL,
+    parent_last_name VARCHAR(255) NULL,
+    parent_sender_chat_id BIGINT NULL,
+    parent_sender_chat_title VARCHAR(255) NULL,
+    parent_text TEXT NULL,
+    parent_media_type VARCHAR(16) NULL,
+    parent_file_id VARCHAR(512) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, message_id)
+);
 """
 
 
@@ -121,6 +137,17 @@ def temp_db(tmp_path: Path) -> Path:
             f"VALUES ({uid}, 100001, 999, 'warn', '2026-07-26 10:00:00')"
         )
 
+    # ── Reply_contexts (УДАЛИТЬ ВСЕ, v5.2.0) ──
+    # Снимки «в ответ на» существуют только ради отчётов о наказаниях.
+    # Пережив чистку, они остались бы мусором, на который уже ничто
+    # не ссылается.
+    for mid in (10, 11):
+        conn.execute(
+            "INSERT INTO reply_contexts (chat_id, message_id, parent_message_id, "
+            "parent_user_id, parent_text, created_at) "
+            f"VALUES (999, {mid}, 1, 200001, 'исходное', '2026-07-26 10:00:00')"
+        )
+
     # ── Chat_admins (опционально удалить) ──
     conn.execute("INSERT INTO chat_admins (chat_id, user_id, added_by) VALUES (999, 200001, 100001)")
     conn.execute("INSERT INTO chat_admins (chat_id, user_id, added_by) VALUES (999, 200002, 100001)")
@@ -148,7 +175,8 @@ def _run(db_path: Path, *args: str) -> subprocess.CompletedProcess:
 def _counts(db_path: Path) -> dict[str, int]:
     conn = sqlite3.connect(db_path)
     out = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-           for t in ("users", "moderators", "punishments", "chat_admins", "chat_settings", "web_users")}
+           for t in ("users", "moderators", "punishments", "chat_admins",
+                     "chat_settings", "web_users", "reply_contexts")}
     out["users_mod_one"] = conn.execute(
         "SELECT COUNT(*) FROM users WHERE user_id = 100001"
     ).fetchone()[0]
@@ -182,6 +210,9 @@ def test_apply_clears_punishments_and_test_users(temp_db: Path) -> None:
     assert after["chat_settings"] == 1
     # chat_admins — по умолчанию НЕ тронуты
     assert after["chat_admins"] == 2, "chat_admins не должны быть тронуты без --include-chat-admins"
+    # v5.2.0: reply_contexts — снимки «в ответ на» уходят вместе с наказаниями,
+    # ради отчётов о которых они и существуют.
+    assert after["reply_contexts"] == 0, "reply_contexts должны быть очищены"
 
 
 def test_apply_with_include_chat_admins(temp_db: Path) -> None:

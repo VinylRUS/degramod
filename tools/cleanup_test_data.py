@@ -63,7 +63,22 @@ def _c(text: str, color: str) -> str:
     return f"{codes.get(color, '')}{text}{codes['reset']}"
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """v5.2.0: есть ли таблица в этой БД.
+
+    Скрипт натравливают и на бэкапы, снятые до появления таблицы. Раньше
+    любое обращение к неизвестной таблице роняло его трейсбеком ещё до
+    отказа-предохранителя — то есть до того, как пользователь видел
+    предупреждение о том, что БД трогать нельзя.
+    """
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+    ).fetchone() is not None
+
+
 def _count(conn: sqlite3.Connection, table: str, where: str = "") -> int:
+    if not _table_exists(conn, table):
+        return 0
     sql = f"SELECT COUNT(*) FROM {table}"
     if where:
         sql += f" WHERE {where}"
@@ -80,6 +95,8 @@ def _show_counts(conn: sqlite3.Connection, label: str, include_chat_admins: bool
         "web_users":     _count(conn, "web_users"),
         "chat_admins":   _count(conn, "chat_admins"),
         "chat_settings": _count(conn, "chat_settings"),
+        # v5.2.0: снимки «в ответ на» для отчётов о наказаниях.
+        "reply_contexts": _count(conn, "reply_contexts"),
     }
     # Сколько users НЕ являются модераторами (т.е. кандидаты на удаление)
     counts["users_to_delete"] = _count(
@@ -95,6 +112,7 @@ def _show_counts(conn: sqlite3.Connection, label: str, include_chat_admins: bool
     print(f"  chat_admins        : {counts['chat_admins']:>6}  "
           f"{_c('[УДАЛЯЕМ]', 'red') if include_chat_admins else _c('[СОХРАНЯЕМ]', 'green')}")
     print(f"  chat_settings      : {counts['chat_settings']:>6}  {_c('[СОХРАНЯЕМ]', 'green')}")
+    print(f"  reply_contexts     : {counts['reply_contexts']:>6}  {_c('[УДАЛЯЕМ ВСЕ]', 'red')}")
     return counts
 
 
@@ -175,11 +193,17 @@ def main() -> int:
 
     deletions: list[tuple[str, str]] = [
         ("punishments", "DELETE FROM punishments"),
+
         (
             "users (не модераторы)",
             "DELETE FROM users WHERE user_id NOT IN (SELECT mod_id FROM moderators)",
         ),
     ]
+    # v5.2.0: снимки «в ответ на» существуют только ради отчётов о
+    # наказаниях — уходят вместе с ними. Таблицы может не быть, если скрипт
+    # запущен на бэкапе, снятом до v5.2.0.
+    if _table_exists(conn, "reply_contexts"):
+        deletions.append(("reply_contexts", "DELETE FROM reply_contexts"))
     if args.include_chat_admins:
         deletions.append(("chat_admins", "DELETE FROM chat_admins"))
 

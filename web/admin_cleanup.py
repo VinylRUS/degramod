@@ -41,6 +41,13 @@ router = APIRouter()
 #  До удаления — бэкап SQLite-файла в той же папке.
 #  После — VACUUM. Бот продолжает работать (WAL).
 # ──────────────────────────────────────────────────────────────────
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    """v5.2.0: есть ли таблица в этой БД (страница переживает старую схему)."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,),
+    ).fetchone() is not None
+
+
 def _cleanup_counts(conn: sqlite3.Connection) -> dict[str, int]:
     """Текущие счётчики для preview. Прямые SELECT'ы — быстро и безопасно."""
     c = {}
@@ -50,6 +57,14 @@ def _cleanup_counts(conn: sqlite3.Connection) -> dict[str, int]:
     c["web_users"] = conn.execute("SELECT COUNT(*) FROM web_users").fetchone()[0]
     c["chat_admins"] = conn.execute("SELECT COUNT(*) FROM chat_admins").fetchone()[0]
     c["chat_settings"] = conn.execute("SELECT COUNT(*) FROM chat_settings").fetchone()[0]
+    # v5.2.0: снимки «в ответ на». Таблица транзиентная (свой TTL в 30 дней),
+    # но после чистки тестовых наказаний её строки — чистый шум.
+    # EXISTS-guard: страница чистки не должна падать на БД, поднятой до
+    # применения миграции v5.2.0.
+    c["reply_contexts"] = (
+        conn.execute("SELECT COUNT(*) FROM reply_contexts").fetchone()[0]
+        if _table_exists(conn, "reply_contexts") else 0
+    )
     # users, не являющиеся модераторами (кандидаты на удаление)
     c["users_to_delete"] = conn.execute(
         "SELECT COUNT(*) FROM users WHERE user_id NOT IN (SELECT mod_id FROM moderators)"
@@ -171,6 +186,11 @@ async def admin_cleanup_apply(
                     "(SELECT mod_id FROM moderators)"
                 )
                 du = cur.rowcount
+
+                # v5.2.0: снимки «в ответ на» уходят вместе с наказаниями —
+                # они существуют только ради отчётов о них.
+                if _table_exists(conn, "reply_contexts"):
+                    conn.execute("DELETE FROM reply_contexts")
 
                 if include_chat_admins:
                     cur = conn.execute("DELETE FROM chat_admins")

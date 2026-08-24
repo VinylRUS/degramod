@@ -89,9 +89,11 @@ class TestHelpFromRegistry(unittest.TestCase):
 
 
 class TestVersion(unittest.TestCase):
-    def test_app_version(self):
-        import web_app
-        self.assertEqual(web_app.APP_VERSION, "v5.1.0")
+    # v5.2.0: проверка «APP_VERSION == v5.1.0» отсюда убрана. Она ломалась
+    # на каждом следующем релизе, ничего при этом не защищая: текущую
+    # версию пинует релизный тест текущей версии (test_v520_release.py).
+    # Здесь остаётся то, что для v5.1.0 действительно инвариант — её
+    # запись в changelog никуда не должна деться.
 
     def test_changelog_entry(self):
         with open(_P("templates/base.html")) as f:

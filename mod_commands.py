@@ -73,7 +73,7 @@ from bot_handlers import (
 from db import BannedStickerPack, Punishment, async_session
 
 if TYPE_CHECKING:
-    pass
+    from bot_handlers import ReplySnapshot
 
 logger = logging.getLogger("shadow_logger")
 
@@ -99,6 +99,14 @@ class ModContext:
         команды. cmd_X читают из него именованные группы (reason/dur/count)
         вместо повторного re.match — диспетчер уже сматчил текст один раз,
         дублировать незачем.
+      reply_context: v5.2.0 — ReplySnapshot сообщения, на которое отвечал
+        нарушитель, либо None. Резолвится диспетчером один раз на команду
+        и уходит в _send_report, чтобы в отчёте была видна ветка, а не
+        только реплика нарушителя.
+      unwarn_count: v5.2.0 — количество варнов для /unwarn, уже разведённое
+        с TGID цели (commands.unwarn_args). Читать match.group("count")
+        напрямую нельзя: «/unwarn 3» по reply кладёт тройку в группу
+        target, а не count. Для остальных команд — None.
     """
 
     chat_id: int
@@ -107,6 +115,8 @@ class ModContext:
     target_content: str | None
     text: str
     match: re.Match
+    reply_context: "ReplySnapshot | None" = None
+    unwarn_count: int | None = None
 
 
 # ── cmd_ban ─────────────────────────────────────────────────────────────────
@@ -225,6 +235,7 @@ async def cmd_ban(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="ban", reason=reason, mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         sticker_pack_info=sticker_pack_info,
         moderator_screenshot=message if message.photo else None,
     )
@@ -317,6 +328,7 @@ async def cmd_mute(message: types.Message, ctx: ModContext) -> None:
         action_type="mute", reason=reason, mod=mod,
         duration_seconds=duration_seconds,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         moderator_screenshot=message if message.photo else None,
     )
 
@@ -418,6 +430,7 @@ async def cmd_smute(message: types.Message, ctx: ModContext) -> None:
         action_type="mute", reason=reason, mod=mod,
         duration_seconds=duration_seconds,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         moderator_screenshot=message if message.photo else None,
     )
 
@@ -477,6 +490,7 @@ async def cmd_warn(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="warn", reason=reason, warn_points=1, mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         moderator_screenshot=message if message.photo else None,
     )
 
@@ -488,6 +502,7 @@ async def cmd_warn(message: types.Message, ctx: ModContext) -> None:
     await _check_warn_threshold(
         bot=message.bot, chat_id=chat_id,
         target=target, mod=mod,
+        reply_context=ctx.reply_context,
     )
 
     if message.reply_to_message is not None:
@@ -527,6 +542,7 @@ async def cmd_swarn(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="warn", reason=reason, warn_points=1, mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         moderator_screenshot=message if message.photo else None,
     )
 
@@ -549,6 +565,7 @@ async def cmd_swarn(message: types.Message, ctx: ModContext) -> None:
     await _check_warn_threshold(
         bot=message.bot, chat_id=chat_id,
         target=target, mod=mod,
+        reply_context=ctx.reply_context,
     )
 
     if message.reply_to_message is not None:
@@ -642,6 +659,7 @@ async def cmd_sban(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="ban", reason=reason, mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
         sticker_pack_info=sticker_pack_info,
         moderator_screenshot=message if message.photo else None,
     )
@@ -732,6 +750,7 @@ async def cmd_unmute(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="unmute", mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
     )
 
     async with async_session() as session:
@@ -787,6 +806,7 @@ async def cmd_unban(message: types.Message, ctx: ModContext) -> None:
         bot=message.bot, chat_id=chat_id, target=target,
         action_type="unban", mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
     )
 
     await _send_ephemeral(
@@ -808,10 +828,10 @@ async def cmd_unwarn(message: types.Message, ctx: ModContext) -> None:
 
     Перенесена из handle_group_command (bot_handlers.py:4687-4735) в v4.8.10.
     """
-    n_str = ctx.match.group("count")
-    n = int(n_str) if n_str else 1
-    if n < 1:
-        n = 1
+    # v5.2.0: счётчик приходит из ctx — диспетчер уже развёл «/unwarn 3»
+    # на цель и количество (commands.unwarn_args). Прямое чтение группы
+    # "count" здесь давало бы 1 варн вместо трёх при «/unwarn 3» по reply.
+    n = ctx.unwarn_count if ctx.unwarn_count is not None else 1
 
     chat_id = ctx.chat_id
     mod = ctx.mod
@@ -837,6 +857,7 @@ async def cmd_unwarn(message: types.Message, ctx: ModContext) -> None:
         action_type="unwarn", reason=f"Снято {revoked_count} варн(а/ов)",
         warn_points=revoked_count, mod=mod,
         reply_to_message=message.reply_to_message,
+        reply_context=ctx.reply_context,
     )
 
     await _send_ephemeral(

@@ -89,6 +89,7 @@ import os
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -140,7 +141,7 @@ from aiogram.types import (
     RichTextSpoiler,
     RichTextUrl,
 )
-from sqlalchemy import desc, func, or_, select, update
+from sqlalchemy import delete, desc, func, or_, select, update
 
 import commands
 from db import (
@@ -154,6 +155,7 @@ from db import (
     LinkAllowlist,
     Moderator,
     Punishment,
+    ReplyContext,
     User,
     WebUser,
     _decrypt_pat,
@@ -647,6 +649,245 @@ class _DisabledChatMiddleware(BaseMiddleware):
 
 # Регистрируем middleware как outer — обрабатывает ВСЕ router.message события.
 router.message.outer_middleware(_DisabledChatMiddleware())
+
+
+# ── v5.2.0: контекст «в ответ на» ─────────────────────────────────────────
+# Отчёт о наказании показывал сообщение нарушителя, но не то, на что
+# нарушитель отвечал: «пошёл ты» без адресата и без повода. Прочитать это
+# из апдейта нельзя — Bot API не вкладывает reply второго уровня, а достать
+# сообщение по id задним числом не даёт вовсе. Единственный момент, когда
+# родитель виден — приход самого сообщения-реплая; там и снимаем.
+
+# Сколько дней храним снимки. Дольше месяца они бесполезны: наказание за
+# сообщение месячной давности — исчезающая редкость, а таблица растёт
+# быстрее всех остальных в базе.
+_REPLY_CONTEXT_TTL_DAYS: int = 30
+
+# Обрезка текста родителя. В отчёте он лежит в свёрнутой цитате — простыня
+# там не нужна, а в БД от неё только вес.
+_REPLY_CONTEXT_TEXT_LIMIT: int = 1000
+
+# Типы медиа, которые умеем встраивать в отчёт по одному file_id.
+# Стикеры сюда не входят: их inline-блок требует скачивания и конвертации
+# (_build_sticker_block), для которой нужен целый types.Sticker, а не ссылка.
+# Стикер-родитель показывается описанием «🎭 [Стикер: 😀]» из parent_text.
+_REPLY_CONTEXT_MEDIA_ATTRS: tuple[str, ...] = (
+    "photo", "video", "animation", "audio", "voice", "sticker",
+    "document", "video_note",
+)
+
+
+@dataclass(frozen=True)
+class ReplySnapshot:
+    """Снимок сообщения, на которое отвечал наказанный.
+
+    Одна и та же форма приходит из двух источников: живого
+    ``message.reply_to_message`` (автоматические наказания видят родителя
+    сразу) и таблицы ``reply_contexts`` (мод-команда по reply — там живого
+    родителя уже нет). Отчёт различать их не должен.
+    """
+
+    parent_message_id: int
+    parent_user_id: int | None = None
+    parent_username: str | None = None
+    parent_first_name: str | None = None
+    parent_last_name: str | None = None
+    parent_sender_chat_id: int | None = None
+    parent_sender_chat_title: str | None = None
+    parent_text: str | None = None
+    parent_media_type: str | None = None
+    parent_file_id: str | None = None
+
+    @property
+    def is_channel_post(self) -> bool:
+        """True, если отвечали посту канала, а не человеку.
+
+        В чате обсуждений пост канала приходит с ``sender_chat`` и с
+        ``from_user`` = GroupAnonymousBot. Показывать в отчёте бота вместо
+        канала — прямая дезинформация модератора.
+        """
+        return self.parent_sender_chat_id is not None
+
+    @property
+    def display_name(self) -> str:
+        """Имя автора родителя для строки отчёта."""
+        if self.is_channel_post:
+            return self.parent_sender_chat_title or "канал"
+        full = " ".join(
+            part for part in (self.parent_first_name, self.parent_last_name)
+            if part
+        ).strip()
+        return full or "(без имени)"
+
+
+def _reply_snapshot_from_message(parent: types.Message) -> ReplySnapshot:
+    """Снимает с родительского сообщения всё, что понадобится отчёту."""
+    sender_chat = getattr(parent, "sender_chat", None)
+    from_user = getattr(parent, "from_user", None)
+
+    media_type: str | None = None
+    file_id: str | None = None
+    for attr in _REPLY_CONTEXT_MEDIA_ATTRS:
+        media = getattr(parent, attr, None)
+        if not media:
+            continue
+        # photo — список PhotoSize; берём последний (самый большой).
+        file_id = getattr(media[-1] if attr == "photo" else media, "file_id", None)
+        media_type = attr
+        break
+
+    # Пустая цитата в отчёте бесполезна: если текста нет, кладём описание
+    # вида «🖼 [Фото]» — модератор хотя бы видит, на что отвечали.
+    text = parent.text or parent.caption or _get_message_content_desc(parent)
+    if text and len(text) > _REPLY_CONTEXT_TEXT_LIMIT:
+        text = text[:_REPLY_CONTEXT_TEXT_LIMIT] + "…"
+
+    return ReplySnapshot(
+        parent_message_id=parent.message_id,
+        parent_user_id=getattr(from_user, "id", None),
+        parent_username=getattr(from_user, "username", None),
+        parent_first_name=getattr(from_user, "first_name", None),
+        parent_last_name=getattr(from_user, "last_name", None),
+        parent_sender_chat_id=getattr(sender_chat, "id", None),
+        parent_sender_chat_title=getattr(sender_chat, "title", None),
+        parent_text=text,
+        parent_media_type=media_type,
+        parent_file_id=file_id,
+    )
+
+
+async def _store_reply_context(
+    chat_id: int, message_id: int, snapshot: ReplySnapshot,
+) -> None:
+    """Кладёт снимок в reply_contexts (upsert по PK (chat_id, message_id))."""
+    async with async_session() as session:
+        row = await session.get(ReplyContext, (chat_id, message_id))
+        if row is None:
+            row = ReplyContext(chat_id=chat_id, message_id=message_id)
+            session.add(row)
+        row.parent_message_id = snapshot.parent_message_id
+        row.parent_user_id = snapshot.parent_user_id
+        row.parent_username = snapshot.parent_username
+        row.parent_first_name = snapshot.parent_first_name
+        row.parent_last_name = snapshot.parent_last_name
+        row.parent_sender_chat_id = snapshot.parent_sender_chat_id
+        row.parent_sender_chat_title = snapshot.parent_sender_chat_title
+        row.parent_text = snapshot.parent_text
+        row.parent_media_type = snapshot.parent_media_type
+        row.parent_file_id = snapshot.parent_file_id
+        row.created_at = datetime.now(timezone.utc)
+        await session.commit()
+
+
+async def _resolve_reply_context(
+    message: types.Message | None,
+) -> ReplySnapshot | None:
+    """Контекст «в ответ на» для сообщения нарушителя, либо None.
+
+    Порядок:
+      1. Живой ``message.reply_to_message`` — так его видят автоматические
+         наказания (фильтры, порог варнов) в момент обработки. БД не нужна.
+      2. Таблица ``reply_contexts`` — путь мод-команды: сообщение
+         нарушителя пришло вложенным в команду и своего reply уже не несёт.
+      3. None — отвечали не на что, либо снимок не сохранился (сообщение
+         старше выката фичи или старше TTL).
+
+    Никогда не бросает: контекст — украшение отчёта, а не наказание.
+    """
+    if message is None:
+        return None
+
+    live_parent = getattr(message, "reply_to_message", None)
+    if live_parent is not None:
+        return _reply_snapshot_from_message(live_parent)
+
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+
+    try:
+        async with async_session() as session:
+            row = await session.get(ReplyContext, (chat_id, message_id))
+    except Exception as e:
+        logger.warning("resolve reply context failed (chat=%s msg=%s): %s",
+                       chat_id, message_id, e)
+        return None
+
+    if row is None:
+        return None
+
+    return ReplySnapshot(
+        parent_message_id=row.parent_message_id,
+        parent_user_id=row.parent_user_id,
+        parent_username=row.parent_username,
+        parent_first_name=row.parent_first_name,
+        parent_last_name=row.parent_last_name,
+        parent_sender_chat_id=row.parent_sender_chat_id,
+        parent_sender_chat_title=row.parent_sender_chat_title,
+        parent_text=row.parent_text,
+        parent_media_type=row.parent_media_type,
+        parent_file_id=row.parent_file_id,
+    )
+
+
+async def _purge_reply_contexts(
+    older_than_days: int = _REPLY_CONTEXT_TTL_DAYS,
+) -> int:
+    """Удаляет снимки старше TTL. Возвращает число удалённых строк."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    async with async_session() as session:
+        result = await session.execute(
+            delete(ReplyContext).where(ReplyContext.created_at < cutoff)
+        )
+        await session.commit()
+    return result.rowcount or 0
+
+
+def _message_link(chat_id: int, message_id: int) -> str | None:
+    """Ссылка t.me на сообщение супергруппы, либо None.
+
+    Работает только для супергрупп/каналов (id вида -100…): у обычных
+    групп ссылок на сообщения не существует в принципе. Форма ``/c/``
+    открывается у тех, кто состоит в чате, — то есть у модераторов.
+    """
+    raw = str(chat_id)
+    if not raw.startswith("-100"):
+        return None
+    return f"https://t.me/c/{raw[4:]}/{message_id}"
+
+
+class _ReplyContextMiddleware(BaseMiddleware):
+    """v5.2.0: снимает родителя у каждого сообщения-реплая в группе.
+
+    Регистрируется ПОСЛЕ _DisabledChatMiddleware: в выключенном чате бот
+    не модерирует, и копить его переписку незачем.
+
+    Пишутся только реплаи, поэтому запись идёт не на каждое сообщение.
+    Любая ошибка проглатывается: контекст — украшение отчёта, из-за него
+    чат не должен остаться без модерации.
+    """
+
+    async def __call__(self, handler, event: types.Message, data: dict):
+        chat = getattr(event, "chat", None)
+        parent = getattr(event, "reply_to_message", None)
+        if parent is not None and getattr(chat, "type", None) in ("group", "supergroup"):
+            try:
+                await _store_reply_context(
+                    chat.id, event.message_id,
+                    _reply_snapshot_from_message(parent),
+                )
+            except Exception as e:
+                logger.warning(
+                    "ReplyContextMiddleware: не удалось сохранить контекст "
+                    "(chat=%s msg=%s): %s",
+                    chat.id, getattr(event, "message_id", None), e,
+                )
+        return await handler(event, data)
+
+
+router.message.outer_middleware(_ReplyContextMiddleware())
 
 
 # ── Permissions snapshot ───────────────────────────────────────────────────
@@ -1176,6 +1417,7 @@ async def _resolve_punishment_target(
     message: types.Message,
     target_str: str | None,
     chat_id: int,
+    require_membership: bool = True,
 ) -> tuple[types.User | None, str | None]:
     """Резолвит цель наказания из reply / @username / TGID.
 
@@ -1196,6 +1438,15 @@ async def _resolve_punishment_target(
          Парсим int, проверяем через bot.get_chat_member что юзер в чате.
          Если да — создаём синтетический User-объект (id, без username/first_name).
       4. Если target_str is None и reply нет — ошибка «укажите цель».
+
+    v5.2.0: параметр ``require_membership``. Для наказательных команд он
+    True — банить того, кого в чате нет, бессмысленно, и провал
+    get_chat_member это честная ошибка. Для команд снятия
+    (commands.LENIENT_TARGET) он False: забаненного или вышедшего юзера в
+    чате как раз и нет, а разбанить его надо. Тогда при провале
+    get_chat_member цель добирается из БД (там есть имя и @username для
+    отчёта), а в последнюю очередь собирается синтетический User с одним
+    id — для unban_chat_member этого достаточно.
     """
     # 1. Reply — приоритет.
     if message.reply_to_message is not None:
@@ -1263,23 +1514,50 @@ async def _resolve_punishment_target(
             return None, "❌ TGID должен быть положительным числом."
 
         # Проверяем что юзер есть в чате (иначе банить некого).
+        member = None
         try:
             member = await message.bot.get_chat_member(
                 chat_id=chat_id, user_id=user_id,
             )
         except TelegramAPIError as e:
-            return None, (
-                f"❌ Не удалось найти пользователя с TGID <code>{user_id}</code> "
-                f"в этом чате: {e}"
+            if require_membership:
+                return None, (
+                    f"❌ Не удалось найти пользователя с TGID <code>{user_id}</code> "
+                    f"в этом чате: {e}"
+                )
+            # v5.2.0: мягкий режим (команды снятия) — идём в fallback ниже.
+            logger.info(
+                "resolve target %s in chat %s: get_chat_member failed (%s), "
+                "мягкий режим — берём цель из БД/синтетику",
+                user_id, chat_id, e,
             )
 
         # member.user — это types.User (даже если юзер покинул чат, но был ранее).
         if member and member.user:
             return member.user, None
 
-        return None, (
-            f"❌ Пользователь с TGID <code>{user_id}</code> не найден в чате."
-        )
+        if require_membership:
+            return None, (
+                f"❌ Пользователь с TGID <code>{user_id}</code> не найден в чате."
+            )
+
+        # v5.2.0: fallback — БД. Даёт имя и @username, без них отчёт о
+        # разбане получился бы безымянным «(без имени) ID: 123».
+        async with async_session() as session:
+            db_user = (await session.execute(
+                select(User).where(User.user_id == user_id)
+            )).scalar_one_or_none()
+        if db_user is not None:
+            return types.User(
+                id=db_user.user_id,
+                is_bot=False,
+                first_name=db_user.first_name or "",
+                last_name=db_user.last_name or "",
+                username=db_user.username,
+            ), None
+
+        # Последний рубеж: голый id. Для unban_chat_member/restrict этого хватает.
+        return types.User(id=user_id, is_bot=False, first_name=""), None
 
     # 4. Не распознано
     return None, (
@@ -2556,6 +2834,89 @@ def _build_media_block(msg: types.Message):
     return None
 
 
+# ── v5.2.0: медиа родителя по сохранённому file_id ────────────────────────
+def _build_media_block_from_ref(media_type: str | None, file_id: str | None):
+    """Как _build_media_block, но из пары (тип, file_id), а не из Message.
+
+    Снимок в reply_contexts хранит именно пару: перечитать родительское
+    сообщение через Bot API нельзя, а file_id не протухает. Типы без
+    rich-блока (стикер, документ, кружок) дают None — они показываются
+    описанием в тексте цитаты.
+    """
+    if not media_type or not file_id:
+        return None
+    try:
+        if media_type == "photo":
+            return InputRichBlockPhoto(photo=InputMediaPhoto(media=file_id))
+        if media_type == "video":
+            return InputRichBlockVideo(video=InputMediaVideo(media=file_id))
+        if media_type == "animation":
+            return InputRichBlockAnimation(
+                animation=InputMediaAnimation(media=file_id)
+            )
+        if media_type == "audio":
+            return InputRichBlockAudio(audio=InputMediaAudio(media=file_id))
+        if media_type == "voice":
+            return InputRichBlockVoiceNote(
+                voice_note=InputMediaVoiceNote(media=file_id)
+            )
+    except Exception as e:
+        logger.warning("Could not build media block from ref (%s): %s",
+                       media_type, e)
+    return None
+
+
+def _build_reply_context_block(chat_id: int, snap: "ReplySnapshot"):
+    """Свёрнутый Details «↩️ В ответ на» — контекст реплая для отчёта.
+
+    Внутри: автор родителя (человек кликабельным упоминанием, канал — с
+    пометкой 📢), цитата текста, медиа по file_id и ссылка на исходное
+    сообщение. is_open=False — как и у блока с сообщением нарушителя:
+    модератор разворачивает сам.
+    """
+    inner: list = []
+
+    if snap.is_channel_post:
+        author_text: list = [f"📢 Канал «{snap.display_name}»"]
+    else:
+        author_text = ["👤 "]
+        if snap.parent_user_id is not None:
+            author_text.append(RichTextUrl(
+                text=snap.display_name,
+                url=f"tg://user?id={snap.parent_user_id}",
+            ))
+        else:
+            author_text.append(snap.display_name)
+        if snap.parent_username:
+            author_text.append(f"  @{snap.parent_username}")
+        if snap.parent_user_id is not None:
+            author_text.append("  ")
+            author_text.append(RichTextCode(text=f"ID: {snap.parent_user_id}"))
+    inner.append(InputRichBlockParagraph(text=author_text))
+
+    if snap.parent_text:
+        inner.append(InputRichBlockBlockQuotation(
+            blocks=[InputRichBlockParagraph(text=snap.parent_text)]
+        ))
+
+    media = _build_media_block_from_ref(
+        snap.parent_media_type, snap.parent_file_id,
+    )
+    if media is not None:
+        inner.append(media)
+
+    link = _message_link(chat_id, snap.parent_message_id)
+    if link:
+        inner.append(InputRichBlockParagraph(text=[
+            "🔗 ",
+            RichTextUrl(text="Открыть сообщение →", url=link),
+        ]))
+
+    return InputRichBlockDetails(
+        summary="↩️ В ответ на", is_open=False, blocks=inner,
+    )
+
+
 # ── v4.8.3: стикер inline в Rich Message ──────────────────────────────────
 async def _build_sticker_block(
     bot: types.Bot,
@@ -2725,6 +3086,7 @@ async def _send_report(
     reply_to_message: types.Message | None = None,
     sticker_pack_info: tuple[str, bool] | None = None,
     moderator_screenshot: types.Message | None = None,
+    reply_context: "ReplySnapshot | None" = None,
 ) -> None:
     """Отправляет Rich-отчёт о санкции в репорт-чат (Bot API 10.2).
 
@@ -2764,6 +3126,13 @@ async def _send_report(
       • Стикерпак-нотификация (sticker_pack_info=(pack_name, was_newly_added)):
         если was_newly_added=True — добавляем в List пункт
         «📦 Использованный стикерпак забанен: <pack_name>».
+
+    v5.2.0: reply_context (ReplySnapshot) — сообщение, на которое отвечал
+    нарушитель. Рисуется отдельным Details «↩️ В ответ на» между блоком
+    сообщения нарушителя и скриншотом модератора. Без него в отчёте
+    оставался голый «пошёл ты» без адресата и без повода. Резолвится
+    вызывающим через _resolve_reply_context; None — штатное значение
+    (отвечали не на что, либо снимка нет).
 
     Returns: None (медиа теперь inline в Details-блоке rich message).
     """
@@ -2927,6 +3296,12 @@ async def _send_report(
             )
         )
 
+    # ── v5.2.0: Details «↩️ В ответ на» (опционально) ──────────────
+    # Идёт сразу за сообщением нарушителя: сначала что сказал, потом кому.
+    if reply_context is not None:
+        blocks.append(InputRichBlockDivider())
+        blocks.append(_build_reply_context_block(chat_id, reply_context))
+
     # ── v4.8.3: Details «📷 Скриншот от модератора» (опционально) ──
     # Если модератор приложил фото к команде (caption содержит !ban ...) —
     # добавляем отдельный сворачиваемый Details с этим фото. Это НЕ сообщение
@@ -3025,6 +3400,7 @@ async def _send_report(
                 total_warns=total_warns,
                 time_str=time_str,
                 hashtag=hashtag,
+                reply_context=reply_context,
             )
         except TelegramAPIError as e2:
             logger.error("Plain-text fallback also failed: %s", e2)
@@ -3058,6 +3434,7 @@ async def _send_report_plain_fallback(
     total_warns: int | None,
     time_str: str,
     hashtag: str,
+    reply_context: "ReplySnapshot | None" = None,
 ) -> None:
     """Резервный plain-text отчёт, если Rich Message не удалась.
 
@@ -3081,6 +3458,17 @@ async def _send_report_plain_fallback(
         parts.append(f"🌐 Открыть профиль: {web_url}")
     if text_content:
         parts.append(f"💬 Контент: {text_content[:500]}")
+    if reply_context is not None:
+        # v5.2.0: одной строкой — в rich-версии это свёрнутый Details, но
+        # ради fallback'а разворачивать формат не стоит.
+        author = ("канал «%s»" % reply_context.display_name
+                  if reply_context.is_channel_post else reply_context.display_name)
+        if reply_context.parent_username:
+            author += f" @{reply_context.parent_username}"
+        line = f"↩️ В ответ на {author}"
+        if reply_context.parent_text:
+            line += f": {reply_context.parent_text[:500]}"
+        parts.append(line)
     if duration_seconds:
         parts.append(f"⏱ Длительность: {_format_duration(duration_seconds)}")
     if total_warns is not None:
@@ -3729,8 +4117,14 @@ async def _check_warn_threshold(
     chat_id: int,
     target: types.User,
     mod: types.User,
+    reply_context: "ReplySnapshot | None" = None,
 ) -> None:
-    """Проверяет, не достигнут ли порог варнов для автосанкции."""
+    """Проверяет, не достигнут ли порог варнов для автосанкции.
+
+    v5.2.0: reply_context прокидывается вызывающим (cmd_warn/cmd_swarn) —
+    автобан и автомьют по порогу отчитываются о том же сообщении, что и
+    сам варн, и в отчёте виден тот же контекст «в ответ на».
+    """
     async with async_session() as session:
         settings = await _get_chat_settings(session, chat_id)
         total_warns = await _count_warns(session, target.id, chat_id)
@@ -3774,7 +4168,7 @@ async def _check_warn_threshold(
                 )
                 await _send_report(bot, chat_id, target, "ban",
                                    f"Автобан: {total_warns} варнов",
-                                   mod=mod)
+                                   mod=mod, reply_context=reply_context)
                 logger.info("Auto-ban triggered for user %s in chat %s (%d warns)",
                             target.id, chat_id, total_warns)
                 # ── Ephemeral-уведомление модератору (видно только ему) ────
@@ -3843,7 +4237,8 @@ async def _check_warn_threshold(
                 await _send_report(bot, chat_id, target, "mute",
                                    f"Автомьют: {total_warns} варнов",
                                    mod=mod,
-                                   duration_seconds=mute_dur)
+                                   duration_seconds=mute_dur,
+                                   reply_context=reply_context)
                 logger.info(
                     "Auto-mute triggered for user %s in chat %s "
                     "(%d warns, %s, automute_count %d→%d)",
@@ -4352,62 +4747,58 @@ async def handle_group_command(message: types.Message) -> None:
         await _send_access_denied(message, chat_id, mod)
         return
 
-    # ── Резолв цели наказания ──────────────────────────────────────────
-    # Команды снятия (unmute/unban/unwarn/warns/resetwarns) — работают
-    # ТОЛЬКО по reply. Если reply нет — отказываем.
-    # Наказательные команды (ban/sban/warn/swarn/mute/smute) —
-    # резолвятся через _resolve_punishment_target (reply → @username → TGID).
-    # v4.8.4: resetmc — тоже резолвится через _resolve_punishment_target
-    # (reply → @username → TGID), но это не наказательная команда
-    # (сброс счётчика, не мьют/варн/бан). Self/friendly-fire checks не применяются.
+    # ── Резолв цели ────────────────────────────────────────────────────
+    # Все команды диспетчера резолвят цель одинаково, через
+    # _resolve_punishment_target (reply → @username → TGID). Reply
+    # приоритетнее аргумента.
+    #
+    # v4.8.4: resetmc — тоже через _resolve_punishment_target, но это не
+    # наказательная команда (сброс счётчика, не мьют/варн/бан).
+    # Self/friendly-fire checks к ней не применяются.
+    #
+    # v5.2.0: раньше здесь была вторая ветка — команды снятия
+    # (unmute/unban/unwarn/warns/resetwarns) работали ТОЛЬКО по reply и без
+    # него получали отказ. Для /unban это был тупик: забаненного в чате нет,
+    # реплаить не на что, и снять бан из Telegram было нельзя в принципе.
+    # Теперь ветка одна, а разница между наказанием и снятием сведена к
+    # строгости резолва TGID (commands.LENIENT_TARGET) — см.
+    # require_membership в _resolve_punishment_target.
     is_punitive_cmd = spec.name in commands.PUNITIVE
-    is_resetmc_cmd = spec.name == "resetmc"
+    is_lenient_target = spec.name in commands.LENIENT_TARGET
 
-    if is_punitive_cmd or is_resetmc_cmd:
-        # Цель — из именованной группы target, если она есть в матче.
-        cmd_target_str: str | None = cmd_match.groupdict().get("target")
-
-        target, target_err = await _resolve_punishment_target(
-            message, cmd_target_str, chat_id,
+    # Цель — из именованной группы target, если она есть в матче.
+    cmd_target_str: str | None = cmd_match.groupdict().get("target")
+    # v5.2.0: у /unwarn группа target делит синтаксис со счётчиком варнов —
+    # «/unwarn 3» это либо три варна по reply, либо TGID 3. Разводит
+    # commands.unwarn_args, чтобы правило жило в одном месте с паттерном.
+    unwarn_count: int | None = None
+    if spec.name == "unwarn":
+        cmd_target_str, unwarn_count = commands.unwarn_args(
+            cmd_match, has_reply=message.reply_to_message is not None,
         )
-        if target_err is not None:
-            # Не удалось зарезолвить цель — ephemeral модератору и выход.
-            try:
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=target_err,
-                )
-            except Exception:
-                pass
-            try:
-                await message.delete()
-            except TelegramAPIError:
-                pass
-            return
-        # target теперь types.User (либо из reply, либо из БД, либо синтетический
-        # из TGID — _resolve_punishment_target возвращает User-объект).
-        target_content: str | None = None
-        if message.reply_to_message is not None:
-            target_content = _get_message_content_desc(message.reply_to_message)
-    else:
-        # Команды снятия — требуют reply.
-        if message.reply_to_message is None:
-            try:
-                await _send_ephemeral(
-                    bot=message.bot, chat_id=chat_id, recipient=mod,
-                    text=(
-                        "❌ Эта команда требует reply на сообщение пользователя, "
-                        "к которому применяется действие."
-                    ),
-                )
-            except Exception:
-                pass
-            try:
-                await message.delete()
-            except TelegramAPIError:
-                pass
-            return
-        target: types.User = message.reply_to_message.from_user
+
+    target, target_err = await _resolve_punishment_target(
+        message, cmd_target_str, chat_id,
+        require_membership=not is_lenient_target,
+    )
+    if target_err is not None:
+        # Не удалось зарезолвить цель — ephemeral модератору и выход.
+        try:
+            await _send_ephemeral(
+                bot=message.bot, chat_id=chat_id, recipient=mod,
+                text=target_err,
+            )
+        except Exception:
+            pass
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            pass
+        return
+    # target теперь types.User (либо из reply, либо из БД, либо синтетический
+    # из TGID — _resolve_punishment_target возвращает User-объект).
+    target_content: str | None = None
+    if message.reply_to_message is not None:
         target_content = _get_message_content_desc(message.reply_to_message)
     if is_punitive_cmd:
         if target.id == mod.id:
@@ -4479,6 +4870,10 @@ async def handle_group_command(message: types.Message) -> None:
         target_content=target_content,
         text=text,
         match=cmd_match,
+        # v5.2.0: контекст «в ответ на» резолвится один раз на команду,
+        # а не в каждом вызове _send_report.
+        reply_context=await _resolve_reply_context(message.reply_to_message),
+        unwarn_count=unwarn_count,
     )
 
     _handler = _MOD_COMMANDS.get(spec.name)
@@ -8039,6 +8434,9 @@ async def handle_new_members(message: types.Message) -> None:
                 bot=message.bot, chat_id=message.chat.id, target=member,
                 action_type="ban", reason=f"CAS auto-ban: {reason}",
                 mod=None,
+                # CAS банит на входе в чат: сообщений от юзера ещё не было,
+                # отвечать ему было не на что.
+                reply_context=None,
             )
         except TelegramAPIError as e:
             logger.error("CAS ban failed for user %s: %s", member.id, e)
