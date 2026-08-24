@@ -336,6 +336,20 @@ class ChatSettings(Base):
     via_bot_rate_limit_seconds = Column(Integer, default=300, nullable=False)  # grace window (def 5 min)
     via_bot_mute_minutes = Column(Integer, default=10, nullable=False)         # mute duration (def 10 min)
 
+    # ── v5.3.0: Удаление сообщений от имени чужих каналов ───────────────
+    # Юзер может писать в группу от имени своего канала. Для спамера это
+    # обход персональных ограничений: замьютили человека — он продолжает
+    # от имени канала. Фильтр удаляет такие сообщения, кроме внесённых в
+    # channel_whitelist.
+    #
+    # Default: OFF. Цена ошибки здесь — массовое удаление чужих сообщений,
+    # поэтому фича не включается сама ни в одном чате.
+    #
+    # ⚠️ Сообщения от самой группы (анонимные админы) и от связанного
+    # канала не удаляются НИКОГДА, независимо от этого флага и списка —
+    # см. _channel_guard_reason.
+    delete_channel_messages = Column(Boolean, default=False, nullable=False)
+
     # ── v4.8.0: Modchat (модераторский чат) + keyword-watch ─────────────
     # Modchat — отдельный чат для оперативных оповещений модераторам:
     # события alarm on/off/auto-off/продление + keyword-watch (упоминания
@@ -485,6 +499,42 @@ class BotWhitelist(Base):
 
     __table_args__ = (
         UniqueConstraint("chat_id", "bot_username", name="uq_bot_whitelist_chat_bot"),
+    )
+
+
+class ChannelWhitelist(Base):
+    """v5.3.0: каналы, которым можно писать в чат от своего имени.
+
+    Калька с BotWhitelist: chat_id=0 означает «во всех чатах», конкретный
+    chat_id — только в этом чате.
+
+    Матч идёт по ``channel_id``: он неизменен, а username сменить можно.
+    ``channel_username`` — запасной путь для упреждающего внесения, когда
+    канал ещё ни разу не писал и его id взять неоткуда; при первой встрече
+    id дописывается (так же, как BotWhitelist поступает с bot_id).
+
+    ⚠️ Список НЕ участвует в защите своих: сама группа и связанный канал
+    пропускаются безусловно, до обращения сюда (см. _channel_guard_reason).
+    Иначе удаление записи кнопкой в веб-панели стоило бы чату обсуждений
+    всех постов, а группе — команд её анонимных админов.
+    """
+
+    __tablename__ = "channel_whitelist"
+
+    id = Column(Integer, primary_key=True)
+    chat_id = Column(BigInteger, nullable=False, default=0)   # 0 = global
+    channel_id = Column(BigInteger, nullable=True)
+    channel_username = Column(String, nullable=True)          # lower, без «@»
+    title = Column(String, nullable=True)                     # для отображения
+    note = Column(String, nullable=True)
+    added_by_mod_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        UniqueConstraint("chat_id", "channel_id",
+                         name="uq_channel_whitelist_chat_id"),
+        UniqueConstraint("chat_id", "channel_username",
+                         name="uq_channel_whitelist_chat_username"),
     )
 
 
@@ -1397,6 +1447,36 @@ async def init_db() -> None:
         """))
         # v4.8.9: индексы ix_idea_log_* создаются через Index() в
         # __table_args__ модели IdeaLog (Base.metadata.create_all).
+
+    # ── v5.3.0: Тумблер удаления сообщений от имени чужих каналов ─────────
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        if "delete_channel_messages" not in existing_cols:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN delete_channel_messages "
+                "BOOLEAN NOT NULL DEFAULT 0"
+            ))
+
+    # ── v5.3.0: Новая таблица channel_whitelist ───────────────────────────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS channel_whitelist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id BIGINT NOT NULL DEFAULT 0,
+                channel_id BIGINT NULL,
+                channel_username VARCHAR NULL,
+                title VARCHAR NULL,
+                note VARCHAR NULL,
+                added_by_mod_id BIGINT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT uq_channel_whitelist_chat_id
+                    UNIQUE (chat_id, channel_id),
+                CONSTRAINT uq_channel_whitelist_chat_username
+                    UNIQUE (chat_id, channel_username)
+            )
+        """))
 
     # ── v5.2.0: Новая таблица reply_contexts (контекст «в ответ на») ───────
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.

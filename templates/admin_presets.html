@@ -555,4 +555,97 @@
     {% endif %}
 </div>
 
+{# ════════════════════════════════════════════════════════════════════ #}
+{# v5.3.0: Вайтлист каналов                                             #}
+{# ════════════════════════════════════════════════════════════════════ #}
+
+<div style="margin-top: var(--sp-7); padding-top: var(--sp-5); border-top: 2px dashed var(--border);">
+    <div class="section-title" style="font-size: 14px;">📢 Вайтлист каналов <a class="anchor" href="#channels">#</a></div>
+
+    <div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin: var(--sp-3) 0 var(--sp-5); color: var(--text); font-size: 12px; line-height: 1.7;">
+        <strong>Что делает:</strong> когда в чате включён тумблер <code>CHAN</code> (на странице
+        «Чаты»), бот удаляет сообщения, отправленные от имени чужих каналов. Каналы из этого
+        списка он не трогает.<br><br>
+        <strong>Зачем нужно:</strong> писать в чат от имени своего канала — способ обойти
+        персональные ограничения: человека замьютили, а он продолжает от имени канала.<br><br>
+        <strong style="color: var(--accent);">⚠️ Свои защищены всегда.</strong> Сообщения от имени
+        самой группы (анонимные админы) и от связанного канала чата обсуждений не удаляются
+        никогда — ни этот список, ни тумблер на них не влияют. Поэтому их и не нужно сюда
+        вносить, а удаление любой записи отсюда им ничем не грозит.<br><br>
+        <strong>chat_id = 0</strong> — во всех чатах. Конкретный chat_id — только в этом чате.
+        То же самое можно сделать командами бота: <code>/channelallow</code> реплаем на сообщение
+        канала прямо в чате, либо <code>/channelallow</code>, <code>/channelunallow</code>,
+        <code>/channelallowlist</code> из личных сообщений.
+    </div>
+
+    {# ── Add channel form ── #}
+    <details style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4); margin-bottom: var(--sp-5);">
+        <summary style="cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700;">+ Добавить канал</summary>
+        <form method="post" action="/admin/presets/channels/add" style="margin-top: var(--sp-4);">
+            {{ csrf_field() }}
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-3); align-items: end;">
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Куда применить</label>
+                    <select name="chat_id_str" required
+                            style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                        <option value="0">🌐 Во всех чатах</option>
+                        {% for c in chats %}
+                        <option value="{{ c.chat_id }}">📍 {{ c.title or c.chat_id }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Канал (@username или ID)</label>
+                    <input type="text" name="channel_ref" required maxlength="64" placeholder="@news или -1001234567890"
+                           style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                </div>
+                <div>
+                    <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Заметка</label>
+                    <input type="text" name="note" maxlength="255" placeholder="необязательно"
+                           style="width: 100%; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-size: 13px;">
+                </div>
+            </div>
+            <button type="submit"
+                    style="margin-top: var(--sp-3); padding: 8px 16px; background: var(--accent); border: 1px solid var(--accent); color: var(--bg); font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; cursor: pointer; border-radius: var(--r-xs);">
+                Добавить
+            </button>
+        </form>
+    </details>
+
+    {# ── Existing channel whitelist ── #}
+    <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--text); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--border);">
+        Вайтлист каналов
+        <span style="color: var(--text-dim); font-size: 10px; margin-left: 8px;">({{ channel_whitelist|length }})</span>
+    </div>
+
+    {% if not channel_whitelist %}
+    <div style="padding: var(--sp-3); background: var(--bg2); border: 1px dashed var(--border); border-radius: var(--r-sm); color: var(--text-dim); font-size: 11px;">
+        Список пуст.
+    </div>
+    {% else %}
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--sp-2);">
+        {% for wl in channel_whitelist %}
+        <div style="display: grid; grid-template-columns: auto 1fr auto; gap: var(--sp-3); padding: var(--sp-2) var(--sp-3); background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-sm); align-items: center;">
+            <span style="font-size: 9px; padding: 2px 6px; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px; font-family: var(--font-mono);
+                {% if wl.chat_id == 0 %}background: rgba(0,204,102,.15); color: var(--accent); border: 1px solid var(--accent);">GLOBAL{% else %}background: rgba(255,200,0,.1); color: var(--warn); border: 1px solid var(--warn);">{{ wl.chat_id }}{% endif %}
+            </span>
+            <span>
+                <code style="color: var(--text); font-size: 12px; word-break: break-all;">{% if wl.channel_username %}@{{ wl.channel_username }}{% else %}{{ wl.channel_id }}{% endif %}</code>
+                {% if wl.title %}<div style="color: var(--text-dim); font-size: 10px; margin-top: 2px;">{{ wl.title }}</div>{% endif %}
+                {% if wl.note %}<div style="color: var(--text-dim); font-size: 10px; margin-top: 2px;">{{ wl.note }}</div>{% endif %}
+            </span>
+            <form method="post" action="/admin/presets/channels/{{ wl.id }}/delete" style="display: inline;"
+                  onsubmit="return confirm('Remove channel from whitelist?');">
+            {{ csrf_field() }}
+                <button type="submit"
+                        style="padding: 2px 8px; background: transparent; border: 1px solid var(--danger); color: var(--danger); font-family: var(--font-mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-radius: var(--r-xs);">
+                    ✕
+                </button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+
 {% endblock %}

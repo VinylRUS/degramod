@@ -485,8 +485,11 @@ async def admin_chats_toggle(
     v4.7.6: упразднён toggle 'private' (система private/non-private удалена).
     v4.7.24: добавлен toggle для via_bot_filter (rate-limit «via @Bot»).
     v4.8.0: добавлен toggle для mod_chat (взаимоисключение с report_chat).
+    v5.3.0: добавлен toggle для channel_filter (удаление сообщений от имени
+    чужих каналов). Свои — сама группа и связанный канал — этим тумблером
+    не управляются, они защищены безусловно (_channel_guard_reason).
 
-    Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days|via_bot_filter|mod_chat — что переключать.
+    Поле form: field=enabled|report_chat|cas|link_filter|night_mode|sanitary_days|via_bot_filter|mod_chat|channel_filter — что переключать.
     """
     try:
         chat_id = int(chat_id_str)
@@ -497,7 +500,10 @@ async def admin_chats_toggle(
         )
     form = await request.form()
     field = (form.get("field") or "").strip().lower()
-    valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode", "sanitary_days", "via_bot_filter", "mod_chat"}
+    valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode",
+                    "sanitary_days", "via_bot_filter", "mod_chat",
+                    # v5.3.0: удаление сообщений от имени чужих каналов.
+                    "channel_filter"}
     if field not in valid_fields:
         return RedirectResponse(
             url="/admin/chats?flash=Invalid+toggle+field",
@@ -519,6 +525,13 @@ async def admin_chats_toggle(
         elif field == "cas":
             cs.cas_check_enabled = not cs.cas_check_enabled
             msg = f"Chat+{chat_id}+CAS+{'enabled' if cs.cas_check_enabled else 'disabled'}"
+        elif field == "channel_filter":
+            # v5.3.0: удаление сообщений от имени чужих каналов.
+            # Свои (сама группа, связанный канал) защищены безусловно и
+            # этим тумблером не управляются — см. _channel_guard_reason.
+            cs.delete_channel_messages = not cs.delete_channel_messages
+            msg = (f"Chat+{chat_id}+Channel+filter+"
+                   f"{'enabled' if cs.delete_channel_messages else 'disabled'}")
         elif field == "link_filter":
             cs.link_filter_enabled = not cs.link_filter_enabled
             msg = f"Chat+{chat_id}+Link+filter+{'enabled' if cs.link_filter_enabled else 'disabled'}"

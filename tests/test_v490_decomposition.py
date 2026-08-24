@@ -36,7 +36,7 @@ from web.deps import get_bot, get_templates  # noqa: E402
 # раньше) плюс /healthz, добавленный в v4.10.2 (Task 16), плюс 2 роута
 # вайтлиста ботов (/admin/presets/bots/add, /admin/presets/bots/{wl_id}/delete),
 # добавленные в v5.1.0 (Task 8).
-_EXPECTED_ROUTES = 57
+_EXPECTED_ROUTES = 59
 
 
 def _walk(routes):

@@ -157,6 +157,11 @@
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.via_bot_filter_enabled %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         VIA {% if c.via_bot_filter_enabled %}●{% else %}○{% endif %}
                     </button>
+                    <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="channel_filter"
+                            title="v5.3.0: удалять сообщения от имени чужих каналов. Сама группа и связанный канал защищены всегда, вне зависимости от этого тумблера и белого списка."
+                            style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.delete_channel_messages %}var(--danger){% else %}var(--border){% endif %}; color: {% if c.delete_channel_messages %}var(--danger){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
+                        CHAN {% if c.delete_channel_messages %}●{% else %}○{% endif %}
+                    </button>
                     <button type="submit" formaction="/admin/chats/{{ c.chat_id }}/toggle" formmethod="post" formnovalidate name="field" value="night_mode"
                             style="width: 100%; padding: 4px 8px; background: transparent; border: 1px solid {% if c.night_mode_enabled %}var(--accent){% else %}var(--border){% endif %}; color: {% if c.night_mode_enabled %}var(--accent){% else %}var(--text-dim){% endif %}; font-family: var(--font-mono); font-size: 9px; cursor: pointer; border-radius: var(--r-xs); text-transform: uppercase; letter-spacing: 0.5px;">
                         NIGHT {% if c.night_mode_enabled %}●{% else %}○{% endif %}

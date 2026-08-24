@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING
 
 from aiogram import types
 from aiogram.exceptions import TelegramAPIError
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from bot_handlers import (
     _EPHEMERAL_DELETE_SEM,
@@ -70,7 +70,7 @@ from bot_handlers import (
     revoke_user_ban,
     tg_safe_call,
 )
-from db import BannedStickerPack, Punishment, async_session
+from db import BannedStickerPack, ChannelWhitelist, Punishment, async_session
 
 if TYPE_CHECKING:
     from bot_handlers import ReplySnapshot
@@ -93,6 +93,8 @@ class ModContext:
       chat_id: ID чата, где идёт модерация.
       mod: User — модератор, вызвавший команду (message.from_user).
       target: User — цель наказания (резолвится из reply/@username/TGID).
+        None у команд из commands.NO_USER_TARGET: их цель — канал, а не
+        участник чата (белый список каналов, v5.3.0).
       target_content: содержимое сообщения нарушителя (для _save_punishment).
       text: полный текст команды (message.text or message.caption).
       match: re.Match — результат commands.resolve(text, ...) для этой же
@@ -111,7 +113,7 @@ class ModContext:
 
     chat_id: int
     mod: types.User
-    target: types.User
+    target: types.User | None
     target_content: str | None
     text: str
     match: re.Match
@@ -1091,6 +1093,166 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
 # v4.8.10: все 12 команд перенесены. handle_group_command теперь ~50-строчный
 # dispatcher: парсит команду → вызывает COMMANDS[cmd](message, ctx).
 
+
+# ── v5.3.0: белый список каналов ────────────────────────────────────────────
+
+
+def _resolve_channel_target(message: types.Message, ctx: ModContext):
+    """Канал из reply на его сообщение, либо из аргумента команды.
+
+    Возвращает (channel_id, username, title) — любое поле может быть None.
+    Реплай приоритетнее: он даёт сразу и id, и название, тогда как из
+    аргумента известно только одно из двух.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    sender_chat = getattr(reply, "sender_chat", None) if reply is not None else None
+    if sender_chat is not None:
+        username = (getattr(sender_chat, "username", None) or "").lower() or None
+        return sender_chat.id, username, getattr(sender_chat, "title", None)
+
+    raw = (ctx.match.groupdict().get("target") or "").strip()
+    if not raw:
+        return None, None, None
+    if raw.startswith("@"):
+        return None, raw[1:].lower() or None, None
+    try:
+        return int(raw), None, None
+    except ValueError:
+        return None, None, None
+
+
+_CHANNEL_TARGET_HINT = (
+    "❌ Не указан канал. Ответьте на сообщение канала командой "
+    "<code>/channelallow</code>, либо укажите <code>@username</code> "
+    "или ID канала."
+)
+
+
+async def cmd_channelallow(message: types.Message, ctx: ModContext) -> None:
+    """/channelallow — разрешить каналу писать в этот чат.
+
+    Вносит канал в белый список ЭТОГО чата (глобальная область — только из
+    лички, где она указывается явно). Главный сценарий — реплай: модератор
+    видит ложно удалённое сообщение в модчате и чинит его на месте.
+    """
+    channel_id, username, title = _resolve_channel_target(message, ctx)
+    if channel_id is None and username is None:
+        await _send_ephemeral(
+            bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod,
+            text=_CHANNEL_TARGET_HINT,
+        )
+        return
+
+    note = (ctx.match.groupdict().get("note") or "").strip() or None
+
+    async with async_session() as session:
+        conditions = []
+        if channel_id is not None:
+            conditions.append(ChannelWhitelist.channel_id == channel_id)
+        if username:
+            conditions.append(
+                func.lower(ChannelWhitelist.channel_username) == username
+            )
+        existing = (await session.execute(
+            select(ChannelWhitelist).where(
+                ChannelWhitelist.chat_id == ctx.chat_id,
+                or_(*conditions),
+            ).limit(1)
+        )).scalars().first()
+        if existing is not None:
+            label = title or (f"@{username}" if username else str(channel_id))
+            await _send_ephemeral(
+                bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod,
+                text=f"⚠️ Канал {html.escape(label, quote=False)} уже в белом списке.",
+            )
+            return
+        session.add(ChannelWhitelist(
+            chat_id=ctx.chat_id,
+            channel_id=channel_id,
+            channel_username=username,
+            title=title,
+            note=note,
+            added_by_mod_id=ctx.mod.id,
+        ))
+        await session.commit()
+
+    label = title or (f"@{username}" if username else str(channel_id))
+    await _send_ephemeral(
+        bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod,
+        text=f"✅ Канал {html.escape(label, quote=False)} добавлен в белый список чата.",
+    )
+
+
+async def cmd_channelunallow(message: types.Message, ctx: ModContext) -> None:
+    """/channelunallow — убрать канал из белого списка этого чата."""
+    channel_id, username, title = _resolve_channel_target(message, ctx)
+    if channel_id is None and username is None:
+        await _send_ephemeral(
+            bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod,
+            text=_CHANNEL_TARGET_HINT.replace("channelallow", "channelunallow"),
+        )
+        return
+
+    async with async_session() as session:
+        conditions = []
+        if channel_id is not None:
+            conditions.append(ChannelWhitelist.channel_id == channel_id)
+        if username:
+            conditions.append(
+                func.lower(ChannelWhitelist.channel_username) == username
+            )
+        rows = (await session.execute(
+            select(ChannelWhitelist).where(
+                ChannelWhitelist.chat_id == ctx.chat_id,
+                or_(*conditions),
+            )
+        )).scalars().all()
+        for row in rows:
+            await session.delete(row)
+        await session.commit()
+
+    label = title or (f"@{username}" if username else str(channel_id))
+    if not rows:
+        text = f"⚠️ Канала {html.escape(label, quote=False)} нет в белом списке чата."
+    else:
+        text = f"✅ Канал {html.escape(label, quote=False)} убран из белого списка."
+    await _send_ephemeral(
+        bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod, text=text,
+    )
+
+
+async def cmd_channellist(message: types.Message, ctx: ModContext) -> None:
+    """/channellist — белый список каналов: этого чата и глобальный."""
+    async with async_session() as session:
+        rows = (await session.execute(
+            select(ChannelWhitelist)
+            .where(ChannelWhitelist.chat_id.in_((ctx.chat_id, 0)))
+            .order_by(ChannelWhitelist.chat_id.asc(),
+                      ChannelWhitelist.id.asc())
+        )).scalars().all()
+
+    if not rows:
+        text = (
+            "📋 Белый список каналов пуст.\n"
+            "Добавить: ответьте на сообщение канала командой "
+            "<code>/channelallow</code>."
+        )
+    else:
+        lines = ["📋 <b>Белый список каналов</b>"]
+        for row in rows:
+            scope = "глобально" if row.chat_id == 0 else "этот чат"
+            label = row.title or (
+                f"@{row.channel_username}" if row.channel_username
+                else str(row.channel_id)
+            )
+            extra = f" <code>{row.channel_id}</code>" if row.channel_id else ""
+            lines.append(f"• {html.escape(label, quote=False)}{extra} — {scope}")
+        text = "\n".join(lines)
+
+    await _send_ephemeral(
+        bot=message.bot, chat_id=ctx.chat_id, recipient=ctx.mod, text=text,
+    )
+
 COMMANDS: dict[str, callable] = {
     "ban": cmd_ban,
     "sban": cmd_sban,
@@ -1101,6 +1263,9 @@ COMMANDS: dict[str, callable] = {
     "unmute": cmd_unmute,
     "unban": cmd_unban,
     "unwarn": cmd_unwarn,
+    "channelallow": cmd_channelallow,
+    "channelunallow": cmd_channelunallow,
+    "channellist": cmd_channellist,
     "warns": cmd_warns,
     "resetwarns": cmd_resetwarns,
     "resetmc": cmd_resetmc,

@@ -33,11 +33,12 @@ import json
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 import web_app
 from db import (
     BotWhitelist,
+    ChannelWhitelist,
     ChatSettings,
     LinkAllowlist,
     PermissionPreset,
@@ -99,6 +100,12 @@ async def admin_presets_page(
             .order_by(BotWhitelist.chat_id.asc(), BotWhitelist.bot_username.asc())
         )).scalars().all()
 
+        # v5.3.0: Вайтлист каналов — паритет с /channelallow, /channellist.
+        channel_whitelist = (await session.execute(
+            select(ChannelWhitelist)
+            .order_by(ChannelWhitelist.chat_id.asc(), ChannelWhitelist.id.asc())
+        )).scalars().all()
+
     # Группируем по scope для UI.
     grouped = {"day": [], "night": [], "sanitary": []}
     for p in presets:
@@ -113,6 +120,7 @@ async def admin_presets_page(
             "word_filters": words,
             "link_allowlist": links,
             "bot_whitelist": bot_whitelist,
+            "channel_whitelist": channel_whitelist,
             "chats": chats,
             "flash": flash,
             "app_version": APP_VERSION,
@@ -741,4 +749,111 @@ async def admin_presets_bots_delete(
 
     return RedirectResponse(
         url=f"/admin/presets?flash=Bot+removed:+{username}", status_code=303,
+    )
+
+
+# ── v5.3.0: вайтлист каналов ────────────────────────────────────────────────
+
+
+@router.post("/admin/presets/channels/add")
+async def admin_presets_channels_add(
+    chat_id_str: str = Form("0"),
+    channel_ref: str = Form(""),
+    note: str = Form(""),
+    _auth: AuthUser = Depends(require_csrf_admin),
+):
+    """v5.3.0: добавить канал в белый список фильтра сообщений от каналов.
+
+    chat_id_str = "0" означает global — паритет с вайтлистом ботов.
+    channel_ref принимает и «@username», и числовой ID («-100…»): у
+    приватного канала username может не быть вовсе, а у публичного его
+    удобнее вводить руками.
+    """
+    try:
+        chat_id_int = int((chat_id_str or "0").strip())
+    except ValueError:
+        return RedirectResponse(
+            url="/admin/presets?flash=Invalid+chat_id", status_code=303,
+        )
+
+    ref = (channel_ref or "").strip()
+    channel_id: int | None = None
+    username: str | None = None
+    if ref.startswith("@"):
+        username = ref[1:].lower() or None
+    elif ref:
+        try:
+            channel_id = int(ref)
+        except ValueError:
+            username = ref.lower()
+    if channel_id is None and not username:
+        return RedirectResponse(
+            url="/admin/presets?flash=Channel+@username+or+ID+required",
+            status_code=303,
+        )
+
+    async with async_session() as session:
+        conditions = []
+        if channel_id is not None:
+            conditions.append(ChannelWhitelist.channel_id == channel_id)
+        if username:
+            conditions.append(
+                func.lower(ChannelWhitelist.channel_username) == username
+            )
+        existing = (await session.execute(
+            select(ChannelWhitelist).where(
+                ChannelWhitelist.chat_id == chat_id_int, or_(*conditions),
+            ).limit(1)
+        )).scalars().first()
+        if existing:
+            return RedirectResponse(
+                url="/admin/presets?flash=Channel+already+whitelisted",
+                status_code=303,
+            )
+        session.add(ChannelWhitelist(
+            chat_id=chat_id_int,
+            channel_id=channel_id,
+            channel_username=username,
+            note=(note or "").strip() or None,
+            added_by_mod_id=_auth.tg_user_id,
+        ))
+        await session.commit()
+        web_app._req_logger.info(
+            "channel_whitelist_add: chat_id=%d channel=%r by=%s",
+            chat_id_int, channel_id or username, _auth.username,
+        )
+
+    return RedirectResponse(
+        url="/admin/presets?flash=Channel+whitelisted", status_code=303,
+    )
+
+
+@router.post("/admin/presets/channels/{wl_id:int}/delete")
+async def admin_presets_channels_delete(
+    wl_id: int,
+    _auth: AuthUser = Depends(require_csrf_admin),
+):
+    """v5.3.0: убрать канал из белого списка (hard delete).
+
+    ⚠️ Удаление записи НЕ угрожает своим: сама группа и связанный канал
+    защищены хардкод-guard'ом (_channel_guard_reason), а не записями здесь.
+    """
+    async with async_session() as session:
+        row = (await session.execute(
+            select(ChannelWhitelist).where(ChannelWhitelist.id == wl_id)
+        )).scalar_one_or_none()
+        if row is None:
+            return RedirectResponse(
+                url="/admin/presets?flash=Channel+not+found", status_code=303,
+            )
+        ident = row.channel_id or row.channel_username
+        await session.delete(row)
+        await session.commit()
+        web_app._req_logger.info(
+            "channel_whitelist_delete: id=%d channel=%r by=%s",
+            wl_id, ident, _auth.username,
+        )
+
+    return RedirectResponse(
+        url="/admin/presets?flash=Channel+removed", status_code=303,
     )

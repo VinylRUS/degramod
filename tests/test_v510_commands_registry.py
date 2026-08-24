@@ -97,6 +97,10 @@ class TestResolve(unittest.TestCase):
             "resetwarns": "/resetwarns",
             "resetmc": "/resetmc",
             "alarm": "/alarm on",
+        # v5.3.0: белый список каналов.
+        "channelallow": "/channelallow @news",
+        "channelunallow": "/channelunallow @news",
+        "channellist": "/channellist",
             "mywarns": "/mywarns",
             "rules": "/rules",
         }

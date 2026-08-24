@@ -153,6 +153,19 @@ _P_ALARM = re.compile(
     r"\s*$",
     re.IGNORECASE,
 )
+# v5.3.0: белый список каналов. Цель этих команд — канал, а не участник,
+# поэтому ID отрицательный («-100…»): «-?\d+», а не «\d+». Главный
+# сценарий — реплай на сообщение канала: id и название берутся из
+# sender_chat, руками их добывать негде.
+_P_CHANNELALLOW = re.compile(
+    r"^channelallow(?:\s+(?P<target>@\w+|-?\d+))?(?:\s+(?P<note>.+))?$",
+    re.IGNORECASE | re.DOTALL,
+)
+_P_CHANNELUNALLOW = re.compile(
+    r"^channelunallow(?:\s+(?P<target>@\w+|-?\d+))?\s*$",
+    re.IGNORECASE,
+)
+_P_CHANNELLIST = re.compile(r"^channellist\s*$", re.IGNORECASE)
 _P_MYWARNS = re.compile(r"^mywarns\s*$", re.IGNORECASE)
 _P_RULES = re.compile(r"^rules\s*$", re.IGNORECASE)
 
@@ -190,6 +203,16 @@ GROUP_COMMANDS: tuple[CommandSpec, ...] = (
                 "обнулить варны", Access.ADMIN),
     CommandSpec("resetmc", _P_RESETMC, "[@user|tgid]",
                 "обнулить счётчик автомьютов", Access.ADMIN),
+    # v5.3.0: белый список каналов. Access.MOD, а не ADMIN: удаление идёт
+    # молча, и единственный способ починить ложное срабатывание — внести
+    # канал в список. Модератор, который его увидел, должен мочь это сам.
+    CommandSpec("channelallow", _P_CHANNELALLOW, "[@channel|id] [заметка]",
+                "разрешить каналу писать в чат (reply на его сообщение)",
+                Access.MOD),
+    CommandSpec("channelunallow", _P_CHANNELUNALLOW, "[@channel|id]",
+                "убрать канал из белого списка", Access.MOD),
+    CommandSpec("channellist", _P_CHANNELLIST, "",
+                "показать белый список каналов", Access.MOD),
     # Режим тревоги.
     CommandSpec("alarm", _P_ALARM, "on [длит] | off",
                 "режим тревоги (усиленные ограничения)", Access.MOD),
@@ -204,6 +227,13 @@ PUNITIVE: frozenset[str] = frozenset({"ban", "warn", "mute", "sban", "swarn", "s
 # (_resolve_punishment_target(require_membership=False)): забаненного или
 # вышедшего юзера в чате уже нет, и строгая проверка через get_chat_member
 # отвергала бы ровно тот случай, ради которого команда и вызывается.
+# v5.3.0: команды, чья цель — канал, а не участник чата. Диспетчер не
+# запускает для них _resolve_punishment_target: тот резолвит пользователей
+# и на «/channellist» отвечал бы «не указана цель».
+NO_USER_TARGET: frozenset[str] = frozenset(
+    {"channelallow", "channelunallow", "channellist"}
+)
+
 LENIENT_TARGET: frozenset[str] = frozenset(
     {"unmute", "unban", "unwarn", "warns", "resetwarns"}
 )

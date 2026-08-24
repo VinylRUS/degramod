@@ -25,6 +25,7 @@ modchat.py — v4.8.0: модераторский чат + keyword-watch.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import time
@@ -400,6 +401,64 @@ def _check_keyword_rate_limit(chat_id: int, phrase_lower: str) -> tuple[bool, in
     # Внутри окна — suppress, увеличиваем счётчик.
     state["count"] += 1
     return False, state["count"]
+
+
+# ── v5.3.0: удалённое сообщение канала ──────────────────────────────────────
+
+# Rate-limit нотификаций об удалении: {(chat_id, channel_id): last_notify_ts}.
+# Канал, который спамит, шлёт сообщения пачками — модчату хватит одного
+# оповещения на канал за окно.
+_channel_delete_rate_limit: dict[tuple[int, int], float] = {}
+_CHANNEL_DELETE_RATE_LIMIT_SECONDS: int = 60
+
+
+async def _send_channel_deleted_to_modchat(
+    bot: types.Bot,
+    source_chat_id: int,
+    sender_chat,
+    content_desc: str | None,
+) -> bool:
+    """Оповещает модчат об удалённом сообщении от имени чужого канала.
+
+    В чате бот молчит (стелс-режим), поэтому ложное срабатывание фильтра
+    иначе никак не заметить. Поэтому же в тексте — готовая подсказка, как
+    внести канал в белый список: реплаем, без похода в веб-панель.
+
+    Rate-limit: не чаще одного оповещения на (чат, канал) в минуту —
+    спамящий канал шлёт сообщения пачками.
+
+    Returns: True при успехе, False если modchat не задан, отправка не
+    удалась или сработал rate-limit.
+    """
+    channel_id = getattr(sender_chat, "id", None)
+    if channel_id is None:
+        return False
+
+    key = (source_chat_id, channel_id)
+    now_ts = time.time()
+    last = _channel_delete_rate_limit.get(key)
+    if last is not None and now_ts - last < _CHANNEL_DELETE_RATE_LIMIT_SECONDS:
+        return False
+    _channel_delete_rate_limit[key] = now_ts
+
+    title = getattr(sender_chat, "title", None) or "(без названия)"
+    username = getattr(sender_chat, "username", None)
+    lines = [
+        "📢 <b>Удалено сообщение от имени канала</b>",
+        f"<b>Канал:</b> {html.escape(title, quote=False)}",
+    ]
+    if username:
+        lines.append(f"<b>Username:</b> @{html.escape(username, quote=False)}")
+    lines.append(f"<b>ID канала:</b> <code>{channel_id}</code>")
+    if content_desc:
+        preview = content_desc[:300]
+        lines.append(f"<b>Текст:</b> {html.escape(preview, quote=False)}")
+    lines.append(
+        "\n💡 Если удалено зря — ответьте на сообщение канала командой "
+        "<code>/channelallow</code>, либо "
+        f"<code>/channelallow {source_chat_id} {channel_id}</code> в личке бота."
+    )
+    return await _send_to_modchat(bot, source_chat_id, "\n".join(lines))
 
 
 # ── Keyword-watch notify (rich format) ──────────────────────────────────────

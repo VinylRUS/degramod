@@ -23,10 +23,9 @@ _VERSION = "v5.2.0"
 
 
 class TestVersion(unittest.TestCase):
-    def test_app_version(self):
-        import web_app
-        self.assertEqual(web_app.APP_VERSION, _VERSION)
-
+    # v5.3.0: проверка «APP_VERSION == v5.2.0» убрана — она ломается на
+    # каждом следующем релизе, ничего при этом не защищая. Текущую версию
+    # пинует релизный тест текущей версии (см. test_v530_release.py).
     def test_release_date_moved(self):
         """Дата сборки должна быть новой — иначе пилюля в футере врёт."""
         import web_app

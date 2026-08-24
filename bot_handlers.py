@@ -148,6 +148,7 @@ from db import (
     AutomuteCounter,
     BannedStickerPack,
     BotWhitelist,
+    ChannelWhitelist,
     ChatAdmin,
     ChatSettings,
     GithubSettings,
@@ -649,6 +650,226 @@ class _DisabledChatMiddleware(BaseMiddleware):
 
 # Регистрируем middleware как outer — обрабатывает ВСЕ router.message события.
 router.message.outer_middleware(_DisabledChatMiddleware())
+
+
+# ── v5.3.0: удаление сообщений от имени чужих каналов ─────────────────────
+# Юзер может писать в группу от имени своего канала. Для спамера это обход
+# персональных ограничений: замьютили человека — он продолжает от имени
+# канала, и рестрикт на него не действует.
+#
+# Фильтр стоит outer-middleware, а не хендлером: порядок объявления
+# хендлеров в этом файле уже дважды ронял прод (!ban и !alarm, changelog
+# v5.1.0), а middleware от этого класса ошибок не зависит вовсе.
+
+# Кэш linked_chat_id: звать get_chat на каждое сообщение канала нельзя.
+# {chat_id: (linked_chat_id | None, ts)}
+_linked_chat_cache: dict[int, tuple[int | None, float]] = {}
+_LINKED_CHAT_CACHE_TTL_SECONDS: int = 3600
+
+
+async def _get_linked_chat_id(bot: types.Bot, chat_id: int) -> int | None:
+    """ID связанного канала для чата обсуждений, либо None.
+
+    Результат кэшируется на час — привязка канала меняется примерно
+    никогда, а вызов идёт на каждое сообщение от имени канала.
+
+    Сбой get_chat кэшируется тоже: иначе чат без привязки (обычная группа)
+    дёргал бы Bot API на каждое такое сообщение. Ценой этого промах guard'а
+    на час — но своих защищает ещё и ветка sender_chat.id == chat.id, а
+    автопосты канала отсекаются по is_automatic_forward.
+    """
+    cached = _linked_chat_cache.get(chat_id)
+    now = time.monotonic()
+    if cached is not None and now - cached[1] < _LINKED_CHAT_CACHE_TTL_SECONDS:
+        return cached[0]
+
+    linked: int | None = None
+    try:
+        chat = await bot.get_chat(chat_id=chat_id)
+        linked = getattr(chat, "linked_chat_id", None)
+    except TelegramAPIError as e:
+        logger.warning("get_chat(%s) for linked_chat_id failed: %s", chat_id, e)
+
+    _linked_chat_cache[chat_id] = (linked, now)
+    return linked
+
+
+def _channel_guard_reason(
+    message: types.Message, linked_chat_id: int | None,
+) -> str | None:
+    """Причина безусловно НЕ трогать сообщение, либо None.
+
+    ⚠️ Инвариант проекта. Возвращённая причина отменяет фильтр целиком —
+    ни тумблер, ни белый список на эти ветки не влияют:
+
+      • Сообщение не от имени чата вообще — фильтру нечего делать.
+      • ``sender_chat.id == chat.id`` — это сама группа, то есть её
+        анонимные админы. Удаляя их, бот съедал бы мод-команды своих же
+        модераторов.
+      • ``sender_chat.id == linked_chat_id`` — связанный канал чата
+        обсуждений: и его посты, и комментарии, написанные от имени
+        канала-владельца.
+      • ``is_automatic_forward`` — автопост канала в чат обсуждений.
+        Вместе с ним из чата исчезла бы вся ветка комментариев.
+
+    Защита сделана хардкодом, а не записью в белом списке намеренно:
+    запись можно случайно удалить кнопкой в веб-панели, и тогда чат
+    обсуждений потеряет все посты. Guard удалить нечем.
+
+    None означает «кандидат на удаление» — дальше решают тумблер и список.
+    """
+    sender_chat = getattr(message, "sender_chat", None)
+    if sender_chat is None:
+        return "не от имени чата"
+
+    chat = getattr(message, "chat", None)
+    if getattr(sender_chat, "id", None) == getattr(chat, "id", None):
+        return "сама группа (анонимный админ)"
+
+    if linked_chat_id is not None and sender_chat.id == linked_chat_id:
+        return "связанный канал чата"
+
+    if getattr(message, "is_automatic_forward", None):
+        return "автопост связанного канала"
+
+    return None
+
+
+async def _is_channel_whitelisted(session, chat_id: int, sender_chat) -> bool:
+    """Есть ли канал в белом списке этого чата или в глобальном.
+
+    Матч по ``channel_id`` — он неизменен. Совпадение по ``@username``
+    (упреждающее внесение канала, который ещё ни разу не писал) дописывает
+    в запись id, чтобы дальше матчилось по нему и переименование канала
+    список не ломало.
+    """
+    channel_id = getattr(sender_chat, "id", None)
+    username = (getattr(sender_chat, "username", None) or "").lower()
+
+    conditions = []
+    if channel_id is not None:
+        conditions.append(ChannelWhitelist.channel_id == channel_id)
+    if username:
+        conditions.append(func.lower(ChannelWhitelist.channel_username) == username)
+    if not conditions:
+        return False
+
+    row = (await session.execute(
+        select(ChannelWhitelist).where(
+            ChannelWhitelist.chat_id.in_((chat_id, 0)),
+            or_(*conditions),
+        ).limit(1)
+    )).scalars().first()
+
+    if row is None:
+        return False
+
+    if row.channel_id is None and channel_id is not None:
+        row.channel_id = channel_id
+        if not row.title:
+            row.title = getattr(sender_chat, "title", None)
+        await session.commit()
+
+    return True
+
+
+async def _notify_channel_message_deleted(
+    bot: types.Bot, chat_id: int, sender_chat, message: types.Message,
+) -> None:
+    """Оповещает модчат об удалённом сообщении канала.
+
+    В чате бот молчит (стелс-режим), поэтому единственный способ заметить
+    ложное срабатывание — модчат. Подсказка про /channelallow там же:
+    модератор вносит канал реплаем, не выходя из модчата.
+    """
+    from modchat import _send_channel_deleted_to_modchat
+    await _send_channel_deleted_to_modchat(
+        bot, chat_id, sender_chat, _get_message_content_desc(message),
+    )
+
+
+class _ChannelMessageMiddleware(BaseMiddleware):
+    """v5.3.0: удаляет сообщения от имени чужих каналов.
+
+    Регистрируется между _DisabledChatMiddleware и _ReplyContextMiddleware:
+    в выключенном чате бот не модерирует вовсе, а контекст «в ответ на»
+    незачем писать для сообщения, которое сейчас исчезнет.
+
+    Порядок проверок (см. _channel_guard_reason — первые три безусловны):
+      sender_chat нет / сама группа / связанный канал / автопост → пропуск
+      тумблер выключен                                          → пропуск
+      канал в белом списке                                      → пропуск
+      иначе                                        → delete + notify модчат
+    """
+
+    async def __call__(self, handler, event: types.Message, data: dict):
+        chat = getattr(event, "chat", None)
+        if getattr(chat, "type", None) not in ("group", "supergroup"):
+            return await handler(event, data)
+
+        sender_chat = getattr(event, "sender_chat", None)
+        if sender_chat is None:
+            return await handler(event, data)
+
+        try:
+            async with async_session() as session:
+                settings = await _get_chat_settings(session, chat.id)
+                if not getattr(settings, "delete_channel_messages", False):
+                    return await handler(event, data)
+
+            linked_chat_id = await _get_linked_chat_id(event.bot, chat.id)
+            guard = _channel_guard_reason(event, linked_chat_id)
+            if guard is not None:
+                logger.debug(
+                    "channel filter: пропуск в чате %s — %s", chat.id, guard,
+                )
+                return await handler(event, data)
+
+            async with async_session() as session:
+                if await _is_channel_whitelisted(session, chat.id, sender_chat):
+                    return await handler(event, data)
+        except Exception as e:
+            # Сбой проверки не должен стоить чату модерации, и тем более
+            # не должен приводить к удалению «на всякий случай».
+            logger.error(
+                "ChannelMessageMiddleware: проверка упала (chat=%s): %s: %s "
+                "— сообщение пропущено",
+                getattr(chat, "id", None), type(e).__name__, e,
+            )
+            return await handler(event, data)
+
+        try:
+            # tg_safe_call, а не голый delete: спамящий канал шлёт пачками,
+            # и первый же 429 иначе оставил бы сообщение в чате молча —
+            # TelegramRetryAfter наследуется от TelegramAPIError и попал бы
+            # в ветку «нет прав» ниже.
+            await tg_safe_call(event.delete, label="channel_filter/delete")
+        except TelegramAPIError as e:
+            # Обычно это отсутствие права «удалять сообщения».
+            logger.error(
+                "channel filter: не удалось удалить сообщение канала %s "
+                "в чате %s: %s — проверьте права бота",
+                getattr(sender_chat, "id", None), chat.id, e,
+            )
+            return await handler(event, data)
+
+        logger.info(
+            "channel filter: удалено сообщение канала %s (%s) в чате %s",
+            getattr(sender_chat, "id", None),
+            getattr(sender_chat, "title", None), chat.id,
+        )
+        try:
+            await _notify_channel_message_deleted(
+                event.bot, chat.id, sender_chat, event,
+            )
+        except Exception as e:
+            logger.warning("channel filter: notify в модчат не ушёл: %s", e)
+
+        # Сообщения больше нет — обработчикам с ним делать нечего.
+        return None
+
+
+router.message.outer_middleware(_ChannelMessageMiddleware())
 
 
 # ── v5.2.0: контекст «в ответ на» ─────────────────────────────────────────
@@ -4778,6 +4999,13 @@ async def handle_group_command(message: types.Message) -> None:
     is_punitive_cmd = spec.name in commands.PUNITIVE
     is_lenient_target = spec.name in commands.LENIENT_TARGET
 
+    # v5.3.0: у команд белого списка каналов цель — канал, а не участник.
+    # _resolve_punishment_target резолвит пользователей и на «/channellist»
+    # ответил бы «не указана цель», поэтому для них он не запускается вовсе.
+    # Ветка не выходит из функции: авто-удаление команды и единая точка
+    # диспетча ниже нужны им ровно так же, как остальным.
+    targets_a_user = spec.name not in commands.NO_USER_TARGET
+
     # Цель — из именованной группы target, если она есть в матче.
     cmd_target_str: str | None = cmd_match.groupdict().get("target")
     # v5.2.0: у /unwarn группа target делит синтаксис со счётчиком варнов —
@@ -4789,10 +5017,13 @@ async def handle_group_command(message: types.Message) -> None:
             cmd_match, has_reply=message.reply_to_message is not None,
         )
 
-    target, target_err = await _resolve_punishment_target(
-        message, cmd_target_str, chat_id,
-        require_membership=not is_lenient_target,
-    )
+    target: types.User | None = None
+    target_err: str | None = None
+    if targets_a_user:
+        target, target_err = await _resolve_punishment_target(
+            message, cmd_target_str, chat_id,
+            require_membership=not is_lenient_target,
+        )
     if target_err is not None:
         # Не удалось зарезолвить цель — ephemeral модератору и выход.
         try:
@@ -4812,7 +5043,7 @@ async def handle_group_command(message: types.Message) -> None:
     target_content: str | None = None
     if message.reply_to_message is not None:
         target_content = _get_message_content_desc(message.reply_to_message)
-    if is_punitive_cmd:
+    if is_punitive_cmd and target is not None:
         if target.id == mod.id:
             try:
                 await _send_ephemeral(
@@ -5998,6 +6229,169 @@ async def cmd_botallow(message: types.Message) -> None:
 
     scope_str = "глобально" if chat_id == 0 else f"в чате {chat_id}"
     await message.reply(f"✅ @{username} добавлен в вайтлист {scope_str}", parse_mode=None)
+
+
+def _parse_channel_ref(arg: str) -> tuple[int | None, str | None]:
+    """«@news» → (None, "news"); «-100123» → (-100123, None); мусор → (None, None)."""
+    value = (arg or "").strip()
+    if not value:
+        return None, None
+    if value.startswith("@"):
+        return None, value[1:].lower() or None
+    try:
+        return int(value), None
+    except ValueError:
+        return None, None
+
+
+@router.message(F.chat.type == "private", Command("channelallow"))
+async def cmd_channelallow_dm(message: types.Message) -> None:
+    """v5.3.0: /channelallow <chat_id|global> <@channel|id> [заметка].
+
+    Форма для лички, в отличие от групповой, требует явной области — зато
+    умеет глобальную и не требует, чтобы канал уже что-то написал.
+    """
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /channelallow chat_id|global <@channel|id> [заметка]\n"
+            "💡 Пример: /channelallow global @news\n"
+            "    /channelallow -1001234567890 -1005555555555 партнёры",
+            parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    channel_id, username = _parse_channel_ref(parts[2])
+    if channel_id is None and username is None:
+        await message.reply(
+            "❌ Укажите канал: @username или числовой ID (обычно -100…)",
+            parse_mode=None,
+        )
+        return
+
+    note = parts[3].strip() if len(parts) > 3 else None
+
+    async with async_session() as session:
+        conditions = []
+        if channel_id is not None:
+            conditions.append(ChannelWhitelist.channel_id == channel_id)
+        if username:
+            conditions.append(
+                func.lower(ChannelWhitelist.channel_username) == username
+            )
+        existing = (await session.execute(
+            select(ChannelWhitelist).where(
+                ChannelWhitelist.chat_id == chat_id, or_(*conditions),
+            ).limit(1)
+        )).scalars().first()
+        if existing is not None:
+            await message.reply("⚠️ Этот канал уже в белом списке", parse_mode=None)
+            return
+        session.add(ChannelWhitelist(
+            chat_id=chat_id, channel_id=channel_id, channel_username=username,
+            note=note, added_by_mod_id=message.from_user.id,
+        ))
+        await session.commit()
+
+    label = f"@{username}" if username else str(channel_id)
+    scope_str = "глобально" if chat_id == 0 else f"в чате {chat_id}"
+    await message.reply(
+        f"✅ Канал {label} добавлен в белый список {scope_str}", parse_mode=None,
+    )
+
+
+@router.message(F.chat.type == "private", Command("channelunallow"))
+async def cmd_channelunallow_dm(message: types.Message) -> None:
+    """v5.3.0: /channelunallow <chat_id|global> <@channel|id>."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply(
+            "📋 Формат: /channelunallow chat_id|global <@channel|id>",
+            parse_mode=None,
+        )
+        return
+
+    chat_id = _parse_whitelist_scope(parts[1])
+    if chat_id is None:
+        await message.reply("❌ chat_id должен быть числом или 'global'", parse_mode=None)
+        return
+
+    channel_id, username = _parse_channel_ref(parts[2])
+    if channel_id is None and username is None:
+        await message.reply("❌ Укажите @username или ID канала", parse_mode=None)
+        return
+
+    async with async_session() as session:
+        conditions = []
+        if channel_id is not None:
+            conditions.append(ChannelWhitelist.channel_id == channel_id)
+        if username:
+            conditions.append(
+                func.lower(ChannelWhitelist.channel_username) == username
+            )
+        rows = (await session.execute(
+            select(ChannelWhitelist).where(
+                ChannelWhitelist.chat_id == chat_id, or_(*conditions),
+            )
+        )).scalars().all()
+        for row in rows:
+            await session.delete(row)
+        await session.commit()
+
+    label = f"@{username}" if username else str(channel_id)
+    if not rows:
+        await message.reply(f"⚠️ Канала {label} нет в этом списке", parse_mode=None)
+        return
+    await message.reply(f"✅ Канал {label} убран из белого списка", parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("channelallowlist"))
+async def cmd_channelallowlist_dm(message: types.Message) -> None:
+    """v5.3.0: /channelallowlist [chat_id|global] — показать белый список."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+
+    stmt = select(ChannelWhitelist).order_by(
+        ChannelWhitelist.chat_id.asc(), ChannelWhitelist.id.asc(),
+    )
+    scope_label = "все области"
+    if len(parts) > 1:
+        chat_id = _parse_whitelist_scope(parts[1])
+        if chat_id is None:
+            await message.reply(
+                "❌ chat_id должен быть числом или 'global'", parse_mode=None,
+            )
+            return
+        stmt = stmt.where(ChannelWhitelist.chat_id == chat_id)
+        scope_label = "глобально" if chat_id == 0 else f"чат {chat_id}"
+
+    async with async_session() as session:
+        rows = (await session.execute(stmt)).scalars().all()
+
+    if not rows:
+        await message.reply(
+            f"📋 Белый список каналов пуст ({scope_label})", parse_mode=None,
+        )
+        return
+
+    lines = [f"📋 Белый список каналов ({scope_label}):"]
+    for row in rows:
+        scope = "global" if row.chat_id == 0 else str(row.chat_id)
+        ident = str(row.channel_id) if row.channel_id else f"@{row.channel_username}"
+        title = f" — {row.title}" if row.title else ""
+        note = f" ({row.note})" if row.note else ""
+        lines.append(f"• [{scope}] {ident}{title}{note}")
+    await message.reply("\n".join(lines), parse_mode=None)
 
 
 @router.message(F.chat.type == "private", Command("botunallow"))
@@ -7901,6 +8295,10 @@ def _build_help_full_rich() -> InputRichMessage:
             _help_row("warns"),
             _help_row("resetwarns"),
             _help_row("resetmc"),
+            # v5.3.0: белый список каналов.
+            _help_row("channelallow"),
+            _help_row("channelunallow"),
+            _help_row("channellist"),
             _help_row("alarm"),
             ("/idea <текст>", "предложить идею → GitHub Issue (только ЛС/modchat)"),
         ],
@@ -8066,6 +8464,11 @@ def _build_help_moderator_rich() -> InputRichMessage:
             _help_row("unban"),
             _help_row("unwarn"),
             _help_row("warns"),
+            # v5.3.0: Access.MOD — модератор чинит ложное срабатывание
+            # фильтра каналов сам, реплаем, поэтому команды и в его справке.
+            _help_row("channelallow"),
+            _help_row("channelunallow"),
+            _help_row("channellist"),
             _help_row("alarm"),
         ],
     ))
