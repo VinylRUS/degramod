@@ -811,9 +811,18 @@ async def _resolve_reply_context(
         async with async_session() as session:
             row = await session.get(ReplyContext, (chat_id, message_id))
     except Exception as e:
-        logger.warning("resolve reply context failed (chat=%s msg=%s): %s",
-                       chat_id, message_id, e)
+        logger.warning("resolve reply context failed (chat=%s msg=%s): %s: %s",
+                       chat_id, message_id, type(e).__name__, e)
         return None
+
+    # Одна строка на мод-команду (живой путь сюда не доходит — он вышел
+    # выше). Промах — единственный симптом, который видно снаружи как
+    # «блок «в ответ на» не появился», и без этого лога он неотличим от
+    # «нарушитель никому не отвечал».
+    logger.info(
+        "reply context lookup: chat=%s msg=%s → %s",
+        chat_id, message_id, "найден" if row is not None else "не найден",
+    )
 
     if row is None:
         return None
@@ -879,10 +888,13 @@ class _ReplyContextMiddleware(BaseMiddleware):
                     _reply_snapshot_from_message(parent),
                 )
             except Exception as e:
-                logger.warning(
+                # Единственное место, где потеря контекста видна изнутри:
+                # снаружи она выглядит как «блок «в ответ на» не появился».
+                logger.error(
                     "ReplyContextMiddleware: не удалось сохранить контекст "
-                    "(chat=%s msg=%s): %s",
-                    chat.id, getattr(event, "message_id", None), e,
+                    "(chat=%s msg=%s): %s: %s",
+                    chat.id, getattr(event, "message_id", None),
+                    type(e).__name__, e,
                 )
         return await handler(event, data)
 

@@ -574,3 +574,28 @@ class TestEndToEndThroughDispatcher(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(ctx.reply_context.parent_text, "кто последний?")
         self.assertEqual(ctx.reply_context.parent_user_id, 555)
+
+
+class TestReplyContextsCountIsVisible(unittest.TestCase):
+    """Счётчик снимков виден в веб-панели.
+
+    Без него понять, наполняется таблица или нет, можно только через
+    консоль контейнера — а это первый вопрос при любой жалобе «контекст
+    не показывается». Число уже считается в _cleanup_counts, оставалось
+    вывести его на страницу.
+    """
+
+    def test_counts_helper_reports_reply_contexts(self):
+        import sqlite3
+        from web.admin_cleanup import _cleanup_counts
+        conn = sqlite3.connect(os.environ["DB_PATH"])
+        try:
+            self.assertIn("reply_contexts", _cleanup_counts(conn))
+        finally:
+            conn.close()
+
+    def test_settings_page_renders_the_count(self):
+        with open(_P("templates/admin_settings.html")) as f:
+            html = f.read()
+        self.assertIn("counts.reply_contexts", html,
+                      "счётчик reply_contexts не выведен на /admin/settings")
