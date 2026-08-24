@@ -455,3 +455,122 @@ class TestAllReportCallsPassContext(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestEndToEndThroughDispatcher(unittest.IsolatedAsyncioTestCase):
+    """Сквозной путь через настоящий aiogram-диспетчер.
+
+    Пробел, который этот класс закрывает: остальные тесты дёргают
+    middleware напрямую и проверяют наличие kwarg'а статикой. Ни один не
+    прогоняет реальную последовательность чата —
+
+      1. нарушитель отвечает на чужое сообщение (middleware обязан снять
+         родителя),
+      2. модератор отвечает «/ban» на сообщение нарушителя, и Telegram
+         присылает это сообщение УЖЕ БЕЗ вложенного reply,
+
+    — то есть ровно то, ради чего таблица и заведена.
+    """
+
+    async def asyncSetUp(self):
+        await init_db()
+        async with async_session() as session:
+            await session.execute(ReplyContext.__table__.delete())
+            await session.commit()
+
+        # Модератор — только 111. Заглушка «True для всех» ловила бы
+        # friendly-fire-защиту (нельзя наказать админа) и до cmd_ban дело
+        # бы не дошло.
+        async def _is_admin(session, chat_id, user_id):
+            return user_id == 111
+
+        p = patch.object(bot_handlers, "_is_admin", _is_admin)
+        p.start()
+        self.addCleanup(p.stop)
+
+        # message.delete()/ephemeral ходят в Telegram — здесь их нет.
+        p = patch.object(bot_handlers, "_send_ephemeral", AsyncMock())
+        p.start()
+        self.addCleanup(p.stop)
+
+        import mod_commands
+        self.captured: list = []
+
+        async def _capture(message, ctx):
+            self.captured.append(ctx)
+
+        p = patch.dict(mod_commands.COMMANDS, {"ban": _capture})
+        p.start()
+        self.addCleanup(p.stop)
+
+    @staticmethod
+    def _real_message(**kw):
+        from aiogram.types import Chat, Message, User
+        base = dict(
+            date=1699999999,
+            chat=Chat(id=_CHAT_ID, type="supergroup", title="Тест"),
+            from_user=User(id=666, is_bot=False, first_name="Нарушитель"),
+        )
+        base.update(kw)
+        return Message(**base)
+
+    # Роутер — модульный синглтон, прицепить его к Dispatcher можно ровно
+    # один раз за процесс (иначе «Router is already attached»). Поэтому
+    # диспетчер собирается один на класс.
+    _dp = None
+    _bot = None
+
+    @classmethod
+    def _dispatcher(cls):
+        if cls._dp is None:
+            from aiogram import Bot, Dispatcher
+            cls._bot = Bot(token="1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+            cls._dp = Dispatcher()
+            cls._dp.include_router(bot_handlers.router)
+        return cls._dp, cls._bot
+
+    async def _feed(self, message):
+        from aiogram.types import Update
+        dp, bot = self._dispatcher()
+        await dp.feed_update(
+            bot=bot, update=Update(update_id=1, message=message),
+        )
+
+    async def test_context_survives_from_chat_message_to_mod_command(self):
+        from aiogram.types import Chat, User
+
+        victim = User(id=555, is_bot=False, first_name="Вася", username="vasya")
+        parent = self._real_message(
+            message_id=100, text="кто последний?", from_user=victim,
+        )
+        # 1. Нарушитель отвечает на сообщение жертвы.
+        offender_msg = self._real_message(
+            message_id=200, text="пошёл ты", reply_to_message=parent,
+        )
+        await self._feed(offender_msg)
+
+        # 2. Модератор отвечает «/ban» на сообщение нарушителя. Telegram
+        #    присылает сообщение нарушителя БЕЗ его собственного reply —
+        #    поэтому здесь reply_to_message у него не задан.
+        offender_as_seen_by_moderator = self._real_message(
+            message_id=200, text="пошёл ты",
+        )
+        mod_cmd = self._real_message(
+            message_id=300, text="/ban Хамство",
+            from_user=User(id=111, is_bot=False, first_name="Модер"),
+            reply_to_message=offender_as_seen_by_moderator,
+        )
+        mod_cmd = mod_cmd.model_copy(update={"chat": Chat(
+            id=_CHAT_ID, type="supergroup", title="Тест",
+        )})
+        await self._feed(mod_cmd)
+
+        self.assertEqual(len(self.captured), 1, "cmd_ban не был вызван")
+        ctx = self.captured[0]
+        self.assertIsNotNone(
+            ctx.reply_context,
+            "контекст «в ответ на» потерян: middleware снял родителя, но "
+            "диспетчер его не нашёл",
+        )
+        self.assertEqual(ctx.reply_context.parent_text, "кто последний?")
+        self.assertEqual(ctx.reply_context.parent_user_id, 555)
