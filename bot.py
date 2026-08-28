@@ -184,8 +184,9 @@ async def _start_polling():
 # night mode может работать как обычно.
 
 
-# v5.2.0: как часто чистить reply_contexts. Час — снимки живут 30 дней,
-# точность до часа тут ничего не решает, а лишние DELETE не нужны.
+# v5.2.0: как часто чистить reply_contexts. Час — снимки живут 7 дней
+# (TTL в bot_handlers), точность до часа тут ничего не решает, а лишние
+# DELETE не нужны.
 _REPLY_CONTEXT_PURGE_INTERVAL_SECONDS: int = 3600
 
 
