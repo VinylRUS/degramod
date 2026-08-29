@@ -4243,6 +4243,7 @@ async def revoke_user_ban(
                     user_id=user_id, added_by=mod_id,
                     comment=f"auto: unban of CAS ban ({last_ban_reason})",
                 ))
+                await session.commit()
                 logger.info(
                     "revoke_user_ban: user %s added to cas_ignore "
                     "(CAS ban revoked in chat %s)", user_id, chat_id,

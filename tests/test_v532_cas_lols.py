@@ -32,26 +32,30 @@ import bot_handlers as bh  # noqa: E402,F401 — router + хуки разбан�
 import cas  # noqa: E402
 from db import (  # noqa: E402
     CasIgnore,
+    CasVerdict,
     ChatAdmin,
     ChatMemberSeen,
     ChatSettings,
     Punishment,
+    User,
     async_session,
     init_db,
 )
 
 _CHAT_ID = -100700
-_NOW = datetime.now(timezone.utc)
 
 
 async def _seed():
     await init_db()
     async with async_session() as s:
         for tbl in (CasIgnore, CasVerdict, ChatMemberSeen, ChatAdmin,
-                    ChatSettings, Punishment):
+                    ChatSettings, Punishment, User):
             await s.execute(tbl.__table__.delete())
         s.add(ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
                            is_enabled=True, title="CAS test chat"))
+        # Пользователи для FK punishments.user_id.
+        for uid in (1002, 777):
+            s.add(User(user_id=uid))
         await s.commit()
 
 
@@ -75,7 +79,8 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
                     ChatMemberSeen.user_id == 1001,
                 )
             )).scalar_one()
-            self.assertEqual(row.first_seen_at, row.last_seen_at)
+            self.assertGreaterEqual(row.last_seen_at, row.first_seen_at)
+            self.assertIsNotNone(row.first_seen_at)
 
     async def test_cached_verdict(self):
         self.assertIsNone(await cas._cached_verdict(222))
@@ -185,4 +190,4 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

@@ -149,7 +149,13 @@ async def _cached_verdict(user_id: int) -> tuple[bool, str, str | None] | None:
         row = (await session.execute(
             select(CasVerdict).where(CasVerdict.user_id == user_id)
         )).scalar_one_or_none()
-    if row is None or row.checked_at < cutoff:
+    if row is None:
+        return None
+    # SQLite отдаёт naive datetime — приводим к UTC-aware перед сравнением.
+    checked = row.checked_at
+    if checked.tzinfo is None:
+        checked = checked.replace(tzinfo=timezone.utc)
+    if checked < cutoff:
         return None
     return row.is_banned, row.source, row.reason
 
@@ -300,8 +306,6 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
         if user_id in chat_admin_ids or user_id in ADMIN_IDS:
             continue
         if await _is_ignored(user_id):
-            continue
-        if await _is_admin_for(cs.chat_id, user_id):
             continue
 
         # Кэш-первый: свежий вердикт (любой) → пропускаем юзера целиком.
@@ -501,6 +505,6 @@ async def cas_sweep_loop(bot) -> None:
 # ── Регистрация middleware ─────────────────────────────────────────────────
 # bot.py импортирует cas ПОСЛЕ bot_handlers — роутер уже собран; aiogram
 # применяет middleware динамически, поэтому порядок не важен.
-from bot_handlers import router as _bh_router  # noqa: E402
+from bot_handlers import router as _bh_router
 
 _bh_router.message(MembersSeenMiddleware())
