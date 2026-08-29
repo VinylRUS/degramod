@@ -148,6 +148,7 @@ from db import (
     AutomuteCounter,
     BannedStickerPack,
     BotWhitelist,
+    CasIgnore,
     ChannelWhitelist,
     ChatAdmin,
     ChatSettings,
@@ -4227,6 +4228,25 @@ async def revoke_user_ban(
                 session, user_id, mod_id, chat_id,
                 "unban", None, reason, None,
             )
+            # v5.3.2: разбан CAS-бана → юзер в cas_ignore, чтобы ночной
+            # свип (cas.py) не забанил его снова. Ложное срабатывание —
+            # единственное ручное действие в цикле ночного дежурства.
+            last_ban_reason = (await session.execute(
+                select(Punishment.reason).where(
+                    Punishment.user_id == user_id,
+                    Punishment.chat_id == chat_id,
+                    Punishment.action_type == "ban",
+                ).order_by(desc(Punishment.created_at)).limit(1)
+            )).scalar_one_or_none()
+            if last_ban_reason and "cas" in last_ban_reason.lower():
+                session.add(CasIgnore(
+                    user_id=user_id, added_by=mod_id,
+                    comment=f"auto: unban of CAS ban ({last_ban_reason})",
+                ))
+                logger.info(
+                    "revoke_user_ban: user %s added to cas_ignore "
+                    "(CAS ban revoked in chat %s)", user_id, chat_id,
+                )
     except Exception as e:
         logger.error(
             "revoke_user_ban: DB error (chat=%s user=%s mod=%s): %s",
