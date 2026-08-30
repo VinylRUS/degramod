@@ -4227,6 +4227,35 @@ async def revoke_user_ban(
                 session, user_id, mod_id, chat_id,
                 "unban", None, reason, None,
             )
+            # v5.3.2: разбан CAS-бана → юзер в cas_ignore, чтобы ночной
+            # свип (cas.py) не забанил его снова. Ложное срабатывание —
+            # единственное ручное действие в цикле ночного дежурства.
+            # v5.3.2 fix: признак CAS-бана — mod_id=0 И reason начинается с
+            # "CAS " (оба CAS-пути, handle_new_members и _sweep_chat, пишут
+            # именно такой префикс), а не подстрока "cas" где угодно в тексте
+            # (ложно матчила обычные баны вида "casino spam") и не голый
+            # mod_id=0 (его же используют Sticker/Via-bot/Content Filter —
+            # match по одному mod_id задел бы их разбаны тоже).
+            # add_to_ignore (а не голый session.add) — upsert, не падает
+            # IntegrityError при повторном разбане того же юзера.
+            last_ban = (await session.execute(
+                select(Punishment.mod_id, Punishment.reason).where(
+                    Punishment.user_id == user_id,
+                    Punishment.chat_id == chat_id,
+                    Punishment.action_type == "ban",
+                ).order_by(desc(Punishment.created_at)).limit(1)
+            )).first()
+            if (last_ban is not None and last_ban.mod_id == 0
+                    and last_ban.reason and last_ban.reason.startswith("CAS ")):
+                from cas import add_to_ignore  # lazy — против circular import
+                await add_to_ignore(
+                    user_id, mod_id,
+                    f"auto: unban of CAS ban ({last_ban.reason})",
+                )
+                logger.info(
+                    "revoke_user_ban: user %s added to cas_ignore "
+                    "(CAS ban revoked in chat %s)", user_id, chat_id,
+                )
     except Exception as e:
         logger.error(
             "revoke_user_ban: DB error (chat=%s user=%s mod=%s): %s",

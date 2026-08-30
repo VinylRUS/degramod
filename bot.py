@@ -87,6 +87,7 @@ from bot_handlers import (
     send_latency_alert_to_su,
 )
 from bot_handlers import router as mod_router
+from cas import cas_sweep_loop  # v5.3.2: ночная CAS+LOLS проверка (см. cas.py)
 from chat_modes import (
     _alarm_auto_off_tick,  # v4.8.9: перенесено из bot.py
     _apply_chat_permissions,
@@ -1567,6 +1568,11 @@ async def lifespan(app):
             purge_task = tg.create_task(
                 _reply_context_purge_loop(), name="reply_context_purge_loop",
             )
+            # v5.3.2: ночная CAS+LOLS проверка сидящих (окно 01:00–05:00 МСК,
+            # санитарный буст, дайджест в 05:00) — паттерн purge loop.
+            cas_task = tg.create_task(
+                cas_sweep_loop(bot), name="cas_sweep_loop",
+            )
             # Long polling — только если вебхук не установлен.
             if use_polling:
                 polling_task = tg.create_task(
@@ -1584,7 +1590,7 @@ async def lifespan(app):
             # v4.10.2: health_task обязан быть в списке. Забыть его —
             # значит подвесить shutdown: TaskGroup ждёт завершения всех
             # задач, а бесконечный while True сам не выйдет.
-            bg_tasks = [night_task, health_task, purge_task]
+            bg_tasks = [night_task, health_task, purge_task, cas_task]
             if polling_task is not None:
                 bg_tasks.append(polling_task)
             for t in bg_tasks:

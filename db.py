@@ -872,6 +872,69 @@ class ReplyContext(Base):
                         nullable=False)
 
 
+# ── v5.3.2: CAS/LOLS ночные проверки ──────────────────────────────────────
+class CasVerdict(Base):
+    """v5.3.2: кэш вердиктов CAS/LOLS по юзеру.
+
+    Правило: один юзер = один внешний запрос в 30 дней. Ночной свип
+    (cas.py) смотрит сюда ДО похода в api.cas.chat / lols.bot.
+
+    source: 'cas' — вердикт из api.cas.chat; 'lols' — из bulk-листа
+    lols.bot (scammers.json). Итоговый вердикт юзера = CAS banned OR
+    LOLS banned.
+    """
+    __tablename__ = "cas_verdicts"
+
+    user_id = Column(BigInteger, primary_key=True)
+    checked_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        nullable=False)
+    source = Column(String(16), default="cas", nullable=False)  # cas|lols
+    is_banned = Column(Boolean, default=False, nullable=False)
+    reason = Column(Text, nullable=True)
+
+
+class ChatMemberSeen(Base):
+    """v5.3.2: кто и когда последний раз писал в чат.
+
+    Источник списка для ночного CAS-свипа (cas.py): Bot API не умеет
+    перечислять участников чата — «сидящие» известны только по тем, кто
+    писал. Наполняется MembersSeenMiddleware (cas.py) на каждом сообщении
+    в чатах с cas_check_enabled=True; это локальный SQLite-upsert, CAS
+    API днём не дёргается. Люркеры, никогда не писавшие, невидимы —
+    платформенное ограничение Bot API (спамер безвреден, пока молчит:
+    первое же сообщение попадает в проверку).
+    """
+    __tablename__ = "chat_members_seen"
+
+    chat_id = Column(BigInteger, primary_key=True)
+    user_id = Column(BigInteger, primary_key=True)
+    first_seen_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                           nullable=False)
+    last_seen_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                          onupdate=lambda: datetime.now(timezone.utc),
+                          nullable=False)
+    __table_args__ = (
+        Index("ix_chat_members_seen_chat_last_seen", "chat_id", "last_seen_at"),
+    )
+
+
+class CasIgnore(Base):
+    """v5.3.2: CAS-ignore whitelist — ложные срабатывания.
+
+    Юзер здесь = «CAS-запись есть, но нам известно, что это не спамер».
+    Наполняется автоматически: разбан CAS-бана (revoke_user_ban) добавляет
+    юзера сюда, чтобы ночной свип не забанил его снова. Вручную — через БД
+    (UI-раздел не заложен в v5.3.2).
+    """
+    __tablename__ = "cas_ignore"
+
+    user_id = Column(BigInteger, primary_key=True)
+    added_by = Column(BigInteger, nullable=True)          # кто разбанил (mod_id)
+    comment = Column(Text, nullable=True)                 # причина из CAS-бана
+    added_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                      nullable=False)
+
+
 # ── v4.8.5: Настройки GitHub Projects интеграции ──────────────────────────
 class GithubSettings(Base):
     """v4.8.5: Настройки подключения к GitHub для `!idea` → Issues.
