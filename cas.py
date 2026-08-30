@@ -43,6 +43,7 @@ from db import (
     ChatAdmin,
     ChatMemberSeen,
     ChatSettings,
+    WebUser,
     async_session,
 )
 
@@ -124,11 +125,17 @@ async def refresh_lols_list() -> int:
         logger.warning("LOLS bulk download failed: %s (keeping old set)", e)
         return len(_lols_set)
 
+    if not isinstance(data, list):
+        logger.warning(
+            "LOLS bulk download failed: unexpected response shape %s "
+            "(keeping old set)", type(data).__name__,
+        )
+        return len(_lols_set)
+
     ids: set[int] = set()
-    if isinstance(data, list):
-        for entry in data:
-            if isinstance(entry, dict) and isinstance(entry.get("user_id"), int):
-                ids.add(entry["user_id"])
+    for entry in data:
+        if isinstance(entry, dict) and isinstance(entry.get("user_id"), int):
+            ids.add(entry["user_id"])
     _lols_set = ids
     _lols_loaded_at = datetime.now(timezone.utc)
     logger.info("LOLS bulk list refreshed: %d user_ids", len(ids))
@@ -300,10 +307,21 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
         chat_admin_ids = set((await session.execute(
             select(ChatAdmin.user_id).where(ChatAdmin.chat_id == cs.chat_id)
         )).scalars().all())
+        # v5.3.2 fix: chat_admins покрывает только синкнутых модеров этого
+        # чата — su/admin веб-панели (CLAUDE.md: WebUser.role действует
+        # во всех чатах) тоже exempt, даже если не привязаны к chat_admins.
+        web_admin_ids = set((await session.execute(
+            select(WebUser.tg_user_id).where(
+                WebUser.role.in_(("su", "admin")),
+                WebUser.is_active.is_(True),
+                WebUser.tg_user_id.is_not(None),
+            )
+        )).scalars().all())
 
     for user_id in user_ids:
-        # Свои — exempt (v4.7.30): админы чата, глобальные SU, боты.
-        if user_id in chat_admin_ids or user_id in ADMIN_IDS:
+        # Свои — exempt (v4.7.30): админы чата, глобальные SU/admin, боты.
+        if (user_id in chat_admin_ids or user_id in ADMIN_IDS
+                or user_id in web_admin_ids):
             continue
         if await _is_ignored(user_id):
             continue
@@ -411,8 +429,13 @@ def _digest_text() -> str:
     banned = _day_stats.get("banned", 0)
     ids = _day_stats.get("ids", [])
     if banned:
-        shown = ", ".join(str(u) for u in ids[:5])
-        more = f" (+{banned - len(ids)})" if banned > len(ids) else ""
+        shown_ids = ids[:5]
+        shown = ", ".join(str(u) for u in shown_ids)
+        # v5.3.2 fix: сравнивали banned с длиной ПОЛНОГО ids (а не
+        # отображённых 5) — banned == len(ids) всегда (по одному id на
+        # бан в _accumulate), поэтому "+N ещё" не показывался никогда.
+        more = (f" (+{banned - len(shown_ids)})"
+                if banned > len(shown_ids) else "")
         return (f"🛡️ CAS/LOLS за сутки: проверено {checked}, "
                 f"забанено {banned} (id: {shown}{more})")
     return f"🛡️ CAS/LOLS за сутки: проверено {checked}, забанено 0"
@@ -488,8 +511,17 @@ async def cas_sweep_loop(bot) -> None:
                 )
                 await _nightly_sweep_all(bot)
 
-            # Дайджест: 05:00–05:59 МСК, раз в сутки.
-            if now.hour == 5 and _last_digest_date != today:
+            # Дайджест: 05:00+ МСК, раз в сутки. v5.3.2 fix: `now` для этой
+            # проверки пересчитан отдельно, а условие — `>=`, не `==`.
+            # Ночной свип при большом бэклоге (CAS ≤5 rps) может занять
+            # часы; со старым `now.hour == 5`, взятым в начале тика,
+            # свип, доехавший до хвоста после 05:59, застревал бы на
+            # `now.hour` вроде 1 в этом тике, а следующий тик мог уже
+            # увидеть час 6+ — и дайджест не отправлялся бы весь день.
+            # `today` — день начала цикла (не день, в который случайно
+            # доехал свип), чтобы дайджест не задвоился при переходе
+            # через полночь.
+            if _now_msk().hour >= 5 and _last_digest_date != today:
                 _last_digest_date = today
                 await _send_daily_digest(bot)
 
@@ -505,6 +537,9 @@ async def cas_sweep_loop(bot) -> None:
 # ── Регистрация middleware ─────────────────────────────────────────────────
 # bot.py импортирует cas ПОСЛЕ bot_handlers — роутер уже собран; aiogram
 # применяет middleware динамически, поэтому порядок не важен.
+# v5.3.2 fix: `.message(...)` — декоратор регистрации хендлера, а не
+# middleware; без .outer_middleware(...) объект просто отбрасывался, и
+# chat_members_seen никогда не наполнялся.
 from bot_handlers import router as _bh_router
 
-_bh_router.message(MembersSeenMiddleware())
+_bh_router.message.outer_middleware(MembersSeenMiddleware())

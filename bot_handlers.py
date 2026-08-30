@@ -148,7 +148,6 @@ from db import (
     AutomuteCounter,
     BannedStickerPack,
     BotWhitelist,
-    CasIgnore,
     ChannelWhitelist,
     ChatAdmin,
     ChatSettings,
@@ -4231,19 +4230,28 @@ async def revoke_user_ban(
             # v5.3.2: разбан CAS-бана → юзер в cas_ignore, чтобы ночной
             # свип (cas.py) не забанил его снова. Ложное срабатывание —
             # единственное ручное действие в цикле ночного дежурства.
-            last_ban_reason = (await session.execute(
-                select(Punishment.reason).where(
+            # v5.3.2 fix: признак CAS-бана — mod_id=0 И reason начинается с
+            # "CAS " (оба CAS-пути, handle_new_members и _sweep_chat, пишут
+            # именно такой префикс), а не подстрока "cas" где угодно в тексте
+            # (ложно матчила обычные баны вида "casino spam") и не голый
+            # mod_id=0 (его же используют Sticker/Via-bot/Content Filter —
+            # match по одному mod_id задел бы их разбаны тоже).
+            # add_to_ignore (а не голый session.add) — upsert, не падает
+            # IntegrityError при повторном разбане того же юзера.
+            last_ban = (await session.execute(
+                select(Punishment.mod_id, Punishment.reason).where(
                     Punishment.user_id == user_id,
                     Punishment.chat_id == chat_id,
                     Punishment.action_type == "ban",
                 ).order_by(desc(Punishment.created_at)).limit(1)
-            )).scalar_one_or_none()
-            if last_ban_reason and "cas" in last_ban_reason.lower():
-                session.add(CasIgnore(
-                    user_id=user_id, added_by=mod_id,
-                    comment=f"auto: unban of CAS ban ({last_ban_reason})",
-                ))
-                await session.commit()
+            )).first()
+            if (last_ban is not None and last_ban.mod_id == 0
+                    and last_ban.reason and last_ban.reason.startswith("CAS ")):
+                from cas import add_to_ignore  # lazy — против circular import
+                await add_to_ignore(
+                    user_id, mod_id,
+                    f"auto: unban of CAS ban ({last_ban.reason})",
+                )
                 logger.info(
                     "revoke_user_ban: user %s added to cas_ignore "
                     "(CAS ban revoked in chat %s)", user_id, chat_id,
