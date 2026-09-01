@@ -69,11 +69,16 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await _seed()
         cas._lols_set = set()
+        cas._lols_hot_set = set()
+        cas._lols_full_set = set()
+        cas._lols_hot_at = None
+        cas._lols_full_at = None
         cas._cas_enabled_chat_ids = {_CHAT_ID}
         cas._last_sanitary_sweep = {}
         cas._last_nightly_date = None
         cas._last_digest_date = None
-        cas._day_stats = {"checked": 0, "banned": 0, "ids": []}
+        cas._day_stats = {"checked": 0, "banned": 0, "marked": 0,
+                          "ids": []}
 
     async def test_touch_member_seen_upsert(self):
         await cas.touch_member_seen(_CHAT_ID, 1001)
@@ -134,6 +139,64 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
                 any("CAS nightly sweep" in (x.reason or "") for x in p),
                 "должна быть запись о бане с причиной CAS nightly sweep",
             )
+
+    async def test_sweep_hot_ban_tier_b(self):
+        """Tier B: юзер в banlist-1h (забанен LOLS час назад) → бан без CAS."""
+        cas._lols_hot_set = {1008}
+        await cas.touch_member_seen(_CHAT_ID, 1008)
+
+        calls = {"n": 0}
+
+        async def fake_cas(user_id):
+            calls["n"] += 1
+            return False, None
+
+        orig = bh._cas_check_user
+        bh._cas_check_user = fake_cas
+        try:
+            bot = AsyncMock()
+            stats = await cas._sweep_chat(
+                bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                                  is_enabled=True),
+            )
+        finally:
+            bh._cas_check_user = orig
+
+        self.assertEqual((stats["checked"], stats["banned"]), (0, 1))
+        self.assertEqual(stats["users"], [1008])
+        self.assertEqual(calls["n"], 0, "hot-тир банится без CAS-запроса")
+        bot.ban_chat_member.assert_called()
+
+    async def test_sweep_potential_marked_not_banned(self):
+        """Tier C: юзер в полном банлисте LOLS, но не подтверждён → пометка,
+        НЕ бан; CAS всё равно проверяется (CAS banned = подтверждение)."""
+        cas._lols_full_set = {1007}
+        await cas.touch_member_seen(_CHAT_ID, 1007)
+
+        async def fake_cas(user_id):
+            return False, None  # CAS чист
+
+        orig = bh._cas_check_user
+        bh._cas_check_user = fake_cas
+        try:
+            bot = AsyncMock()
+            stats = await cas._sweep_chat(
+                bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                                  is_enabled=True),
+            )
+        finally:
+            bh._cas_check_user = orig
+
+        self.assertEqual(stats["banned"], 0, "потенциального НЕ баним")
+        self.assertEqual(stats["marked"], 1)
+        bot.ban_chat_member.assert_not_called()
+
+        async with async_session() as s:
+            v = (await s.execute(
+                select(CasVerdict).where(CasVerdict.user_id == 1007)
+            )).scalar_one()
+            self.assertFalse(v.is_banned)
+            self.assertIn("potential", v.reason or "")
 
     async def test_sweep_skips_fresh_verdict_ignore_and_admin(self):
         """Свежий кэш, cas_ignore и админ чата не проверяются вообще."""
