@@ -34,8 +34,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -117,8 +119,48 @@ def _now_msk() -> datetime:
 
 # ── LOLS bulk ──────────────────────────────────────────────────────────────
 
-async def _fetch_lols_ids(url: str, label: str) -> set[int]:
-    """Скачивает bulk-лист LOLS → set(user_id). Ошибка/кривая форма → пустой set."""
+_INT_RE = re.compile(rb"-?\d+")
+
+
+def _parse_lols_payload(raw: bytes, label: str) -> set[int]:
+    """Тело bulk-листа LOLS → set(user_id). Кривая форма → пустой set.
+
+    v5.4.0 FIX: у lols.bot ДВЕ разных формы ответа, и парсер знал только
+    первую — banlist-1h.json и banlist.json разбирались в пустой набор,
+    то есть Tier B и Tier C не работали вовсе (тесты подсовывали
+    `_lols_hot_set`/`_lols_full_set` напрямую и промаха не видели):
+      • scammers.json — [{"user_id": 123, "names": [...], ...}, ...]
+      • banlist*.json — [123, -100456, ...] — плоский список чисел.
+
+    Плоский список разбираем регуляркой по сырому телу, а не json.loads:
+    в banlist.json 4.1 млн чисел, и промежуточный list[int] добавляет
+    ~200 МБ к пиковому RSS сверх самого set'а.
+    """
+    head = raw[:64].lstrip()
+    if not head.startswith(b"["):
+        logger.warning("LOLS %s: unexpected response shape", label)
+        return set()
+    if head[1:].lstrip()[:1] != b"{":
+        return {int(m.group()) for m in _INT_RE.finditer(raw)}
+
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        logger.warning("LOLS %s: bad JSON (%s)", label, e)
+        return set()
+    ids: set[int] = set()
+    for entry in data:
+        if isinstance(entry, dict) and isinstance(entry.get("user_id"), int):
+            ids.add(entry["user_id"])
+    return ids
+
+
+async def _fetch_lols_ids(url: str, label: str) -> set[int] | None:
+    """Скачивает bulk-лист LOLS → set(user_id).
+
+    None — сбой сети/HTTP (вызывающий решает, сохранять ли старый набор);
+    пустой set — ответ пришёл, но разобрать нечего.
+    """
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=180),
@@ -128,22 +170,13 @@ async def _fetch_lols_ids(url: str, label: str) -> set[int]:
                     logger.warning(
                         "LOLS %s download failed: HTTP %s", label, resp.status,
                     )
-                    return set()
-                data = await resp.json(content_type=None)
+                    return None
+                raw = await resp.read()
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
         logger.warning("LOLS %s download failed: %s", label, e)
-        return set()
+        return None
 
-    ids: set[int] = set()
-    if not isinstance(data, list):
-        logger.warning(
-            "LOLS %s: unexpected response shape %s", label, type(data).__name__,
-        )
-        return ids
-    for entry in data:
-        if isinstance(entry, dict) and isinstance(entry.get("user_id"), int):
-            ids.add(entry["user_id"])
-    return ids
+    return _parse_lols_payload(raw, label)
 
 
 async def refresh_lols_list() -> int:
@@ -171,6 +204,14 @@ async def refresh_lols_hot() -> int:
     """
     global _lols_hot_set, _lols_hot_at
     ids = await _fetch_lols_ids(_LOLS_HOT_URL, "hot")
+    if ids is None:
+        # Сбой сети: держим предыдущий набор (он максимум на час старее),
+        # время загрузки не штампуем — следующий тик повторит попытку.
+        logger.warning(
+            "LOLS hot banlist: refresh failed, keeping %d ids",
+            len(_lols_hot_set),
+        )
+        return len(_lols_hot_set)
     _lols_hot_set = ids
     _lols_hot_at = datetime.now(timezone.utc)
     logger.info("LOLS hot banlist refreshed: %d user_ids", len(ids))
@@ -190,6 +231,19 @@ async def refresh_lols_full() -> int:
         _lols_full_at = datetime.now(timezone.utc)
     logger.info("LOLS full banlist refreshed: %d user_ids", len(ids))
     return len(ids)
+
+
+def _release_lols_full() -> None:
+    """Освобождает полный банлист после ночного свипа.
+
+    4.1 млн id — это ~134 МБ резидентной памяти в контейнере, который
+    делит процесс с ботом и веб-панелью. Список нужен только внутри
+    ночного окна (пометка потенциальных), днём в памяти остаются лишь
+    verified + hot — как и заявлено в шапке модуля.
+    """
+    global _lols_full_set, _lols_full_at
+    _lols_full_set = set()
+    _lols_full_at = None
 
 
 def _lols_is_confirmed(user_id: int) -> bool:
@@ -328,7 +382,8 @@ class MembersSeenMiddleware(BaseMiddleware):
 async def _sweep_chat(bot, cs: ChatSettings) -> dict:
     """Прогон одного чата: chat_members_seen → вердикты → автобаны.
 
-    Пропускает: cas_ignore, свежий кэш (≤30 дней — юзер уже известен),
+    Пропускает: cas_ignore, свежий кэш (≤30 дней — юзер уже известен;
+    вердикт «чист» не отменяет проверку по LOLS-тирам, см. ниже),
     админов/модов чата, ADMIN_IDS, ботов. Баны перманентные, через
     tg_safe_call; каждая санкция — _save_punishment (mod_id=0, CAS System).
     """
@@ -376,14 +431,26 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
         if await _is_ignored(user_id):
             continue
 
-        # Кэш-первый: свежий вердикт (любой) → пропускаем юзера целиком.
+        # Кэш вердиктов существует ради экономии per-id запросов к CAS.
+        # v5.4.0 FIX: он больше не отменяет бесплатную (set в памяти)
+        # проверку по подтверждённым LOLS-тирам. Со старым порядком
+        # «кэш-первый» Tier B не работал для сидящих в принципе: у них с
+        # прошлого свипа лежит вердикт «чист» на 30 дней, и юзер
+        # пропускался целиком, ни разу не сверившись с горячим списком —
+        # то есть попасть в banlist-1h успевали только те, кого бот вообще
+        # ещё не проверял. Свежий бан-вердикт по-прежнему прекращает
+        # разбор: второй раз того же юзера не банимся.
         fresh = await _cached_verdict(user_id)
-        if fresh is not None:
+        if fresh is not None and fresh[0]:
             continue
 
         # 1) Подтверждённые LOLS-тиры (v5.4.0): verified scammer (Tier A)
         #    или бан LOLS за последний час (Tier B) — CAS не проверяем.
-        if _lols_is_confirmed(user_id):
+        confirmed = _lols_is_confirmed(user_id)
+        if fresh is not None and not confirmed:
+            continue
+
+        if confirmed:
             if user_id in _lols_set:
                 source, reason = "lols", "verified scammer (LOLS)"
             else:
@@ -443,16 +510,19 @@ async def _nightly_sweep_all(bot) -> None:
     """Ночной свип всех чатов с cas_check_enabled=True."""
     await refresh_lols_list()
     await refresh_lols_full()
-    for chat_id in sorted(_cas_enabled_chat_ids):
-        async with async_session() as session:
-            cs = (await session.execute(
-                select(ChatSettings).where(ChatSettings.chat_id == chat_id)
-            )).scalar_one_or_none()
-        if cs is None:
-            continue
-        stats = await _sweep_chat(bot, cs)
-        _accumulate(stats)
-        logger.info("CAS nightly sweep chat %s: %s", chat_id, stats)
+    try:
+        for chat_id in sorted(_cas_enabled_chat_ids):
+            async with async_session() as session:
+                cs = (await session.execute(
+                    select(ChatSettings).where(ChatSettings.chat_id == chat_id)
+                )).scalar_one_or_none()
+            if cs is None:
+                continue
+            stats = await _sweep_chat(bot, cs)
+            _accumulate(stats)
+            logger.info("CAS nightly sweep chat %s: %s", chat_id, stats)
+    finally:
+        _release_lols_full()
 
 
 async def _sanitary_boost(bot, now: datetime) -> None:
@@ -576,9 +646,11 @@ async def cas_sweep_loop(bot) -> None:
 
             # Tier B: горячий банлист LOLS каждый час (~10 КБ) — дневное
             # покрытие без per-id запросов (решение владельца 30.08.2026).
-            if (_lols_hot_at is None
-                    or (datetime.now(timezone.utc) - _lols_hot_at)
-                    >= timedelta(minutes=55)):
+            if _cas_enabled_chat_ids and (
+                _lols_hot_at is None
+                or (datetime.now(timezone.utc) - _lols_hot_at)
+                >= timedelta(minutes=55)
+            ):
                 await refresh_lols_hot()
 
             # Ночной свип: 01:00–01:59 МСК, раз в сутки.
