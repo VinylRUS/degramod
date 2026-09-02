@@ -69,11 +69,16 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await _seed()
         cas._lols_set = set()
+        cas._lols_hot_set = set()
+        cas._lols_full_set = set()
+        cas._lols_hot_at = None
+        cas._lols_full_at = None
         cas._cas_enabled_chat_ids = {_CHAT_ID}
         cas._last_sanitary_sweep = {}
         cas._last_nightly_date = None
         cas._last_digest_date = None
-        cas._day_stats = {"checked": 0, "banned": 0, "ids": []}
+        cas._day_stats = {"checked": 0, "banned": 0, "marked": 0,
+                          "ids": []}
 
     async def test_touch_member_seen_upsert(self):
         await cas.touch_member_seen(_CHAT_ID, 1001)
@@ -134,6 +139,108 @@ class CasSweepTest(unittest.IsolatedAsyncioTestCase):
                 any("CAS nightly sweep" in (x.reason or "") for x in p),
                 "должна быть запись о бане с причиной CAS nightly sweep",
             )
+
+    async def test_sweep_hot_ban_tier_b(self):
+        """Tier B: юзер в banlist-1h (забанен LOLS час назад) → бан без CAS."""
+        cas._lols_hot_set = {1008}
+        await cas.touch_member_seen(_CHAT_ID, 1008)
+
+        calls = {"n": 0}
+
+        async def fake_cas(user_id):
+            calls["n"] += 1
+            return False, None
+
+        orig = bh._cas_check_user
+        bh._cas_check_user = fake_cas
+        try:
+            bot = AsyncMock()
+            stats = await cas._sweep_chat(
+                bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                                  is_enabled=True),
+            )
+        finally:
+            bh._cas_check_user = orig
+
+        self.assertEqual((stats["checked"], stats["banned"]), (0, 1))
+        self.assertEqual(stats["users"], [1008])
+        self.assertEqual(calls["n"], 0, "hot-тир банится без CAS-запроса")
+        bot.ban_chat_member.assert_called()
+
+    async def test_sweep_potential_marked_not_banned(self):
+        """Tier C: юзер в полном банлисте LOLS, но не подтверждён → пометка,
+        НЕ бан; CAS всё равно проверяется (CAS banned = подтверждение)."""
+        cas._lols_full_set = {1007}
+        await cas.touch_member_seen(_CHAT_ID, 1007)
+
+        async def fake_cas(user_id):
+            return False, None  # CAS чист
+
+        orig = bh._cas_check_user
+        bh._cas_check_user = fake_cas
+        try:
+            bot = AsyncMock()
+            stats = await cas._sweep_chat(
+                bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                                  is_enabled=True),
+            )
+        finally:
+            bh._cas_check_user = orig
+
+        self.assertEqual(stats["banned"], 0, "потенциального НЕ баним")
+        self.assertEqual(stats["marked"], 1)
+        bot.ban_chat_member.assert_not_called()
+
+        async with async_session() as s:
+            v = (await s.execute(
+                select(CasVerdict).where(CasVerdict.user_id == 1007)
+            )).scalar_one()
+            self.assertFalse(v.is_banned)
+            self.assertIn("potential", v.reason or "")
+
+    async def test_hot_ban_beats_stale_clean_verdict(self):
+        """v5.4.0 регресс: свежий вердикт «чист» не должен отменять Tier B.
+
+        Со старым порядком (кэш-первый) сидящий с вердиктом «чист» с
+        прошлого свипа пропускался целиком на 30 дней — то есть попасть
+        под banlist-1h успевали только незнакомые боту юзеры.
+        """
+        await cas.touch_member_seen(_CHAT_ID, 1003)
+        await cas._store_verdict(1003, "cas", False, None)  # свежий «чист»
+        cas._lols_hot_set = {1003}
+
+        async def fake_cas(user_id):
+            raise AssertionError("CAS не должен дёргаться для hot-тира")
+
+        orig = bh._cas_check_user
+        bh._cas_check_user = fake_cas
+        try:
+            bot = AsyncMock()
+            stats = await cas._sweep_chat(
+                bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                                  is_enabled=True),
+            )
+        finally:
+            bh._cas_check_user = orig
+
+        self.assertEqual(stats["banned"], 1)
+        self.assertEqual(stats["users"], [1003])
+
+    async def test_fresh_ban_verdict_not_rebanned(self):
+        """Обратная сторона: уже забаненного по вердикту не банимся снова,
+        даже если он всё ещё лежит в verified-списке LOLS."""
+        await cas.touch_member_seen(_CHAT_ID, 1009)
+        await cas._store_verdict(1009, "lols", True,
+                                 "verified scammer (LOLS)")
+        cas._lols_set = {1009}
+
+        bot = AsyncMock()
+        stats = await cas._sweep_chat(
+            bot, ChatSettings(chat_id=_CHAT_ID, cas_check_enabled=True,
+                              is_enabled=True),
+        )
+        self.assertEqual(stats["banned"], 0)
+        bot.ban_chat_member.assert_not_called()
 
     async def test_sweep_skips_fresh_verdict_ignore_and_admin(self):
         """Свежий кэш, cas_ignore и админ чата не проверяются вообще."""
@@ -317,12 +424,14 @@ class LolsRefreshTest(unittest.IsolatedAsyncioTestCase):
         cas._lols_set = {12345}
         cas._lols_loaded_at = None
 
-    async def test_non_list_response_keeps_old_set(self):
+    @staticmethod
+    def _fake_session(body: bytes, status: int = 200):
         class _FakeResp:
-            status = 200
+            def __init__(self):
+                self.status = status
 
-            async def json(self, content_type=None):
-                return {"users": [12345, 999]}  # неожиданная форма
+            async def read(self):
+                return body
 
             async def __aenter__(self):
                 return self
@@ -340,12 +449,62 @@ class LolsRefreshTest(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *a):
                 return False
 
-        with patch("cas.aiohttp.ClientSession", return_value=_FakeSession()):
+        return _FakeSession()
+
+    async def test_non_list_response_keeps_old_set(self):
+        body = b'{"users": [12345, 999]}'  # неожиданная форма
+        with patch("cas.aiohttp.ClientSession",
+                   return_value=self._fake_session(body)):
             size = await cas.refresh_lols_list()
 
         self.assertEqual(size, 1)
         self.assertEqual(cas._lols_set, {12345},
                          "старый набор должен сохраниться, а не обнулиться")
+
+    async def test_scammers_json_shape_parsed(self):
+        """scammers.json: список словарей с user_id (Tier A)."""
+        body = (b'[{"user_id":8045177421,"names":["X"],"usernames":["@x"]},'
+                b'{"user_id":777,"names":[]}]')
+        with patch("cas.aiohttp.ClientSession",
+                   return_value=self._fake_session(body)):
+            await cas.refresh_lols_list()
+        self.assertEqual(cas._lols_set, {8045177421, 777})
+
+    async def test_flat_int_list_shape_parsed(self):
+        """v5.4.0 регресс: banlist-1h.json/banlist.json — ПЛОСКИЙ список
+        чисел, а не словарей. Старый парсер разбирал их в пустой набор,
+        и Tier B с Tier C не работали в проде вообще."""
+        cas._lols_hot_set = set()
+        cas._lols_hot_at = None
+        body = b"[350007112,674584862,-1004499466373,7006041058]"
+        with patch("cas.aiohttp.ClientSession",
+                   return_value=self._fake_session(body)):
+            size = await cas.refresh_lols_hot()
+
+        self.assertEqual(size, 4)
+        self.assertIn(350007112, cas._lols_hot_set)
+        self.assertIn(7006041058, cas._lols_hot_set)
+        self.assertIsNotNone(cas._lols_hot_at)
+
+    async def test_hot_refresh_failure_keeps_previous_set(self):
+        """Сбой сети не обнуляет часовой набор: он максимум на час старее."""
+        cas._lols_hot_set = {555}
+        cas._lols_hot_at = None
+        with patch("cas.aiohttp.ClientSession",
+                   return_value=self._fake_session(b"", status=500)):
+            size = await cas.refresh_lols_hot()
+
+        self.assertEqual(size, 1)
+        self.assertEqual(cas._lols_hot_set, {555})
+        self.assertIsNone(cas._lols_hot_at,
+                          "время загрузки не штампуется — тик повторит")
+
+    async def test_release_lols_full_frees_memory(self):
+        """Полный банлист живёт только внутри ночного окна."""
+        cas._lols_full_set = {1, 2, 3}
+        cas._lols_full_at = None
+        cas._release_lols_full()
+        self.assertEqual(cas._lols_full_set, set())
 
 
 class CasSweepDispatcherTest(unittest.IsolatedAsyncioTestCase):

@@ -640,6 +640,12 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v5.4.0</strong> — 30 августа 2026 (градация LOLS-тиров: бан только подтверждённым)</p>
+                <ul>
+                    <li><strong>Бан только подтверждённым спамерам:</strong> LOLS verified scammer (scammers.json), бан LOLS за последний час (banlist-1h) или CAS banned. Потенциальные скамеры из полного банлиста LOLS (43 МБ) больше не баним — помечаем в cas_verdicts и считаем в дайджесте («на карандаше»); повторная проверка не раньше чем через 30 дней.</li>
+                    <li><strong>Tier B почасово:</strong> banlist-1h (~10 КБ) качается каждый час, днём и ночью — свежие баны LOLS ловятся в чате без per-id запросов и без дневного RPS.</li>
+                    <li><strong>Дайджест с тир-разбивкой:</strong> «🛡️ … забанено M (id: …), на карандаше K».</li>
+                </ul>
                 <p><strong>v5.3.2</strong> — 30 августа 2026 (TTL reply_contexts + ночной CAS/LOLS-свип)</p>
                 <ul>
                     <li><strong>TTL снимков «в ответ на» 30 → 7 дней.</strong> Таблица reply_contexts под живым трафиком набирает ~6 МБ за четверо суток (21 958 строк при ~5400 реплаев/сутки). Снимки нужны по горячим следам, ссылка t.me/c/… живёт вечно — 7 дней с запасом. После деплоя: разово <code>_purge_reply_contexts(7)</code> + VACUUM в настройках панели.</li>
