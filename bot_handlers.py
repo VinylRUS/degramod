@@ -82,7 +82,9 @@ v4.8.1: word_filter команды /addword//delword//listwords удалены (
 from __future__ import annotations
 
 import asyncio
+import csv
 import html
+import io
 import json
 import logging
 import os
@@ -150,6 +152,7 @@ from db import (
     BotWhitelist,
     ChannelWhitelist,
     ChatAdmin,
+    ChatMemberSeen,
     ChatSettings,
     GithubSettings,
     IdeaLog,
@@ -8773,6 +8776,129 @@ async def private_start_handler(message: types.Message) -> None:
             "private_start: send credentials DM failed for tg_uid=%s: %s",
             tg_uid, e,
         )
+
+
+# ── v5.5.0: импорт дамп-CSV участников (юзербот) ───────────────────────────
+# Только для ADMIN_IDS: админ шлёт боту CSV-дамп юзербота документом,
+# бот раскладывает участников в chat_members_seen (люркеры) и Users.
+# Строки со статусом banned скипаются (уже наказаны). Отчёт — ответом.
+
+_IMPORT_MAX_BYTES = 8 * 1024 * 1024
+_IMPORT_MAX_ROWS = 50_000
+
+
+async def _import_members_csv(text: str) -> dict:
+    """v5.5.0: дамп-CSV юзербота → chat_members_seen + Users.
+
+    Формат: chat_id,user_id,username,first_name,last_name,is_bot,
+    is_deleted,status,dumped_at. Строки со status=banned скипаются
+    (уже наказаны), существующие (chat_id, user_id) не трогаются
+    (реальный last_seen важнее даты импорта). Возвращает статистику.
+    """
+    stats: dict = {"rows": 0, "new": 0, "existing": 0, "banned": 0,
+                   "bad": 0, "unknown_chats": 0, "chats": {}}
+    parsed: dict[int, dict[int, dict]] = {}
+
+    async with async_session() as session:
+        known_chats = set((await session.execute(
+            select(ChatSettings.chat_id)
+        )).scalars().all())
+
+    for row in csv.DictReader(io.StringIO(text)):
+        stats["rows"] += 1
+        if stats["rows"] > _IMPORT_MAX_ROWS:
+            break
+        try:
+            chat_id = int((row.get("chat_id") or "").strip())
+            user_id = int((row.get("user_id") or "").strip())
+        except (TypeError, ValueError):
+            stats["bad"] += 1
+            continue
+        if chat_id not in known_chats:
+            stats["unknown_chats"] += 1
+            continue
+        if (row.get("status") or "").strip().lower() == "banned":
+            stats["banned"] += 1
+            continue
+        parsed.setdefault(chat_id, {}).setdefault(user_id, row)
+
+    async with async_session() as session:
+        for chat_id, members in sorted(parsed.items()):
+            existing = set((await session.execute(
+                select(ChatMemberSeen.user_id).where(
+                    ChatMemberSeen.chat_id == chat_id,
+                )
+            )).scalars().all())
+            now = datetime.now(timezone.utc)
+            fresh = 0
+            for user_id, row in members.items():
+                if user_id in existing:
+                    stats["existing"] += 1
+                    continue
+                session.add(ChatMemberSeen(
+                    chat_id=chat_id, user_id=user_id,
+                    first_seen_at=now, last_seen_at=now,
+                ))
+                if any(row.get(k) for k in ("username", "first_name", "last_name")):
+                    await _upsert_user(
+                        session, user_id,
+                        row.get("username") or None,
+                        row.get("first_name") or None,
+                        row.get("last_name") or None,
+                    )
+                fresh += 1
+            stats["new"] += fresh
+            stats["chats"][str(chat_id)] = fresh
+        await session.commit()
+    return stats
+
+
+@router.message(F.document, F.from_user.id.in_(ADMIN_IDS))
+async def handle_members_import(message: types.Message, bot: types.Bot):
+    """v5.5.0: CSV-дамп юзербота от админа → chat_members_seen.
+
+    Только ADMIN_IDS. Строки со status=banned скипаются (уже наказаны),
+    существующие (chat_id, user_id) не трогаются. Отчёт — ответом.
+    """
+    doc = message.document
+    if not doc or not (doc.file_name or "").lower().endswith(".csv"):
+        await message.reply("Жду CSV-дамп юзербота (файл .csv).")
+        return
+    if (doc.file_size or 0) > _IMPORT_MAX_BYTES:
+        await message.reply(
+            f"Файл больше {_IMPORT_MAX_BYTES // (1024 * 1024)} МБ — не поддерживается."
+        )
+        return
+
+    buf = io.BytesIO()
+    try:
+        await bot.download(doc, destination=buf)
+    except Exception as e:
+        await message.reply(f"Не смог скачать файл: {html.escape(str(e))}")
+        return
+    buf.seek(0)
+    text = buf.getvalue().decode("utf-8-sig", errors="replace")
+
+    try:
+        stats = await _import_members_csv(text)
+    except Exception as e:
+        logger.error("members import failed: %s", e)
+        await message.reply(f"Импорт упал: {html.escape(str(e))}")
+        return
+
+    report = (f"📊 Импорт дампа: строк {stats['rows']} → "
+              f"новых {stats['new']}, уже было {stats['existing']}")
+    extras = []
+    if stats["banned"]:
+        extras.append(f"banned-скип {stats['banned']}")
+    if stats["bad"]:
+        extras.append(f"битых {stats['bad']}")
+    if stats["unknown_chats"]:
+        extras.append(f"неизвестных чатов {stats['unknown_chats']}")
+    if extras:
+        report += " · " + ", ".join(extras)
+    report += "\nНочному свипу теперь есть что проверять. 🌙"
+    await message.reply(report)
 
 
 @router.message(F.chat.type == "private")

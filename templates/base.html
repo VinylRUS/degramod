@@ -598,6 +598,9 @@
         <a href="/admin/presets" class="nav-link {% if request.url.path.startswith('/admin/presets') %}active{% endif %}">Presets</a>
         <a href="/admin/keywords" class="nav-link {% if request.url.path.startswith('/admin/keywords') %}active{% endif %}">Keywords</a>
         <a href="/admin/settings" class="nav-link {% if request.url.path.startswith('/admin/settings') %}active{% endif %}">Settings</a>
+        <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
+        <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
+        <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
         {% endif %}
         <span class="spacer"></span>
         {% if auth_user %}
@@ -640,6 +643,13 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v5.5.0</strong> — 01 сентября 2026 (импорт дамп-CSV + пороги в панели + «На карандаше»)</p>
+                <ul>
+                    <li><strong>Импорт дамп-CSV юзербота.</strong> Админ из ADMIN_IDS шлёт боту CSV-дамп участников документом — бот раскладывает их в chat_members_seen (люркеры!) и Users. banned-строки скипаются, существующие не трогаются. Отчёт — ответом.</li>
+                    <li><strong>Каскад /account для потенциальных.</strong> Юзер из полного банлиста LOLS без подтверждения получает тир по метрикам (spam_factor/offenses/scammer) — C1/C2/C3. Санкций каскад не выдаёт: потенциальных не баним и не мьютим (решение владельца) — тир уходит в cas_verdicts и в «На карандаше».</li>
+                    <li><strong>Вкладка «На карандаше» (/admin/cas)</strong>: потенциальные с spam_factor/offenses, кнопки бан/игнор на месте; пороги каскада правятся там же.</li>
+                    <li><strong>Юзербот-дампер в tools/</strong> (Pyrogram, сессия в .gitignore) + README.</li>
+                </ul>
                 <p><strong>v5.4.0</strong> — 30 августа 2026 (градация LOLS-тиров: бан только подтверждённым)</p>
                 <ul>
                     <li><strong>Бан только подтверждённым спамерам:</strong> LOLS verified scammer (scammers.json), бан LOLS за последний час (banlist-1h) или CAS banned. Потенциальные скамеры из полного банлиста LOLS (43 МБ) больше не баним — помечаем в cas_verdicts и считаем в дайджесте («на карандаше»); повторная проверка не раньше чем через 30 дней.</li>

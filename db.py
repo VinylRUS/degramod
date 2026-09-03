@@ -18,6 +18,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     ForeignKey,
     Index,  # v4.8.9: для явных Index() declarations в __table_args__
     Integer,
@@ -891,6 +892,11 @@ class CasVerdict(Base):
     source = Column(String(16), default="cas", nullable=False)  # cas|lols
     is_banned = Column(Boolean, default=False, nullable=False)
     reason = Column(Text, nullable=True)
+    # v5.5.0: метрики /account (каскад тиров) для вкладки «На карандаше».
+    spam_factor = Column(Float, nullable=True)
+    offenses = Column(Integer, nullable=True)
+    scammer = Column(Boolean, nullable=True)
+    tier = Column(String(16), nullable=True)  # C1_ban | C2_mute | C3_watch | clean
 
 
 class ChatMemberSeen(Base):
@@ -936,6 +942,26 @@ class CasIgnore(Base):
 
 
 # ── v4.8.5: Настройки GitHub Projects интеграции ──────────────────────────
+# ── v5.5.0: Пороги каскада CAS/LOLS (singleton, правится в панели) ────────
+class CasSettings(Base):
+    """v5.5.0: пороги каскада /account (singleton, id=1).
+
+    Правятся в веб-панели (/admin/cas). Каскад по метрикам НЕ выдаёт
+    санкций: тир — это метка для «На карандаше», бан только по
+    подтверждённым источникам (verified/hot/CAS). Решение владельца
+    30.08.2026: потенциальных не баним и не мьютим.
+    """
+    __tablename__ = "cas_settings"
+
+    id = Column(Integer, primary_key=True)                  # всегда 1 (singleton)
+    spamfactor_ban = Column(Float, default=60.0, nullable=False)
+    spamfactor_mute = Column(Float, default=30.0, nullable=False)
+    offenses_mute = Column(Integer, default=10, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+    updated_by = Column(String(64), nullable=True)          # username из веб-панели
+
+
 class GithubSettings(Base):
     """v4.8.5: Настройки подключения к GitHub для `!idea` → Issues.
 

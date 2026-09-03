@@ -46,6 +46,7 @@ from sqlalchemy import select
 
 from db import (
     CasIgnore,
+    CasSettings,
     CasVerdict,
     ChatAdmin,
     ChatMemberSeen,
@@ -251,6 +252,70 @@ def _lols_is_confirmed(user_id: int) -> bool:
     return user_id in _lols_set or user_id in _lols_hot_set
 
 
+async def _cas_thresholds() -> tuple[float, float, int]:
+    """Пороги каскада из cas_settings (правятся в панели). Дефолты 60/30/10."""
+    async with async_session() as session:
+        row = (await session.execute(
+            select(CasSettings).where(CasSettings.id == 1)
+        )).scalar_one_or_none()
+    if row is None:
+        return 60.0, 30.0, 10
+    return (float(row.spamfactor_ban), float(row.spamfactor_mute),
+            int(row.offenses_mute))
+
+
+async def _lols_account(user_id: int) -> dict:
+    """GET api.lols.bot/account?id= → метрики юзера.
+
+    Возвращает dict с banned/offenses/spam_factor/scammer или {} при сбое
+    (fail-open: потенциальный без метрик уйдёт в C3_watch).
+    """
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as http:
+            async with http.get(
+                f"https://api.lols.bot/account?id={user_id}"
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "LOLS account probe %s: HTTP %s", user_id, resp.status,
+                    )
+                    return {}
+                data = await resp.json(content_type=None)
+                return data if isinstance(data, dict) else {}
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        logger.warning("LOLS account probe %s failed: %s", user_id, e)
+        return {}
+
+
+def _lols_tier(acc: dict, sf_ban: float, sf_mute: float,
+               off_mute: int) -> tuple[str, str]:
+    """Тир по метрикам LOLS: (C1_ban | C2_mute | C3_watch | clean, detail).
+
+    Санкций здесь НЕТ: потенциальных не баним и не мьютим (решение
+    владельца 30.08.2026) — тир это метка для «На карандаше» панели,
+    где модератор решает вручную.
+    """
+    if not acc.get("banned"):
+        return "clean", ""
+    try:
+        sf_val = float(acc.get("spam_factor") or 0.0)
+    except (TypeError, ValueError):
+        sf_val = 0.0
+    try:
+        off_val = int(acc.get("offenses") or 0)
+    except (TypeError, ValueError):
+        off_val = 0
+    scammer = bool(acc.get("scammer"))
+    detail = f"spam_factor={sf_val:g}, offenses={off_val}, scammer={scammer}"
+    if scammer or sf_val >= sf_ban:
+        return "C1_ban", detail
+    if sf_val >= sf_mute or off_val >= off_mute:
+        return "C2_mute", detail
+    return "C3_watch", detail
+
+
 # ── Кэш вердиктов ──────────────────────────────────────────────────────────
 
 async def _cached_verdict(user_id: int) -> tuple[bool, str, str | None] | None:
@@ -272,7 +337,11 @@ async def _cached_verdict(user_id: int) -> tuple[bool, str, str | None] | None:
 
 
 async def _store_verdict(user_id: int, source: str,
-                         is_banned: bool, reason: str | None) -> None:
+                         is_banned: bool, reason: str | None,
+                         *, spam_factor: float | None = None,
+                         offenses: int | None = None,
+                         scammer: bool | None = None,
+                         tier: str | None = None) -> None:
     """Upsert вердикта в кэш. Ошибки глотаются — кэш не критичен."""
     try:
         async with async_session() as session:
@@ -283,12 +352,18 @@ async def _store_verdict(user_id: int, source: str,
                 session.add(CasVerdict(
                     user_id=user_id, source=source,
                     is_banned=is_banned, reason=reason,
+                    spam_factor=spam_factor, offenses=offenses,
+                    scammer=scammer, tier=tier,
                 ))
             else:
                 row.checked_at = datetime.now(timezone.utc)
                 row.source = source
                 row.is_banned = is_banned
                 row.reason = reason
+                row.spam_factor = spam_factor
+                row.offenses = offenses
+                row.scammer = scammer
+                row.tier = tier
             await session.commit()
     except Exception as e:
         logger.warning("cas verdict store failed for %s: %s", user_id, e)
@@ -423,6 +498,8 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
             )
         )).scalars().all())
 
+    sf_ban, sf_mute, off_mute = await _cas_thresholds()
+
     for user_id in user_ids:
         # Свои — exempt (v4.7.30): админы чата, глобальные SU/admin, боты.
         if (user_id in chat_admin_ids or user_id in ADMIN_IDS
@@ -452,11 +529,11 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
 
         if confirmed:
             if user_id in _lols_set:
-                source, reason = "lols", "verified scammer (LOLS)"
+                source, reason, tier = "lols", "verified scammer (LOLS)", "A_verified"
             else:
-                source, reason = "lols", "banned by LOLS in the last hour"
+                source, reason, tier = "lols", "banned by LOLS in the last hour", "B_hot"
             is_banned = True
-            await _store_verdict(user_id, source, is_banned, reason)
+            await _store_verdict(user_id, source, is_banned, reason, tier=tier)
         else:
             # 2) CAS — подтверждающий фактор (в т.ч. для потенциальных:
             #    CAS banned = подтверждение → бан).
@@ -464,14 +541,30 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
             source = "cas"
             stats["checked"] += 1
             await asyncio.sleep(1.0 / _CAS_RPS)
-            # 3) Потенциальный скамер (v5.4.0): в полном банлисте LOLS, но
-            #    не подтверждён никем — помечаем и НЕ баним (решение
-            #    владельца 30.08.2026).
+            # 3) Потенциальный скамер (v5.5.0): в полном банлисте LOLS, но
+            #    не подтверждён никем — каскад /account ставит ТИР, а не
+            #    санкцию: потенциальных не баним и не мьютим (решение
+            #    владельца 30.08.2026). Тир уходит в cas_verdicts и в
+            #    «На карандаше» панели.
+            potential = False
+            acc: dict = {}
             if not is_banned and user_id in _lols_full_set:
+                potential = True
+                acc = await _lols_account(user_id)
+                tier, detail = _lols_tier(acc, sf_ban, sf_mute, off_mute)
                 source = "lols"
-                reason = "potential: full LOLS banlist (не подтверждён)"
+                reason = f"potential ({tier}): {detail}"
                 stats["marked"] += 1
-            await _store_verdict(user_id, source, is_banned, reason)
+            await _store_verdict(
+                user_id, source, is_banned, reason,
+                spam_factor=(float(acc.get("spam_factor") or 0.0)
+                             if potential else None),
+                offenses=(int(acc.get("offenses") or 0)
+                          if potential else None),
+                scammer=(bool(acc.get("scammer"))
+                         if potential else None),
+                tier=tier if potential else None,
+            )
 
         if not is_banned:
             continue
