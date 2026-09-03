@@ -1596,6 +1596,47 @@ async def init_db() -> None:
             "ON reply_contexts (created_at)"
         ))
 
+    # ── v5.5.0: метрики каскада /account в cas_verdicts + cas_settings ────
+    # Таблицы cas_verdicts (v5.3.2) на боевой БД уже есть, а create_all()
+    # колонки в существующую таблицу не добавляет — без этого блока легаси-
+    # путь (DB_USE_LEGACY_MIGRATIONS=1 или fallback init_db_with_fallback
+    # при сбое Alembic) роняет ЛЮБОЙ ORM-запрос к CasVerdict с «no such
+    # column: cas_verdicts.spam_factor»: ночной свип и /admin/cas.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(cas_verdicts)"))
+        cols = {row[1] for row in result.fetchall()}
+        for col, ddl in (
+            ("spam_factor", "FLOAT"),
+            ("offenses", "INTEGER"),
+            ("scammer", "BOOLEAN"),
+            ("tier", "VARCHAR(16)"),
+        ):
+            if col not in cols:
+                await conn.execute(text(
+                    f"ALTER TABLE cas_verdicts ADD COLUMN {col} {ddl}"
+                ))
+                logger.info("v5.5.0 init_db: cas_verdicts.%s добавлена", col)
+
+    # ── v5.5.0: Новая таблица cas_settings (singleton, пороги каскада) ────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF NOT
+    # EXISTS + seed строки id=1 (Alembic делает то же самое в f2b3c4d5e6f7).
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS cas_settings (
+                id INTEGER PRIMARY KEY,
+                spamfactor_ban FLOAT NOT NULL DEFAULT 60.0,
+                spamfactor_mute FLOAT NOT NULL DEFAULT 30.0,
+                offenses_mute INTEGER NOT NULL DEFAULT 10,
+                updated_at DATETIME,
+                updated_by VARCHAR(64)
+            )
+        """))
+        await conn.execute(text(
+            "INSERT OR IGNORE INTO cas_settings "
+            "(id, spamfactor_ban, spamfactor_mute, offenses_mute, updated_at) "
+            "VALUES (1, 60.0, 30.0, 10, CURRENT_TIMESTAMP)"
+        ))
+
     # ── v4.8.5: Новая таблица github_settings (singleton для PAT и репо) ───
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
     # ВАЖНО: здесь указываем ВСЕ колонки, что в модели GithubSettings — иначе при

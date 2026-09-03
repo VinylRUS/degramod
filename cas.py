@@ -296,7 +296,16 @@ def _lols_tier(acc: dict, sf_ban: float, sf_mute: float,
     Санкций здесь НЕТ: потенциальных не баним и не мьютим (решение
     владельца 30.08.2026) — тир это метка для «На карандаше» панели,
     где модератор решает вручную.
+
+    v5.5.0 FIX: пустой ответ (`{}` — сбой /account) — это НЕ «чист».
+    Юзер сюда попадает только из полного банлиста LOLS, и раньше сбой
+    сети ставил ему tier="clean": строка не попадала в «На карандаше»
+    (там фильтр tier LIKE 'C%'), а вердикт кэшировался на 30 дней — то
+    есть отметка терялась молча и надолго. Fail-open = C3_watch, как и
+    обещает докстрока `_lols_account`.
     """
+    if not acc:
+        return "C3_watch", "метрики недоступны (/account не ответил)"
     if not acc.get("banned"):
         return "clean", ""
     try:
@@ -555,14 +564,18 @@ async def _sweep_chat(bot, cs: ChatSettings) -> dict:
                 source = "lols"
                 reason = f"potential ({tier}): {detail}"
                 stats["marked"] += 1
+            # v5.5.0 FIX: метрики пишем только когда /account реально
+            # ответил. Пустой acc раньше давал spam_factor=0.0/offenses=0
+            # — в «На карандаше» это выглядело как «проверен, чистенький»,
+            # хотя проверки не было вовсе.
             await _store_verdict(
                 user_id, source, is_banned, reason,
                 spam_factor=(float(acc.get("spam_factor") or 0.0)
-                             if potential else None),
+                             if potential and acc else None),
                 offenses=(int(acc.get("offenses") or 0)
-                          if potential else None),
+                          if potential and acc else None),
                 scammer=(bool(acc.get("scammer"))
-                         if potential else None),
+                         if potential and acc else None),
                 tier=tier if potential else None,
             )
 

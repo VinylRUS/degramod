@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select
 
+import web_app
 from db import (
     CasIgnore,
     CasSettings,
@@ -69,10 +70,18 @@ async def _watch_rows(session) -> list[dict]:
         .limit(500)
     )).all()
 
-    seen = (await session.execute(select(ChatMemberSeen))).scalars().all()
+    # Чаты присутствия — только для показанных 500 строк. `select(
+    # ChatMemberSeen)` целиком тянул в память всю таблицу, а после импорта
+    # дампов юзербота это десятки тысяч строк на каждый показ страницы.
     chats_by_user: dict[int, list[str]] = {}
-    for cm in seen:
-        chats_by_user.setdefault(cm.user_id, []).append(str(cm.chat_id))
+    watch_ids = [v.user_id for v, _u, _f in rows]
+    if watch_ids:
+        pairs = (await session.execute(
+            select(ChatMemberSeen.user_id, ChatMemberSeen.chat_id)
+            .where(ChatMemberSeen.user_id.in_(watch_ids))
+        )).all()
+        for user_id, chat_id in pairs:
+            chats_by_user.setdefault(user_id, []).append(str(chat_id))
 
     out = []
     for v, username, first_name in rows:
@@ -175,8 +184,22 @@ async def cas_action_post(
         tg_safe_call,
     )
 
-    mod_id = getattr(_auth, "tg_user_id", None) or 0
+    # mod_id: инвариант v4.8.11 (см. web/api.py::api_unban и CLAUDE.md).
+    # Учётки веб-панели заводятся только через привязку в боте, поэтому
+    # обычный юзер без tg_user_id — нарушение инварианта, а не штатный
+    # случай: `or 0` заводил бы через _upsert_moderator несуществующего
+    # модератора 0 и вешал на него все ручные баны с этой страницы.
+    # Исключение — встроенный su (TG ID у него нет по построению):
+    # ему служебный _SU_WEB_MOD_ID, а автор уходит в текст причины.
     mod_name = getattr(_auth, "username", None) or "web"
+    mod_id = getattr(_auth, "tg_user_id", None)
+    if mod_id is None:
+        if getattr(_auth, "role", None) != "su":
+            return RedirectResponse(
+                f"/admin/cas?flash={quote('Учётка не привязана к Telegram — привяжите аккаунт через бота, иначе действие некому записать')}",
+                status_code=303,
+            )
+        mod_id = web_app._SU_WEB_MOD_ID
 
     if action == "ban":
         banned_chats: list[int] = []
@@ -200,7 +223,8 @@ async def cas_action_post(
                     await _save_punishment(
                         session, user_id, mod_id, chat_id,
                         "ban", None,
-                        "Ручной бан из «На карандаше» (потенциальный по LOLS)",
+                        "Ручной бан из «На карандаше» (потенциальный по "
+                        f"LOLS), через веб-панель: {mod_name}",
                         None,
                     )
             except TelegramAPIError as e:

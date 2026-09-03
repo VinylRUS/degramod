@@ -96,7 +96,7 @@ from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import aiohttp
-from aiogram import BaseMiddleware, F, Router, types
+from aiogram import BaseMiddleware, Bot, F, Router, types
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import BaseFilter, Command
 
@@ -8853,8 +8853,14 @@ async def _import_members_csv(text: str) -> dict:
     return stats
 
 
-@router.message(F.document, F.from_user.id.in_(ADMIN_IDS))
-async def handle_members_import(message: types.Message, bot: types.Bot):
+# v5.5.0 FIX: фильтр `F.chat.type == "private"` обязателен. Без него хендлер
+# стоял выше групповых (8927/9021/9412) и перехватывал ЛЮБОЙ документ от
+# админа в любой группе: бот отвечал «Жду CSV-дамп» в чат, а групповая
+# обработка (мод-команды, контент-фильтры) для этого сообщения не
+# запускалась вовсе — в aiogram выигрывает первый совпавший хендлер.
+@router.message(F.chat.type == "private", F.document,
+                F.from_user.id.in_(ADMIN_IDS))
+async def handle_members_import(message: types.Message, bot: Bot) -> None:
     """v5.5.0: CSV-дамп юзербота от админа → chat_members_seen.
 
     Только ADMIN_IDS. Строки со status=banned скипаются (уже наказаны),

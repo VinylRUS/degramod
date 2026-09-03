@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from _paths import _P
@@ -134,7 +135,12 @@ class CasCascadeTest(unittest.IsolatedAsyncioTestCase):
                              "sf 25 ≥ 20 должен попасть в C2 при кастомном пороге")
 
     async def test_account_fail_open(self):
-        """LOLS /account недоступен → юзер не падает, тир C3_watch без метрик."""
+        """LOLS /account недоступен → юзер не падает, тир C3_watch без метрик.
+
+        v5.5.0 FIX: раньше пустой ответ давал tier="clean" — строка не
+        попадала в «На карандаше» (фильтр tier LIKE 'C%'), а вердикт
+        кэшировался на 30 дней, то есть отметка терялась молча.
+        """
         cas._lols_account = AsyncMock(return_value={})
         await cas.touch_member_seen(_CHAT, 1007)
         bot = AsyncMock()
@@ -148,6 +154,17 @@ class CasCascadeTest(unittest.IsolatedAsyncioTestCase):
                 select(CasVerdict).where(CasVerdict.user_id == 1007)
             )).scalar_one()
             self.assertFalse(v.is_banned)
+            self.assertEqual(v.tier, "C3_watch",
+                             "сбой /account — не повод считать юзера чистым")
+            self.assertIsNone(v.spam_factor,
+                              "метрик не было — нули писать нельзя")
+            self.assertIsNone(v.offenses)
+
+    def test_tier_clean_only_for_unbanned(self):
+        """«clean» — только когда LOLS явно ответил banned=false."""
+        self.assertEqual(cas._lols_tier({}, 60.0, 30.0, 10)[0], "C3_watch")
+        self.assertEqual(
+            cas._lols_tier({"banned": False}, 60.0, 30.0, 10)[0], "clean")
 
 
 class ImportTest(unittest.IsolatedAsyncioTestCase):
@@ -208,6 +225,48 @@ class ImportTest(unittest.IsolatedAsyncioTestCase):
         stats = await bh._import_members_csv(text)
         self.assertEqual(stats["bad"], 2)
         self.assertEqual(stats["unknown_chats"], 0)
+
+
+class ImportHandlerFilterTest(unittest.TestCase):
+    """v5.5.0 FIX: хендлер импорта обязан быть private-only.
+
+    Он зарегистрирован ВЫШЕ групповых хендлеров, и без фильтра по типу
+    чата перехватывал любой документ от админа в любой группе: бот
+    отвечал «Жду CSV-дамп» в чат, а групповая обработка (мод-команды,
+    контент-фильтры) для сообщения не запускалась вовсе.
+    """
+
+    def _handler(self):
+        for h in bh.router.message.handlers:
+            if getattr(h.callback, "__name__", "") == "handle_members_import":
+                return h
+        self.fail("handle_members_import не зарегистрирован в router")
+
+    @staticmethod
+    def _msg(chat_type: str):
+        """Минимальный «документ от админа» в чате нужного типа."""
+        return SimpleNamespace(
+            chat=SimpleNamespace(type=chat_type),
+            document=SimpleNamespace(file_name="dump.csv", file_size=10),
+            from_user=SimpleNamespace(id=111),   # ADMIN_IDS = {111}
+        )
+
+    def _matches(self, chat_type: str) -> bool:
+        h = self._handler()
+        return all(bool(f.callback(self._msg(chat_type))) for f in h.filters)
+
+    def test_matches_in_private(self):
+        self.assertTrue(self._matches("private"),
+                        "в личке от админа хендлер обязан срабатывать")
+
+    def test_group_document_not_intercepted(self):
+        for chat_type in ("group", "supergroup"):
+            with self.subTest(chat_type=chat_type):
+                self.assertFalse(
+                    self._matches(chat_type),
+                    "документ от админа в группе не должен уходить в импорт: "
+                    "хендлер стоит выше групповых и съедает сообщение целиком",
+                )
 
 
 if __name__ == "__main__":

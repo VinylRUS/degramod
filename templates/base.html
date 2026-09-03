@@ -599,8 +599,6 @@
         <a href="/admin/keywords" class="nav-link {% if request.url.path.startswith('/admin/keywords') %}active{% endif %}">Keywords</a>
         <a href="/admin/settings" class="nav-link {% if request.url.path.startswith('/admin/settings') %}active{% endif %}">Settings</a>
         <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
-        <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
-        <a href="/admin/cas" class="nav-link {% if request.url.path.startswith('/admin/cas') %}active{% endif %}">CAS</a>
         {% endif %}
         <span class="spacer"></span>
         {% if auth_user %}
@@ -648,7 +646,7 @@
                     <li><strong>Импорт дамп-CSV юзербота.</strong> Админ из ADMIN_IDS шлёт боту CSV-дамп участников документом — бот раскладывает их в chat_members_seen (люркеры!) и Users. banned-строки скипаются, существующие не трогаются. Отчёт — ответом.</li>
                     <li><strong>Каскад /account для потенциальных.</strong> Юзер из полного банлиста LOLS без подтверждения получает тир по метрикам (spam_factor/offenses/scammer) — C1/C2/C3. Санкций каскад не выдаёт: потенциальных не баним и не мьютим (решение владельца) — тир уходит в cas_verdicts и в «На карандаше».</li>
                     <li><strong>Вкладка «На карандаше» (/admin/cas)</strong>: потенциальные с spam_factor/offenses, кнопки бан/игнор на месте; пороги каскада правятся там же.</li>
-                    <li><strong>Юзербот-дампер в tools/</strong> (Pyrogram, сессия в .gitignore) + README.</li>
+                    <li><strong>Юзербот-дампер в tools/</strong> (Telethon; сессия, дампы и config.yaml в .gitignore) + README и config.example.yaml.</li>
                 </ul>
                 <p><strong>v5.4.0</strong> — 30 августа 2026 (градация LOLS-тиров: бан только подтверждённым)</p>
                 <ul>
