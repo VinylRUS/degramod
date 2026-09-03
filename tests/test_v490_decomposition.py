@@ -35,8 +35,9 @@ from web.deps import get_bot, get_templates  # noqa: E402
 # Эталон: 54 роута после декомпозиции (47 из create_app + 7 вынесенных
 # раньше) плюс /healthz, добавленный в v4.10.2 (Task 16), плюс 2 роута
 # вайтлиста ботов (/admin/presets/bots/add, /admin/presets/bots/{wl_id}/delete),
-# добавленные в v5.1.0 (Task 8).
-_EXPECTED_ROUTES = 59
+# добавленные в v5.1.0 (Task 8), плюс 3 роута /admin/cas (GET + thresholds
+# + action) из v5.5.0.
+_EXPECTED_ROUTES = 62
 
 
 def _walk(routes):

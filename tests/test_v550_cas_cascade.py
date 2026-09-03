@@ -171,7 +171,7 @@ class ImportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["existing"], 0)   # 3000 не в CSV — существующим не считается
         self.assertEqual(stats["banned"], 1)
         self.assertEqual(stats["bad"], 0)
-        self.assertEqual(stats["unknown_chats"], 0)
+        self.assertEqual(stats["unknown_chats"], 1)  # 999999 не в ChatSettings
         async with async_session() as s:
             row = (await s.execute(
                 select(ChatMemberSeen).where(

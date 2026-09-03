@@ -34,8 +34,8 @@ from web.deps import (
     AuthUser,
     get_bot,
     get_templates,
-    require_admin,
     require_auth,
+    require_csrf_admin,
 )
 
 router = APIRouter()
@@ -120,7 +120,7 @@ async def cas_thresholds_post(
     spamfactor_ban: str = Form(""),
     spamfactor_mute: str = Form(""),
     offenses_mute: str = Form(""),
-    _auth: AuthUser = Depends(require_admin),
+    _auth: AuthUser = Depends(require_csrf_admin),
     templates: Jinja2Templates = Depends(get_templates),
 ):
     """Сохраняет пороги каскада. Каскад санкций не выдаёт — пороги влияют
@@ -157,7 +157,7 @@ async def cas_action_post(
     request: Request,
     action: str = Form(...),
     user_id: int = Form(...),
-    _auth: AuthUser = Depends(require_admin),
+    _auth: AuthUser = Depends(require_csrf_admin),
     bot=Depends(get_bot),
     templates: Jinja2Templates = Depends(get_templates),
 ):
