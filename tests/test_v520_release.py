@@ -27,9 +27,17 @@ class TestVersion(unittest.TestCase):
     # каждом следующем релизе, ничего при этом не защищая. Текущую версию
     # пинует релизный тест текущей версии (см. test_v530_release.py).
     def test_release_date_moved(self):
-        """Дата сборки должна быть новой — иначе пилюля в футере врёт."""
+        """Дата сборки должна быть новой — иначе пилюля в футере врёт.
+
+        v5.5.0: было `assertEqual(..., "2026-08-24")` — та же болезнь,
+        что у убранной проверки APP_VERSION выше: константа ломает тест
+        на каждом релизе и потому подталкивает НЕ двигать дату вовсе
+        (v5.5.0 так и приехала с датой v5.3.0 в футере). Смысл проверки
+        — «дата не отстаёт», его и сверяем: не раньше предыдущего
+        релиза, как это делает tests/test_v4717_preset_edit.py.
+        """
         import web_app
-        self.assertEqual(web_app.APP_RELEASE_DATE, "2026-08-24")
+        self.assertGreaterEqual(web_app.APP_RELEASE_DATE, "2026-08-24")
 
 
 class TestChangelog(unittest.TestCase):

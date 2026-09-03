@@ -1,0 +1,39 @@
+# tools/config.example.yaml — шаблон для userbot_member_dump.py.
+# Скопируй в tools/config.yaml (он в .gitignore: держит id чатов и пароль
+# прокси) и поправь под себя. Ключи session/chats/output/rate обязательны.
+
+session:
+  # Имя файла сессии Telethon: рядом ляжет tools/<name>.session (в .gitignore).
+  # Первый запуск спросит телефон, код из SMS и пароль 2FA — дальше молча.
+  name: dumper
+
+chats:
+  # id — обязательно int и с префиксом -100 для супергрупп.
+  # slug — короткое имя: им же называется CSV и работает `--only <slug>`.
+  # Юзербот должен быть админом чата, иначе Telegram не отдаёт список
+  # участников целиком (см. rate.skip_if_not_admin).
+  - id: -1001234567890
+    slug: main-chat
+  - id: -1009876543210
+    slug: offtop
+
+output:
+  dir: ./dumps            # относительно tools/; каталог в .gitignore
+  csv_encoding: utf-8
+  delimiter: ","
+
+rate:
+  sec_between_requests: 1.5   # пауза между запросами участников
+  flood_wait_extra: 1         # + секунд сверх того, что просит FloodWait
+  max_consecutive_floods: 10  # столько FloodWait подряд — сдаёмся
+  skip_if_not_admin: true     # не админ в чате → пропустить, а не падать
+
+proxy:
+  # MTProto-прокси питоновские клиенты не умеют: нужен SOCKS5-мост или VPN.
+  enabled: false
+  type: socks5            # socks5 | socks4 | http | mtproto
+  host: ""
+  port: 1080
+  secret: ""              # только для type: mtproto
+  username: ""            # для socks/http: либо оба поля, либо ни одного
+  password: ""

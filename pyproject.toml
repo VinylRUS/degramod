@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "5.4.0"  # держать в синхроне с APP_VERSION в web_app.py
+version = "5.5.0"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [
@@ -111,6 +111,7 @@ ignore = [
     "B007", "B023", "RUF059",
 ]
 "cas.py" = ["E402", "B023"]
+"web/admin_cas.py" = ["B023"]
 # В web_app.py ~1000 строк (после выноса роутов в web/, v4.10.0).
 # E402 — `from db import (...)` стоит после `_req_logger = logging.getLogger(...)`.
 # Это намеренно: logger инициализируется до импорта db, чтобы в случае ошибки

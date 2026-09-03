@@ -118,8 +118,8 @@ PAGE_SIZE = 50  # записей на страницу в дашборде
 # v4.5.5: Проверка прав бота при добавлении в чат + DM Admin/SU если прав
 # не хватает, бейдж ⚠ RIGHTS и кнопка Recheck в /admin/chats.
 # v4.5.4: Санитарные дни — lockdown чата на заданные даты.
-APP_VERSION = "v5.4.0"
-APP_RELEASE_DATE = "2026-08-24"
+APP_VERSION = "v5.5.0"
+APP_RELEASE_DATE = "2026-09-01"
 
 # v4.8.11: служебный mod_id для действий встроенного su из веб-панели.
 # У su нет привязанного Telegram-аккаунта (создаётся сидом init_db, логин по
@@ -897,6 +897,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     # v4.9.0/v4.10.0: декомпозиция завершена — все остальные роуты переехали
     # в web/*.py, в create_app() их не осталось (см. докстроку модуля).
     from web.admin_bans import router as admin_bans_router
+    from web.admin_cas import router as admin_cas_router
     from web.admin_chats import router as admin_chats_router
     from web.admin_cleanup import router as admin_cleanup_router
     from web.admin_keywords import router as admin_keywords_router
@@ -912,6 +913,7 @@ def create_app(lifespan=None, bot=None) -> FastAPI:
     app.include_router(me_router)
     app.include_router(api_router)
     app.include_router(admin_bans_router)
+    app.include_router(admin_cas_router)
     app.include_router(admin_chats_router)
     app.include_router(admin_cleanup_router)
     app.include_router(admin_keywords_router)
