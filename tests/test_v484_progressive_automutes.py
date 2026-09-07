@@ -125,7 +125,10 @@ def test_static():
     # переехали из web_app.py в web/api.py вместе с импортом AutomuteCounter.
     try:
         wa_src = (WORK_DIR / "web" / "api.py").read_text()
-        assert "AutomuteCounter" in wa_src, "AutomuteCounter не импортирован в web/api.py"
+        # v5.6.0: прямой ORM-доступ к AutomuteCounter убран — оба эндпоинта
+        # зовут хелперы bot_handlers (там же считается decay). Проверяем это.
+        assert "_automute_count" in wa_src, "web/api.py не зовёт хелперы счётчика"
+        assert "AUTOMUTE_KINDS" in wa_src, "web/api.py не знает про виды счётчика"
         assert "/api/reset-automute-count" in wa_src, "endpoint /api/reset-automute-count не найден"
         assert "/api/automute-count" in wa_src, "endpoint /api/automute-count не найден"
         _ok("T4: Импорты и API в web/api.py")
@@ -149,7 +152,7 @@ async def test_functional():
     async with db_mod.async_session() as session:
         # T5: _get_automute_count — 0 для нового юзера
         try:
-            count = await bot_handlers._get_automute_count(session, -100123, 42)
+            count = await bot_handlers._get_automute_count(session, -100123, 42, "warns")
             assert count == 0, f"expected 0, got {count}"
             _ok("T5: _get_automute_count = 0 для нового юзера")
         except Exception as e:
@@ -157,17 +160,17 @@ async def test_functional():
 
         # T6: _increment_automute_count — 0→1→2→3
         try:
-            c1 = await bot_handlers._increment_automute_count(session, -100123, 42)
+            c1 = await bot_handlers._increment_automute_count(session, -100123, 42, "warns")
             await session.commit()
             assert c1 == 1, f"1st increment: expected 1, got {c1}"
-            c2 = await bot_handlers._increment_automute_count(session, -100123, 42)
+            c2 = await bot_handlers._increment_automute_count(session, -100123, 42, "warns")
             await session.commit()
             assert c2 == 2, f"2nd increment: expected 2, got {c2}"
-            c3 = await bot_handlers._increment_automute_count(session, -100123, 42)
+            c3 = await bot_handlers._increment_automute_count(session, -100123, 42, "warns")
             await session.commit()
             assert c3 == 3, f"3rd increment: expected 3, got {c3}"
             # Verify read-back
-            count = await bot_handlers._get_automute_count(session, -100123, 42)
+            count = await bot_handlers._get_automute_count(session, -100123, 42, "warns")
             assert count == 3, f"read-back: expected 3, got {count}"
             _ok("T6: _increment_automute_count 0→1→2→3")
         except Exception as e:
@@ -175,13 +178,13 @@ async def test_functional():
 
         # T7: _reset_automute_count — сброс, возврат старого значения
         try:
-            old = await bot_handlers._reset_automute_count(session, -100123, 42)
+            old = await bot_handlers._reset_automute_count(session, -100123, 42, "warns")
             await session.commit()
             assert old == 3, f"old count: expected 3, got {old}"
-            count = await bot_handlers._get_automute_count(session, -100123, 42)
+            count = await bot_handlers._get_automute_count(session, -100123, 42, "warns")
             assert count == 0, f"after reset: expected 0, got {count}"
             # Reset again (already 0) — should return 0
-            old2 = await bot_handlers._reset_automute_count(session, -100123, 42)
+            old2 = await bot_handlers._reset_automute_count(session, -100123, 42, "warns")
             await session.commit()
             assert old2 == 0, f"2nd reset: expected 0, got {old2}"
             _ok("T7: _reset_automute_count (old=3→0, 2nd reset=0)")
@@ -191,16 +194,16 @@ async def test_functional():
         # T8: Per-chat independence
         try:
             # Chat A: increment 2 times
-            await bot_handlers._increment_automute_count(session, -100456, 99)
+            await bot_handlers._increment_automute_count(session, -100456, 99, "warns")
             await session.commit()
-            await bot_handlers._increment_automute_count(session, -100456, 99)
+            await bot_handlers._increment_automute_count(session, -100456, 99, "warns")
             await session.commit()
             # Chat B: increment 5 times
             for _ in range(5):
-                await bot_handlers._increment_automute_count(session, -100789, 99)
+                await bot_handlers._increment_automute_count(session, -100789, 99, "warns")
             await session.commit()
-            count_a = await bot_handlers._get_automute_count(session, -100456, 99)
-            count_b = await bot_handlers._get_automute_count(session, -100789, 99)
+            count_a = await bot_handlers._get_automute_count(session, -100456, 99, "warns")
+            count_b = await bot_handlers._get_automute_count(session, -100789, 99, "warns")
             assert count_a == 2, f"chat A: expected 2, got {count_a}"
             assert count_b == 5, f"chat B: expected 5, got {count_b}"
             _ok("T8: Per-chat independence (chat A=2, chat B=5)")
@@ -211,13 +214,13 @@ async def test_functional():
         try:
             # User 100: increment 3 times
             for _ in range(3):
-                await bot_handlers._increment_automute_count(session, -100999, 100)
+                await bot_handlers._increment_automute_count(session, -100999, 100, "warns")
             await session.commit()
             # User 200: increment 1 time
-            await bot_handlers._increment_automute_count(session, -100999, 200)
+            await bot_handlers._increment_automute_count(session, -100999, 200, "warns")
             await session.commit()
-            count_100 = await bot_handlers._get_automute_count(session, -100999, 100)
-            count_200 = await bot_handlers._get_automute_count(session, -100999, 200)
+            count_100 = await bot_handlers._get_automute_count(session, -100999, 100, "warns")
+            count_200 = await bot_handlers._get_automute_count(session, -100999, 200, "warns")
             assert count_100 == 3, f"user 100: expected 3, got {count_100}"
             assert count_200 == 1, f"user 200: expected 1, got {count_200}"
             _ok("T9: Per-user independence (user 100=3, user 200=1)")
@@ -425,6 +428,12 @@ def test_automute_paths():
         formula_count = bh_src.count("auto_count * 60")
         assert formula_count >= 4, \
             f"formula 'auto_count * 60' found {formula_count} times, expected >= 4"
+
+        # v5.6.0: у каждого пути свой вид счётчика — иначе автомьюты разных
+        # источников снова начнут складываться (см. test_v560_automute_kinds).
+        for kind in ("warns", "via_bot", "sticker", "content"):
+            assert "_automute_count(session, chat_id, " in bh_src
+            assert f'"{kind}")' in bh_src, f'путь с kind="{kind}" не найден'
 
         _ok("T19: 4 пути автомьюта модифицированы",
             f"increment={increment_count}, get={get_count}, formula={formula_count}")

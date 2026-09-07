@@ -147,6 +147,7 @@ from sqlalchemy import delete, desc, func, or_, select, update
 
 import commands
 from db import (
+    AUTOMUTE_KINDS,
     AutomuteCounter,
     BannedStickerPack,
     BotWhitelist,
@@ -1981,62 +1982,153 @@ async def _revoke_last_action(
 
 
 # ── v4.8.4: Прогрессивные автомьюты — хелперы для счётчика ──────────────────
-# Счётчик automute_counters хранит количество автомьютов per (chat_id, user_id).
-# Формула: mute_duration = base_duration + (count * 60 сек), где count —
-# значение ДО инкремента (0 для первого мута). Не сбрасывается при !resetwarns
-# или !unmute — только через !resetmc или веб-панель.
+# Счётчик automute_counters хранит количество автомьютов
+# per (chat_id, user_id, kind). Формула: mute_duration = base_duration +
+# (count * 60 сек), где count — значение ДО инкремента (0 для первого мута).
+# Не сбрасывается при !resetwarns или !unmute — только через !resetmc или
+# веб-панель.
+#
+# v5.6.0: FIX — счётчик разделён по видам (kind, см. db.AUTOMUTE_KINDS).
+# Раньше он был один на (chat_id, user_id), и все четыре источника автомьюта
+# инкрементировали его вместе: замьютили за спам ботами — следующий автомьют
+# за варны становился длиннее. Виды больше не пересекаются, kind обязателен
+# у каждого вызова.
+#
+# v5.6.0: decay — если у чата задан automute_decay_days > 0, счётчик
+# ступенчато тает: -1 за каждые N полных дней с момента последнего автомьюта
+# (updated_at). Фоновой таски нет: decay применяется при чтении и
+# материализуется при следующем инкременте (count = effective + 1,
+# updated_at = now). Остаток неполного шага при этом сгорает — иначе счётчик
+# «отматывался» бы дважды.
 
-async def _get_automute_count(session, chat_id: int, user_id: int) -> int:
-    """Возвращает текущее значение счётчика автомьютов (0 если записи нет)."""
-    counter = (await session.execute(
-        select(AutomuteCounter).where(
-            AutomuteCounter.chat_id == chat_id,
-            AutomuteCounter.user_id == user_id,
+def _decay_automute_count(count: int, updated_at, decay_days: int) -> int:
+    """v5.6.0: применяет ступенчатый decay к значению счётчика.
+
+    ``decay_days <= 0`` — decay отключён, значение возвращается как есть.
+    Ниже нуля не опускается. ``updated_at`` из SQLite приходит naive —
+    считаем его UTC (везде пишем ``datetime.now(timezone.utc)``).
+    """
+    if decay_days <= 0 or count <= 0 or updated_at is None:
+        return max(0, count)
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    elapsed_days = (datetime.now(timezone.utc) - updated_at).days
+    if elapsed_days < decay_days:
+        return count
+    return max(0, count - elapsed_days // decay_days)
+
+
+async def _get_automute_decay_days(session, chat_id: int) -> int:
+    """v5.6.0: срок decay счётчика автомьютов для чата (0 = отключён).
+
+    Читает настройки напрямую, а не через ``_get_chat_settings``: тот заводит
+    строку с дефолтами, если её нет, а сюда приходят и запросы веб-панели с
+    произвольным chat_id — плодить от них chat_settings незачем.
+    """
+    decay = (await session.execute(
+        select(ChatSettings.automute_decay_days).where(
+            ChatSettings.chat_id == chat_id,
         )
     )).scalar_one_or_none()
-    return counter.count if counter else 0
+    return decay or 0
 
 
-async def _increment_automute_count(session, chat_id: int, user_id: int) -> int:
-    """Инкрементирует счётчик автомьютов. Возвращает НОВОЕ значение.
+async def _get_automute_count(
+    session, chat_id: int, user_id: int, kind: str,
+) -> int:
+    """Возвращает счётчик автомьютов вида ``kind`` (0 если записи нет).
 
-    Создаёт запись если её не было (0 → 1). Вызывающий код должен
-    сделать commit (или коммитит в рамках своей транзакции).
+    v5.6.0: к сохранённому значению применяется decay чата.
     """
     counter = (await session.execute(
         select(AutomuteCounter).where(
             AutomuteCounter.chat_id == chat_id,
             AutomuteCounter.user_id == user_id,
+            AutomuteCounter.kind == kind,
         )
     )).scalar_one_or_none()
     if counter is None:
-        counter = AutomuteCounter(chat_id=chat_id, user_id=user_id, count=1)
+        return 0
+    decay_days = await _get_automute_decay_days(session, chat_id)
+    return _decay_automute_count(counter.count, counter.updated_at, decay_days)
+
+
+async def _increment_automute_count(
+    session, chat_id: int, user_id: int, kind: str,
+) -> int:
+    """Инкрементирует счётчик автомьютов вида ``kind``. Возвращает НОВОЕ значение.
+
+    Создаёт запись если её не было (0 → 1). Вызывающий код должен
+    сделать commit (или коммитит в рамках своей транзакции).
+    v5.6.0: инкремент идёт от значения ПОСЛЕ decay и материализует его.
+    """
+    counter = (await session.execute(
+        select(AutomuteCounter).where(
+            AutomuteCounter.chat_id == chat_id,
+            AutomuteCounter.user_id == user_id,
+            AutomuteCounter.kind == kind,
+        )
+    )).scalar_one_or_none()
+    if counter is None:
+        counter = AutomuteCounter(
+            chat_id=chat_id, user_id=user_id, kind=kind, count=1,
+        )
         session.add(counter)
     else:
-        counter.count += 1
+        decay_days = await _get_automute_decay_days(session, chat_id)
+        counter.count = _decay_automute_count(
+            counter.count, counter.updated_at, decay_days,
+        ) + 1
     counter.updated_at = datetime.now(timezone.utc)
     await session.flush()
     return counter.count
 
 
-async def _reset_automute_count(session, chat_id: int, user_id: int) -> int:
-    """Сбрасывает счётчик автомьютов в 0. Возвращает СТАРОЕ значение.
+async def _reset_automute_count(
+    session, chat_id: int, user_id: int, kind: str,
+) -> int:
+    """Сбрасывает счётчик вида ``kind`` в 0. Возвращает СТАРОЕ значение.
 
-    Если записи не было — возвращает 0 (нечего сбрасывать).
+    Если записи не было — возвращает 0 (нечего сбрасывать). Старое значение
+    отдаётся с учётом decay: показываем то же число, что видел модератор.
     """
     counter = (await session.execute(
         select(AutomuteCounter).where(
             AutomuteCounter.chat_id == chat_id,
             AutomuteCounter.user_id == user_id,
+            AutomuteCounter.kind == kind,
         )
     )).scalar_one_or_none()
     if counter is None:
         return 0
-    old_count = counter.count
+    decay_days = await _get_automute_decay_days(session, chat_id)
+    old_count = _decay_automute_count(
+        counter.count, counter.updated_at, decay_days,
+    )
     counter.count = 0
     counter.updated_at = datetime.now(timezone.utc)
     await session.flush()
     return old_count
+
+
+async def _get_all_automute_counts(
+    session, chat_id: int, user_id: int,
+) -> dict[str, int]:
+    """v5.6.0: разбивка счётчиков по видам — {kind: count} для всех видов."""
+    return {
+        kind: await _get_automute_count(session, chat_id, user_id, kind)
+        for kind in AUTOMUTE_KINDS
+    }
+
+
+async def _reset_all_automute_counts(
+    session, chat_id: int, user_id: int,
+) -> dict[str, int]:
+    """v5.6.0: сбрасывает счётчики всех видов. Возвращает СТАРУЮ разбивку."""
+    return {
+        kind: await _reset_automute_count(session, chat_id, user_id, kind)
+        for kind in AUTOMUTE_KINDS
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4463,7 +4555,9 @@ async def _check_warn_threshold(
             mute_dur = settings.mute_duration_seconds or 3600
             # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
             # count = значение ДО инкремента (0 для первого мута).
-            auto_count = await _get_automute_count(session, chat_id, target.id)
+            # v5.6.0: счётчик вида "warns" — автомьюты за спам ботами,
+            # стикер-паки и ссылки этот мут больше не удлиняют.
+            auto_count = await _get_automute_count(session, chat_id, target.id, "warns")
             mute_dur = mute_dur + (auto_count * 60)
             until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
             try:
@@ -4493,7 +4587,7 @@ async def _check_warn_threshold(
                     session, target.id, chat_id, "auto_mute",
                 )
                 # v4.8.4: инкремент счётчика автомьютов (после успешного мьюта).
-                new_count = await _increment_automute_count(session, chat_id, target.id)
+                new_count = await _increment_automute_count(session, chat_id, target.id, "warns")
                 await session.commit()
                 logger.info(
                     "Auto-mute: marked %d warns as consumed_by_action=auto_mute "
@@ -9119,8 +9213,9 @@ async def handle_sticker_message(message: types.Message) -> None:
     if punishment == "mute":
         mute_dur = pack.mute_duration or 3600
         # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+        # v5.6.0: свой счётчик вида "sticker".
         async with async_session() as session:
-            auto_count = await _get_automute_count(session, chat_id, target.id)
+            auto_count = await _get_automute_count(session, chat_id, target.id, "sticker")
         mute_dur = mute_dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + mute_dur
         try:
@@ -9141,7 +9236,7 @@ async def handle_sticker_message(message: types.Message) -> None:
                     target_content,
                 )
                 # v4.8.4: инкремент счётчика автомьютов.
-                new_count = await _increment_automute_count(session, chat_id, target.id)
+                new_count = await _increment_automute_count(session, chat_id, target.id, "sticker")
                 await session.commit()
             logger.info(
                 "Sticker pack '%s' mute issued in chat %s (user %s, %s, "
@@ -9352,8 +9447,10 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
 
     dur = max(mute_min, 1) * 60
     # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+    # v5.6.0: FIX — счётчик вида "via_bot". Раньше он был общим, и минуты,
+    # набежавшие за спам ботами, приплюсовывались к автомьюту за варны.
     async with async_session() as session:
-        auto_count = await _get_automute_count(session, chat_id, fu.id)
+        auto_count = await _get_automute_count(session, chat_id, fu.id, "via_bot")
     dur = dur + (auto_count * 60)
     until_date = int(now.timestamp()) + dur
     try:
@@ -9377,7 +9474,7 @@ async def _check_via_bot_filter(message: types.Message, chat_id: int) -> bool:
                 "mute", dur, reason, target_content,
             )
             # v4.8.4: инкремент счётчика автомьютов (после успешного мьюта).
-            new_count = await _increment_automute_count(session, chat_id, fu.id)
+            new_count = await _increment_automute_count(session, chat_id, fu.id, "via_bot")
             await session.commit()
         logger.info(
             "Via-bot filter (mute %s) in chat %s (user %s, bot @%s): "
@@ -9632,8 +9729,9 @@ async def handle_content_filters(message: types.Message) -> None:
     if action == "mute":
         dur = mute_dur or 3600
         # v4.8.4: прогрессивный автомьют — base + (count * 60 сек).
+        # v5.6.0: свой счётчик вида "content" (word/link фильтры).
         async with async_session() as session:
-            auto_count = await _get_automute_count(session, chat_id, target.id)
+            auto_count = await _get_automute_count(session, chat_id, target.id, "content")
         dur = dur + (auto_count * 60)
         until_date = int(datetime.now(timezone.utc).timestamp()) + dur
         try:
@@ -9652,7 +9750,7 @@ async def handle_content_filters(message: types.Message) -> None:
                     "mute", dur, reason, target_content,
                 )
                 # v4.8.4: инкремент счётчика автомьютов.
-                new_count = await _increment_automute_count(session, chat_id, target.id)
+                new_count = await _increment_automute_count(session, chat_id, target.id, "content")
                 await session.commit()
             logger.info(
                 "Content filter (mute %s) in chat %s (user %s): %s "

@@ -53,7 +53,7 @@ from bot_handlers import (
     _mark_bot_ban,
     _mute_permissions,
     _parse_duration,
-    _reset_automute_count,
+    _reset_all_automute_counts,
     _revoke_last_action,
     _revoke_last_warns,
     _save_punishment,
@@ -1059,8 +1059,14 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
         await _upsert_user(session, target.id, target.username,
                            target.first_name, target.last_name)
         await _upsert_moderator(session, mod.id, mod.username, mod.first_name)
-        old_count = await _reset_automute_count(session, chat_id, target.id)
+        # v5.6.0: счётчик разделён по видам — !resetmc чистит все.
+        old_counts = await _reset_all_automute_counts(session, chat_id, target.id)
         await session.commit()
+    old_count = sum(old_counts.values())
+    # Разбивка по видам — только непустые, иначе в отчёте шум из нулей.
+    breakdown = ", ".join(
+        f"{kind}={cnt}" for kind, cnt in old_counts.items() if cnt
+    ) or "все нули"
 
     try:
         await message.bot.send_message(
@@ -1070,7 +1076,7 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
                 f"{target.first_name or ''}"
                 f"{' ' + target.last_name if target.last_name else ''}"
                 f"{' @' + target.username if target.username else ''}"
-                f" (было {old_count})"
+                f" (было {old_count}: {breakdown})"
             ),
         )
     except TelegramAPIError:
@@ -1079,7 +1085,7 @@ async def cmd_resetmc(message: types.Message, ctx: ModContext) -> None:
     await _send_audit_to_report(
         bot=message.bot, chat_id=chat_id, mod=mod, target=target,
         action_label="счётчик автомьютов — сброс",
-        detail=f"команда /resetmc (было {old_count})",
+        detail=f"команда /resetmc (было {old_count}: {breakdown})",
         count=old_count,
     )
 

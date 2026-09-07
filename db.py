@@ -200,6 +200,10 @@ class ChatSettings(Base):
     # Warn decay (#45): варны старше N дней не учитываются в счётчике.
     # 0 = отключено (варны копятся вечно). Типичное значение: 30 дней.
     warn_decay_days = Column(Integer, default=0, nullable=False)
+    # v5.6.0: decay счётчика прогрессивных автомьютов. Ступенчато: за каждые
+    # N дней без автомьюта счётчик (любого вида, см. AUTOMUTE_KINDS)
+    # уменьшается на 1. 0 = отключено — счётчик копится вечно, как до v5.6.0.
+    automute_decay_days = Column(Integer, default=0, nullable=False)
     # Auto night mode (user-requested #29-33): автоматическое включение
     # ограничительных прав в заданное время. Background-таска в bot.py
     # проверяет расписание каждую минуту.
@@ -581,11 +585,24 @@ class BannedStickerPack(Base):
     is_active = Column(Boolean, default=True, nullable=False)
 
 
+# ── v5.6.0: виды автомьютов ────────────────────────────────────────────────
+# Счётчик прогрессивных автомьютов ведётся отдельно для каждого источника
+# наказания. До v5.6.0 счётчик был один на (chat_id, user_id), и автомьют за
+# спам ботами удлинял автомьют за варны (и наоборот) — источники «складывались».
+#   warns   — порог варнов (_check_warn_threshold)
+#   via_bot — rate-limit сообщений «via @Bot» (_check_via_bot_filter)
+#   sticker — забаненные стикер-паки (_check_sticker_filter)
+#   content — word/link фильтры (handle_content_filters)
+AUTOMUTE_KINDS: tuple[str, ...] = ("warns", "via_bot", "sticker", "content")
+AUTOMUTE_KIND_DEFAULT = "warns"
+
+
 class AutomuteCounter(Base):
     """v4.8.4: Счётчик автомьютов для прогрессивных мутов.
 
     Хранит количество раз, которое бот автоматически замьютил юзера
-    в конкретном чате. Используется для прогрессивной формулы:
+    в конкретном чате **по конкретному поводу** (``kind``, v5.6.0).
+    Используется для прогрессивной формулы:
 
         mute_duration = base_duration + (count * 60 секунд)
 
@@ -603,13 +620,23 @@ class AutomuteCounter(Base):
       • **Только автомьюты**: ручные мьюты (``!mute``, ``!smute``) НЕ
         инкрементируют счётчик и не используют прогрессивную формулу.
       • Сбрасывается только через ``!resetmc`` (SU/Admin) или веб-панель.
+      • **v5.6.0: per-kind** — виды из ``AUTOMUTE_KINDS`` не пересекаются.
+        Муты за спам ботами не удлиняют автомьют за варны.
+      • **v5.6.0: decay** — если у чата задан ``automute_decay_days > 0``,
+        счётчик ступенчато тает: -1 за каждые N дней с ``updated_at``.
+        Само поле ``count`` при этом не переписывается фоново — decay
+        считается при чтении (``_get_automute_count``) и материализуется
+        при следующем инкременте.
 
-    PK: ``(chat_id, user_id)`` — одна запись на юзера на чат.
+    PK: ``(chat_id, user_id, kind)`` — одна запись на вид наказания.
     """
     __tablename__ = "automute_counters"
 
     chat_id = Column(BigInteger, primary_key=True)
     user_id = Column(BigInteger, primary_key=True)
+    # v5.6.0: вид автомьюта (см. AUTOMUTE_KINDS). Легаси-строки мигрируют
+    # в 'warns' — именно этот счётчик видел модератор в панели до v5.6.0.
+    kind = Column(String(16), primary_key=True, default=AUTOMUTE_KIND_DEFAULT)
     count = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
                         onupdate=lambda: datetime.now(timezone.utc))
@@ -1177,6 +1204,19 @@ async def init_db() -> None:
                     f"ALTER TABLE chat_settings ADD COLUMN {col_name} {col_type}"
                 ))
 
+    # ── Миграция: automute_decay_days в chat_settings (v5.6.0) ─────────
+    # Идёт ДО любого ORM-запроса к ChatSettings: ORM подставляет в SELECT все
+    # колонки модели и на старой БД падает с «no such column».
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "automute_decay_days" not in columns:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN automute_decay_days "
+                "INTEGER NOT NULL DEFAULT 0"
+            ))
+            logger.info("v5.6.0 init_db: chat_settings.automute_decay_days добавлена")
+
     # ── Миграция: расширение chat_settings (v4.5.3) ────────────────────
     # Новые поля для расширенной настройки ночного режима: per-chat tz,
     # отдельное расписание на выходные, уведомления входа/выхода.
@@ -1510,9 +1550,46 @@ async def init_db() -> None:
                 user_id BIGINT NOT NULL,
                 count INTEGER NOT NULL DEFAULT 0,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (chat_id, user_id)
+                kind VARCHAR(16) NOT NULL DEFAULT 'warns',
+                PRIMARY KEY (chat_id, user_id, kind)
             )
         """))
+
+    # ── v5.6.0: миграция automute_counters — kind в первичном ключе ────────
+    # До v5.6.0 PK был (chat_id, user_id): один счётчик на все источники
+    # автомьюта, из-за чего муты за спам ботами удлиняли автомьют за варны.
+    # SQLite не умеет менять PRIMARY KEY через ALTER TABLE — пересобираем
+    # таблицу. Легаси-строки уезжают в kind='warns': именно этот счётчик
+    # показывался модератору в панели и сбрасывался через !resetmc, а
+    # остальные виды начинают с нуля.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(automute_counters)"))
+        columns = [row[1] for row in result.fetchall()]
+        if "kind" not in columns:
+            await conn.execute(text("""
+                CREATE TABLE automute_counters_v560 (
+                    chat_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    kind VARCHAR(16) NOT NULL DEFAULT 'warns',
+                    count INTEGER NOT NULL DEFAULT 0,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, user_id, kind)
+                )
+            """))
+            await conn.execute(text(
+                "INSERT INTO automute_counters_v560 "
+                "(chat_id, user_id, kind, count, updated_at) "
+                "SELECT chat_id, user_id, 'warns', count, updated_at "
+                "FROM automute_counters"
+            ))
+            await conn.execute(text("DROP TABLE automute_counters"))
+            await conn.execute(text(
+                "ALTER TABLE automute_counters_v560 RENAME TO automute_counters"
+            ))
+            logger.info(
+                "v5.6.0 init_db: automute_counters пересобрана, "
+                "легаси-строки перенесены в kind='warns'"
+            )
 
     # ── v4.8.5: Новая таблица idea_log (лог идей → GitHub Issues) ──────────
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.
