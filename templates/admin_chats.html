@@ -237,7 +237,7 @@
             <summary style="cursor: pointer; padding: var(--sp-3); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent); font-weight: 700; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: var(--sp-3);">
                 <span>⚖ Наказания</span>
                 <span style="color: var(--text-dim); font-size: 10px; font-weight: 400; text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                    {{ c.warns_to_mute }} / {{ c.mute_duration_seconds }} / {{ c.warns_to_ban }}{% if c.warn_decay_days %} · decay {{ c.warn_decay_days }}d{% endif %} · link={{ c.link_filter_action }}{% if c.via_bot_filter_enabled %} · via_bot={{ c.via_bot_rate_limit_seconds }}s/{{ c.via_bot_mute_minutes }}m{% endif %}
+                    {{ c.warns_to_mute }} / {{ c.mute_duration_seconds }} / {{ c.warns_to_ban }}{% if c.warn_decay_days %} · decay {{ c.warn_decay_days }}d{% endif %}{% if c.automute_decay_days %} · mc-decay {{ c.automute_decay_days }}d{% endif %} · link={{ c.link_filter_action }}{% if c.via_bot_filter_enabled %} · via_bot={{ c.via_bot_rate_limit_seconds }}s/{{ c.via_bot_mute_minutes }}m{% endif %}
                 </span>
             </summary>
             <div style="padding: var(--sp-3); border-top: 1px solid var(--border);">
@@ -258,10 +258,19 @@
                                style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
                     </div>
                 </div>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: var(--sp-2); margin-top: var(--sp-2);">
                     <div>
                         <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Warn decay (days, 0=off)</label>
                         <input type="text" name="warn_decay_days" value="{{ c.warn_decay_days or 0 }}" pattern="[0-9]+"
+                               style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
+                    </div>
+                    {# v5.6.0: decay счётчика прогрессивных автомьютов. Ступенчато:
+                       -1 к счётчику за каждые N дней без автомьюта. Действует на
+                       все виды счётчика (варны / via-bot / стикеры / ссылки). #}
+                    <div>
+                        <label style="display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 4px;">Automute decay (days, 0=off)</label>
+                        <input type="text" name="automute_decay_days" value="{{ c.automute_decay_days or 0 }}" pattern="[0-9]+"
+                               title="Счётчик прогрессивных автомьютов уменьшается на 1 за каждые N дней без автомьюта. 0 = копится вечно."
                                style="width: 100%; padding: 6px 10px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;">
                     </div>
                     <div>

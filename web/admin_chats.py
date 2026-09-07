@@ -138,6 +138,11 @@ async def admin_chats_update(
     mute_duration_seconds: str = Form(""),
     warns_to_ban: str = Form(""),
     warn_decay_days: str = Form(""),
+    # v5.6.0: decay счётчика прогрессивных автомьютов (-1 за каждые N дней
+    # без автомьюта). 0 = отключено, счётчик копится вечно. Дефолт "0", а не
+    # "": форму шлют и без этого поля (старые вкладки, тесты v4.5.1), а
+    # _parse_int на пустой строке падает с «must be a number».
+    automute_decay_days: str = Form("0"),
     link_filter_action: str = Form("delete"),
     # v4.5.3: расширенная настройка ночного режима.
     night_mode_start: str = Form("23:00"),
@@ -196,6 +201,7 @@ async def admin_chats_update(
         wtb = _parse_int(warns_to_ban, "warns_to_ban", 0)
         rc = _parse_int(report_chat_id, "report_chat_id", -10**15)
         decay = _parse_int(warn_decay_days, "warn_decay_days", 0)
+        am_decay = _parse_int(automute_decay_days or "0", "automute_decay_days", 0)
         # v4.7.24: via-bot rate-limit settings (1..86400 sec / 1..1440 min)
         vb_rl = _parse_int(via_bot_rate_limit_seconds, "via_bot_rate_limit_seconds", 1)
         vb_mm = _parse_int(via_bot_mute_minutes, "via_bot_mute_minutes", 1)
@@ -413,6 +419,8 @@ async def admin_chats_update(
         cs.warns_to_ban = wtb if wtb is not None else 0
         # v4.5.2: новые поля
         cs.warn_decay_days = decay if decay is not None else 0
+        # v5.6.0: decay счётчика автомьютов (все виды сразу).
+        cs.automute_decay_days = am_decay if am_decay is not None else 0
         cs.link_filter_action = link_filter_action
         cs.night_mode_start = nm_start
         cs.night_mode_end = nm_end
@@ -448,12 +456,12 @@ async def admin_chats_update(
     web_app._req_logger.info(
         "admin_chats_update: chat_id=%s updated by=%s (hashtag=%s, "
         "report_chat_id=%s, warns_to_mute=%s, mute_dur=%s, warns_to_ban=%s, "
-        "warn_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
+        "warn_decay=%s, automute_decay=%s, link_filter_action=%s, night=%s-%s [%s], tz=%s, "
         "weekend=%s-%s, notify=%s, sanitary=%s, day_perms=%s, san_perms=%s, "
         "night_preset_id=%s, day_slow=%s, night_slow=%s, "
         "via_bot_rl=%ss, via_bot_mute=%smin)",
         chat_id, _auth.username, ht, rc, wtm, mdb, wtb,
-        decay, link_filter_action, nm_start, nm_end,
+        decay, am_decay, link_filter_action, nm_start, nm_end,
         night_preset_id or "(none)",
         nm_tz, nm_wknd_start or "-", nm_wknd_end or "-",
         night_mode_notify == "on",

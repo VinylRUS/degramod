@@ -641,6 +641,13 @@
                 <span class="changelog-close" onclick="document.getElementById('changelog-modal').style.display='none'">✕</span>
             </div>
             <div class="changelog-modal-body">
+                <p><strong>v5.6.0</strong> — 08 сентября 2026 (счётчик автомьютов раздельно по видам + его decay)</p>
+                <ul>
+                    <li><strong>БАГ: минуты за спам ботами приплюсовывались к автомьюту за варны.</strong> Счётчик прогрессивных автомьютов был один на <code>(chat_id, user_id)</code>, а инкрементировали его все четыре источника наказания. Замьютили за спам через ботов — следующий автомьют за варны выходил длиннее на те же минуты, и наоборот. Теперь у счётчика есть <code>kind</code>: <code>warns</code> / <code>via_bot</code> / <code>sticker</code> / <code>content</code>, и виды не пересекаются. PK <code>automute_counters</code> стал <code>(chat_id, user_id, kind)</code>; старые строки уехали в <code>warns</code> — этот счётчик и был виден в панели.</li>
+                    <li><strong>Новая настройка <code>automute_decay_days</code></strong> (поле «Automute decay» в карточке чата, раздел «Наказания»). Ступенчато: за каждые N дней без автомьюта счётчик уменьшается на 1. Считается при чтении и фиксируется при следующем автомьюте, фоновых тасок нет. <code>0</code> = отключено, счётчик копится вечно — поведение до v5.6.0. Настройка одна на чат и действует на все виды счётчика.</li>
+                    <li><strong>!resetmc</strong> чистит все виды разом и показывает разбивку («было 5: warns=2, via_bot=3»). <strong>API</strong>: <code>GET /api/automute-count</code> отдаёт <code>counts</code> по видам (<code>count</code> остался суммой), <code>POST /api/reset-automute-count</code> принимает необязательный <code>kind</code>.</li>
+                    <li><strong>Миграция</strong> — Alembic <code>a3b4c5d6e7f8</code> и легаси-путь в <code>init_db()</code>: SQLite не меняет PRIMARY KEY через ALTER TABLE, поэтому таблица пересобирается (create → copy → drop → rename). Тесты — <code>tests/test_v560_automute_kinds.py</code> (17 проверок, включая изоляцию видов, ступенчатый decay и перенос легаси-строк).</li>
+                </ul>
                 <p><strong>v5.5.0</strong> — 01 сентября 2026 (импорт дамп-CSV + пороги в панели + «На карандаше»)</p>
                 <ul>
                     <li><strong>Импорт дамп-CSV юзербота.</strong> Админ из ADMIN_IDS шлёт боту CSV-дамп участников документом — бот раскладывает их в chat_members_seen (люркеры!) и Users. banned-строки скипаются, существующие не трогаются. Отчёт — ответом.</li>

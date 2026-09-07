@@ -14,7 +14,7 @@ v4.9.0 (Task 6): перенесены /api/dashboard, /api/search, /api/unban
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import timezone
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -22,7 +22,7 @@ from sqlalchemy import func, select
 
 import web_app
 from db import (
-    AutomuteCounter,
+    AUTOMUTE_KINDS,
     Moderator,
     PermissionPreset,
     Punishment,
@@ -69,29 +69,46 @@ async def api_get_automute_count(
     request: Request,
     chat_id: int = 0,
     user_id: int = 0,
+    kind: str = "",
     _auth: AuthUser = Depends(require_auth),
 ):
     """v4.8.4: Возвращает счётчик автомьютов для (chat_id, user_id).
 
     v4.8.10: перенесён из create_app() в web/api.py.
+    v5.6.0: счётчик разделён по видам (warns | via_bot | sticker | content).
+    Без параметра ``kind`` отдаётся разбивка ``counts`` по всем видам, а
+    ``count`` остаётся суммой — поле было в ответе до v5.6.0. С ``kind`` —
+    счётчик одного вида (``counts`` тогда содержит только его).
+    Значения приходят с учётом decay чата (``automute_decay_days``).
     """
     if chat_id == 0 or user_id == 0:
         return JSONResponse(
             {"ok": False, "error": "chat_id and user_id are required"},
             status_code=400,
         )
+    if kind and kind not in AUTOMUTE_KINDS:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown kind: {kind}"},
+            status_code=400,
+        )
+    import bot_handlers  # lazy — против circular import
     try:
         async with async_session() as session:
-            counter = (await session.execute(
-                select(AutomuteCounter).where(
-                    AutomuteCounter.chat_id == chat_id,
-                    AutomuteCounter.user_id == user_id,
+            if kind:
+                counts = {
+                    kind: await bot_handlers._get_automute_count(
+                        session, chat_id, user_id, kind,
+                    )
+                }
+            else:
+                counts = await bot_handlers._get_all_automute_counts(
+                    session, chat_id, user_id,
                 )
-            )).scalar_one_or_none()
-            count = counter.count if counter else 0
+            count = sum(counts.values())
         return JSONResponse({
             "ok": True,
             "count": count,
+            "counts": counts,
             "chat_id": chat_id,
             "user_id": user_id,
         })
@@ -353,6 +370,7 @@ async def api_reset_automute_count(
     request: Request,
     chat_id: int = Form(...),
     user_id: int = Form(...),
+    kind: str = Form(""),
     _auth: AuthUser = Depends(require_admin),
 ):
     """v4.8.4: Сброс счётчика автомьютов (прогрессивные муты).
@@ -362,35 +380,42 @@ async def api_reset_automute_count(
     следующий автомьют будет = base duration (без штрафа).
 
     v4.9.0 (Task 6): перенесён из create_app() в web/api.py.
+    v5.6.0: без ``kind`` чистятся все виды счётчика; с ``kind`` — только
+    указанный. ``old_count`` — сумма сброшенного, ``old_counts`` — разбивка.
     """
-    from sqlalchemy import select as _sel
+    import bot_handlers  # lazy — против circular import
     web_app._req_logger.info(
-        "api_reset_automute_count: attempt — chat_id=%s user_id=%s by=%s",
-        chat_id, user_id, _auth.username,
+        "api_reset_automute_count: attempt — chat_id=%s user_id=%s kind=%s by=%s",
+        chat_id, user_id, kind or "*", _auth.username,
     )
+    if kind and kind not in AUTOMUTE_KINDS:
+        return JSONResponse(
+            {"ok": False, "error": f"unknown kind: {kind}"},
+            status_code=400,
+        )
     try:
         async with async_session() as session:
-            counter = (await session.execute(
-                _sel(AutomuteCounter).where(
-                    AutomuteCounter.chat_id == chat_id,
-                    AutomuteCounter.user_id == user_id,
-                )
-            )).scalar_one_or_none()
-            if counter is None:
-                old_count = 0
+            if kind:
+                old_counts = {
+                    kind: await bot_handlers._reset_automute_count(
+                        session, chat_id, user_id, kind,
+                    )
+                }
             else:
-                old_count = counter.count
-                counter.count = 0
-                counter.updated_at = datetime.now(timezone.utc)
-                await session.commit()
+                old_counts = await bot_handlers._reset_all_automute_counts(
+                    session, chat_id, user_id,
+                )
+            await session.commit()
+        old_count = sum(old_counts.values())
         web_app._req_logger.info(
             "api_reset_automute_count: success — chat_id=%s user_id=%s "
-            "old_count=%d by=%s",
-            chat_id, user_id, old_count, _auth.username,
+            "old_counts=%s by=%s",
+            chat_id, user_id, old_counts, _auth.username,
         )
         return JSONResponse({
             "ok": True,
             "old_count": old_count,
+            "old_counts": old_counts,
             "chat_id": chat_id,
             "user_id": user_id,
         })
