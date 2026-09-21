@@ -20,9 +20,6 @@ os.environ["DB_PATH"] = "/tmp/degramod_v530_release.db"
 
 sys.path.insert(0, _P())
 
-_VERSION = "v5.6.0"
-
-
 class TestVersion(unittest.TestCase):
     def test_app_version(self):
         import web_app
