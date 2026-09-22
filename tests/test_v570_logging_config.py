@@ -56,12 +56,16 @@ def _reset_root_logger() -> None:
 
 
 def _invalidate_logging_modules() -> None:
+<<<<<<< Updated upstream
     """Удаляет кеш импорта logging_config и logging_loki из sys.modules.
 
     Нужно, чтобы patch.dict(sys.modules, ...) подействовал — иначе
     повторный `import logging_config` возьмёт кеш и не переимпортирует
     `logging_loki` внутри.
     """
+=======
+    """Удаляет кеш импорта logging_config и logging_loki из sys.modules."""
+>>>>>>> Stashed changes
     sys.modules.pop("logging_config", None)
     sys.modules.pop("logging_loki", None)
 
