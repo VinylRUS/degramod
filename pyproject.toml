@@ -6,7 +6,7 @@
 
 [project]
 name = "ded-vobzhak"
-version = "5.6.1"  # держать в синхроне с APP_VERSION в web_app.py
+version = "5.7.0"  # держать в синхроне с APP_VERSION в web_app.py
 description = "Telegram-бот модерации чатов «Дед Вобжак» + FastAPI веб-панель"
 requires-python = ">=3.14,<3.15"
 authors = [
@@ -33,6 +33,11 @@ dependencies = [
     # но db.run_migrations_async() импортирует alembic — без пакета старт упадёт,
     # если флаг когда-нибудь снимут.
     "alembic>=1.13",
+    # v5.7.0: отправка логов в Grafana Cloud Loki. Импорт guarded — если
+    # LOKI_URL не задан, библиотека не используется. Имя пакета на PyPI —
+    # python-logging-loki (импорт logging_loki). Пакет не обновлялся с 2020,
+    # но код прост (~200 строк, один emitter), стабилен и работает с Py3.14.
+    "python-logging-loki>=0.3.1",
 ]
 
 [tool.uv]

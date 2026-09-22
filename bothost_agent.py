@@ -320,19 +320,33 @@ def token_source() -> str | None:
 
 
 def _auth_headers(token: str | None = None) -> dict[str, str]:
-    """Заголовок авторизации агента, если токен задан.
+    """Заголовки авторизации агента.
 
-    v5.1.0 (fix-2): раньше запросы уходили вовсе без авторизации, хотя
-    roadmaps/ROADMAP_v5.0.0.md:651 требует Bearer token для agent API —
-    при переносе в спеку v5.1.0 пункт потерялся. Токена нет — заголовок
-    не выдумываем: пусть агент ответит 401, это внятнее подделки.
+    v5.7.0 (drop-bearer): Bearer убран. Документация Bothost прямо говорит
+    (см. https://bothost.ru/llms-full.txt, раздел про Agent API):
+
+        «Без Bearer-токена: используется только X-Bot-ID».
+
+    Bothost кладёт в `BOT_API_TOKEN`/`API_TOKEN` тот же самый Telegram-токен
+    от @BotFather (см. документацию: «API_TOKEN — альтернативное имя для
+    BOT_TOKEN, совместимость»). Агент не знает, что с ним делать, и
+    отвергает с `Unauthorized: invalid token`. Это наблюдалось на проде
+    22.09.2026 (incident #39a6a58): все 4 кандидата `agent:8000`/etc не
+    резолвились, внешний URL `n19.bothost.ru` отвечал, но Bearer с
+    Telegram-токеном отвергался.
+
+    Решение: единственная авторизация для Agent API — заголовок `X-Bot-ID`.
+    Он добавляется в `_request` отдельно (см. ниже). Функция возвращает
+    пустой словарь — оставлена для обратной совместимости, чтобы не
+    ломать внешние вызовы `bothost_agent._auth_headers(...)`, если они
+    где-то есть.
+
+    Параметр `token` оставлен в сигнатуре по той же причине, но
+    игнорируется. Когда-нибудь в будущем Bothost выдаст настоящий
+    API key (не Telegram-токен) — тогда вернём Bearer с этим ключом.
+    Пока что его нет ни в free, ни в Pro-тарифе (по состоянию на 22.09).
     """
-    # v5.1.0 (fix-4): у платформы переменная встречается под несколькими
-    # именами; порядок TOKEN_ENV_NAMES задаёт приоритет.
-    if token is None:
-        token = next((os.getenv(n) for n in TOKEN_ENV_NAMES if os.getenv(n)), "")
-    token = _clean_token(token)
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    return {}
 
 
 async def _request(method: str, path: str, token: str | None = None, **kwargs) -> AgentResult:
@@ -349,11 +363,12 @@ async def _request(method: str, path: str, token: str | None = None, **kwargs) -
                   "а переменная BOTHOST_AGENT_URL пуста",
         )
     url = f"{base}{path}"
-    # Заголовки вызывающего (X-Bot-ID у restart_self) дополняются авторизацией,
-    # а не заменяются ею.
-    # v5.1.0 (fix-7): X-Bot-ID — штатная авторизация агента по документации
-    # («Без Bearer-токена: используется только X-Bot-ID»). Раньше стоял лишь
-    # у restart_self. Bearer оставлен для внешнего шлюза, если ключ задан.
+    # Заголовки вызывающего (X-Bot-ID у restart_self) дополняются
+    # авторизацией, а не заменяются ею.
+    # v5.1.0 (fix-7): X-Bot-ID — штатная авторизация агента по документации.
+    # v5.7.0 (drop-bearer): _auth_headers() возвращает пустой словарь —
+    # Bearer убран (Bothost отвергает Telegram-токен как invalid).
+    # См. docstring _auth_headers для контекста.
     base_headers: dict[str, str] = {}
     if _bot_id():
         base_headers["X-Bot-ID"] = _bot_id()
@@ -401,12 +416,17 @@ async def get_stats(token: str | None = None) -> AgentResult:
 
 
 async def diagnose_tokens() -> list[tuple[str, str]]:
-    """Спрашивает у агента, какая из переменных с ключом ему подходит.
+    """Диагностика: какие переменные с токеном есть в env.
 
-    v5.1.0 (fix-5): прод отвечал «Unauthorized: invalid token» — значит
-    адрес, путь и схема Bearer верны, а отвергается значение. Какая из
-    переменных окружения «та самая», снаружи не видно, поэтому не гадаем,
-    а спрашиваем у самого агента.
+    v5.7.0 (drop-bearer): раньше эта функция перебирала все токены и шла к
+    агенту с каждым, чтобы узнать «какой примется». После drop-bearer
+    Bearer вообще не шлётся — единственная авторизация через X-Bot-ID,
+    и перебирать токены нет смысла. Функция теперь только показывает
+    наличие/отсутствие и форму переменной, без сетевых запросов.
+
+    Это нужно для диагностического блока в `/admin/settings` — там
+    пользователь видит «у тебя задан BOT_API_TOKEN длиной 46 — но он
+    не используется для авторизации агента, только X-Bot-ID».
 
     Возвращает пары (имя переменной, вердикт). Значения ключей в отчёт не
     попадают никогда — он уходит в веб-панель.
@@ -416,8 +436,11 @@ async def diagnose_tokens() -> list[tuple[str, str]]:
         value = os.getenv(name)
         if not value:
             continue
-        result = await get_stats(token=value)
-        report.append((name, "принят агентом" if result.ok else (result.error or "отказ")))
+        # v5.7.0: показываем, что переменная задана, но Bearer не используется.
+        # Раньше пытались авторизоваться каждым токеном — это давало
+        # «Unauthorized: invalid token» для всех, потому что Bothost кладёт
+        # туда Telegram-токен, а агент его не принимает.
+        report.append((name, "задан (не используется для agent API)"))
     return report
 
 
