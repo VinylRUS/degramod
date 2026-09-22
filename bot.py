@@ -48,6 +48,12 @@ import commands as commands_registry
 # См. chat_modes.py для архитектурных инвариантов и приоритета режимов.
 import health_probe
 
+# v5.7.0: конфигурация логирования (stdout + файл + Grafana Cloud Loki).
+# Импортируется здесь, но вызывается ниже — после того, как станет доступен
+# APP_VERSION из web_app.py (нужен как label в Loki). См. configure_logging()
+# ниже, после импорта web_app.
+import logging_config
+
 # v4.5.2: helpers для night mode background task (defined in bot_handlers)
 # v4.5.3: добавлен _night_mode_in_window для поддержки per-chat tz + weekend.
 # v4.5.4: добавлены helpers для санитарных дней (chat-level ChatPermissions lockdown).
@@ -96,7 +102,7 @@ from chat_modes import (
     _snapshot_chat_permissions,
 )
 from db import ChatSettings, async_session, init_db_with_fallback
-from web_app import create_app
+from web_app import APP_VERSION, create_app
 
 # v4.7.19: TelegramAPIError — базовый класс для ВСЕХ Telegram-ошибок
 # (TelegramNotFound, TelegramForbiddenError, TelegramConflictError, ...).
@@ -107,11 +113,15 @@ from web_app import create_app
 # _night_mode_tick и засоряло лог ERROR'ами каждую минуту. Теперь ловим
 # базовый класс — любая ошибка Telegram логируется как warning и не валит tick.
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(name)-24s │ %(levelname)-7s │ %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# v5.7.0: конфигурация логирования. Заменяет logging.basicConfig из v5.6.1
+# на 3 handler'а: StreamHandler (stdout для Bothost terminal),
+# TimedRotatingFileHandler (/app/data/logs/bot.log, 7 дней — offline
+# fallback), LokiHandler (если LOKI_URL задан — отправка в Grafana Cloud).
+# APP_VERSION выставляется в env перед вызовом, чтобы logging_config
+# подставил его как Loki label (`version=v5.7.0`). Без этого Loki label
+# был бы "unknown".
+os.environ.setdefault("APP_VERSION_TAG", APP_VERSION)
+logging_config.configure_logging()
 logger = logging.getLogger("shadow_logger")
 
 # ── Env ─────────────────────────────────────────────────────────────────────
