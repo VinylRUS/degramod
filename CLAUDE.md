@@ -140,6 +140,18 @@ _exit_night_mode = get_exit_night_mode()
 - `modchat.py` — отправка в модчат, keyword-watch, rate-limit алармов.
 - `github_client.py` — GitHub REST + GraphQL (Issues + Projects v2).
 - `sticker_cache.py` — конвертация стикеров (webp/tgs/webm) в PNG через BytesIO.
+- `llm_client.py` (v5.8.0) — обёртка над GigaChat API. По образцу
+  `bothost_agent.py`: `LLMResult` датакласс, **не бросает исключений наружу**,
+  async через `aiohttp` (без вариантов — `ASYNC230` без исключений). Ключ
+  GigaChat **не** в env — SU вводит через `/admin/settings#llm`, шифруется
+  Fernet'ом тем же ключом, что и GitHub PAT (`db._load_or_create_enc_key`).
+  Глобальный рубильник — `LlmSettings.is_active` (singleton id=1 в
+  `llm_settings`). Per-chat тумблер — `chat_settings.llm_expand_reason`.
+  См. roadmap.md §14.
+- `docs/rules.md` (v5.8.0) — правила чата в markdown, загружаются как
+  контекст для LLM при авторазвёртке причин наказаний. Источник:
+  rules.degradach.ru. Кеш на процесс (`_load_rules_md_for_llm` в
+  `bot_handlers.py`); при обновлении файла нужен рестарт бота.
 - `tools/` — `run_tests.py` (раннер сюиты), `cleanup_test_data.py` (очистка
   тестовых данных из БД), `legacy/` (одноразовые кодмоды v4.8.8, не запускать).
 

@@ -20,6 +20,8 @@
     <span class="dim" style="padding: 0 4px; font-size: 10px;">)</span>
     <span class="dim" style="padding: 0 4px;">·</span>
     <a href="#github">GitHub</a>
+    <span class="dim" style="padding: 0 4px;">·</span>
+    <a href="#llm">LLM</a>
 </div>
 
 {% if flash %}
@@ -490,5 +492,124 @@ document.getElementById('github-test-btn')?.addEventListener('click', async func
     }
 });
 </script>
+
+{# ════════════════════════════════════════════════════════════════════════ #}
+{# ── v5.8.0: GigaChat (LLM) — авторазвёртка причин наказаний ─────────────── #}
+{# ════════════════════════════════════════════════════════════════════════ #}
+<div id="llm" class="section-title" style="margin-top: var(--sp-6);">GigaChat (LLM) <a class="anchor" href="#llm">#</a></div>
+<div style="background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r-md); padding: var(--sp-4) var(--sp-5); margin-bottom: var(--sp-4);">
+
+    <div style="font-size: 11px; color: var(--text-dim); margin-bottom: var(--sp-4); line-height: 1.7;">
+        Авторазвёртка коротких причин наказаний (варн/бан/мьют) через GigaChat.
+        Модератор пишет <code>!warn спам</code> — LLM разворачивает в
+        «Реклама онлайн-казино в основном чате (повторное нарушение, прошлый
+        варн 2 дня назад)» и сохраняет в журнал санкций. Контекст: цитата
+        нарушителя, причина модератора, правила чата из
+        <code>docs/rules.md</code>, последние 3 причины этого юзера.
+        Глобальный рубильник тут; per-chat тумблер — на странице
+        <a href="/admin/chats">/admin/chats</a>.
+        Ключ GigaChat шифруется через Fernet (тем же ключом, что и GitHub PAT
+        — в <code>{{ db_path_dir }}/.github_enc_key</code>). При потере ключа
+        перезавести оба токена.
+    </div>
+
+    <form method="POST" action="/admin/settings/llm" id="llm-form"
+          style="display: flex; flex-direction: column; gap: var(--sp-3); max-width: 480px;">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <label style="display: flex; flex-direction: column; gap: var(--sp-1); font-size: 12px;">
+            API key (GigaChat)
+            <input type="password" name="api_key" autocomplete="off"
+                   placeholder="оставьте пустым, чтобы не менять"
+                   style="padding: 6px 8px; background: var(--bg1); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: monospace; font-size: 12px;">
+        </label>
+
+        <label style="display: flex; flex-direction: column; gap: var(--sp-1); font-size: 12px;">
+            Модель (GigaChat-Pro / GigaChat-Plus / GigaChat-Lite)
+            <input type="text" name="model_name" value="" autocomplete="off"
+                   placeholder="GigaChat-Pro (по умолчанию)"
+                   style="padding: 6px 8px; background: var(--bg1); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: monospace; font-size: 12px;">
+        </label>
+
+        <label style="display: flex; flex-direction: column; gap: var(--sp-1); font-size: 12px;">
+            Таймаут запроса, сек (10..60)
+            <input type="number" name="timeout_seconds" min="10" max="60" value=""
+                   placeholder="30 (по умолчанию)"
+                   style="padding: 6px 8px; background: var(--bg1); border: 1px solid var(--border); border-radius: var(--r-sm); color: var(--text); font-family: monospace; font-size: 12px;">
+        </label>
+
+        <label style="display: flex; align-items: center; gap: var(--sp-2); font-size: 12px;">
+            <input type="checkbox" name="is_active" value="1">
+            Включить LLM глобально (рубильник)
+        </label>
+
+        <div style="display: flex; gap: var(--sp-2); flex-wrap: wrap;">
+            <button type="submit"
+                    style="padding: 6px 14px; background: var(--accent); color: #fff; border: none; border-radius: var(--r-sm); font-size: 12px; cursor: pointer;">
+                Сохранить
+            </button>
+            <button type="button" id="llm-test-btn"
+                    style="padding: 6px 14px; background: var(--bg1); color: var(--text); border: 1px solid var(--border); border-radius: var(--r-sm); font-size: 12px; cursor: pointer;">
+                Проверить ключ
+            </button>
+        </div>
+        <div id="llm-test-status" style="font-size: 11px; color: var(--text-dim); min-height: 16px;"></div>
+    </form>
+
+    <script>
+    // Загрузка текущих настроек — для pre-fill формы.
+    (async () => {
+        try {
+            const resp = await fetch('/admin/settings/llm', {credentials: 'same-origin'});
+            if (!resp.ok) return;
+            const data = await resp.json();
+            const form = document.getElementById('llm-form');
+            // Ключ не возвращается в открытом виде — только признак.
+            form.querySelector('[name="model_name"]').value = data.model_name || '';
+            form.querySelector('[name="timeout_seconds"]').value = data.timeout_seconds || '';
+            form.querySelector('[name="is_active"]').checked = !!data.is_active;
+        } catch (e) { /* ignore — форма остаётся пустой, SU заполнит */ }
+    })();
+
+    document.getElementById('llm-test-btn').addEventListener('click', async () => {
+        const btn = document.getElementById('llm-test-btn');
+        const status = document.getElementById('llm-test-status');
+        const form = document.getElementById('llm-form');
+        const fd = new FormData();
+        fd.append('csrf_token', '{{ csrf_token }}');
+        // Берём то, что введено прямо сейчас (не из БД).
+        const apiKey = form.querySelector('[name="api_key"]').value.trim();
+        const modelName = form.querySelector('[name="model_name"]').value.trim();
+        if (apiKey) fd.append('api_key', apiKey);
+        if (modelName) fd.append('model_name', modelName);
+        btn.disabled = true;
+        btn.style.opacity = '0.6';
+        status.textContent = 'Проверка…';
+        status.style.color = 'var(--text-dim)';
+        try {
+            const resp = await fetch('/admin/settings/llm/test', {
+                method: 'POST',
+                body: fd,
+                credentials: 'same-origin',
+            });
+            const data = await resp.json();
+            if (data.ok) {
+                status.textContent = '✓ Ключ рабочий: ' + (data.message || 'ok');
+                status.style.color = '#2ea043';
+            } else {
+                status.textContent = '✗ ' + (data.message || 'проверка не прошла');
+                status.style.color = 'var(--danger)';
+            }
+        } catch (e) {
+            status.textContent = '✗ Сетевая ошибка: ' + e;
+            status.style.color = 'var(--danger)';
+        } finally {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+        }
+    });
+    </script>
+
+</div>
 
 {% endblock %}
