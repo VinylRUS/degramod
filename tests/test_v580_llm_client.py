@@ -440,7 +440,8 @@ class TestExpandReason(unittest.TestCase):
     def tearDown(self):
         _reset_llm_client_state()
 
-    def test_t13_messages_structure(self):
+    def test_t13_messages_structure_with_reason(self):
+        """T13: с reason — компактный промпт, rules_md не подаётся целиком."""
         import llm_client
         session = _FakeSession()
         with patch("aiohttp.ClientSession", return_value=session):
@@ -449,33 +450,102 @@ class TestExpandReason(unittest.TestCase):
                 mod_reason="спам",
                 offender_text="реклама казино, жми сюда",
                 reply_context_text=None,
-                rules_md="## Правила",
+                rules_md="## Правила чата\n\nмного правил",
                 recent_reasons=None,
             ))
         self.assertTrue(result.ok)
-        # Проверяем структуру отправленного payload.
         payload = session.captured[0]["json"]
         self.assertEqual(len(payload["messages"]), 2)
-        self.assertEqual(payload["messages"][0]["role"], "system")
-        self.assertIn("Правила чата", payload["messages"][0]["content"])
-        self.assertEqual(payload["messages"][1]["role"], "user")
-        self.assertIn("варн", payload["messages"][1]["content"])
-        self.assertIn("спам", payload["messages"][1]["content"])
-        self.assertIn("реклама казино", payload["messages"][1]["content"])
+        # system: режим с reason — правила НЕ подаются целиком.
+        system_content = payload["messages"][0]["content"]
+        self.assertIn("Модератор Telegram-чата", system_content)
+        # В system есть первая строка правил (название чата), но НЕ весь текст.
+        self.assertIn("Правила чата", system_content)
+        self.assertNotIn("много правил", system_content, "в режиме с reason весь rules_md не шлётся")
+        # user: причина + цитата.
+        user_content = payload["messages"][1]["content"]
+        self.assertIn("варн", user_content)
+        self.assertIn("спам", user_content)
+        self.assertIn("реклама казино", user_content)
 
-    def test_t13b_handles_none_offender_text(self):
+    def test_t13b_no_reason_mode_includes_compact_rules(self):
+        """T13b: при пустом reason в system подаётся компактизированная выжимка правил.
+
+        v5.8.0 (no-reason mode): если модератор не указал причину, LLM
+        сама классифицирует нарушение. Для этого в system-промпт подаётся
+        компактизированный список правил (через _compact_rules_for_classification).
+        """
+        import llm_client
+        session = _FakeSession()
+        rules = (
+            "## Бан без предупреждения\n\n1. Пропаганда ЛГБТ.\n2. Спам.\n"
+            "## Сначала варн\n\n1. Фурри-контент.\n"
+        )
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(llm_client.expand_reason(
+                action_type="ban",
+                mod_reason="",  # нет причины
+                offender_text="всякая реклама тут",
+                reply_context_text=None,
+                rules_md=rules,
+                recent_reasons=None,
+            ))
+        self.assertTrue(result.ok)
+        payload = session.captured[0]["json"]
+        system_content = payload["messages"][0]["content"]
+        # В no-reason mode system-промпт содержит правила.
+        self.assertIn("Модератор не указал причину", system_content)
+        self.assertIn("Бан: Пропаганда ЛГБТ", system_content)
+        self.assertIn("Варн: Фурри-контент", system_content)
+        # User-промпт: причина НЕ упомянута (она пустая).
+        user_content = payload["messages"][1]["content"]
+        self.assertNotIn("Причина:", user_content)
+        self.assertIn("всякая реклама", user_content)
+
+    def test_t13c_no_reason_no_offender_text_still_works(self):
+        """T13c: no-reason mode + нет цитаты — не падает, выдает 'нарушение не ясно'."""
+        import llm_client
+        session = _FakeSession()
+        with patch("aiohttp.ClientSession", return_value=session):
+            result = asyncio.run(llm_client.expand_reason(
+                action_type="warn",
+                mod_reason="",
+                offender_text=None,
+                reply_context_text=None,
+                rules_md="## Бан без предупреждения\n\n1. Спам.",
+                recent_reasons=None,
+            ))
+        self.assertTrue(result.ok)
+        # Промпт построен — не падает.
+
+    def test_t13d_compact_rules_function_strips_explanations(self):
+        """T13d: _compact_rules_for_classification убирает пояснения в скобках."""
+        import llm_client
+        rules = (
+            "## Бан без предупреждения\n\n"
+            "1. Обсуждение наркотиков и разговоры на тематику оружия (из игр можно).\n"
+            "2. Спам.\n"
+        )
+        result = llm_client._compact_rules_for_classification(rules)
+        self.assertIn("Бан:", result)
+        self.assertIn("Обсуждение наркотиков", result)
+        self.assertIn("Спам", result)
+        # Пояснение в скобках убрано.
+        self.assertNotIn("(из игр можно)", result)
+
+    def test_t13e_handles_none_offender_text(self):
+        """T13e: с reason + None offender_text — работает."""
         import llm_client
         session = _FakeSession()
         with patch("aiohttp.ClientSession", return_value=session):
             result = asyncio.run(llm_client.expand_reason(
                 action_type="ban",
-                mod_reason="",
+                mod_reason="оскорбление",
                 offender_text=None,
                 reply_context_text=None,
                 rules_md="",
                 recent_reasons=None,
             ))
-        # LLM вернёт ответ — expand_reason не падает от пустых входов.
         self.assertTrue(result.ok)
 
 

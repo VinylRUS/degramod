@@ -3749,12 +3749,15 @@ async def _send_report(
     # ── v5.8.0: LLM-авторазвёртка причины (background) ────────────────
     # Если в чате включён per-chat тумблер chat_settings.llm_expand_reason
     # и LLM доступна глобально (llm_client.is_available()) — запускаем
-    # фоновую таску: LLM разворачивает короткий reason модератора в
-    # внятное описание, обновляет запись в punishments.reason и шлёт
-    # отдельное follow-up сообщение в репорт-чат. Не блокирует отправку
-    # основного rich-отчёта — фоновая, через _spawn_background_task
-    # (см. CLAUDE.md «asyncio.create_task»).
-    if reason and action_type in ("warn", "ban", "mute"):
+    # фоновую таску.
+    #
+    # v5.8.0 (no-reason mode): LLM вызывается ДАЖЕ ПРИ ПУСТОМ reason. Если
+    # модератор не указал причину — модель сама анализирует цитату
+    # нарушителя и ищет подходящее нарушение в правилах чата (см. expand_reason,
+    # режим без reason — туда подаётся компактизированная выжимка rules.md).
+    # Раньше gate «if reason» пропускал этот кейс — модератор не указал
+    # причину, в журнале оставалась пустота, теперь LLM заполняет.
+    if action_type in ("warn", "ban", "mute"):
         await _maybe_spawn_llm_reason_expand(
             bot=bot,
             report_dest=report_dest,
@@ -4181,13 +4184,24 @@ async def _maybe_spawn_llm_reason_expand(
                        chat_id, e)
         return
 
-    # Системные причины — пропускаем.
-    reason_lower = mod_reason.lower()
-    if reason_lower.startswith("автобан:") or reason_lower.startswith("cas auto-ban"):
-        return
+    # Системные причины — пропускаем. Имеют смысл только если reason непустой:
+    # при пустом reason (no-reason mode) эти строки не сработают, и LLM
+    # спокойно классифицирует цитату нарушителя по правилам.
+    if mod_reason:
+        reason_lower = mod_reason.lower()
+        if reason_lower.startswith("автобан:") or reason_lower.startswith("cas auto-ban"):
+            return
 
-    # Если reason уже длинный — модератор сам расписал, не мешаем.
-    if len(mod_reason) >= 200:
+        # Если reason уже длинный — модератор сам расписал, не мешаем.
+        # Для no-reason mode (mod_reason пустой) эту проверку пропускаем.
+        if len(mod_reason) >= 200:
+            return
+
+    # v5.8.0 (no-reason mode): если цитаты нарушителя нет (например, бан по
+    # @username без reply) и reason пустой — LLM нечего анализировать,
+    # выходим. Модель не может придумать нарушение «из воздуха».
+    if not mod_reason and not offender_text:
+        logger.info("llm_reason_expand: skip (no reason AND no offender_text)")
         return
 
     # Последние 3 причины этого юзера (для контекста «повторное нарушение»).
