@@ -36,7 +36,7 @@ LLM-провайдера для авторазвёртки коротких пр
 | `db.py` | Новая ORM-модель `LlmSettings` (singleton id=1, шифрованный ключ). Колонка `chat_settings.llm_expand_reason` (per-chat тумблер). Идемпотентная миграция в `init_db()` + seed singleton. |
 | `web/admin_settings.py` | Роуты `GET/POST /admin/settings/llm` + `POST /admin/settings/llm/test`. Форма SU для ввода ключа GigaChat с шифрованием Fernet. Кнопка теста ключа. |
 | `web/admin_chats.py` | Параметр `llm_expand_reason` в `/admin/chats/{id}/update`. Toggle `llm_expand` в `/admin/chats/{id}/toggle`. |
-| `bot_handlers.py` | Хелпер `_maybe_spawn_llm_reason_expand()` — фоновая задача (через `_spawn_background_task`), не блокирует `_send_report`. Хелпер `_load_rules_md_for_llm()` — кеш правил на процесс. |
+| `bot_handlers.py` | Хелпер `_maybe_spawn_llm_reason_expand()` — фоновая задача (через `_spawn_background_task`), не блокирует `_send_report`. Хелпер `_load_rules_md_for_llm()` — кеш правил на процесс. **v5.8.0 edit mode**: `_try_edit_rich_reason()` — редактирует исходный rich-репорт через `bot.edit_message_text(rich_message=...)` (Bot API 10.3), заменяя пункт «📝 <reason>» на развёрнутый. В `_send_report` сохранён `report_message_id` от `send_rich_message` для последующего edit. |
 | `templates/admin_settings.html` | Раздел `#llm` с формой (API key, model, timeout, is_active) и кнопкой «Проверить ключ». |
 | `templates/admin_chats.html` | Кнопка `LLM` в карточке чата, чекбокс в форме, бейдж в заголовке. |
 | `templates/base.html` | Changelog v5.8.0. |
@@ -70,7 +70,8 @@ LLM-провайдера для авторазвёртки коротких пр
 ┌─────────────────────────────────────────────────────────────────┐
 │ Когда модератор !warn/!ban/!mute:                                │
 │  _send_report()                                                  │
-│   └─> _maybe_spawn_llm_reason_expand()                           │
+│   ├─> send_rich_message(rich_msg) → Message → report_message_id  │
+│   └─> _maybe_spawn_llm_reason_expand(report_message_id, rich_msg)│
 │        ├─ is_available()? → False? выходим (рубильник выкл)      │
 │        ├─ chat_settings.llm_expand_reason? False? выходим        │
 │        ├─ reason >= 200 символов? модератор расписал, выходим    │
@@ -79,8 +80,14 @@ LLM-провайдера для авторазвёртки коротких пр
 │             ├─ llm_client.expand_reason(...)                     │
 │             │    system: правила + анти-галлюцинации             │
 │             │    user:    тип + reason + цитата + контекст        │
-│             ├─ bot.send_message(report_chat, expanded)           │
-│             └─ UPDATE punishments SET reason=expanded WHERE ...  │
+│             ├─ UPDATE punishments SET reason=expanded WHERE ...  │
+│             └─ _try_edit_rich_reason(rich_msg, expanded):        │
+│                  ├─ deep copy rich_msg (model_copy)              │
+│                  ├─ find InputRichBlockList, ищем пункт «📝 …»    │
+│                  ├─ заменяем text на «📝 <expanded>»              │
+│                  ├─ no-reason mode? добавляем новый ListItem      │
+│                  └─ bot.edit_message_text(rich_message=new_rich)│
+│                     Fallback при ошибке: send_message(follow-up) │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

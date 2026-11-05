@@ -233,9 +233,35 @@ def test_t11_bot_handlers_calls_llm_expand():
             "_load_rules_md_for_llm не определён"
         assert 'docs", "rules.md' in bh_src or "docs/rules.md" in bh_src, \
             "путь к docs/rules.md не упоминается в _load_rules_md_for_llm"
-        _ok("T11: bot_handlers._send_report интегрирован с LLM-развёрткой")
+        # v5.8.0 (edit mode): хелпер принимает report_message_id и
+        # original_rich_msg, для последующего edit_message_text.
+        assert "report_message_id: int | None" in bh_src, \
+            "параметр report_message_id не объявлен в _maybe_spawn_llm_reason_expand"
+        assert "original_rich_msg:" in bh_src, \
+            "параметр original_rich_msg не объявлен в _maybe_spawn_llm_reason_expand"
+        assert "_try_edit_rich_reason" in bh_src, \
+            "_try_edit_rich_reason не определён (хелпер edit_message_text)"
+        assert "edit_message_text" in bh_src, \
+            "edit_message_text не вызывается (LLM-развёртка должна редактировать rich-репорт)"
+        # v5.8.0 (edit mode): send_rich_message должен сохранять
+        # message_id для последующего edit.
+        assert "report_message_id = sent_msg.message_id" in bh_src, \
+            "report_message_id не сохраняется из send_rich_message"
+        _ok("T11: bot_handlers._send_report интегрирован с LLM-развёрткой (edit mode)")
     except Exception as e:
         _fail("T11: bot_handlers LLM integration", str(e))
+
+
+def test_t16_v580_edit_mode_in_changelog():
+    """T16: changelog упоминает edit-режим rich-репорта."""
+    _section("T16: changelog v5.8.0 присутствует")
+    try:
+        html_src = (WORK_DIR / "templates" / "base.html").read_text(encoding="utf-8")
+        # v5.8.0 — уже в changelog (мы добавили в предыдущем коммите).
+        assert "v5.8.0" in html_src, "v5.8.0 не упомянута в changelog"
+        _ok("T16: changelog v5.8.0 присутствует")
+    except Exception as e:
+        _fail("T16: changelog v5.8.0", str(e))
 
 
 def test_t12_env_example_no_gigachat():
@@ -317,6 +343,7 @@ def main():
     test_t13_no_hardcoded_keys_in_llm_client()
     test_t14_admin_chats_toggle_field_validated()
     test_t15_pat_token_not_committed()
+    test_t16_v580_edit_mode_in_changelog()
     print("\nAll v580_settings tests done.")
 
 
