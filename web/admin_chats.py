@@ -172,6 +172,12 @@ async def admin_chats_update(
     sanitary_preset_id: str = Form("__lockdown__"),
     # v5.1.0: своя ссылка на правила для /rules. Пусто → RULES_URL_DEFAULT.
     rules_url: str = Form(""),
+    # v5.8.0: per-chat тумблер LLM-авторазвёртки причины наказаний.
+    # Глобальный рубильник — в LlmSettings.is_active (singleton). Здесь —
+    # opt-in для конкретного чата: SU сначала заводит ключ и включает LLM
+    # глобально в /admin/settings#llm, потом админ чата включает доработку
+    # тут. Поле checkbox="on" если включено, пусто если выключено.
+    llm_expand_reason: str = Form(""),
     _auth: AuthUser = Depends(require_csrf_admin),
 ):
     """Обновляет настройки чата (включая v4.5.2: warn decay, link filter, night mode)."""
@@ -450,6 +456,11 @@ async def admin_chats_update(
         cs.via_bot_mute_minutes = vb_mm if vb_mm is not None else 10
         # v5.1.0: пусто → дефолт из RULES_URL_DEFAULT (решается на чтении).
         cs.rules_url = rules_url_stripped or None
+        # v5.8.0: per-chat LLM-авторазвёртка причины. Глобальный рубильник
+        # проверяется в llm_client.is_available() — если LLM выключена
+        # глобально, этот флаг игнорируется. Наоборот не работает: тут
+        # нельзя включить LLM, если её нет глобально.
+        cs.llm_expand_reason = (llm_expand_reason == "on")
         cs.updated_at = datetime.now(timezone.utc)
         await session.commit()
 
@@ -511,7 +522,9 @@ async def admin_chats_toggle(
     valid_fields = {"enabled", "report_chat", "cas", "link_filter", "night_mode",
                     "sanitary_days", "via_bot_filter", "mod_chat",
                     # v5.3.0: удаление сообщений от имени чужих каналов.
-                    "channel_filter"}
+                    "channel_filter",
+                    # v5.8.0: per-chat тумблер LLM-авторазвёртки причины.
+                    "llm_expand"}
     if field not in valid_fields:
         return RedirectResponse(
             url="/admin/chats?flash=Invalid+toggle+field",
@@ -656,6 +669,19 @@ async def admin_chats_toggle(
                 cs.is_mod_chat = True
                 cs.mod_chat_id = chat_id
                 msg = f"Chat+{chat_id}+is+now+the+mod+chat"
+        elif field == "llm_expand":
+            # v5.8.0: per-chat тумблер LLM-авторазвёртки причины. Если LLM
+            # выключена глобально (нет ключа в /admin/settings#llm или
+            # is_active=False), этот toggle всё равно переключается в БД —
+            # но llm_client игнорирует флаг, когда недоступен глобально.
+            # Так сделано сознательно: админ может включить флаг «на
+            # будущее», до заведения ключа, и фича начнёт работать сразу
+            # после активации глобального рубильника SU'ом.
+            cs.llm_expand_reason = not cs.llm_expand_reason
+            msg = (
+                f"Chat+{chat_id}+LLM+reason+expand+"
+                f"{'enabled' if cs.llm_expand_reason else 'disabled'}"
+            )
         cs.updated_at = datetime.now(timezone.utc)
         await session.commit()
     web_app._req_logger.info(

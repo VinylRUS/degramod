@@ -3710,8 +3710,15 @@ async def _send_report(
     if WEB_PUBLIC_URL:
         web_url_plain = f"{WEB_PUBLIC_URL}/user/{target.id}"
 
+    # v5.8.0: report_message_id для последующего editMessageText с
+    # развёрнутой причиной от LLM. Раньше поле было soft-deprecated
+    # (медиа встраивалось inline), но для LLM-развёртки через
+    # editMessageText(rich_message=...) он снова нужен.
+    report_message_id: int | None = None
     try:
-        await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
+        sent_msg = await bot.send_rich_message(chat_id=report_dest, rich_message=rich_msg)
+        if sent_msg is not None and getattr(sent_msg, "message_id", None) is not None:
+            report_message_id = sent_msg.message_id
     except TelegramAPIError as e:
         logger.error("Failed to send rich report to chat %s: %s", report_dest, e)
         # ── Fallback: простой plain-text отчёт ──────────────
@@ -3745,6 +3752,41 @@ async def _send_report(
         except TelegramAPIError as e:
             logger.warning("Failed to attach sticker to report chat %s: %s",
                            report_dest, e)
+
+    # ── v5.8.0: LLM-авторазвёртка причины (background) ────────────────
+    # Если в чате включён per-chat тумблер chat_settings.llm_expand_reason
+    # и LLM доступна глобально (llm_client.is_available()) — запускаем
+    # фоновую таску.
+    #
+    # v5.8.0 (no-reason mode): LLM вызывается ДАЖЕ ПРИ ПУСТОМ reason. Если
+    # модератор не указал причину — модель сама анализирует цитату
+    # нарушителя и ищет подходящее нарушение в правилах чата (см. expand_reason,
+    # режим без reason — туда подаётся компактизированная выжимка rules.md).
+    # Раньше gate «if reason» пропускал этот кейс — модератор не указал
+    # причину, в журнале оставалась пустота, теперь LLM заполняет.
+    #
+    # v5.8.0 (edit mode): развёрнутая причина РЕДАКТИРУЕТ исходный rich-репорт
+    # через bot.edit_message_text(rich_message=...), а не шлёт follow-up
+    # отдельным сообщением. Журнал чище — одно сообщение на одно наказание,
+    # reason обновляется прямо в нём. Дополнительно обновляется punishments
+    # .reason в БД, чтобы веб-панель /mywarns / /user/<id> показывали
+    # развёрнутое описание, а не короткий «спам».
+    if action_type in ("warn", "ban", "mute"):
+        await _maybe_spawn_llm_reason_expand(
+            bot=bot,
+            report_dest=report_dest,
+            report_message_id=report_message_id,
+            original_rich_msg=rich_msg,
+            chat_id=chat_id,
+            target=target,
+            action_type=action_type,
+            mod_reason=reason,
+            offender_text=text_content,
+            reply_context_text=(
+                reply_context.text if reply_context is not None else None
+            ),
+            mod=mod,
+        )
 
     return None
 
@@ -4060,6 +4102,387 @@ async def _schedule_ephemeral_delete(
 
     # v4.8.7: strong ref через _spawn_background_task — GC не убьёт задачу до delete.
     _spawn_background_task(_del_ephemeral(), label="del_ephemeral")
+
+
+# ── v5.8.0: LLM-авторазвёртка причины наказаний ──────────────────────────────
+
+# In-memory кеш правил чата. Загружается один раз при первом обращении
+# LLM-хелпера, дальше хранится до конца жизни процесса. Если файл
+# docs/rules.md меняется — нужен рестарт бота. Это сознательно: правила
+# меняются редко (последнее обновление — август 2026), и подтягивать их
+# на каждый запрос бессмысленно, а кешить с TTL — лишняя сложность.
+#
+# Если docs/rules.md отсутствует (тесты, dev-окружение без клона репо) —
+# кеш остаётся None, и _load_rules_md_for_llm возвращает пустую строку.
+# LLM в этом случае работает без контекста правил — менее точно, но
+# не падает.
+_rules_md_cache: str | None = None
+_rules_md_loaded: bool = False
+
+
+def _load_rules_md_for_llm() -> str:
+    """Возвращает текст правил из docs/rules.md для контекста LLM.
+
+    Кешируется на уровне процесса. При первом вызове читает файл, дальше
+    возвращает закешированную строку. Если файл отсутствует — пустая строка
+    (LLM работает без правил, фича остаётся активной).
+
+    Файл лежит в docs/rules.md рядом с кодом. Путь вычисляется от
+    __file__: bot_handlers.py → .. / docs / rules.md. На прод-контейнере
+    Bothost это /app/docs/rules.md (Docker COPY).
+    """
+    global _rules_md_cache, _rules_md_loaded
+    if _rules_md_loaded:
+        return _rules_md_cache or ""
+    _rules_md_loaded = True
+    try:
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        rules_path = _os.path.join(here, "docs", "rules.md")
+        # v4.10.3 (Task 6): блокирующий open() вынесен в asyncio.to_thread
+        # для других кейсов. Тут чтение одноразовое при первом обращении —
+        # гонять его через to_thread значит вешать блок на первый warn
+        # в процессе. Чище: файл маленький (~3KB), читаем синхронно,
+        # один раз, при первом обращении. Это допустимое исключение из
+        # правила ASYNC230 — обосновано и отмечено.
+        with open(rules_path, "r", encoding="utf-8") as f:
+            _rules_md_cache = f.read().strip()
+        logger.info("llm rules loaded: %d chars from %s",
+                    len(_rules_md_cache or ""), rules_path)
+    except OSError as e:
+        logger.warning("llm rules: cannot read docs/rules.md: %s — "
+                       "LLM работает без контекста правил", e)
+        _rules_md_cache = None
+    return _rules_md_cache or ""
+
+
+async def _maybe_spawn_llm_reason_expand(
+    *,
+    bot: types.Bot,
+    report_dest: int,
+    chat_id: int,
+    target: types.User,
+    action_type: str,
+    mod_reason: str,
+    offender_text: str | None,
+    reply_context_text: str | None,
+    mod: types.User | None,
+    report_message_id: int | None = None,
+    original_rich_msg: "InputRichMessage | None" = None,
+) -> None:
+    """Запускает фоновую LLM-авторазвёртку причины (если чат того хочет).
+
+    Не блокирует вызов. Все ошибки глушатся на уровне logging.warning —
+    LLM-фича некритичная, её падение не должно влиять на модерацию.
+
+    v5.8.0 (edit mode): после успеха LLM — редактирует исходный rich-репорт
+    через ``bot.edit_message_text(rich_message=...)`` (Bot API 10.3),
+    заменяя короткий reason на развёрнутый прямо в сообщении. Журнал
+    остаётся чистым: одно сообщение на одно наказание, без follow-up.
+    Дополнительно обновляет ``punishments.reason`` в БД — веб-панель
+    ``/mywarns`` и ``/user/<id>`` показывают развёрнутое описание.
+
+    Если ``report_message_id`` или ``original_rich_msg`` отсутствуют
+    (например, ``send_rich_message`` упал и был fallback на plain text,
+    или aiogram не вернул message_id) — fallback на старое поведение:
+    follow-up отдельным сообщением. Это страховка, не основной путь.
+
+    Проверки перед запуском:
+      1. Глобальный рубильник llm_client.is_available() — без сетевого
+         запроса, по in-memory кешу. False → выходим, не таскаем БД.
+      2. Per-chat тумблер chat_settings.llm_expand_reason. Если False —
+         фича выключена в этом чате.
+      3. mod_reason достаточно короткий, чтобы имело смысл разворачивать.
+         Если reason уже длинный (>= 200 символов) — модератор сам
+         расписал, LLM не трогает.
+      4. reason не системный (не «Автобан: ...», не «CAS auto-ban: ...»).
+         Такие причины формирует бот, не модератор — LLM их не касается.
+    """
+    import llm_client
+
+    if not llm_client.is_available():
+        return  # Глобальный рубильник выключен.
+
+    # Per-chat тумблер.
+    try:
+        async with async_session() as session:
+            settings = await _get_chat_settings(session, chat_id)
+            if not settings.llm_expand_reason:
+                return
+    except Exception as e:
+        logger.warning("llm_reason_expand: cannot read chat_settings for %s: %s",
+                       chat_id, e)
+        return
+
+    # Системные причины — пропускаем. Имеют смысл только если reason непустой:
+    # при пустом reason (no-reason mode) эти строки не сработают, и LLM
+    # спокойно классифицирует цитату нарушителя по правилам.
+    if mod_reason:
+        reason_lower = mod_reason.lower()
+        if reason_lower.startswith("автобан:") or reason_lower.startswith("cas auto-ban"):
+            return
+
+        # Если reason уже длинный — модератор сам расписал, не мешаем.
+        # Для no-reason mode (mod_reason пустой) эту проверку пропускаем.
+        if len(mod_reason) >= 200:
+            return
+
+    # v5.8.0 (no-reason mode): если цитаты нарушителя нет (например, бан по
+    # @username без reply) и reason пустой — LLM нечего анализировать,
+    # выходим. Модель не может придумать нарушение «из воздуха».
+    if not mod_reason and not offender_text:
+        logger.info("llm_reason_expand: skip (no reason AND no offender_text)")
+        return
+
+    # Последние 3 причины этого юзера (для контекста «повторное нарушение»).
+    recent_reasons: list[str] = []
+    try:
+        async with async_session() as session:
+            from db import Punishment as _Pun
+            rows = (await session.execute(
+                select(_Pun.reason)
+                .where(_Pun.user_id == target.id, _Pun.chat_id == chat_id,
+                       _Pun.action_type.in_(["warn", "ban", "mute"]),
+                       _Pun.reason.is_not(None))
+                .order_by(_Pun.created_at.desc())
+                .limit(3)
+            )).scalars().all()
+            recent_reasons = [r for r in rows if r and not r.lower().startswith(("автобан:", "cas auto-ban"))]
+    except Exception as e:
+        logger.warning("llm_reason_expand: cannot load recent reasons: %s", e)
+
+    rules_md = _load_rules_md_for_llm()
+
+    async def _expand_and_report() -> None:
+        """Тело фоновой задачи: LLM → edit rich-репорта + update punishments.reason.
+
+        v5.8.0 (edit mode): основной путь — ``bot.edit_message_text`` с
+        новым ``rich_message``, где в List заменён пункт «📝 <reason>»
+        на развёрнутый. Журнал остаётся чистым: одно сообщение на одно
+        наказание, без follow-up.
+
+        Fallback: если ``report_message_id`` или ``original_rich_msg``
+        отсутствуют — старое поведение (follow-up отдельным сообщением).
+        Это бывает, когда ``send_rich_message`` упал и был plain-text
+        fallback, или когда aiogram не вернул message_id.
+        """
+        try:
+            result = await llm_client.expand_reason(
+                action_type=action_type,
+                mod_reason=mod_reason,
+                offender_text=offender_text,
+                reply_context_text=reply_context_text,
+                rules_md=rules_md,
+                recent_reasons=recent_reasons,
+            )
+            if not result.ok or not result.text:
+                logger.info("llm_reason_expand: skipped (result not ok): %s",
+                            result.error or "empty")
+                return
+            expanded = result.text.strip()
+            # Если LLM вернула пустоту или то же самое — пропускаем.
+            if not expanded or expanded == mod_reason:
+                logger.info("llm_reason_expand: LLM returned same/empty, skip")
+                return
+
+            # ── Обновляем punishments.reason в БД ────────────────────────
+            # Берём последнюю запись наказания этого юзера в этом чате.
+            # Это «best effort»: если запись ещё не сохранена к моменту
+            # LLM-ответа (гонка) — обновление промахнётся молча. Чтобы
+            # не затереть причину, которую модератор уже поменял вручную
+            # через /unwarn+перевыдать, проверяем row.reason == mod_reason.
+            try:
+                async with async_session() as session:
+                    from db import Punishment as _Pun
+                    row = (await session.execute(
+                        select(_Pun)
+                        .where(_Pun.user_id == target.id, _Pun.chat_id == chat_id)
+                        .order_by(_Pun.created_at.desc())
+                        .limit(1)
+                    )).scalar_one_or_none()
+                    if row is not None and row.reason == mod_reason:
+                        row.reason = expanded
+                        await session.commit()
+                        logger.info(
+                            "llm_reason_expand: updated punishments.reason "
+                            "for user %s in chat %s: %r → %r",
+                            target.id, chat_id, mod_reason, expanded,
+                        )
+            except Exception as e:
+                logger.warning("llm_reason_expand: cannot update punishment: %s", e)
+
+            # ── Редактируем rich-репорт в репорт-чате ────────────────────
+            # Проходим по original_rich_msg.blocks, ищем InputRichBlockList,
+            # в нём — list_items, в каждом InputRichBlockListItem ищем
+            # InputRichBlockParagraph где text — строка, начинающаяся с
+            # «📝 ». Заменяем text на «📝 <expanded>».
+            #
+            # Если rich_msg нет (fallback на plain text был) или пункт
+            # с reason не найден (например, reason был пустой — тогда
+            # пункта в списке вообще нет) — fallback на send_message
+            # с plain text. Это страховка, не основной путь.
+            edited_via_rich = False
+            if report_message_id is not None and original_rich_msg is not None:
+                edited_via_rich = await _try_edit_rich_reason(
+                    bot=bot,
+                    report_dest=report_dest,
+                    report_message_id=report_message_id,
+                    original_rich_msg=original_rich_msg,
+                    mod_reason=mod_reason,
+                    expanded=expanded,
+                )
+
+            if not edited_via_rich:
+                # Fallback: follow-up отдельным сообщением (старое поведение).
+                # Срабатывает если:
+                #   • send_rich_message упал в _send_report → plain text
+                #   • aiogram не вернул message_id
+                #   • edit_message_text упал (сообщение удалено/слишком старое)
+                #   • в rich_msg не нашлось пункта с reason (no-reason mode:
+                #     пункта «📝 <reason>» в листе не было, причина была пустая)
+                text = (
+                    "🔍 <b>Развёрнутая причина (LLM):</b>\n"
+                    + html.escape(expanded)
+                )
+                try:
+                    await tg_safe_call(
+                        lambda: bot.send_message(
+                            chat_id=report_dest,
+                            text=text,
+                            parse_mode="HTML",
+                        ),
+                        label="llm_reason_expand",
+                    )
+                except TelegramAPIError as e:
+                    logger.warning("llm_reason_expand: send_message fallback failed: %s", e)
+        except Exception as e:
+            logger.warning("llm_reason_expand task failed: %s", e)
+
+    _spawn_background_task(_expand_and_report(), label="llm_reason_expand")
+
+
+async def _try_edit_rich_reason(
+    *,
+    bot: types.Bot,
+    report_dest: int,
+    report_message_id: int,
+    original_rich_msg: "InputRichMessage",
+    mod_reason: str | None,
+    expanded: str,
+) -> bool:
+    """Редактирует rich-репорт, заменяя пункт «📝 <reason>» на развёрнутый.
+
+    Возвращает True при успехе, False если:
+      • в rich_msg не нашёлся пункт с reason (no-reason mode — пункт
+        не создавался, потому что reason был пустой);
+      • edit_message_text упал (сообщение удалено/слишком старое/нет прав).
+
+    Итерируем original_rich_msg.blocks → InputRichBlockList → items →
+    InputRichBlockListItem → blocks → InputRichBlockParagraph. В Paragraph
+    text может быть str или list[str | RichText*]. Ищем строку, которая
+    начинается с «📝 » и равна «📝 <mod_reason>» (или просто «📝 ...»,
+    если mod_reason был пустой — тогда замены нет, нет пункта).
+
+    Альтернатива: no-reason mode, когда пункта с «📝 » не было вообще
+    (mod_reason был пустой). В этом случае — добавляем новый пункт в
+    существующий List, чтобы в журнале появилась категория нарушения.
+    """
+    try:
+        # Глубокая копия blocks через model_copy(deep=True) — aiogram
+        # модели pydantic v2, поддерживают. Иначе мутировали бы исходный
+        # rich_msg, что в принципе безопасно (он больше не используется),
+        # но чистота важнее.
+        new_rich = original_rich_msg.model_copy(deep=True)
+
+        # v5.8.0 (no-reason mode): если reason был пустой, пункта «📝 » в
+        # List нет. Добавляем новый InputRichBlockListItem с Paragraph
+        # «📝 <expanded>» в конец List. Это и есть «LLM сама нашла
+        # нарушение и добавила его в журнал».
+        reason_marker = "📝 "
+        found_and_replaced = False
+        list_block_idx: int | None = None
+
+        for block_idx, block in enumerate(new_rich.blocks):
+            # Ищем InputRichBlockList (по имени класса, чтобы не импортировать
+            # всё — aiogram модели имеют __class__.__name__).
+            if type(block).__name__ != "InputRichBlockList":
+                continue
+            list_block_idx = block_idx
+            items = getattr(block, "items", None) or []
+            for item in items:
+                item_blocks = getattr(item, "blocks", None) or []
+                for inner in item_blocks:
+                    if type(inner).__name__ != "InputRichBlockParagraph":
+                        continue
+                    text_attr = getattr(inner, "text", None)
+                    if text_attr is None:
+                        continue
+                    # text может быть str или list[str | RichText*].
+                    if isinstance(text_attr, str):
+                        if text_attr.startswith(reason_marker):
+                            inner.text = f"{reason_marker}{expanded}"
+                            found_and_replaced = True
+                            break
+                    elif isinstance(text_attr, list):
+                        # Ищем первый str-элемент, начинающийся с маркера.
+                        for i, part in enumerate(text_attr):
+                            if isinstance(part, str) and part.startswith(reason_marker):
+                                text_attr[i] = f"{reason_marker}{expanded}"
+                                found_and_replaced = True
+                                break
+                        if found_and_replaced:
+                            break
+                if found_and_replaced:
+                    break
+            if found_and_replaced:
+                break
+
+        # v5.8.0 (no-reason mode): пункта с reason не было. Добавляем
+        # новый ListItem в существующий List (если нашли List).
+        if not found_and_replaced and list_block_idx is not None:
+            list_block = new_rich.blocks[list_block_idx]
+            new_item = InputRichBlockListItem(
+                blocks=[InputRichBlockParagraph(
+                    text=f"{reason_marker}{expanded}"
+                )]
+            )
+            if list_block.items is None:
+                list_block.items = []
+            list_block.items.append(new_item)
+            found_and_replaced = True  # считаем успехом — пункт добавлен
+
+        if not found_and_replaced:
+            # В rich_msg вообще нет List — нечего редактировать. Fallback.
+            logger.info(
+                "llm_reason_expand: no InputRichBlockList in rich_msg, "
+                "fallback to send_message"
+            )
+            return False
+
+        # Редактируем сообщение.
+        try:
+            await tg_safe_call(
+                lambda: bot.edit_message_text(
+                    chat_id=report_dest,
+                    message_id=report_message_id,
+                    rich_message=new_rich,
+                ),
+                label="llm_reason_expand_edit",
+            )
+            logger.info(
+                "llm_reason_expand: edited rich report %s/%s with expanded reason",
+                report_dest, report_message_id,
+            )
+            return True
+        except TelegramAPIError as e:
+            logger.warning(
+                "llm_reason_expand: edit_message_text failed: %s — fallback to send_message",
+                e,
+            )
+            return False
+    except Exception as e:
+        logger.warning("llm_reason_expand: _try_edit_rich_reason failed: %s", e)
+        return False
 
 
 async def _send_ephemeral(

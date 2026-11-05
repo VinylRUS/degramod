@@ -355,6 +355,19 @@ class ChatSettings(Base):
     # см. _channel_guard_reason.
     delete_channel_messages = Column(Boolean, default=False, nullable=False)
 
+    # ── v5.8.0: LLM-авторазвёртка причин наказаний ───────────────────────
+    # Per-chat тумблер для авторазвёртки причины warn/ban/mute через
+    # GigaChat. Глобальный рубильник живёт отдельно — в LlmSettings.is_active
+    # (singleton в таблице llm_settings). Если глобальный рубильник
+    # выключен (нет ключа или is_active=False), этот per-chat флаг
+    # игнорируется — фича молча остаётся выключенной. SU сначала заводит
+    # ключ и включает LLM глобально, потом модераторы/админы могут
+    # точечно включать доработку в конкретных чатах.
+    #
+    # По умолчанию False — фича opt-in, как все автоматические наказания в
+    # проекте (см. CLAUDE.md «Асимметрия в коде — решение, а не недоделка»).
+    llm_expand_reason = Column(Boolean, default=False, nullable=False)
+
     # ── v4.8.0: Modchat (модераторский чат) + keyword-watch ─────────────
     # Modchat — отдельный чат для оперативных оповещений модераторам:
     # события alarm on/off/auto-off/продление + keyword-watch (упоминания
@@ -1031,6 +1044,45 @@ class GithubSettings(Base):
     updated_by = Column(String(64), nullable=True)          # username из веб-панели
 
 
+# ── v5.8.0: LLM-настройки (GigaChat) ──────────────────────────────────────────
+class LlmSettings(Base):
+    """v5.8.0: Настройки подключения к GigaChat.
+
+    Singleton (id=1) — настройки глобальные на весь бот. Аналог
+    GithubSettings по структуре: ключ шифруется через Fernet тем же
+    ключом, что и PAT (см. ``_load_or_create_enc_key``). При потере
+    ``.github_enc_key`` теряются одновременно и PAT, и GigaChat-ключ —
+    это задокументировано в ``.env.example``.
+
+    В отличие от GitHub PAT, у GigaChat-ключа нет «тонких» настроек —
+    только ключ, модель и таймаут. Один эндпоинт (``gigachat.devices
+    .sberbank.ru``) хардкожен в ``llm_client.py``: документация Sber
+    рекомендует не выносить его в env, чтобы избежать опечаток в проде.
+
+    Поля:
+      • api_key_encrypted — Fernet-шифр ключа GigaChat. Расшифровка
+        через ``_decrypt_pat`` (тем же ключом, что и GitHub PAT).
+      • model_name — модель (GigaChat-Pro / GigaChat-Plus / GigaChat-Lite).
+        None → DEFAULT_MODEL в llm_client.
+      • timeout_seconds — таймаут на запрос к API. None → 30 сек.
+      • is_active — флаг включения LLM-фич. Если False — все вызовы
+        llm_client.complete() fast-path к LLMResult(ok=False), без
+        сетевых запросов. Это глобальный рубильник, отдельный от
+        per-chat тумблера в ChatSettings.llm_expand_reason.
+      • updated_at, updated_by — audit.
+    """
+    __tablename__ = "llm_settings"
+
+    id = Column(Integer, primary_key=True)                  # всегда 1 (singleton)
+    api_key_encrypted = Column(Text, nullable=True)          # Fernet-шифр GigaChat API key
+    model_name = Column(String(64), nullable=True)           # GigaChat-Pro / Plus / Lite
+    timeout_seconds = Column(Integer, nullable=True)         # 10..60
+    is_active = Column(Boolean, default=False, nullable=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+    updated_by = Column(String(64), nullable=True)           # username из веб-панели
+
+
 # ── Init / Shutdown ────────────────────────────────────────────────────────
 async def init_db() -> None:
     """Создаёт таблицы при первом запуске + миграции для новых колонок."""
@@ -1623,6 +1675,50 @@ async def init_db() -> None:
                 "ALTER TABLE chat_settings ADD COLUMN delete_channel_messages "
                 "BOOLEAN NOT NULL DEFAULT 0"
             ))
+
+    # ── v5.8.0: chat_settings.llm_expand_reason (per-chat тумблер LLM) ───
+    # Глобальный рубильник живёт в таблице llm_settings (см. ниже), эта
+    # колонка — per-chat. Идемпотентно: если колонки нет — добавляем с
+    # DEFAULT 0. Существующие чаты остаются без LLM, новые тоже.
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(chat_settings)"))
+        existing_cols = {row[1] for row in result.fetchall()}
+        if "llm_expand_reason" not in existing_cols:
+            await conn.execute(text(
+                "ALTER TABLE chat_settings ADD COLUMN llm_expand_reason "
+                "BOOLEAN NOT NULL DEFAULT 0"
+            ))
+
+    # ── v5.8.0: Новая таблица llm_settings (singleton для GigaChat) ────
+    # create_all() создаст её для новой БД; для существующей — CREATE IF
+    # NOT EXISTS. ВАЖНО: здесь указываем ВСЕ колонки из модели LlmSettings
+    # — иначе при ручном создании БД без Base.metadata.create_all у нас
+    # будет таблица без новых колонок, и ORM-SELECT упадёт. Аналогично
+    # блоку github_settings выше.
+    async with engine.begin() as conn:
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS llm_settings (
+                id INTEGER PRIMARY KEY,
+                api_key_encrypted TEXT NULL,
+                model_name VARCHAR(64) NULL,
+                timeout_seconds INTEGER NULL,
+                is_active BOOLEAN NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_by VARCHAR(64) NULL
+            )
+        """))
+
+    # ── v5.8.0: Seed singleton-строки llm_settings (id=1) ──────────────
+    # Гарантируем, что строка с id=1 существует — на ней будут UPDATE'ы
+    # из веб-панели. Без этого INSERT через веб-форму упадёт на PK-конфликте
+    # при повторном сохранении. Аналогично github_settings.
+    async with async_session() as session:
+        existing_llm = (await session.execute(
+            select(LlmSettings).where(LlmSettings.id == 1)
+        )).scalar_one_or_none()
+        if existing_llm is None:
+            session.add(LlmSettings(id=1, is_active=False))
+            await session.commit()
 
     # ── v5.3.0: Новая таблица channel_whitelist ───────────────────────────
     # create_all() создаст её для новой БД; для существующей — CREATE IF NOT EXISTS.

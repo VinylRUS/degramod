@@ -35,7 +35,8 @@ from sqlalchemy import select
 
 import health_probe
 import web_app
-from db import DB_PATH, GithubSettings, _decrypt_pat, _encrypt_pat, async_session
+import llm_client
+from db import DB_PATH, GithubSettings, LlmSettings, _decrypt_pat, _encrypt_pat, async_session
 from web.admin_cleanup import _cleanup_counts
 from web.deps import APP_VERSION, AuthUser, get_templates, require_csrf_su, require_su
 
@@ -587,4 +588,222 @@ async def admin_settings_github_test(
         "ok": result.ok,
         "message": result.message,
         "details": result.details,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  v5.8.0: GigaChat (LLM) — настройки для авторазвёртки причин наказаний
+# ════════════════════════════════════════════════════════════════════════════
+#
+#  Структура аналогична GitHub Projects-секции выше:
+#    • GET  /admin/settings/llm         — JSON с текущими настройками (для
+#                                         pre-fill формы в JavaScript).
+#    • POST /admin/settings/llm         — сохранение формы (ключ шифруется
+#                                         Fernet'ом, как GitHub PAT).
+#    • POST /admin/settings/llm/test    — проверка ключа одним коротким
+#                                         запросом к GigaChat (без
+#                                         сохранения в БД — ровно тот ключ,
+#                                         что ввёл SU).
+#
+#  Токен в открытом виде в JSON не возвращается — только признак
+#  is_api_key_set. Как и у GitHub PAT: значений ключей в панель не
+#  выводится никогда (см. CLAUDE.md «Логи» / переменные окружения).
+#  Дополнительно см. llm_client.py §контракт: модуль держит расшифрованный
+#  ключ в in-memory кеше только между запросами и никогда не пишет в лог
+#  промпт/ответ — только длительность, токены, модель.
+
+
+async def _load_llm_settings_row(session) -> LlmSettings:
+    """Гарантирует что singleton-строка LlmSettings (id=1) есть в БД
+    и возвращает её. Если нет — создаёт пустую. Аналог
+    ``_load_github_settings_row`` выше.
+    """
+    row = (await session.execute(
+        select(LlmSettings).where(LlmSettings.id == 1)
+    )).scalar_one_or_none()
+    if row is None:
+        row = LlmSettings(id=1, is_active=False)
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
+@router.get("/admin/settings/llm")
+async def admin_settings_llm_get(
+    request: Request,
+    _auth: AuthUser = Depends(require_su),
+):
+    """v5.8.0: возвращает текущие настройки GigaChat как JSON.
+
+    Используется JS-формой для pre-fill при загрузке страницы.
+    Ключ НЕ возвращается в открытом виде — только признак
+    is_api_key_set (True/False), как у GitHub PAT.
+    """
+    async with async_session() as session:
+        row = await _load_llm_settings_row(session)
+        return {
+            "is_active": row.is_active,
+            "is_api_key_set": bool(row.api_key_encrypted),
+            "model_name": row.model_name or "",
+            "timeout_seconds": row.timeout_seconds,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            "updated_by": row.updated_by,
+        }
+
+
+@router.post("/admin/settings/llm")
+async def admin_settings_llm_post(
+    request: Request,
+    api_key: str = Form(""),
+    model_name: str = Form(""),
+    timeout_seconds: str = Form(""),
+    is_active: str = Form(""),
+    _auth: AuthUser = Depends(require_csrf_su),
+):
+    """v5.8.0: сохраняет настройки GigaChat.
+
+    Логика (аналогична /admin/settings/github):
+      • api_key: если поле непустое — шифруем и сохраняем. Если пустое —
+        оставляем старый ключ (не затираем). Это чтобы SU мог менять
+        другие поля (model_name, timeout) не перезаводя ключ.
+      • model_name: строка, сохраняется как есть. Пустое → NULL →
+        DEFAULT_MODEL в llm_client.
+      • timeout_seconds: int 10..60 или NULL. Защита от опечатки.
+      • is_active: '1' если чекбокс включён, иначе '0'.
+      • Сохранение сбрасывает кеш llm_client (settings_changed), чтобы
+        следующий запрос использовал новый ключ/настройки.
+      • Сохранение НЕ запускает test_connection — это отдельный endpoint.
+
+    После сохранения — редирект на /admin/settings#llm с flash-статусом.
+    """
+    is_active_flag = is_active == "1"
+    async with async_session() as session:
+        row = await _load_llm_settings_row(session)
+
+        # Ключ — только если задан новый.
+        if api_key.strip():
+            try:
+                row.api_key_encrypted = _encrypt_pat(api_key.strip())
+            except Exception as e:
+                web_app._req_logger.error(
+                    "admin_settings_llm_post: encrypt key failed: %s", e,
+                )
+                return RedirectResponse(
+                    url=f"/admin/settings?flash=LLM+key+encryption+failed%3A+{e}#llm",
+                    status_code=303,
+                )
+
+        row.model_name = model_name.strip() or None
+
+        # timeout_seconds — int 10..60 или NULL.
+        ts_str = timeout_seconds.strip()
+        if ts_str:
+            try:
+                ts_int = int(ts_str)
+                if not (10 <= ts_int <= 60):
+                    raise ValueError("timeout out of range 10..60")
+                row.timeout_seconds = ts_int
+            except ValueError as e:
+                return RedirectResponse(
+                    url=f"/admin/settings?flash=LLM+timeout+invalid%3A+{e}#llm",
+                    status_code=303,
+                )
+        else:
+            row.timeout_seconds = None
+
+        # Если активируется — проверяем что ключ задан.
+        if is_active_flag and not row.api_key_encrypted:
+            web_app._req_logger.warning(
+                "admin_settings_llm_post: cannot activate — no API key",
+            )
+            return RedirectResponse(
+                url="/admin/settings?flash=Cannot+activate+LLM%3A+API+key+not+set#llm",
+                status_code=303,
+            )
+
+        row.is_active = is_active_flag
+        row.updated_by = _auth.username
+
+        await session.commit()
+
+    # Сбрасываем кеш llm_client — следующий запрос перечитает настройки.
+    llm_client.settings_changed()
+
+    web_app._req_logger.info(
+        "admin_settings_llm_post: saved (by=%s, active=%s, model=%s)",
+        _auth.username, is_active_flag, row.model_name or "(default)",
+    )
+    return RedirectResponse(
+        url="/admin/settings?flash=LLM+settings+saved.#llm",
+        status_code=303,
+    )
+
+
+@router.post("/admin/settings/llm/test")
+async def admin_settings_llm_test(
+    request: Request,
+    api_key: str = Form(""),
+    model_name: str = Form(""),
+    _auth: AuthUser = Depends(require_csrf_su),
+):
+    """v5.8.0: проверка ключа GigaChat одним коротким запросом.
+
+    Логика:
+      • Если поле api_key непустое — тестируем ровно его (то, что SU
+        ввёл сейчас, до сохранения).
+      • Если пустое — берём сохранённый из БД (расшифровываем).
+      • Шлём ``"Ответь одним словом: ok"`` — самый дешёвый промпт для
+        проверки валидности ключа.
+      • model_name опционален: если задан — тестируем с ним, иначе с
+        DEFAULT_MODEL или с тем, что в БД.
+
+    Возвращает JSON {ok, message} для фронтенда.
+    """
+    # Резолвим ключ для теста.
+    if api_key.strip():
+        test_key = api_key.strip()
+    else:
+        async with async_session() as session:
+            row = await _load_llm_settings_row(session)
+            if not row.api_key_encrypted:
+                return {
+                    "ok": False,
+                    "message": "Ключ не задан. Сначала введите ключ в форму.",
+                }
+            try:
+                test_key = _decrypt_pat(row.api_key_encrypted)
+            except Exception as e:
+                web_app._req_logger.error(
+                    "admin_settings_llm_test: decrypt key failed: %s", e,
+                )
+                return {
+                    "ok": False,
+                    "message": f"Не удалось расшифровать ключ: {e}. "
+                    "Перезаведите токен через форму.",
+                }
+
+    # Модель для теста.
+    test_model = model_name.strip() or None
+    # Если пусто и есть в БД — берём оттуда.
+    if not test_model:
+        async with async_session() as session:
+            row = await _load_llm_settings_row(session)
+            test_model = row.model_name or None
+
+    try:
+        result = await llm_client.test_connection(test_key, model=test_model)
+    except Exception as e:
+        web_app._req_logger.exception(
+            "admin_settings_llm_test: unexpected error: %s", e,
+        )
+        return {"ok": False, "message": f"Unexpected error: {e}"}
+
+    web_app._req_logger.info(
+        "admin_settings_llm_test: result ok=%s (by=%s, message=%s)",
+        result.ok, _auth.username, result.error or "ok",
+    )
+    return {
+        "ok": result.ok,
+        "message": result.text if result.ok else (result.error or "ошибка"),
     }
